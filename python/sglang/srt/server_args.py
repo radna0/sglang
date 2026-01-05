@@ -1220,7 +1220,7 @@ class ServerArgs:
                 else:
                     self.attention_backend = "triton"
 
-            supported_backends = ["triton", "trtllm_mha", "fa3", "fa4"]
+            supported_backends = ["triton", "trtllm_mha", "fa3", "fa4", "flashinfer"]
             prefill_attn_backend, decode_attn_backend = self.get_attention_backends()
             assert (
                 prefill_attn_backend in supported_backends
@@ -1826,6 +1826,7 @@ class ServerArgs:
                             "torch_native",
                             "flex_attention",
                             "trtllm_mha",
+                            "flashinfer",
                         ]
                         assert (
                             self.attention_backend in KV4_ATTENTION_MHA_BACKEND_CHOICES
