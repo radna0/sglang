@@ -69,10 +69,6 @@ class OpenAIServingCompletion(OpenAIServingBase):
         raw_request: Request = None,
     ) -> tuple[GenerateReqInput, CompletionRequest]:
         """Convert OpenAI completion request to internal format"""
-        # GptOss model needs to keep special tokens for harmony parsing
-        if self.is_gpt_oss:
-            request.skip_special_tokens = False
-
         # NOTE: with openai API, the prompt's logprobs are always not computed
         if request.echo and request.logprobs:
             logger.warning(

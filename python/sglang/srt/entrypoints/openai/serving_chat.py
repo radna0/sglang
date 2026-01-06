@@ -259,10 +259,6 @@ class OpenAIServingChat(OpenAIServingBase):
         self, request: ChatCompletionRequest, is_multimodal: bool
     ) -> MessageProcessingResult:
         """Process chat messages and apply chat template"""
-        # GptOss model needs to keep special tokens for harmony parsing
-        if self.is_gpt_oss:
-            request.skip_special_tokens = False
-
         tool_call_constraint = None
 
         # Apply chat template and its stop strings
