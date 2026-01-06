@@ -535,6 +535,7 @@ class OpenAIServingChat(OpenAIServingBase):
         is_firsts = {}
         stream_buffers = {}
         n_prev_tokens = {}
+        token_buffers = {} if request.return_token_ids else None
         has_tool_calls = {}
         finish_reasons = {}
 
@@ -593,6 +594,21 @@ class OpenAIServingChat(OpenAIServingBase):
                 stream_buffer = stream_buffers.get(index, "")
                 delta = content["text"][len(stream_buffer) :]
                 stream_buffers[index] = stream_buffer + delta
+
+                token_delta = None
+                if request.return_token_ids:
+                    output_ids = content.get("output_ids", []) or []
+                    if not self.tokenizer_manager.server_args.stream_output:
+                        prev_tokens = token_buffers.get(index, [])
+                        if len(output_ids) >= len(prev_tokens):
+                            token_delta = output_ids[len(prev_tokens) :]
+                            token_buffers[index] = output_ids
+                        else:
+                            token_delta = output_ids
+                            token_buffers[index] = prev_tokens + output_ids
+                    else:
+                        token_delta = output_ids
+                        token_buffers[index] = token_buffers.get(index, []) + output_ids
 
                 # Handle reasoning content
                 if self.reasoning_parser and request.separate_reasoning:
@@ -657,20 +673,12 @@ class OpenAIServingChat(OpenAIServingBase):
                             index=index,
                             delta=DeltaMessage(
                                 content=delta,
-                                token_ids=(
-                                    content["output_ids"]
-                                    if request.return_token_ids
-                                    else None
-                                ),
+                                token_ids=token_delta,
                             ),
                             finish_reason=None,
                             matched_stop=None,
                             logprobs=choice_logprobs,
-                            token_ids=(
-                                content["output_ids"]
-                                if request.return_token_ids
-                                else None
-                            ),
+                            token_ids=token_delta,
                         )
                         chunk = ChatCompletionStreamResponse(
                             id=content["meta_info"]["id"],
