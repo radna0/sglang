@@ -21,10 +21,12 @@ from sglang.srt.entrypoints.openai.utils import (
     process_hidden_states_from_ret,
     to_openai_style_logprobs,
 )
+from sglang.srt.entrypoints.harmony_utils import get_stop_tokens_for_assistant_actions
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.code_completion_parser import (
     generate_completion_prompt_from_request,
 )
+from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.utils import convert_json_schema_to_str
 
 if TYPE_CHECKING:
@@ -51,6 +53,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
             and hasattr(self.tokenizer_manager.model_config.hf_config, "model_type")
             and self.tokenizer_manager.model_config.hf_config.model_type == "gpt_oss"
         )
+        self.reasoning_parser = self.tokenizer_manager.server_args.reasoning_parser
 
     def _request_id_prefix(self) -> str:
         return "cmpl-"
@@ -174,6 +177,15 @@ class OpenAIServingCompletion(OpenAIServingBase):
         ):
             sampling_params["structural_tag"] = convert_json_schema_to_str(
                 request.response_format.model_dump(by_alias=True)
+            )
+
+        # Handle GPT-OSS specific stop tokens
+        if self.is_gpt_oss:
+            sampling_params["skip_special_tokens"] = False
+            if sampling_params["stop_token_ids"] is None:
+                sampling_params["stop_token_ids"] = []
+            sampling_params["stop_token_ids"].extend(
+                get_stop_tokens_for_assistant_actions()
             )
 
         return sampling_params
