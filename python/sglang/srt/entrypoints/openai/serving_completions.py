@@ -45,6 +45,13 @@ class OpenAIServingCompletion(OpenAIServingBase):
         super().__init__(tokenizer_manager)
         self.template_manager = template_manager
 
+        # Check if the model is a GPT-OSS model
+        self.is_gpt_oss = (
+            hasattr(self.tokenizer_manager.model_config, "hf_config")
+            and hasattr(self.tokenizer_manager.model_config.hf_config, "model_type")
+            and self.tokenizer_manager.model_config.hf_config.model_type == "gpt_oss"
+        )
+
     def _request_id_prefix(self) -> str:
         return "cmpl-"
 
@@ -62,6 +69,10 @@ class OpenAIServingCompletion(OpenAIServingBase):
         raw_request: Request = None,
     ) -> tuple[GenerateReqInput, CompletionRequest]:
         """Convert OpenAI completion request to internal format"""
+        # GptOss model needs to keep special tokens for harmony parsing
+        if self.is_gpt_oss:
+            request.skip_special_tokens = False
+
         # NOTE: with openai API, the prompt's logprobs are always not computed
         if request.echo and request.logprobs:
             logger.warning(
@@ -265,6 +276,9 @@ class OpenAIServingCompletion(OpenAIServingBase):
                         if finish_reason and "matched" in finish_reason
                         else None
                     ),
+                    token_ids=(
+                        content["output_ids"] if request.return_token_ids else None
+                    ),
                 )
                 chunk = CompletionStreamResponse(
                     id=content["meta_info"]["id"],
@@ -419,6 +433,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
                     if finish_reason and "matched" in finish_reason
                     else None
                 ),
+                token_ids=ret_item["output_ids"] if request.return_token_ids else None,
                 hidden_states=hidden_states,
             )
             choices.append(choice_data)

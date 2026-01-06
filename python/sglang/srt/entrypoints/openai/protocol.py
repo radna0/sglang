@@ -232,6 +232,7 @@ class CompletionRequest(BaseModel):
     top_p: float = 1.0
     user: Optional[str] = None
     return_hidden_states: bool = False
+    return_token_ids: bool = False
 
     # Extra parameters for SRT backend only and will be ignored by OpenAI models.
     top_k: int = -1
@@ -286,6 +287,7 @@ class CompletionResponseChoice(BaseModel):
     logprobs: Optional[LogProbs] = None
     finish_reason: Optional[Literal["stop", "length", "content_filter", "abort"]] = None
     matched_stop: Union[None, int, str] = None
+    token_ids: Optional[List[int]] = None
     hidden_states: Optional[object] = None
 
     @model_serializer(mode="wrap")
@@ -312,6 +314,7 @@ class CompletionResponseStreamChoice(BaseModel):
     logprobs: Optional[LogProbs] = None
     finish_reason: Optional[Literal["stop", "length", "content_filter", "abort"]] = None
     matched_stop: Union[None, int, str] = None
+    token_ids: Optional[List[int]] = None
     hidden_states: Optional[object] = None
 
     @model_serializer(mode="wrap")
@@ -493,6 +496,7 @@ class ChatCompletionRequest(BaseModel):
         default="auto", examples=["none"]
     )  # noqa
     return_hidden_states: bool = False
+    return_token_ids: bool = False
     reasoning_effort: Optional[Literal["low", "medium", "high"]] = Field(
         default="medium",
         description="Constrains effort on reasoning for reasoning models. "
@@ -721,6 +725,7 @@ class ChatCompletionResponseChoice(BaseModel):
         ]
     ] = None
     matched_stop: Union[None, int, str] = None
+    token_ids: Optional[List[int]] = None
     hidden_states: Optional[object] = None
 
     @model_serializer(mode="wrap")
@@ -746,6 +751,7 @@ class DeltaMessage(BaseModel):
     content: Optional[str] = None
     reasoning_content: Optional[str] = None
     tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
+    token_ids: Optional[List[int]] = None
     hidden_states: Optional[object] = None
 
     @model_serializer(mode="wrap")
@@ -766,6 +772,7 @@ class ChatCompletionResponseStreamChoice(BaseModel):
         ]
     ] = None
     matched_stop: Union[None, int, str] = None
+    token_ids: Optional[List[int]] = None
 
 
 class ChatCompletionStreamResponse(BaseModel):

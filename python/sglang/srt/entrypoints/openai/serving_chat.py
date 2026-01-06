@@ -659,10 +659,22 @@ class OpenAIServingChat(OpenAIServingBase):
                     if delta:
                         choice_data = ChatCompletionResponseStreamChoice(
                             index=index,
-                            delta=DeltaMessage(content=delta),
+                            delta=DeltaMessage(
+                                content=delta,
+                                token_ids=(
+                                    content["output_ids"]
+                                    if request.return_token_ids
+                                    else None
+                                ),
+                            ),
                             finish_reason=None,
                             matched_stop=None,
                             logprobs=choice_logprobs,
+                            token_ids=(
+                                content["output_ids"]
+                                if request.return_token_ids
+                                else None
+                            ),
                         )
                         chunk = ChatCompletionStreamResponse(
                             id=content["meta_info"]["id"],
@@ -863,6 +875,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     if finish_reason and "matched" in finish_reason
                     else None
                 ),
+                token_ids=ret_item["output_ids"] if request.return_token_ids else None,
                 hidden_states=hidden_states,
             )
             choices.append(choice_data)
