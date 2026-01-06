@@ -121,6 +121,7 @@ class FlashInferAttnBackend(AttentionBackend):
         init_new_workspace: bool = False,
     ):
         super().__init__()
+        self._supports_sinks_in_wrappers: Optional[bool] = None
 
         # Store multi-item scoring delimiter for efficient access
         self.multi_item_scoring_delimiter = (
@@ -749,6 +750,7 @@ class FlashInferAttnBackend(AttentionBackend):
         save_kv_cache=True,
         **kwargs,
     ):
+        sinks = kwargs.get("sinks", None)
         prefill_wrapper_paged = self.forward_metadata.prefill_wrappers[
             self._get_wrapper_idx(layer)
         ]
@@ -769,7 +771,8 @@ class FlashInferAttnBackend(AttentionBackend):
                         layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                     )
 
-            o = prefill_wrapper_paged.forward(
+            o = self._call_prefill_wrapper(
+                prefill_wrapper_paged,
                 q.view(-1, layer.tp_q_head_num, layer.head_dim),
                 forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
                 causal=not layer.is_cross_attention,
@@ -792,6 +795,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
                 k_scale=layer.k_scale_float,
                 v_scale=layer.v_scale_float,
+                sinks=sinks,
             )
         else:
             causal = True
@@ -807,13 +811,15 @@ class FlashInferAttnBackend(AttentionBackend):
                 # NOTE: FlashInfer currently has limitations with head_dim = 32 or other dimensions
                 # The FlashInfer head_dim limitation itself is tracked here:
                 # https://github.com/flashinfer-ai/flashinfer/issues/1048
-                o = self.prefill_wrapper_ragged.forward(
+                o = self._call_prefill_wrapper(
+                    self.prefill_wrapper_ragged,
                     q.view(-1, layer.tp_q_head_num, layer.head_dim),
                     k.view(-1, layer.tp_k_head_num, layer.head_dim),
                     v.view(-1, layer.tp_v_head_num, layer.head_dim),
                     causal=causal,
                     sm_scale=layer.scaling,
                     logits_soft_cap=logits_soft_cap,
+                    sinks=sinks,
                 )
 
             else:
@@ -822,20 +828,26 @@ class FlashInferAttnBackend(AttentionBackend):
                     # For other models, use causal attention for the ragged part as previously
                     causal = True
 
-                o1, s1 = self.prefill_wrapper_ragged.forward_return_lse(
+                o1, s1 = self._call_prefill_wrapper(
+                    self.prefill_wrapper_ragged,
                     q.view(-1, layer.tp_q_head_num, layer.head_dim),
                     k.view(-1, layer.tp_k_head_num, layer.head_dim),
                     v.view(-1, layer.tp_v_head_num, layer.head_dim),
                     causal=causal,
                     sm_scale=layer.scaling,
                     logits_soft_cap=logits_soft_cap,
+                    sinks=sinks,
+                    return_lse=True,
                 )
-                o2, s2 = prefill_wrapper_paged.forward_return_lse(
+                o2, s2 = self._call_prefill_wrapper(
+                    prefill_wrapper_paged,
                     q.view(-1, layer.tp_q_head_num, layer.head_dim),
                     forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
                     causal=False,
                     sm_scale=layer.scaling,
                     logits_soft_cap=logits_soft_cap,
+                    sinks=sinks,
+                    return_lse=True,
                 )
 
                 o, _ = merge_state(o1, s1, o2, s2)
@@ -857,6 +869,7 @@ class FlashInferAttnBackend(AttentionBackend):
         save_kv_cache=True,
         **kwargs,
     ):
+        sinks = kwargs.get("sinks", None)
         decode_wrapper = self.forward_metadata.decode_wrappers[
             self._get_wrapper_idx(layer)
         ]
@@ -873,18 +886,84 @@ class FlashInferAttnBackend(AttentionBackend):
                     layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                 )
 
-        # Call the wrapped function
-        o = decode_wrapper.forward(
-            q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-            forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
-            sm_scale=layer.scaling,
-            logits_soft_cap=layer.logit_cap,
-            # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
-            k_scale=layer.k_scale_float,
-            v_scale=layer.v_scale_float,
-        )
+        q_view = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+        kv_buffer = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+
+        try:
+            # Call the wrapped function (attempt sinks first if provided)
+            o = decode_wrapper.forward(
+                q_view,
+                kv_buffer,
+                sm_scale=layer.scaling,
+                logits_soft_cap=layer.logit_cap,
+                # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
+                k_scale=layer.k_scale_float,
+                v_scale=layer.v_scale_float,
+                **self._sinks_kwargs(sinks),
+            )
+            if sinks is not None:
+                self._supports_sinks_in_wrappers = True
+        except TypeError as e:
+            if sinks is not None and "sinks" in str(e):
+                if self._supports_sinks_in_wrappers is not False:
+                    logger.warning(
+                        "FlashInfer decode wrapper does not support sink tokens; "
+                        "ignoring sinks for FlashInfer backend."
+                    )
+                self._supports_sinks_in_wrappers = False
+                o = decode_wrapper.forward(
+                    q_view,
+                    kv_buffer,
+                    sm_scale=layer.scaling,
+                    logits_soft_cap=layer.logit_cap,
+                    k_scale=layer.k_scale_float,
+                    v_scale=layer.v_scale_float,
+                )
+            else:
+                raise
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
+
+    def _sinks_kwargs(self, sinks: Optional[torch.Tensor]) -> dict:
+        """Build kwargs for flashinfer wrapper calls with optional sinks support."""
+        if sinks is None:
+            return {}
+        # If we've already detected sinks are unsupported, skip passing them through
+        if self._supports_sinks_in_wrappers is False:
+            return {}
+        return {"sinks": sinks}
+
+    def _call_prefill_wrapper(
+        self,
+        wrapper,
+        *args,
+        sinks: Optional[torch.Tensor] = None,
+        return_lse: bool = False,
+        **kwargs,
+    ):
+        """Invoke flashinfer prefill wrapper, gracefully handling missing sinks support."""
+        fn_name = "forward_return_lse" if return_lse else "forward"
+        fn = getattr(wrapper, fn_name)
+
+        if sinks is None or self._supports_sinks_in_wrappers is False:
+            return fn(*args, **kwargs)
+
+        try:
+            out = fn(*args, sinks=sinks, **kwargs)
+            # If sinks are accepted once, cache the capability.
+            self._supports_sinks_in_wrappers = True
+            return out
+        except TypeError as e:
+            # Older flashinfer builds may not support sinks; fall back but warn once.
+            if "sinks" in str(e):
+                if self._supports_sinks_in_wrappers is not False:
+                    logger.warning(
+                        "FlashInfer attention wrapper does not support sink tokens; "
+                        "falling back to ignoring sinks for FlashInfer backend."
+                    )
+                self._supports_sinks_in_wrappers = False
+                return fn(*args, **kwargs)
+            raise
 
     def _get_wrapper_idx(self, layer: RadixAttention):
         if self.num_wrappers == 1:
