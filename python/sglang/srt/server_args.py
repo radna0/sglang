@@ -1676,9 +1676,9 @@ class ServerArgs:
             or self.decode_attention_backend == "trtllm_mha"
             or self.prefill_attention_backend == "trtllm_mha"
         ):
-            if not is_sm100_supported():
+            if not is_sm100_supported() and not is_sm90_supported():
                 raise ValueError(
-                    "TRTLLM MHA backend is only supported on Blackwell GPUs (SM100). Please use a different backend."
+                    "TRTLLM MHA backend is only supported on Blackwell GPUs (SM100) or SM90. Please use a different backend."
                 )
 
             if self.page_size not in [16, 32, 64]:
