@@ -2426,12 +2426,24 @@ def launch_dummy_health_check_server(host, port, enable_metrics):
 
 
 def set_cuda_arch():
-    if is_flashinfer_available():
-        capability = torch.cuda.get_device_capability()
-        arch = f"{capability[0]}.{capability[1]}"
-        os.environ["FLASHINFER_CUDA_ARCH_LIST"] = (
-            f"{arch}{'a' if capability[0] >= 9 else ''}"
-        )
+    if not is_flashinfer_available():
+        return
+
+    # Respect explicit user override.
+    if os.environ.get("FLASHINFER_CUDA_ARCH_LIST"):
+        return
+
+    capability = torch.cuda.get_device_capability()
+    arch = f"{capability[0]}.{capability[1]}"
+
+    # Avoid emitting the Hopper "a" suffix on H100 (sm90), which fails
+    # when flashinfer JIT targets sm90a-only instructions (cp.async.bulk).
+    device_name = torch.cuda.get_device_name(torch.cuda.current_device()).lower()
+    is_arch_a = capability[0] > 9 or any(
+        hint in device_name for hint in ("gh200", "grace hopper", "h200", "blackwell")
+    )
+
+    os.environ["FLASHINFER_CUDA_ARCH_LIST"] = f"{arch}{'a' if is_arch_a else ''}"
 
 
 def next_power_of_2(n: int):
