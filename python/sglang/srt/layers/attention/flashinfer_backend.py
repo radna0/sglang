@@ -1195,46 +1195,74 @@ class FlashInferIndicesUpdaterDecode:
             and wrapper.begin_forward.func == fast_decode_plan
         )
 
-        if wrapper_uses_fast_decode_plan:
-            # When begin_forward is replaced with fast_decode_plan, pass global_override_indptr_cpu
-            wrapper.begin_forward(
-                kv_indptr,
-                kv_indices,
-                self.kv_last_page_len[:bs],
-                self.num_qo_heads,
-                self.num_kv_heads,
-                self.head_dim,
-                1,
-                data_type=self.data_type,
-                q_data_type=self.q_data_type,
-                non_blocking=True,
-                fixed_split_size=fixed_split_size,
-                disable_split_kv=(
-                    disable_split_kv if disable_split_kv is not None else False
-                ),
-                global_override_indptr_cpu=global_override_indptr_cpu,
-            )
-        else:
-            # When using original begin_forward, don't pass global_override_indptr_cpu
-            wrapper.begin_forward(
-                kv_indptr,
-                kv_indices,
-                self.kv_last_page_len[:bs],
-                self.num_qo_heads,
-                self.num_kv_heads,
-                self.head_dim,
-                1,
-                data_type=self.data_type,
-                q_data_type=self.q_data_type,
-                non_blocking=True,
-                fixed_split_size=fixed_split_size,
-                disable_split_kv=(
-                    disable_split_kv if disable_split_kv is not None else False
-                ),
-            )
+        # Use a signature-aware call to handle different flashinfer versions gracefully
+        self._safe_begin_forward(
+            wrapper.begin_forward,
+            kv_indptr=kv_indptr,
+            kv_indices=kv_indices,
+            last_page_len=self.kv_last_page_len[:bs],
+            num_qo_heads=self.num_qo_heads,
+            num_kv_heads=self.num_kv_heads,
+            head_dim=self.head_dim,
+            page_size=1,
+            pos_encoding_mode="NONE",
+            window_left=-1,
+            logits_soft_cap=0.0,
+            q_data_type=self.q_data_type,
+            kv_data_type=self.kv_data_type,
+            data_type=self.data_type,
+            sm_scale=None,
+            rope_scale=None,
+            rope_theta=None,
+            non_blocking=True,
+            fixed_split_size=fixed_split_size,
+            disable_split_kv=(disable_split_kv if disable_split_kv is not None else False),
+            global_override_indptr_cpu=global_override_indptr_cpu if wrapper_uses_fast_decode_plan else None,
+        )
 
         if locally_override:
             global_override_indptr_cpu = None
+
+    def _safe_begin_forward(self, fn, **kwargs):
+        """
+        Call flashinfer begin_forward/fast_decode_plan with only supported kwargs to avoid
+        mismatched-argument errors across flashinfer versions.
+        """
+        sig = inspect.signature(fn)
+        supported = {k: v for k, v in kwargs.items() if k in sig.parameters and v is not None}
+
+        positional = []
+        keyword = {}
+        for name, param in sig.parameters.items():
+            if name in supported:
+                if param.kind in (
+                    inspect.Parameter.POSITIONAL_ONLY,
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                ) and param.default is inspect._empty:
+                    positional.append(supported[name])
+                else:
+                    keyword[name] = supported[name]
+        try:
+            return fn(*positional, **keyword)
+        except TypeError as e:
+            logger.warning(
+                "flashinfer begin_forward signature mismatch; retrying with positional fallback: %s",
+                e,
+            )
+            required = [
+                "kv_indptr",
+                "kv_indices",
+                "last_page_len",
+                "num_qo_heads",
+                "num_kv_heads",
+                "head_dim",
+                "page_size",
+            ]
+            pos_fallback = []
+            for key in required:
+                if key in supported:
+                    pos_fallback.append(supported[key])
+            return fn(*pos_fallback)
 
 
 class FlashInferIndicesUpdaterPrefill:
