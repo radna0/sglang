@@ -989,6 +989,7 @@ class FlashInferIndicesUpdaterDecode:
         self.head_dim = model_runner.model_config.head_dim
         self.data_type = model_runner.kv_cache_dtype
         self.q_data_type = model_runner.dtype
+        self.kv_data_type = model_runner.kv_cache_dtype
         self.sliding_window_size = model_runner.sliding_window_size
         self.attn_backend = attn_backend
 
