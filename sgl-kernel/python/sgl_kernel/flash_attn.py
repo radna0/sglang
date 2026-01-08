@@ -12,7 +12,7 @@ except:
 
 try:
     from ._fa4_interface import flash_attn_varlen_func as flash_attn_varlen_func_v4
-except ImportError:
+except Exception:
     flash_attn_varlen_func_v4 = None
 
 

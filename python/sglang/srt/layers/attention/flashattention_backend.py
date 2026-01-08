@@ -1003,11 +1003,13 @@ class FlashAttentionBackend(AttentionBackend):
                     max_seqlen_q=max_seqlen_q,
                     softmax_scale=layer.scaling,
                     causal=False if use_cascade_attn else causal,
+                    window_size=window_size,
                     softcap=layer.logit_cap,
                     k_descale=k_descale,
                     v_descale=v_descale,
                     return_softmax_lse=use_cascade_attn,
                     num_splits=self.num_splits,
+                    **kwargs,
                 )
                 if use_cascade_attn:
                     o, softmax_lse, *rest = result
@@ -1030,6 +1032,7 @@ class FlashAttentionBackend(AttentionBackend):
                             v_descale=v_descale,
                             return_softmax_lse=True,
                             num_splits=self.num_splits,
+                            **kwargs,
                         )
                     )
                     o, _ = merge_state_v2_wrapper(
@@ -1284,11 +1287,13 @@ class FlashAttentionBackend(AttentionBackend):
                 max_seqlen_q=max_seqlen_q,
                 softmax_scale=layer.scaling,
                 causal=False if use_cascade_attn else causal,
+                window_size=window_size,
                 softcap=layer.logit_cap,
                 k_descale=k_descale,
                 v_descale=v_descale,
                 return_softmax_lse=use_cascade_attn,  # softmax_lse is needed for merge states
                 num_splits=self.num_splits,
+                **kwargs,
             )
             if use_cascade_attn:
                 o, softmax_lse, *rest = result
@@ -1310,6 +1315,7 @@ class FlashAttentionBackend(AttentionBackend):
                     v_descale=v_descale,
                     return_softmax_lse=True,
                     num_splits=self.num_splits,
+                    **kwargs,
                 )
                 o, _ = merge_state_v2(
                     o,

@@ -367,6 +367,51 @@ class ModelConfig:
 
         # FIXME: temporary special judge for MLA architecture
         if (
+            # GPT-OSS TransMLA checkpoints reuse the GPT-OSS architecture name but switch the
+            # attention stack to absorbed MLA (DeepSeek-style). Treat them as MLA for backend
+            # selection and kernel dispatch.
+            "GptOssForCausalLM" in self.hf_config.architectures
+            and bool(getattr(self.hf_config, "use_transmla", False))
+        ):
+            # NOTE: TransMLA can run in two modes:
+            # - Compute-efficient (materialize K/V and use MHA kernels) for correctness bring-up.
+            # - Absorbed MLA (latent KV cache + MLA kernels) for KV-cache compression + speed.
+            #
+            # Force absorbed MLA via env var; default to MHA for safety/correctness.
+            force_mla = os.getenv("SGLANG_GPTOSS_TRANSMLA_FORCE_MLA_BACKEND", "").lower() in (
+                "1",
+                "true",
+                "yes",
+            )
+            self.attention_arch = AttentionArch.MLA if force_mla else AttentionArch.MHA
+            self.kv_lora_rank = int(getattr(self.hf_config, "kv_lora_rank"))
+            self.qk_nope_head_dim = int(
+                getattr(self.hf_config, "qk_nope_head_dim", self.head_dim)
+            )
+            self.qk_rope_head_dim = int(
+                getattr(
+                    self.hf_config,
+                    "qk_rope_head_dim",
+                    getattr(self.hf_config, "qk_mqa_dim", 64),
+                )
+            )
+            self.v_head_dim = int(getattr(self.hf_config, "v_head_dim", self.head_dim))
+            self.index_head_dim = None
+            self.scaling = 1 / math.sqrt(self.qk_nope_head_dim + self.qk_rope_head_dim)
+            # NOTE: TransMLA GPT-OSS supports two KV-cache layouts:
+            # - MHA mode (materialized): cache K with dim (qk_nope+qk_rope) per head and V with v_head_dim.
+            # - MLA mode (absorbed): cache a single latent KV vector (handled by MLATokenToKVPool).
+            #
+            # For correctness bring-up we default to MHA mode, so the KV-cache head_dim must
+            # match the materialized K dimension.
+            if self.attention_arch == AttentionArch.MHA:
+                self.head_dim = int(self.qk_nope_head_dim + self.qk_rope_head_dim)
+                # FA3 kvcache kernels have limited support for Q/K head_dim != V head_dim.
+                # For GPT-OSS TransMLA bring-up we pad V up to head_dim and slice back inside
+                # the model, so the cache-side v_head_dim must match head_dim.
+                self.v_head_dim = self.head_dim
+
+        elif (
             "DeepseekV2ForCausalLM" in self.hf_config.architectures
             or "DeepseekV32ForCausalLM" in self.hf_config.architectures
             or "DeepseekV3ForCausalLM" in self.hf_config.architectures
@@ -478,6 +523,15 @@ class ModelConfig:
     # adapted from https://github.com/vllm-project/vllm/blob/main/vllm/config.py#L289
     def get_total_num_kv_heads(self) -> int:
         """Returns the total number of KV heads."""
+        # GPT-OSS TransMLA (MHA/materialized mode): kv_b_proj materializes per-Q-head K/V,
+        # so KV cache must use the full attention head count.
+        if (
+            "GptOssForCausalLM" in self.hf_config.architectures
+            and bool(getattr(self.hf_config, "use_transmla", False))
+            and getattr(self, "attention_arch", None) == AttentionArch.MHA
+        ):
+            return self.hf_text_config.num_attention_heads
+
         # For GPTBigCode & Falcon:
         # NOTE: for falcon, when new_decoder_architecture is True, the
         # multi_query flag is ignored and we use n_head_kv for the number of

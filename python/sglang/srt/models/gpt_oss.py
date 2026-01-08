@@ -45,6 +45,7 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
+    ColumnParallelLinear,
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
@@ -57,7 +58,7 @@ from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8_utils import dequant_mxfp4
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.rotary_embedding import get_rope, get_rope_wrapper
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -249,10 +250,15 @@ class GptOssAttention(nn.Module):
             prefix=add_prefix("qkv_proj", prefix),
         )
 
-        # Choose dtype of sinks based on attention backend: trtllm_mha requires float32,
-        # others can use bfloat16
+        # Choose dtype of sinks based on attention backend.
+        # FlashInfer's sinks API expects float32 (matches FlashInfer benchmarks); TRTLLM MHA
+        # also requires float32.
         attn_backend = get_global_server_args().attention_backend
-        sinks_dtype = torch.float32 if attn_backend == "trtllm_mha" else torch.bfloat16
+        sinks_dtype = (
+            torch.float32
+            if attn_backend in ("flashinfer", "trtllm_mha")
+            else torch.bfloat16
+        )
         self.sinks = nn.Parameter(
             torch.empty(self.num_heads, dtype=sinks_dtype), requires_grad=False
         )
@@ -344,6 +350,282 @@ class GptOssAttention(nn.Module):
         return self.forward_core(s)
 
 
+def _get_current_attention_backend_name(forward_batch: ForwardBatch) -> str:
+    args = get_global_server_args()
+
+    if forward_batch.forward_mode.is_decode_or_idle():
+        return getattr(args, "decode_attention_backend", args.attention_backend)
+
+    if forward_batch.forward_mode.is_target_verify() or forward_batch.forward_mode.is_draft_extend():
+        speculative_mode = getattr(args, "speculative_attention_mode", "prefill")
+        if speculative_mode == "decode":
+            return getattr(args, "decode_attention_backend", args.attention_backend)
+        return getattr(args, "prefill_attention_backend", args.attention_backend)
+
+    return getattr(args, "prefill_attention_backend", args.attention_backend)
+
+
+def _is_mla_backend(attention_backend: str) -> bool:
+    if not isinstance(attention_backend, str) or not attention_backend:
+        return False
+    if attention_backend.endswith("_mla"):
+        return True
+    return attention_backend in {"flashmla", "flashinfer", "cutlass_mla", "trtllm_mla", "nsa"}
+
+
+class GptOssTransMLAAttention(nn.Module):
+    def __init__(
+        self,
+        config: GptOssConfig,
+        layer_id: int = 0,
+        rope_theta: float = 10000,
+        rope_scaling: Optional[Dict[str, Any]] = None,
+        max_position_embeddings: int = 8192,
+        rms_norm_eps: float = 1e-06,
+        attention_bias: bool = False,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+        sliding_window_size: int = -1,
+        layer_type: str = "",
+        params_dtype: torch.dtype = torch.bfloat16,
+    ) -> None:
+        super().__init__()
+        self.layer_id = layer_id
+        self.hidden_size = config.hidden_size
+        self.sliding_window_size = sliding_window_size
+
+        attn_tp_rank = get_attention_tp_rank()
+        attn_tp_size = get_attention_tp_size()
+
+        self.total_num_heads = config.num_attention_heads
+        assert self.total_num_heads % attn_tp_size == 0
+        self.num_local_heads = self.total_num_heads // attn_tp_size
+
+        self.qk_nope_head_dim = int(getattr(config, "qk_nope_head_dim"))
+        self.qk_rope_head_dim = int(getattr(config, "qk_rope_head_dim"))
+        self.qk_head_dim = int(getattr(config, "qk_head_dim", self.qk_nope_head_dim + self.qk_rope_head_dim))
+        self.v_head_dim = int(getattr(config, "v_head_dim"))
+        self.kv_lora_rank = int(getattr(config, "kv_lora_rank", getattr(config, "latent_dim", 0)))
+        if self.kv_lora_rank <= 0:
+            raise ValueError("TransMLA config requires kv_lora_rank > 0")
+
+        self.scaling = self.qk_head_dim**-0.5
+        self.rope_theta = rope_theta
+        self.max_position_embeddings = max_position_embeddings
+        self.quant_config = quant_config
+
+        self.q_proj = ColumnParallelLinear(
+            self.hidden_size,
+            self.total_num_heads * self.qk_head_dim,
+            bias=attention_bias,
+            params_dtype=params_dtype,
+            quant_config=quant_config,
+            tp_rank=attn_tp_rank,
+            tp_size=attn_tp_size,
+            prefix=add_prefix("q_proj", prefix),
+        )
+
+        self.kv_a_proj_with_mqa = ReplicatedLinear(
+            self.hidden_size,
+            self.kv_lora_rank + self.qk_rope_head_dim,
+            bias=attention_bias,
+            params_dtype=params_dtype,
+            quant_config=quant_config,
+            prefix=add_prefix("kv_a_proj_with_mqa", prefix),
+        )
+
+        self.kv_b_proj = ColumnParallelLinear(
+            self.kv_lora_rank,
+            self.total_num_heads * (self.qk_nope_head_dim + self.v_head_dim),
+            bias=False,
+            params_dtype=params_dtype,
+            quant_config=quant_config,
+            tp_rank=attn_tp_rank,
+            tp_size=attn_tp_size,
+            prefix=add_prefix("kv_b_proj", prefix),
+        )
+
+        # Choose dtype of sinks based on attention backend.
+        attn_backend = get_global_server_args().attention_backend
+        sinks_dtype = (
+            torch.float32
+            if attn_backend in ("flashinfer", "trtllm_mha")
+            else torch.bfloat16
+        )
+        self.attention_sink = nn.Parameter(
+            torch.empty(self.num_local_heads, dtype=sinks_dtype), requires_grad=False
+        )
+
+        self.o_proj = RowParallelLinear(
+            self.total_num_heads * self.v_head_dim,
+            self.hidden_size,
+            bias=attention_bias,
+            quant_config=quant_config,
+            tp_rank=attn_tp_rank,
+            tp_size=attn_tp_size,
+            reduce_results=False,
+            params_dtype=params_dtype,
+            prefix=add_prefix("o_proj", prefix),
+        )
+
+        self.rotary_emb = get_rope_wrapper(
+            self.qk_rope_head_dim,
+            rotary_dim=self.qk_rope_head_dim,
+            max_position=max_position_embeddings,
+            base=rope_theta,
+            rope_scaling=rope_scaling,
+            is_neox_style=True,
+            device=get_global_server_args().device,
+        )
+
+        assert layer_type in {"sliding_attention", "full_attention"}
+        use_sliding_window = layer_type == "sliding_attention"
+        # FA3 kvcache kernels have limited support for Q/K head_dim != V head_dim.
+        # For correctness bring-up we pad V up to qk_head_dim for attention/KV-cache,
+        # then slice back to the real v_head_dim before o_proj.
+        self._mha_cache_v_head_dim = self.qk_head_dim
+        self.attn_mha = RadixAttention(
+            self.num_local_heads,
+            self.qk_head_dim,
+            self.scaling,
+            num_kv_heads=self.num_local_heads,
+            layer_id=layer_id,
+            v_head_dim=self._mha_cache_v_head_dim,
+            prefix=add_prefix("attn_mha", prefix),
+            sliding_window_size=(sliding_window_size if use_sliding_window else -1),
+            quant_config=quant_config,
+        )
+        self.attn_mqa = RadixAttention(
+            self.num_local_heads,
+            self.kv_lora_rank + self.qk_rope_head_dim,
+            self.scaling,
+            num_kv_heads=1,
+            layer_id=layer_id,
+            v_head_dim=self.kv_lora_rank,
+            prefix=add_prefix("attn_mqa", prefix),
+            sliding_window_size=(sliding_window_size if use_sliding_window else -1),
+            quant_config=quant_config,
+        )
+
+        self._w_kc: torch.Tensor | None = None
+        self._w_vc: torch.Tensor | None = None
+
+    def _maybe_init_w_kc_vc(self) -> tuple[torch.Tensor, torch.Tensor]:
+        if self._w_kc is not None and self._w_vc is not None:
+            return self._w_kc, self._w_vc
+
+        w = self.kv_b_proj.weight
+        w = w.view(
+            self.num_local_heads,
+            self.qk_nope_head_dim + self.v_head_dim,
+            self.kv_lora_rank,
+        )
+        w_kc, w_vc = w.split([self.qk_nope_head_dim, self.v_head_dim], dim=1)
+        self._w_kc = w_kc.contiguous()
+        self._w_vc = w_vc.transpose(1, 2).contiguous()
+        return self._w_kc, self._w_vc
+
+    def forward_prepare(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ):
+        if hidden_states.shape[0] == 0:
+            return hidden_states, forward_batch, None
+
+        args = get_global_server_args()
+        use_mla = bool(getattr(args, "use_mla_backend", False))
+
+        q = self.q_proj(hidden_states)[0].view(-1, self.num_local_heads, self.qk_head_dim)
+        latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
+        k_nope = latent_cache[..., : self.kv_lora_rank]
+        k_pe = latent_cache[..., self.kv_lora_rank :].unsqueeze(1)
+
+        q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+        q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
+
+        if use_mla:
+            w_kc, w_vc = self._maybe_init_w_kc_vc()
+            q_nope_out = torch.bmm(q_nope.transpose(0, 1), w_kc).transpose(0, 1)
+            inner_state = ("mla", q_nope_out, q_pe, k_nope.unsqueeze(1), k_pe, w_vc, forward_batch)
+        else:
+            kv = self.kv_b_proj(k_nope)[0].view(
+                -1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim
+            )
+            k_pass = kv[..., : self.qk_nope_head_dim]
+            v = kv[..., self.qk_nope_head_dim :]
+            k = torch.cat([k_pass, k_pe.expand(-1, self.num_local_heads, -1)], dim=-1)
+            q2 = torch.cat([q_nope, q_pe], dim=-1).reshape(-1, self.num_local_heads * self.qk_head_dim)
+            k2 = k.reshape(-1, self.num_local_heads * self.qk_head_dim)
+            if self._mha_cache_v_head_dim == self.v_head_dim:
+                v2 = v.reshape(-1, self.num_local_heads * self.v_head_dim)
+            else:
+                v_pad = v.new_zeros((v.shape[0], self.num_local_heads, self._mha_cache_v_head_dim))
+                v_pad[..., : self.v_head_dim] = v
+                v2 = v_pad.reshape(-1, self.num_local_heads * self._mha_cache_v_head_dim)
+            inner_state = ("mha", q2, k2, v2, forward_batch)
+
+        return None, forward_batch, inner_state
+
+    def forward_core(self, intermediate_state):
+        hidden_states, forward_batch, inner_state = intermediate_state
+        if inner_state is None:
+            return hidden_states
+
+        mode = inner_state[0]
+        if mode == "mla":
+            _, q_nope_out, q_pe, k_nope, k_pe, w_vc, forward_batch = inner_state
+            attn_output = self.attn_mqa(
+                q_nope_out,
+                k_nope,
+                k_nope,
+                forward_batch,
+                q_rope=q_pe,
+                k_rope=k_pe,
+                sinks=self.attention_sink,
+                save_kv_cache=True,
+            )
+            attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
+            attn_output = torch.bmm(attn_output.transpose(0, 1), w_vc).transpose(0, 1)
+            attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
+            output, _ = self.o_proj(attn_output)
+            return output
+
+        if mode == "mha":
+            _, q, k, v, forward_batch = inner_state
+            attn_output = self.attn_mha(
+                q,
+                k,
+                v,
+                forward_batch,
+                sinks=self.attention_sink,
+                save_kv_cache=True,
+            )
+            if self._mha_cache_v_head_dim != self.v_head_dim:
+                attn_output = attn_output.view(
+                    -1, self.num_local_heads, self._mha_cache_v_head_dim
+                )[..., : self.v_head_dim]
+                attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
+            output, _ = self.o_proj(attn_output)
+            return output
+
+        raise ValueError(f"Unknown attention mode: {mode}")
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        s = self.forward_prepare(
+            positions=positions,
+            hidden_states=hidden_states,
+            forward_batch=forward_batch,
+        )
+        return self.forward_core(s)
+
+
 class GptOssDecoderLayer(nn.Module):
     def __init__(
         self,
@@ -370,22 +652,37 @@ class GptOssDecoderLayer(nn.Module):
         else:
             self.sliding_window_size = sliding_window_size
 
-        self.self_attn = GptOssAttention(
-            hidden_size=self.hidden_size,
-            num_heads=config.num_attention_heads,
-            num_kv_heads=config.num_key_value_heads,
-            layer_id=layer_id,
-            rope_theta=rope_theta,
-            rope_scaling=rope_scaling,
-            max_position_embeddings=max_position_embeddings,
-            head_dim=head_dim,
-            rms_norm_eps=rms_norm_eps,
-            attention_bias=attention_bias,
-            prefix=add_prefix("self_attn", prefix),
-            sliding_window_size=self.sliding_window_size,
-            layer_type=config.layer_types[layer_id],
-            params_dtype=config.torch_dtype,
-        )
+        if getattr(config, "use_transmla", False):
+            self.self_attn = GptOssTransMLAAttention(
+                config=config,
+                layer_id=layer_id,
+                rope_theta=rope_theta,
+                rope_scaling=rope_scaling,
+                max_position_embeddings=max_position_embeddings,
+                rms_norm_eps=rms_norm_eps,
+                attention_bias=attention_bias,
+                prefix=add_prefix("self_attn", prefix),
+                sliding_window_size=self.sliding_window_size,
+                layer_type=config.layer_types[layer_id],
+                params_dtype=config.torch_dtype,
+            )
+        else:
+            self.self_attn = GptOssAttention(
+                hidden_size=self.hidden_size,
+                num_heads=config.num_attention_heads,
+                num_kv_heads=config.num_key_value_heads,
+                layer_id=layer_id,
+                rope_theta=rope_theta,
+                rope_scaling=rope_scaling,
+                max_position_embeddings=max_position_embeddings,
+                head_dim=head_dim,
+                rms_norm_eps=rms_norm_eps,
+                attention_bias=attention_bias,
+                prefix=add_prefix("self_attn", prefix),
+                sliding_window_size=self.sliding_window_size,
+                layer_type=config.layer_types[layer_id],
+                params_dtype=config.torch_dtype,
+            )
 
         self.layer_id = layer_id
 
@@ -1028,13 +1325,13 @@ class GptOssForCausalLM(nn.Module):
                 if "mlp.experts" in name:
                     continue
 
-                name = name.replace(weight_name, param_name)
-                if name.endswith(".bias") and name not in params_dict:
+                mapped_name = name.replace(weight_name, param_name)
+                if mapped_name.endswith(".bias") and mapped_name not in params_dict:
                     continue
-                if name not in params_dict:
+                if mapped_name not in params_dict:
                     continue
 
-                param = params_dict[name]
+                param = params_dict[mapped_name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
                 break
@@ -1067,7 +1364,7 @@ class GptOssForCausalLM(nn.Module):
                         continue
                     if name in params_dict.keys():
                         param = params_dict[name]
-                        if "sinks" in name:
+                        if "sinks" in name or "attention_sink" in name:
                             start = get_attention_tp_rank() * param.numel()
                             param.data.copy_(
                                 loaded_weight[start : start + param.numel()]

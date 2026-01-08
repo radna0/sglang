@@ -526,7 +526,20 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         save_kv_cache: bool = True,
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
+        sinks: Optional[torch.Tensor] = None,
     ):
+        # GPT-OSS attention sinks:
+        # - `sinks` is per-head log-sink in natural log space (ln sink_value).
+        # - FlashInfer MLA wrappers do not accept `sinks` yet, so we emulate it by
+        #   rescaling the attention output using the kernel-provided LSE.
+        #
+        # If the kernel output is O = softmax(S) V and LSE = log2(sum(exp(S))),
+        # then with sinks the denominator becomes sum(exp(S)) + exp(sinks),
+        # so we can scale O by:
+        #   scale = sum / (sum + exp(sinks)) = 1 / (1 + exp(sinks) / sum)
+        #         = 1 / (1 + exp2(sinks * log2e - LSE))
+        LOG2E = 1.4426950408889634
+
         if forward_batch.attn_attend_prefix_cache is not None and any(
             forward_batch.extend_prefix_lens_cpu
         ):  # MHA Chunk
@@ -562,14 +575,34 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             qall = q.view(-1, layer.tp_q_head_num, layer.head_dim)
             if k_rope is not None:
                 k = torch.cat([k, k_rope], dim=-1)
-            o = self.prefill_wrapper_ragged.forward(
-                qall,
-                k.view(-1, layer.tp_k_head_num, layer.head_dim).to(q.dtype),
-                v.view(-1, layer.tp_k_head_num, layer.v_head_dim).to(q.dtype),
-                causal=True,
-                sm_scale=layer.scaling,
-                logits_soft_cap=logits_soft_cap,
-            )
+            if sinks is None:
+                o = self.prefill_wrapper_ragged.forward(
+                    qall,
+                    k.view(-1, layer.tp_k_head_num, layer.head_dim).to(q.dtype),
+                    v.view(-1, layer.tp_k_head_num, layer.v_head_dim).to(q.dtype),
+                    causal=True,
+                    sm_scale=layer.scaling,
+                    logits_soft_cap=logits_soft_cap,
+                )
+            else:
+                o, lse = self.prefill_wrapper_ragged.forward_return_lse(
+                    qall,
+                    k.view(-1, layer.tp_k_head_num, layer.head_dim).to(q.dtype),
+                    v.view(-1, layer.tp_k_head_num, layer.v_head_dim).to(q.dtype),
+                    causal=True,
+                    sm_scale=layer.scaling,
+                    logits_soft_cap=logits_soft_cap,
+                )
+                sinks_f = sinks.to(torch.float32)
+                lse_f = lse.to(torch.float32)
+                if sinks_f.ndim == 1:
+                    sinks_f = sinks_f.view(1, -1)
+                if sinks_f.shape[-1] != lse_f.shape[-1]:
+                    raise ValueError(
+                        f"sinks shape mismatch: sinks={tuple(sinks_f.shape)} lse={tuple(lse_f.shape)}"
+                    )
+                scale = 1.0 / (1.0 + torch.exp2(sinks_f * LOG2E - lse_f))
+                o = o * scale.to(o.dtype).unsqueeze(-1)
         else:
             # mla paged prefill
             k_buf = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).to(
@@ -582,13 +615,33 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                     qall[:, :, layer.v_head_dim :],
                 )
             o = q.new_empty(q.shape)
-            o = prefill_wrapper_paged.run(
-                q,
-                q_rope,
-                k_buf[:, :, : layer.v_head_dim],
-                k_buf[:, :, layer.v_head_dim :],
-                out=o,
-            )
+            if sinks is None:
+                o = prefill_wrapper_paged.run(
+                    q,
+                    q_rope,
+                    k_buf[:, :, : layer.v_head_dim],
+                    k_buf[:, :, layer.v_head_dim :],
+                    out=o,
+                )
+            else:
+                o, lse = prefill_wrapper_paged.run(
+                    q,
+                    q_rope,
+                    k_buf[:, :, : layer.v_head_dim],
+                    k_buf[:, :, layer.v_head_dim :],
+                    out=o,
+                    return_lse=True,
+                )
+                sinks_f = sinks.to(torch.float32)
+                lse_f = lse.to(torch.float32)
+                if sinks_f.ndim == 1:
+                    sinks_f = sinks_f.view(1, -1)
+                if sinks_f.shape[-1] != lse_f.shape[-1]:
+                    raise ValueError(
+                        f"sinks shape mismatch: sinks={tuple(sinks_f.shape)} lse={tuple(lse_f.shape)}"
+                    )
+                scale = 1.0 / (1.0 + torch.exp2(sinks_f * LOG2E - lse_f))
+                o = o * scale.to(o.dtype).unsqueeze(-1)
 
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
@@ -603,7 +656,9 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         # For multi-head latent attention
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
+        sinks: Optional[torch.Tensor] = None,
     ):
+        LOG2E = 1.4426950408889634
         decode_wrapper = self.forward_metadata.decode_wrapper
         cache_loc = forward_batch.out_cache_loc
 
@@ -641,14 +696,34 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         )
 
         o = q_nope.new_empty(q_nope.shape)
-        # Direct call to run without the wrapper
-        o = decode_wrapper.run(
-            q_nope,
-            q_rope,
-            k_buffer[:, :, : layer.v_head_dim],
-            k_buffer[:, :, layer.v_head_dim :],
-            out=o,
-        )
+        if sinks is None:
+            # Direct call to run without the wrapper
+            o = decode_wrapper.run(
+                q_nope,
+                q_rope,
+                k_buffer[:, :, : layer.v_head_dim],
+                k_buffer[:, :, layer.v_head_dim :],
+                out=o,
+            )
+        else:
+            o, lse = decode_wrapper.run(
+                q_nope,
+                q_rope,
+                k_buffer[:, :, : layer.v_head_dim],
+                k_buffer[:, :, layer.v_head_dim :],
+                out=o,
+                return_lse=True,
+            )
+            sinks_f = sinks.to(torch.float32)
+            lse_f = lse.to(torch.float32)
+            if sinks_f.ndim == 1:
+                sinks_f = sinks_f.view(1, -1)
+            if sinks_f.shape[-1] != lse_f.shape[-1]:
+                raise ValueError(
+                    f"sinks shape mismatch: sinks={tuple(sinks_f.shape)} lse={tuple(lse_f.shape)}"
+                )
+            scale = 1.0 / (1.0 + torch.exp2(sinks_f * LOG2E - lse_f))
+            o = o * scale.to(o.dtype).unsqueeze(-1)
 
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 

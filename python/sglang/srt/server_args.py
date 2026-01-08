@@ -1209,16 +1209,32 @@ class ServerArgs:
                         )
 
         elif model_arch in ["GptOssForCausalLM"]:
+            use_transmla = bool(getattr(hf_config, "use_transmla", False))
+            use_mla_backend = self.use_mla_backend()
+
             # Set attention backend for GPT-OSS
             if self.is_attention_backend_not_set():
-                if is_sm100_supported():
-                    self.attention_backend = "trtllm_mha"
-                elif is_sm90_supported():
-                    self.attention_backend = "fa3"
+                if not use_mla_backend:
+                    if is_sm100_supported():
+                        self.attention_backend = "trtllm_mha"
+                    elif is_sm90_supported():
+                        self.attention_backend = "fa3"
+                    else:
+                        self.attention_backend = "triton"
                 else:
-                    self.attention_backend = "triton"
+                    # Absorbed MLA requires MLA-capable attention backends.
+                    if is_sm90_supported():
+                        self.attention_backend = "flashmla"
+                    else:
+                        self.attention_backend = "flashinfer"
 
-            supported_backends = ["triton", "trtllm_mha", "fa3", "fa4"]
+            supported_backends = (
+                # When running GPT-OSS TransMLA in absorbed MLA mode, FA3 (FlashAttention)
+                # is also supported via the absorbed-MLA path in FlashAttentionBackend.
+                ["fa3", "flashinfer", "flashmla"]
+                if use_transmla and use_mla_backend
+                else ["triton", "trtllm_mha", "fa3", "fa4", "flashinfer"]
+            )
             prefill_attn_backend, decode_attn_backend = self.get_attention_backends()
             assert (
                 prefill_attn_backend in supported_backends
@@ -1826,6 +1842,7 @@ class ServerArgs:
                             "torch_native",
                             "flex_attention",
                             "trtllm_mha",
+                            "flashinfer",
                         ]
                         assert (
                             self.attention_backend in KV4_ATTENTION_MHA_BACKEND_CHOICES

@@ -351,22 +351,43 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache: bool = True,
+        q_rope: Optional[torch.Tensor] = None,
+        k_rope: Optional[torch.Tensor] = None,
+        sinks: Optional[torch.Tensor] = None,
     ):
+        LOG2E = 1.4426950408889634
         cache_loc = forward_batch.out_cache_loc
 
         if k is not None:
             assert v is not None
             if save_kv_cache:
-                forward_batch.token_to_kv_pool.set_kv_buffer(
-                    layer,
-                    cache_loc,
-                    k,
-                    v,
-                )
+                if k_rope is not None:
+                    forward_batch.token_to_kv_pool.set_mla_kv_buffer(
+                        layer,
+                        cache_loc,
+                        k,
+                        k_rope,
+                    )
+                else:
+                    forward_batch.token_to_kv_pool.set_kv_buffer(
+                        layer,
+                        cache_loc,
+                        k,
+                        v,
+                    )
         bs = forward_batch.batch_size
         k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
 
-        reshape_q = q.view(bs, -1, layer.tp_q_head_num, layer.head_dim)
+        if q_rope is not None:
+            q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+            q_rope = q_rope.view(
+                -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
+            )
+            reshape_q = torch.cat([q_nope, q_rope], dim=-1).view(
+                bs, -1, layer.tp_q_head_num, layer.head_dim
+            )
+        else:
+            reshape_q = q.view(bs, -1, layer.tp_q_head_num, layer.head_dim)
         if self.is_fp8_kvcache:
             # For FP8 KV cache, Q needs to be converted to FP8 for FlashMLA kernel
             # In SGLang, we use layer.k_scale for both q and k scales
@@ -389,7 +410,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             reshape_q_2d = reshape_q.reshape(-1, q_shape[-1])
             reshape_q_fp8_2d, _ = scaled_fp8_quant(reshape_q_2d, q_scale)
             reshape_q_fp8 = reshape_q_fp8_2d.reshape(q_shape)
-            o, _ = flash_mla_with_kvcache(
+            o, softmax_lse = flash_mla_with_kvcache(
                 q=reshape_q_fp8,
                 k_cache=k_cache.view(-1, PAGE_SIZE, 1, self.kv_cache_dim),
                 block_table=self.forward_metadata.block_kv_indices[:bs],
@@ -402,11 +423,22 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 descale_q=descale_q,
                 descale_k=descale_k,
             )
+            if sinks is not None:
+                sinks_f = sinks.to(torch.float32)
+                if sinks_f.ndim == 1:
+                    sinks_f = sinks_f.view(1, 1, -1)
+                lse_f = softmax_lse.permute(0, 2, 1).to(torch.float32)
+                if sinks_f.shape[-1] != lse_f.shape[-1]:
+                    raise ValueError(
+                        f"sinks shape mismatch: sinks={tuple(sinks_f.shape)} lse={tuple(lse_f.shape)}"
+                    )
+                scale = 1.0 / (1.0 + torch.exp2(sinks_f * LOG2E - lse_f))
+                o = o * scale.to(o.dtype).unsqueeze(-1)
 
             return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
         else:
             # todo: need check all causal True or False?
-            o, _ = flash_mla_with_kvcache(
+            o, softmax_lse = flash_mla_with_kvcache(
                 q=reshape_q,
                 k_cache=k_cache.view(-1, PAGE_SIZE, 1, self.kv_cache_dim),
                 block_table=self.forward_metadata.block_kv_indices[:bs],
@@ -417,6 +449,17 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 softmax_scale=layer.scaling,
                 causal=True,
             )
+            if sinks is not None:
+                sinks_f = sinks.to(torch.float32)
+                if sinks_f.ndim == 1:
+                    sinks_f = sinks_f.view(1, 1, -1)
+                lse_f = softmax_lse.permute(0, 2, 1).to(torch.float32)
+                if sinks_f.shape[-1] != lse_f.shape[-1]:
+                    raise ValueError(
+                        f"sinks shape mismatch: sinks={tuple(sinks_f.shape)} lse={tuple(lse_f.shape)}"
+                    )
+                scale = 1.0 / (1.0 + torch.exp2(sinks_f * LOG2E - lse_f))
+                o = o * scale.to(o.dtype).unsqueeze(-1)
 
             return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
@@ -428,24 +471,57 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache: bool = True,
+        q_rope: Optional[torch.Tensor] = None,
+        k_rope: Optional[torch.Tensor] = None,
+        sinks: Optional[torch.Tensor] = None,
     ):
         if (
             forward_batch.forward_mode == ForwardMode.EXTEND
             or forward_batch.forward_mode == ForwardMode.DRAFT_EXTEND
         ):
-            return super().forward_extend(q, k, v, layer, forward_batch, save_kv_cache)
+            return super().forward_extend(
+                q,
+                k,
+                v,
+                layer,
+                forward_batch,
+                save_kv_cache,
+                q_rope=q_rope,
+                k_rope=k_rope,
+                sinks=sinks,
+            )
         else:
+            LOG2E = 1.4426950408889634
             cache_loc = forward_batch.out_cache_loc
 
             if k is not None:
                 assert v is not None
                 if save_kv_cache:
-                    forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
+                    if k_rope is not None:
+                        forward_batch.token_to_kv_pool.set_mla_kv_buffer(
+                            layer,
+                            cache_loc,
+                            k,
+                            k_rope,
+                        )
+                    else:
+                        forward_batch.token_to_kv_pool.set_kv_buffer(
+                            layer, cache_loc, k, v
+                        )
 
             bs = forward_batch.batch_size
             k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
 
-            reshape_q = q.view(bs, -1, layer.tp_q_head_num, layer.head_dim)
+            if q_rope is not None:
+                q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+                q_rope = q_rope.view(
+                    -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
+                )
+                reshape_q = torch.cat([q_nope, q_rope], dim=-1).view(
+                    bs, -1, layer.tp_q_head_num, layer.head_dim
+                )
+            else:
+                reshape_q = q.view(bs, -1, layer.tp_q_head_num, layer.head_dim)
             if self.is_fp8_kvcache:
                 # For FP8 KV cache, Q needs to be converted to FP8 for FlashMLA kernel
                 # In SGLang, we use layer.k_scale for both q and k scales
@@ -471,7 +547,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 reshape_q_2d = reshape_q.reshape(-1, q_shape[-1])
                 reshape_q_fp8_2d, _ = scaled_fp8_quant(reshape_q_2d, q_scale)
                 reshape_q_fp8 = reshape_q_fp8_2d.reshape(q_shape)
-                o, _ = flash_mla_with_kvcache(
+                o, softmax_lse = flash_mla_with_kvcache(
                     q=reshape_q_fp8,
                     k_cache=k_cache.view(-1, PAGE_SIZE, 1, self.kv_cache_dim),
                     block_table=self.forward_metadata.block_kv_indices[:bs],
@@ -486,7 +562,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                     descale_k=descale_k,
                 )
             else:
-                o, _ = flash_mla_with_kvcache(
+                o, softmax_lse = flash_mla_with_kvcache(
                     q=reshape_q,
                     k_cache=k_cache.view(-1, PAGE_SIZE, 1, self.kv_cache_dim),
                     block_table=self.forward_metadata.block_kv_indices[:bs],
@@ -498,6 +574,17 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                     softmax_scale=layer.scaling,
                     causal=True,
                 )
+            if sinks is not None:
+                sinks_f = sinks.to(torch.float32)
+                if sinks_f.ndim == 1:
+                    sinks_f = sinks_f.view(1, 1, -1)
+                lse_f = softmax_lse.permute(0, 2, 1).to(torch.float32)
+                if sinks_f.shape[-1] != lse_f.shape[-1]:
+                    raise ValueError(
+                        f"sinks shape mismatch: sinks={tuple(sinks_f.shape)} lse={tuple(lse_f.shape)}"
+                    )
+                scale = 1.0 / (1.0 + torch.exp2(sinks_f * LOG2E - lse_f))
+                o = o * scale.to(o.dtype).unsqueeze(-1)
             return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
 

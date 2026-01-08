@@ -540,6 +540,12 @@ class ModelRunnerKVCacheMixin:
                 )
             else:
                 if is_float4_e2m1fn_x2(self.kv_cache_dtype):
+                    if self.model_config.v_head_dim != self.model_config.head_dim:
+                        raise ValueError(
+                            "FP4 KV cache currently requires v_head_dim == head_dim, "
+                            f"but got v_head_dim={self.model_config.v_head_dim} head_dim={self.model_config.head_dim}. "
+                            "Use BF16/FP8 KV cache for TransMLA GPT-OSS MHA bring-up, or switch to absorbed MLA mode."
+                        )
                     self.token_to_kv_pool = MHATokenToKVPoolFP4(
                         self.max_total_num_tokens,
                         page_size=self.page_size,
@@ -567,6 +573,7 @@ class ModelRunnerKVCacheMixin:
                             get_attention_tp_size()
                         ),
                         head_dim=self.model_config.head_dim,
+                        v_head_dim=self.model_config.v_head_dim,
                         layer_num=self.num_effective_layers,
                         device=self.device,
                         enable_memory_saver=self.server_args.enable_memory_saver,
