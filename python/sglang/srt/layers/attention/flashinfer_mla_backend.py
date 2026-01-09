@@ -9,6 +9,7 @@ and uses BatchMLAPaged wrapper for decoding.
 More details can be found in https://docs.flashinfer.ai/api/mla.html
 """
 
+import os
 from dataclasses import dataclass
 from functools import partial
 from typing import TYPE_CHECKING, Callable, Optional, Union
@@ -55,6 +56,7 @@ if is_flashinfer_available():
 @dataclass
 class DecodeMetadata:
     decode_wrapper: BatchMLAPagedAttentionWrapper
+    decode_wrapper_swa: Optional[BatchMLAPagedAttentionWrapper] = None
 
 
 @dataclass
@@ -199,6 +201,53 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         q_indptr_decode_buf: Optional[torch.Tensor] = None,
     ):
         super().__init__()
+        self.model_runner = model_runner
+        self._gptoss_transmla_force_mla = bool(
+            getattr(getattr(model_runner.model_config, "hf_config", None), "architectures", None)
+            and "GptOssForCausalLM" in model_runner.model_config.hf_config.architectures
+            and bool(getattr(model_runner.model_config.hf_config, "use_transmla", False))
+            and model_runner.use_mla_backend
+        )
+        # Optional optimization: implement GPT-OSS sliding-window layers in FlashInfer by
+        # truncating the KV indices to the last `sliding_window` tokens. This avoids
+        # falling back to FA3 for SWA layers.
+        self._gptoss_transmla_flashinfer_swa = False
+        self._gptoss_transmla_swa_window_len = 0
+        if self._gptoss_transmla_force_mla:
+            enable_swa = os.getenv(
+                "SGLANG_GPTOSS_TRANSMLA_FLASHINFER_SWA", "1"
+            ).lower() in ("1", "true", "yes")
+            window_len = int(
+                getattr(model_runner.model_config.hf_config, "sliding_window", 0) or 0
+            )
+            if enable_swa and window_len > 0:
+                self._gptoss_transmla_flashinfer_swa = True
+                self._gptoss_transmla_swa_window_len = window_len
+
+        # Correctness-first fallback for GPT-OSS TransMLA:
+        # - FlashInfer MLA kernels do not implement GPT-OSS's sliding-window masking.
+        # - Use FA3 for prefill, and for sliding layers in decode.
+        #
+        # NOTE: When kv_cache_dtype=fp4_e2m1, the FA3 prefill path can trigger
+        # a catastrophic dequantization/allocation in the FP4 KV pool when it
+        # requests a BF16 key buffer. In that case, we must bypass FA3 prefill
+        # and use FlashInfer's paged MLA prefill path instead.
+        self._gptoss_transmla_use_fa3_prefill = True
+        if self._gptoss_transmla_force_mla:
+            env_prefill = os.getenv(
+                "SGLANG_GPTOSS_TRANSMLA_FLASHINFER_FA3_PREFILL", "1"
+            ).lower()
+            self._gptoss_transmla_use_fa3_prefill = env_prefill in ("1", "true", "yes")
+            kv_cache_dtype_str = str(getattr(model_runner.server_args, "kv_cache_dtype", "auto"))
+            if kv_cache_dtype_str == "fp4_e2m1":
+                self._gptoss_transmla_use_fa3_prefill = False
+        self._fa3_backend: AttentionBackend | None = None
+        if self._gptoss_transmla_force_mla and self._gptoss_transmla_use_fa3_prefill:
+            from sglang.srt.layers.attention.flashattention_backend import (
+                FlashAttentionBackend,
+            )
+
+            self._fa3_backend = FlashAttentionBackend(model_runner)
 
         # Parse constants
         self.max_context_len = model_runner.model_config.context_len
@@ -230,6 +279,11 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             )
         else:
             self.kv_indptr = kv_indptr_buf
+        self.kv_indptr_swa: torch.Tensor | None = None
+        if self._gptoss_transmla_flashinfer_swa:
+            self.kv_indptr_swa = torch.zeros(
+                (max_bs + 1,), dtype=torch.int32, device=model_runner.device
+            )
 
         if not self.skip_prefill:
             self.qo_indptr = torch.zeros(
@@ -267,6 +321,11 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         self.decode_wrapper = BatchMLAPagedAttentionWrapper(
             self.workspace_buffer, backend="auto"
         )
+        self.decode_wrapper_swa: BatchMLAPagedAttentionWrapper | None = None
+        if self._gptoss_transmla_flashinfer_swa:
+            self.decode_wrapper_swa = BatchMLAPagedAttentionWrapper(
+                self.workspace_buffer, backend="auto"
+            )
 
         # Create indices updater
         if not skip_prefill:
@@ -283,9 +342,13 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         # Other metadata
         self.forward_metadata: Union[PrefillMetadata, DecodeMetadata] = None
         self.decode_cuda_graph_metadata = {}
+        self.decode_cuda_graph_metadata_swa = {}
         self.prefill_cuda_graph_metadata = {}  # For verify
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
+        if self._fa3_backend is not None:
+            self._fa3_backend.init_forward_metadata(forward_batch)
+
         if forward_batch.forward_mode.is_decode_or_idle():
             self.indices_updater_decode.update(
                 forward_batch.req_pool_indices,
@@ -294,7 +357,28 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 decode_wrapper=self.decode_wrapper,
                 init_metadata_replay=False,
             )
-            self.forward_metadata = DecodeMetadata(self.decode_wrapper)
+            decode_wrapper_swa = None
+            if self._gptoss_transmla_flashinfer_swa and self.decode_wrapper_swa is not None:
+                window_len = int(self._gptoss_transmla_swa_window_len)
+                seq_lens = forward_batch.seq_lens.to(torch.int32)
+                window_lens = torch.minimum(
+                    seq_lens,
+                    torch.full_like(seq_lens, window_len, dtype=torch.int32),
+                )
+                kv_start_idx = (seq_lens - window_lens).to(torch.int32)
+                window_lens_sum = int(window_lens.sum().item())
+                self.indices_updater_decode.update(
+                    forward_batch.req_pool_indices,
+                    window_lens,
+                    window_lens_sum,
+                    decode_wrapper=self.decode_wrapper_swa,
+                    init_metadata_replay=False,
+                    kv_indptr=self.kv_indptr_swa,
+                    kv_start_idx=kv_start_idx,
+                )
+                decode_wrapper_swa = self.decode_wrapper_swa
+
+            self.forward_metadata = DecodeMetadata(self.decode_wrapper, decode_wrapper_swa)
         elif forward_batch.forward_mode.is_draft_extend():
             self.indices_updater_prefill.update(
                 forward_batch.req_pool_indices,
@@ -326,6 +410,19 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 # Piecewise cuda graph should use paged prefill to be compatible with prefix cache
                 and not is_in_piecewise_cuda_graph()
             )
+            # GPT-OSS TransMLA "force MLA" mode uses absorbed MLA for prefill (q_nope has
+            # kv_lora_rank dims, num_kv_heads=1). FlashInfer's ragged prefill wrapper is for
+            # the *non-absorbed* (materialized) prefill path, so using it here silently
+            # truncates head dims and produces nonsense outputs.
+            #
+            # Force paged prefill (BatchMLAPagedAttentionWrapper) for correctness.
+            if (
+                getattr(getattr(self.model_runner.model_config, "hf_config", None), "architectures", None)
+                and "GptOssForCausalLM" in self.model_runner.model_config.hf_config.architectures
+                and bool(getattr(self.model_runner.model_config.hf_config, "use_transmla", False))
+                and self.model_runner.use_mla_backend
+            ):
+                use_ragged = False
 
             self.indices_updater_prefill.update(
                 forward_batch.req_pool_indices,
@@ -345,6 +442,13 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         max_num_tokens: int,
         kv_indices_buf: Optional[torch.Tensor] = None,
     ):
+        # Hybrid GPT-OSS TransMLA mode may dispatch prefill and/or sliding-window
+        # layers to FA3 even when the selected backend is FlashInfer MLA. When
+        # CUDA graph capture/replay is enabled, FA3 must have its own graph
+        # buffers/metadata initialized too.
+        if self._fa3_backend is not None:
+            self._fa3_backend.init_cuda_graph_state(max_bs, max_num_tokens)
+
         if kv_indices_buf is None:
             cuda_graph_kv_indices = torch.zeros(
                 (max_bs * self.max_context_len,),
@@ -370,6 +474,32 @@ class FlashInferMLAAttnBackend(AttentionBackend):
             "kv_indices": self.cuda_graph_kv_indices,
         }
 
+        # Optional SWA (sliding-window attention) wrapper buffers for GPT-OSS TransMLA.
+        self.cuda_graph_kv_indices_swa: torch.Tensor | None = None
+        self.cuda_graph_kv_indptr_swa: torch.Tensor | None = None
+        self.cuda_graph_kv_lens_swa: torch.Tensor | None = None
+        self.cuda_graph_kv_indptr_cpu_swa: torch.Tensor | None = None
+        self.fast_decode_kwargs_swa: dict | None = None
+        if self._gptoss_transmla_flashinfer_swa:
+            window_len = max(1, int(self._gptoss_transmla_swa_window_len))
+            self.cuda_graph_kv_indices_swa = torch.zeros(
+                (max_bs * window_len,),
+                dtype=torch.int32,
+                device="cuda",
+            )
+            self.cuda_graph_kv_indptr_swa = torch.zeros(
+                (max_bs + 1,), dtype=torch.int32, device=self.device
+            )
+            self.cuda_graph_kv_lens_swa = torch.ones(
+                (max_bs,), dtype=torch.int32, device=self.device
+            )
+            self.cuda_graph_kv_indptr_cpu_swa = self.cuda_graph_kv_indptr_swa.to("cpu")
+            self.fast_decode_kwargs_swa = {
+                "qo_indptr_cpu": self.cuda_graph_qo_indptr_cpu,
+                "kv_indptr_cpu": self.cuda_graph_kv_indptr_cpu_swa,
+                "kv_indices": self.cuda_graph_kv_indices_swa,
+            }
+
     def init_forward_metadata_capture_cuda_graph(
         self,
         bs: int,
@@ -380,6 +510,17 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
     ):
+        if self._fa3_backend is not None:
+            self._fa3_backend.init_forward_metadata_capture_cuda_graph(
+                bs,
+                num_tokens,
+                req_pool_indices,
+                seq_lens,
+                encoder_lens,
+                forward_mode,
+                spec_info,
+            )
+
         if forward_mode.is_decode_or_idle():
             decode_wrapper = BatchMLAPagedAttentionWrapper(
                 self.workspace_buffer,
@@ -401,8 +542,46 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 spec_info=spec_info,
             )
             self.decode_cuda_graph_metadata[bs] = decode_wrapper
-            self.forward_metadata = DecodeMetadata(decode_wrapper)
+            decode_wrapper_swa = None
+            if (
+                self._gptoss_transmla_flashinfer_swa
+                and self.cuda_graph_kv_indices_swa is not None
+                and self.cuda_graph_kv_indptr_swa is not None
+                and self.cuda_graph_kv_lens_swa is not None
+            ):
+                decode_wrapper_swa = BatchMLAPagedAttentionWrapper(
+                    self.workspace_buffer,
+                    use_cuda_graph=True,
+                    qo_indptr=self.cuda_graph_qo_indptr[: num_tokens + 1],
+                    kv_indptr=self.cuda_graph_kv_indptr_swa[: num_tokens + 1],
+                    kv_indices=self.cuda_graph_kv_indices_swa,
+                    kv_len_arr=self.cuda_graph_kv_lens_swa[:num_tokens],
+                    backend="auto",
+                )
+                window_len = int(self._gptoss_transmla_swa_window_len)
+                seq_lens_i32 = seq_lens.to(torch.int32)
+                window_lens = torch.minimum(
+                    seq_lens_i32,
+                    torch.full_like(seq_lens_i32, window_len, dtype=torch.int32),
+                )
+                kv_start_idx = (seq_lens_i32 - window_lens).to(torch.int32)
+                window_lens_sum = int(window_lens.sum().item())
+                self.indices_updater_decode.update(
+                    req_pool_indices,
+                    window_lens,
+                    window_lens_sum,
+                    decode_wrapper=decode_wrapper_swa,
+                    init_metadata_replay=False,
+                    spec_info=spec_info,
+                    kv_indptr=self.cuda_graph_kv_indptr_swa,
+                    kv_start_idx=kv_start_idx,
+                )
+                self.decode_cuda_graph_metadata_swa[bs] = decode_wrapper_swa
+
+            self.forward_metadata = DecodeMetadata(decode_wrapper, decode_wrapper_swa)
             decode_wrapper.plan = partial(fast_mla_decode_plan, decode_wrapper)
+            if decode_wrapper_swa is not None:
+                decode_wrapper_swa.plan = partial(fast_mla_decode_plan, decode_wrapper_swa)
         elif forward_mode.is_target_verify():
             verify_wrapper = BatchMLAPagedAttentionWrapper(
                 self.workspace_buffer,
@@ -461,6 +640,18 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
     ):
+        if self._fa3_backend is not None:
+            self._fa3_backend.init_forward_metadata_replay_cuda_graph(
+                bs,
+                req_pool_indices,
+                seq_lens,
+                seq_lens_sum,
+                encoder_lens,
+                forward_mode,
+                spec_info,
+                seq_lens_cpu,
+            )
+
         if forward_mode.is_decode_or_idle():
             assert seq_lens_cpu is not None
             kv_len_arr_cpu = seq_lens_cpu[:bs]
@@ -483,6 +674,54 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 init_metadata_replay=True,
                 spec_info=spec_info,
                 **self.fast_decode_kwargs,
+            )
+            decode_wrapper_swa = None
+            if (
+                self._gptoss_transmla_flashinfer_swa
+                and self.fast_decode_kwargs_swa is not None
+                and self.cuda_graph_kv_indptr_cpu_swa is not None
+                and self.cuda_graph_kv_indptr_swa is not None
+                and self.decode_cuda_graph_metadata_swa.get(bs) is not None
+            ):
+                decode_wrapper_swa = self.decode_cuda_graph_metadata_swa[bs]
+                window_len = int(self._gptoss_transmla_swa_window_len)
+                window_lens_cpu = torch.minimum(
+                    kv_len_arr_cpu.to(torch.int32),
+                    torch.full_like(kv_len_arr_cpu, window_len, dtype=torch.int32),
+                )
+                self.cuda_graph_kv_indptr_cpu_swa[1 : bs + 1] = torch.cumsum(
+                    window_lens_cpu, dim=0
+                )
+                self.fast_decode_kwargs_swa.update(
+                    {
+                        "qo_indptr_cpu": self.cuda_graph_qo_indptr_cpu[: bs + 1],
+                        "kv_indptr_cpu": self.cuda_graph_kv_indptr_cpu_swa[: bs + 1],
+                        "kv_len_arr_cpu": window_lens_cpu,
+                    }
+                )
+
+                window_lens = torch.minimum(
+                    seq_lens[:bs].to(torch.int32),
+                    torch.full_like(seq_lens[:bs], window_len, dtype=torch.int32),
+                )
+                kv_start_idx = (seq_lens[:bs].to(torch.int32) - window_lens).to(
+                    torch.int32
+                )
+                window_lens_sum = int(window_lens_cpu.sum().item())
+                self.indices_updater_decode.update(
+                    req_pool_indices[:bs],
+                    window_lens,
+                    window_lens_sum,
+                    decode_wrapper=decode_wrapper_swa,
+                    init_metadata_replay=True,
+                    spec_info=spec_info,
+                    kv_indptr=self.cuda_graph_kv_indptr_swa,
+                    kv_start_idx=kv_start_idx,
+                    **self.fast_decode_kwargs_swa,
+                )
+
+            self.forward_metadata = DecodeMetadata(
+                self.decode_cuda_graph_metadata[bs], decode_wrapper_swa
             )
         elif forward_mode.is_target_verify():
             self.indices_updater_prefill.update(
@@ -528,6 +767,21 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         k_rope: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
     ):
+        if self._fa3_backend is not None and self._gptoss_transmla_use_fa3_prefill:
+            if sinks is not None and sinks.dtype != q.dtype:
+                sinks = sinks.to(q.dtype)
+            return self._fa3_backend.forward_extend(
+                q,
+                k,
+                v,
+                layer,
+                forward_batch,
+                save_kv_cache=save_kv_cache,
+                q_rope=q_rope,
+                k_rope=k_rope,
+                sinks=sinks,
+            )
+
         # GPT-OSS attention sinks:
         # - `sinks` is per-head log-sink in natural log space (ln sink_value).
         # - FlashInfer MLA wrappers do not accept `sinks` yet, so we emulate it by
@@ -659,7 +913,35 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         sinks: Optional[torch.Tensor] = None,
     ):
         LOG2E = 1.4426950408889634
+        is_swa_layer = (
+            layer.sliding_window_size is not None and layer.sliding_window_size > -1
+        )
         decode_wrapper = self.forward_metadata.decode_wrapper
+        if is_swa_layer and self._gptoss_transmla_flashinfer_swa:
+            decode_wrapper_swa = getattr(self.forward_metadata, "decode_wrapper_swa", None)
+            if decode_wrapper_swa is not None:
+                decode_wrapper = decode_wrapper_swa
+        if (
+            is_swa_layer
+            and self._fa3_backend is not None
+            and (
+                not self._gptoss_transmla_flashinfer_swa
+                or getattr(self.forward_metadata, "decode_wrapper_swa", None) is None
+            )
+        ):
+            if sinks is not None and sinks.dtype != q.dtype:
+                sinks = sinks.to(q.dtype)
+            return self._fa3_backend.forward_decode(
+                q,
+                k,
+                v,
+                layer,
+                forward_batch,
+                save_kv_cache=save_kv_cache,
+                q_rope=q_rope,
+                k_rope=k_rope,
+                sinks=sinks,
+            )
         cache_loc = forward_batch.out_cache_loc
 
         if k is not None:
@@ -754,6 +1036,8 @@ class FlashInferMLAIndicesUpdaterDecode:
         decode_wrapper: BatchMLAPagedAttentionWrapper,
         init_metadata_replay: bool = False,
         spec_info: Optional[SpecInput] = None,
+        kv_indptr: Optional[torch.Tensor] = None,
+        kv_start_idx: Optional[torch.Tensor] = None,
         **fast_decode_kwargs,
     ):
         decode_wrapper = decode_wrapper or self.decode_wrapper
@@ -763,9 +1047,10 @@ class FlashInferMLAIndicesUpdaterDecode:
             seq_lens,
             seq_lens_sum,
             self.q_indptr,
-            self.kv_indptr,
+            self.kv_indptr if kv_indptr is None else kv_indptr,
             init_metadata_replay,
             spec_info,
+            kv_start_idx=kv_start_idx,
             **fast_decode_kwargs,
         )
 
@@ -779,6 +1064,7 @@ class FlashInferMLAIndicesUpdaterDecode:
         kv_indptr: torch.Tensor,
         init_metadata_replay: bool = False,
         spec_info: Optional[SpecInput] = None,
+        kv_start_idx: Optional[torch.Tensor] = None,
         **fast_decode_kwargs,
     ):
         bs = len(req_pool_indices)
@@ -798,7 +1084,7 @@ class FlashInferMLAIndicesUpdaterDecode:
                 req_pool_indices,
                 paged_kernel_lens,
                 kv_indptr,
-                None,
+                kv_start_idx,
                 kv_indices,
                 self.req_to_token.shape[1],
             )
