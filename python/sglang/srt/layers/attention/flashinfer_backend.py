@@ -12,6 +12,7 @@ import os
 from dataclasses import dataclass
 from enum import Enum, auto
 from functools import partial
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, Callable, List, Optional, Union
 
 import torch
@@ -41,6 +42,22 @@ logger = logging.getLogger(__name__)
 if envs.SGLANG_ENABLE_TORCH_COMPILE.get():
     torch._logging.set_logs(dynamo=logging.ERROR)
     torch._dynamo.config.suppress_errors = True
+
+
+def _nvtx_enabled() -> bool:
+    return os.environ.get("SGLANG_FLASHINFER_NVTX", "0") == "1"
+
+
+@contextmanager
+def _nvtx_range(name: str):
+    if _nvtx_enabled():
+        torch.cuda.nvtx.range_push(name)
+        try:
+            yield
+        finally:
+            torch.cuda.nvtx.range_pop()
+    else:
+        yield
 
 
 if is_flashinfer_available():
@@ -135,17 +152,17 @@ class FlashInferAttnBackend(AttentionBackend):
             or "GptOssForCausalLM" in (getattr(hf_config, "architectures", None) or [])
         )
 
-        # IMPORTANT: GPT-OSS requires attention sinks. FlashInfer's attention-sink
-        # prefill kernels currently fail to compile for FP8 query inputs on SM90,
-        # so keep Q in model dtype even when KV is FP8.
+        # IMPORTANT (GPT-OSS): attention sinks require FlashInfer's AttentionSink kernels.
+        # For FP8 KV-cache runs on SM90, the AttentionSink paged prefill kernel template
+        # does NOT support mixed BF16(Q) × FP8(KV) GMMA, so we must quantize Q to FP8
+        # as well (and keep O in BF16 inside the wrapper for stability).
+        #
+        # For non-FP8 KV-cache runs we keep Q in the model dtype (BF16/FP16).
+        is_fp8_kv = self.kv_cache_dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
         if self.requires_attention_sinks:
-            self.paged_q_data_type = self.model_dtype
+            self.paged_q_data_type = self.kv_cache_dtype if is_fp8_kv else self.model_dtype
         else:
-            self.paged_q_data_type = (
-                self.kv_cache_dtype
-                if self.kv_cache_dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
-                else self.model_dtype
-            )
+            self.paged_q_data_type = self.kv_cache_dtype if is_fp8_kv else self.model_dtype
 
         # Store multi-item scoring delimiter for efficient access
         self.multi_item_scoring_delimiter = (
@@ -334,16 +351,14 @@ class FlashInferAttnBackend(AttentionBackend):
                         )
                     )
             if self.requires_attention_sinks:
+                # GPT-OSS requires attention sinks, but FlashInfer's decode wrapper now supports
+                # `sinks=` directly. Prefer the dedicated decode wrapper to avoid routing decode
+                # through the (much slower) prefill-style AttentionSink wrapper.
                 self.decode_wrappers.append(
-                    BatchAttentionWithAttentionSinkWrapper(
+                    BatchDecodeWithPagedKVCacheWrapper(
                         self.workspace_buffer,
                         "NHD",
-                        backend="auto",
-                        q_data_type=self.paged_q_data_type,
-                        kv_data_type=self.kv_cache_dtype,
-                        head_dim_qk=model_runner.model_config.head_dim,
-                        head_dim_vo=model_runner.model_config.head_dim,
-                        window_left=-1,
+                        use_tensor_cores=self.decode_use_tensor_cores,
                     )
                 )
             else:
@@ -657,38 +672,20 @@ class FlashInferAttnBackend(AttentionBackend):
         if forward_mode.is_decode_or_idle():
             decode_wrappers = []
             for i in range(self.num_wrappers):
-                if self.requires_attention_sinks:
-                    decode_wrappers.append(
-                        BatchAttentionWithAttentionSinkWrapper(
-                            self.workspace_buffer,
-                            "NHD",
-                            backend="auto",
-                            use_cuda_graph=True,
-                            qo_indptr_buf=self.cuda_graph_qo_indptr[i][: num_tokens + 1],
-                            paged_kv_indptr_buf=self.kv_indptr[i][: num_tokens + 1],
-                            paged_kv_indices_buf=self.cuda_graph_kv_indices[i],
-                            paged_kv_last_page_len_buf=self.kv_last_page_len[:num_tokens],
-                            q_data_type=self.paged_q_data_type,
-                            kv_data_type=self.kv_cache_dtype,
-                            head_dim_qk=self.head_dim,
-                            head_dim_vo=self.head_dim,
-                            window_left=-1,
-                        )
+                # NOTE (GPT-OSS): Prefer BatchDecodeWithPagedKVCacheWrapper even when sinks are
+                # enabled. FlashInfer's decode wrapper supports `sinks=` directly, and routing
+                # decode through the prefill-style AttentionSink wrapper is significantly slower.
+                decode_wrappers.append(
+                    BatchDecodeWithPagedKVCacheWrapper(
+                        self.workspace_buffer,
+                        "NHD",
+                        use_cuda_graph=True,
+                        use_tensor_cores=self.decode_use_tensor_cores,
+                        paged_kv_indptr_buffer=self.kv_indptr[i][: num_tokens + 1],
+                        paged_kv_indices_buffer=self.cuda_graph_kv_indices[i],
+                        paged_kv_last_page_len_buffer=self.kv_last_page_len[:num_tokens],
                     )
-                else:
-                    decode_wrappers.append(
-                        BatchDecodeWithPagedKVCacheWrapper(
-                            self.workspace_buffer,
-                            "NHD",
-                            use_cuda_graph=True,
-                            use_tensor_cores=self.decode_use_tensor_cores,
-                            paged_kv_indptr_buffer=self.kv_indptr[i][: num_tokens + 1],
-                            paged_kv_indices_buffer=self.cuda_graph_kv_indices[i],
-                            paged_kv_last_page_len_buffer=self.kv_last_page_len[
-                                :num_tokens
-                            ],
-                        )
-                    )
+                )
             seq_lens_sum = seq_lens.sum().item()
             self.indices_updater_decode.update(
                 req_pool_indices,
@@ -1019,31 +1016,33 @@ class FlashInferAttnBackend(AttentionBackend):
 
         # Call the wrapped function
         q = q.contiguous()
-        if q.dtype != self.paged_q_data_type:
-            q = q.to(self.paged_q_data_type)
-        if isinstance(decode_wrapper, BatchDecodeWithPagedKVCacheWrapper):
-            o = decode_wrapper.forward(
-                q.view(-1, layer.tp_q_head_num, layer.head_dim),
-                forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
-                sm_scale=layer.scaling,
-                logits_soft_cap=layer.logit_cap,
-                # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
-                k_scale=layer.k_scale_float,
-                v_scale=layer.v_scale_float,
-                sinks=kwargs.get("sinks", None),
-            )
-        else:
-            o = decode_wrapper.forward(
-                q.view(-1, layer.tp_q_head_num, layer.head_dim),
-                forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
-                causal=False,
-                sm_scale=layer.scaling,
-                logits_soft_cap=layer.logit_cap,
-                # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
-                k_scale=layer.k_scale_float,
-                v_scale=layer.v_scale_float,
-                sinks=kwargs.get("sinks", None),
-            )
+        with _nvtx_range("flashinfer.decode.cast_q"):
+            if q.dtype != self.paged_q_data_type:
+                q = q.to(self.paged_q_data_type)
+        with _nvtx_range("flashinfer.decode.attn"):
+            if isinstance(decode_wrapper, BatchDecodeWithPagedKVCacheWrapper):
+                o = decode_wrapper.forward(
+                    q.view(-1, layer.tp_q_head_num, layer.head_dim),
+                    forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
+                    sm_scale=layer.scaling,
+                    logits_soft_cap=layer.logit_cap,
+                    # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
+                    k_scale=layer.k_scale_float,
+                    v_scale=layer.v_scale_float,
+                    sinks=kwargs.get("sinks", None),
+                )
+            else:
+                o = decode_wrapper.forward(
+                    q.view(-1, layer.tp_q_head_num, layer.head_dim),
+                    forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
+                    causal=False,
+                    sm_scale=layer.scaling,
+                    logits_soft_cap=layer.logit_cap,
+                    # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
+                    k_scale=layer.k_scale_float,
+                    v_scale=layer.v_scale_float,
+                    sinks=kwargs.get("sinks", None),
+                )
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
@@ -1074,7 +1073,10 @@ class FlashInferIndicesUpdaterDecode:
         self.o_data_type = model_runner.dtype
         self.sliding_window_size = model_runner.sliding_window_size
         self.attn_backend = attn_backend
-        self._use_prefill_wrapper_for_decode = attn_backend.requires_attention_sinks
+        self._use_prefill_wrapper_for_decode = any(
+            not isinstance(w, BatchDecodeWithPagedKVCacheWrapper)
+            for w in attn_backend.decode_wrappers
+        )
         self._qo_indptr = None
         self._qo_indptr_range = None
         if self._use_prefill_wrapper_for_decode:
@@ -1307,42 +1309,44 @@ class FlashInferIndicesUpdaterDecode:
 
             if wrapper_uses_fast_decode_plan:
                 # When begin_forward is replaced with fast_decode_plan, pass global_override_indptr_cpu
-                wrapper.begin_forward(
-                    kv_indptr,
-                    kv_indices,
-                    self.kv_last_page_len[:bs],
-                    self.num_qo_heads,
-                    self.num_kv_heads,
-                    self.head_dim,
-                    1,
-                    data_type=self.data_type,
-                    q_data_type=self.q_data_type,
-                    non_blocking=True,
-                    fixed_split_size=fixed_split_size,
-                    disable_split_kv=(
-                        disable_split_kv if disable_split_kv is not None else False
-                    ),
-                    global_override_indptr_cpu=global_override_indptr_cpu,
-                )
+                with _nvtx_range("flashinfer.decode.begin_forward"):
+                    wrapper.begin_forward(
+                        kv_indptr,
+                        kv_indices,
+                        self.kv_last_page_len[:bs],
+                        self.num_qo_heads,
+                        self.num_kv_heads,
+                        self.head_dim,
+                        1,
+                        data_type=self.data_type,
+                        q_data_type=self.q_data_type,
+                        non_blocking=True,
+                        fixed_split_size=fixed_split_size,
+                        disable_split_kv=(
+                            disable_split_kv if disable_split_kv is not None else False
+                        ),
+                        global_override_indptr_cpu=global_override_indptr_cpu,
+                    )
             else:
                 # When using original begin_forward, don't pass global_override_indptr_cpu
-                wrapper.begin_forward(
-                    kv_indptr,
-                    kv_indices,
-                    self.kv_last_page_len[:bs],
-                    self.num_qo_heads,
-                    self.num_kv_heads,
-                    self.head_dim,
-                    1,
-                    data_type=self.data_type,
-                    q_data_type=self.q_data_type,
-                    o_data_type=self.o_data_type,
-                    non_blocking=True,
-                    fixed_split_size=fixed_split_size,
-                    disable_split_kv=(
-                        disable_split_kv if disable_split_kv is not None else False
-                    ),
-                )
+                with _nvtx_range("flashinfer.decode.begin_forward"):
+                    wrapper.begin_forward(
+                        kv_indptr,
+                        kv_indices,
+                        self.kv_last_page_len[:bs],
+                        self.num_qo_heads,
+                        self.num_kv_heads,
+                        self.head_dim,
+                        1,
+                        data_type=self.data_type,
+                        q_data_type=self.q_data_type,
+                        o_data_type=self.o_data_type,
+                        non_blocking=True,
+                        fixed_split_size=fixed_split_size,
+                        disable_split_kv=(
+                            disable_split_kv if disable_split_kv is not None else False
+                        ),
+                    )
         else:
             if qo_indptr is None:
                 raise ValueError(
@@ -1354,24 +1358,25 @@ class FlashInferIndicesUpdaterDecode:
             qo_indptr[: bs + 1].copy_(self._qo_indptr_range[: bs + 1], non_blocking=True)
             qo_indptr = qo_indptr[: bs + 1]
 
-            wrapper.begin_forward(
-                qo_indptr,
-                kv_indptr,
-                kv_indices,
-                self.kv_last_page_len[:bs],
-                self.num_qo_heads,
-                self.num_kv_heads,
-                self.head_dim,
-                1,
-                q_data_type=self.q_data_type,
-                kv_data_type=self.data_type,
-                o_data_type=self.o_data_type,
-                non_blocking=True,
-                fixed_split_size=fixed_split_size,
-                disable_split_kv=(
-                    disable_split_kv if disable_split_kv is not None else False
-                ),
-            )
+            with _nvtx_range("flashinfer.decode.begin_forward"):
+                wrapper.begin_forward(
+                    qo_indptr,
+                    kv_indptr,
+                    kv_indices,
+                    self.kv_last_page_len[:bs],
+                    self.num_qo_heads,
+                    self.num_kv_heads,
+                    self.head_dim,
+                    1,
+                    q_data_type=self.q_data_type,
+                    kv_data_type=self.data_type,
+                    o_data_type=self.o_data_type,
+                    non_blocking=True,
+                    fixed_split_size=fixed_split_size,
+                    disable_split_kv=(
+                        disable_split_kv if disable_split_kv is not None else False
+                    ),
+                )
 
         if locally_override:
             global_override_indptr_cpu = None

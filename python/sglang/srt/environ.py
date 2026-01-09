@@ -220,6 +220,9 @@ class Envs:
     SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP = EnvBool(False)
     SGLANG_SCHEDULER_MAX_RECV_PER_POLL = EnvInt(-1)
     SGLANG_EXPERIMENTAL_CPP_RADIX_TREE = EnvBool(False)
+    # Experimental: enable FourOverSix-inspired adaptive block scaling for FP4 KV cache
+    # (only takes effect when `--kv-cache-dtype fp4_e2m1` is used).
+    SGLANG_EXPERIMENTAL_NVFP4 = EnvBool(False)
     SGLANG_DYNAMIC_CHUNKING_SMOOTH_FACTOR = EnvFloat(0.75)
     SGLANG_SCHEDULER_SKIP_ALL_GATHER = EnvBool(False)
     SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE = EnvBool(False)

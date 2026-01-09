@@ -2504,14 +2504,38 @@ class Scheduler(
         return success
 
     def get_internal_state(self, recv_req: GetInternalStateReq):
-        ret = vars(get_global_server_args())
+        minimal = os.getenv("SGLANG_INTERNAL_STATE_MINIMAL", "").lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+        if minimal:
+            ret = {}
+        else:
+            ret = vars(get_global_server_args())
         ret["last_gen_throughput"] = self.last_gen_throughput
+        kvcache = self.token_to_kv_pool_allocator.get_kvcache()
+        kv_size_bytes = kvcache.get_kv_size_bytes()
+        if isinstance(kv_size_bytes, tuple):
+            k_bytes, v_bytes = kv_size_bytes
+            kv_bytes_total = int(k_bytes + v_bytes)
+            k_bytes_i = int(k_bytes)
+            v_bytes_i = int(v_bytes)
+        else:
+            kv_bytes_total = int(kv_size_bytes)
+            k_bytes_i = None
+            v_bytes_i = None
+        token_capacity = int(self.max_total_num_tokens)
+        bytes_per_token = kv_bytes_total / max(token_capacity, 1)
         ret["memory_usage"] = {
             "weight": round(self.tp_worker.model_runner.weight_load_mem_usage, 2),
-            "kvcache": round(
-                self.token_to_kv_pool_allocator.get_kvcache().mem_usage, 2
-            ),
-            "token_capacity": int(self.max_total_num_tokens),
+            "kvcache": round(kvcache.mem_usage, 2),
+            "kvcache_bytes": kv_bytes_total,
+            "kvcache_k_bytes": k_bytes_i,
+            "kvcache_v_bytes": v_bytes_i,
+            "kvcache_bytes_per_token": bytes_per_token,
+            "kvcache_class": type(kvcache).__name__,
+            "token_capacity": token_capacity,
             "graph": round(self.tp_worker.model_runner.graph_mem_usage, 2),
         }
         ret["effective_max_running_requests_per_dp"] = self.max_running_requests

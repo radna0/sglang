@@ -17,12 +17,15 @@
 
 import logging
 import math
+import os
 from collections.abc import Iterable
+from contextlib import contextmanager, nullcontext
 from functools import partial
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 from torch import nn
+from torch.profiler import record_function
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import (
@@ -262,6 +265,9 @@ class GptOssAttention(nn.Module):
         self.sinks = nn.Parameter(
             torch.empty(self.num_heads, dtype=sinks_dtype), requires_grad=False
         )
+        self._diag_disable_sinks = os.getenv(
+            "SGLANG_GPTOSS_DIAG_DISABLE_SINKS", ""
+        ).lower() in ("1", "true", "yes")
 
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
@@ -296,6 +302,28 @@ class GptOssAttention(nn.Module):
         )
         self.layer_id = layer_id
 
+        if os.getenv("SGLANG_GPTOSS_DEBUG_ROPE", "").lower() in ("1", "true", "yes"):
+            import json
+
+            print(
+                "[GPTOSS_DEBUG] "
+                + json.dumps(
+                    {
+                        "kind": "GptOssAttention",
+                        "layer_id": int(layer_id),
+                        "layer_type": str(layer_type),
+                        "sliding_window_size": int(sliding_window_size),
+                        "rope_theta": rope_theta,
+                        "rope_scaling": rope_scaling,
+                        "max_position_embeddings": int(max_position_embeddings),
+                        "sinks_dtype": str(sinks_dtype).replace("torch.", ""),
+                        "diag_disable_sinks": bool(self._diag_disable_sinks),
+                    },
+                    ensure_ascii=True,
+                    sort_keys=True,
+                )
+            )
+
     def forward_prepare(
         self,
         positions: torch.Tensor,
@@ -328,9 +356,10 @@ class GptOssAttention(nn.Module):
         hidden_states, forward_batch, inner_state = intermediate_state
         if inner_state is None:
             return hidden_states
+        sinks = None if self._diag_disable_sinks else self.sinks
         attn_output = self.attn(
             *inner_state,
-            sinks=self.sinks,
+            sinks=sinks,
             save_kv_cache=not enable_fused_set_kv_buffer(forward_batch),
         )
         output, _ = self.o_proj(attn_output)
@@ -373,6 +402,21 @@ def _is_mla_backend(attention_backend: str) -> bool:
     return attention_backend in {"flashmla", "flashinfer", "cutlass_mla", "trtllm_mla", "nsa"}
 
 
+@contextmanager
+def _maybe_nvtx(enabled: bool, name: str):
+    if not enabled:
+        yield
+        return
+
+    # Use NVTX for Nsight Systems, and record_function so torch.profiler traces include the ranges.
+    torch.cuda.nvtx.range_push(name)
+    try:
+        with record_function(name):
+            yield
+    finally:
+        torch.cuda.nvtx.range_pop()
+
+
 class GptOssTransMLAAttention(nn.Module):
     def __init__(
         self,
@@ -393,6 +437,11 @@ class GptOssTransMLAAttention(nn.Module):
         self.layer_id = layer_id
         self.hidden_size = config.hidden_size
         self.sliding_window_size = sliding_window_size
+        self._transmla_nvtx = os.getenv("SGLANG_GPTOSS_TRANSMLA_NVTX", "").lower() in (
+            "1",
+            "true",
+            "yes",
+        )
 
         attn_tp_rank = get_attention_tp_rank()
         attn_tp_size = get_attention_tp_size()
@@ -455,6 +504,9 @@ class GptOssTransMLAAttention(nn.Module):
         self.attention_sink = nn.Parameter(
             torch.empty(self.num_local_heads, dtype=sinks_dtype), requires_grad=False
         )
+        self._diag_disable_sinks = os.getenv(
+            "SGLANG_GPTOSS_DIAG_DISABLE_SINKS", ""
+        ).lower() in ("1", "true", "yes")
 
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.v_head_dim,
@@ -507,6 +559,33 @@ class GptOssTransMLAAttention(nn.Module):
             quant_config=quant_config,
         )
 
+        if os.getenv("SGLANG_GPTOSS_DEBUG_ROPE", "").lower() in ("1", "true", "yes"):
+            import json
+
+            print(
+                "[GPTOSS_DEBUG] "
+                + json.dumps(
+                    {
+                        "kind": "GptOssTransMLAAttention",
+                        "layer_id": int(layer_id),
+                        "layer_type": str(layer_type),
+                        "sliding_window_size": int(sliding_window_size),
+                        "rope_theta": rope_theta,
+                        "rope_scaling": rope_scaling,
+                        "max_position_embeddings": int(max_position_embeddings),
+                        "qk_nope_head_dim": int(self.qk_nope_head_dim),
+                        "qk_rope_head_dim": int(self.qk_rope_head_dim),
+                        "qk_head_dim": int(self.qk_head_dim),
+                        "v_head_dim": int(self.v_head_dim),
+                        "kv_lora_rank": int(self.kv_lora_rank),
+                        "sinks_dtype": str(sinks_dtype).replace("torch.", ""),
+                        "diag_disable_sinks": bool(self._diag_disable_sinks),
+                    },
+                    ensure_ascii=True,
+                    sort_keys=True,
+                )
+            )
+
         self._w_kc: torch.Tensor | None = None
         self._w_vc: torch.Tensor | None = None
 
@@ -537,25 +616,40 @@ class GptOssTransMLAAttention(nn.Module):
         args = get_global_server_args()
         use_mla = bool(getattr(args, "use_mla_backend", False))
 
-        q = self.q_proj(hidden_states)[0].view(-1, self.num_local_heads, self.qk_head_dim)
-        latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
-        k_nope = latent_cache[..., : self.kv_lora_rank]
-        k_pe = latent_cache[..., self.kv_lora_rank :].unsqueeze(1)
+        with _maybe_nvtx(self._transmla_nvtx, "gptoss_transmla/q_proj"):
+            q = self.q_proj(hidden_states)[0].view(
+                -1, self.num_local_heads, self.qk_head_dim
+            )
+
+        with _maybe_nvtx(self._transmla_nvtx, "gptoss_transmla/kv_a_proj_with_mqa"):
+            latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
+
+        with _maybe_nvtx(self._transmla_nvtx, "gptoss_transmla/rope_split"):
+            k_nope = latent_cache[..., : self.kv_lora_rank]
+            k_pe = latent_cache[..., self.kv_lora_rank :].unsqueeze(1)
 
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-        q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
+        with _maybe_nvtx(self._transmla_nvtx, "gptoss_transmla/rope_apply"):
+            q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
 
         if use_mla:
             w_kc, w_vc = self._maybe_init_w_kc_vc()
-            q_nope_out = torch.bmm(q_nope.transpose(0, 1), w_kc).transpose(0, 1)
+            with _maybe_nvtx(self._transmla_nvtx, "gptoss_transmla/q_nope_out_bmm"):
+                q_nope_out = torch.bmm(q_nope.transpose(0, 1), w_kc).transpose(0, 1)
             inner_state = ("mla", q_nope_out, q_pe, k_nope.unsqueeze(1), k_pe, w_vc, forward_batch)
         else:
-            kv = self.kv_b_proj(k_nope)[0].view(
-                -1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim
-            )
+            with _maybe_nvtx(self._transmla_nvtx, "gptoss_transmla/kv_b_proj"):
+                kv = self.kv_b_proj(k_nope)[0].view(
+                    -1,
+                    self.num_local_heads,
+                    self.qk_nope_head_dim + self.v_head_dim,
+                )
             k_pass = kv[..., : self.qk_nope_head_dim]
             v = kv[..., self.qk_nope_head_dim :]
-            k = torch.cat([k_pass, k_pe.expand(-1, self.num_local_heads, -1)], dim=-1)
+            with _maybe_nvtx(self._transmla_nvtx, "gptoss_transmla/k_concat"):
+                k = torch.cat(
+                    [k_pass, k_pe.expand(-1, self.num_local_heads, -1)], dim=-1
+                )
             q2 = torch.cat([q_nope, q_pe], dim=-1).reshape(-1, self.num_local_heads * self.qk_head_dim)
             k2 = k.reshape(-1, self.num_local_heads * self.qk_head_dim)
             if self._mha_cache_v_head_dim == self.v_head_dim:
@@ -573,41 +667,48 @@ class GptOssTransMLAAttention(nn.Module):
         if inner_state is None:
             return hidden_states
 
+        sinks = None if self._diag_disable_sinks else self.attention_sink
+
         mode = inner_state[0]
         if mode == "mla":
             _, q_nope_out, q_pe, k_nope, k_pe, w_vc, forward_batch = inner_state
-            attn_output = self.attn_mqa(
-                q_nope_out,
-                k_nope,
-                k_nope,
-                forward_batch,
-                q_rope=q_pe,
-                k_rope=k_pe,
-                sinks=self.attention_sink,
-                save_kv_cache=True,
-            )
+            with _maybe_nvtx(self._transmla_nvtx, "gptoss_transmla/attn_mqa"):
+                attn_output = self.attn_mqa(
+                    q_nope_out,
+                    k_nope,
+                    k_nope,
+                    forward_batch,
+                    q_rope=q_pe,
+                    k_rope=k_pe,
+                    sinks=sinks,
+                    save_kv_cache=True,
+                )
             attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
-            attn_output = torch.bmm(attn_output.transpose(0, 1), w_vc).transpose(0, 1)
+            with _maybe_nvtx(self._transmla_nvtx, "gptoss_transmla/v_reconstruct_bmm"):
+                attn_output = torch.bmm(attn_output.transpose(0, 1), w_vc).transpose(0, 1)
             attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
-            output, _ = self.o_proj(attn_output)
+            with _maybe_nvtx(self._transmla_nvtx, "gptoss_transmla/o_proj"):
+                output, _ = self.o_proj(attn_output)
             return output
 
         if mode == "mha":
             _, q, k, v, forward_batch = inner_state
-            attn_output = self.attn_mha(
-                q,
-                k,
-                v,
-                forward_batch,
-                sinks=self.attention_sink,
-                save_kv_cache=True,
-            )
+            with _maybe_nvtx(self._transmla_nvtx, "gptoss_transmla/attn_mha"):
+                attn_output = self.attn_mha(
+                    q,
+                    k,
+                    v,
+                    forward_batch,
+                    sinks=sinks,
+                    save_kv_cache=True,
+                )
             if self._mha_cache_v_head_dim != self.v_head_dim:
                 attn_output = attn_output.view(
                     -1, self.num_local_heads, self._mha_cache_v_head_dim
                 )[..., : self.v_head_dim]
                 attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
-            output, _ = self.o_proj(attn_output)
+            with _maybe_nvtx(self._transmla_nvtx, "gptoss_transmla/o_proj"):
+                output, _ = self.o_proj(attn_output)
             return output
 
         raise ValueError(f"Unknown attention mode: {mode}")
