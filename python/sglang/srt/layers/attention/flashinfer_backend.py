@@ -313,6 +313,10 @@ class FlashInferAttnBackend(AttentionBackend):
         self.prefill_wrappers_paged = []
         self.prefill_wrappers_verify = []
         self.decode_wrappers = []
+        decode_sinks_wrapper = os.environ.get(
+            "SGLANG_FLASHINFER_DECODE_SINKS_WRAPPER", "sink"
+        ).lower()
+        use_decode_wrapper_for_sinks = decode_sinks_wrapper in ("decode", "paged")
         prefill_paged_backend = (
             "fa3"
             if self.paged_q_data_type in (torch.float8_e4m3fn, torch.float8_e5m2)
@@ -362,19 +366,31 @@ class FlashInferAttnBackend(AttentionBackend):
                         )
                     )
             if self.requires_attention_sinks:
-                self.decode_wrappers.append(
-                    BatchAttentionWithAttentionSinkWrapper(
-                        self.workspace_buffer,
-                        "NHD",
-                        backend="auto",
-                        q_data_type=self.paged_q_data_type,
-                        kv_data_type=self.kv_cache_dtype,
-                        o_data_type=self.model_dtype,
-                        head_dim_qk=model_runner.model_config.head_dim,
-                        head_dim_vo=model_runner.model_config.head_dim,
-                        window_left=-1,
+                if use_decode_wrapper_for_sinks:
+                    # Experimental: use the dedicated decode wrapper (often faster)
+                    # even for GPT-OSS sinks, if FlashInfer supports sinks in this path.
+                    self.decode_wrappers.append(
+                        BatchDecodeWithPagedKVCacheWrapper(
+                            self.workspace_buffer,
+                            "NHD",
+                            use_tensor_cores=self.decode_use_tensor_cores,
+                        )
                     )
-                )
+                else:
+                    # Default: use the attention-sink wrapper (prefill-style kernels).
+                    self.decode_wrappers.append(
+                        BatchAttentionWithAttentionSinkWrapper(
+                            self.workspace_buffer,
+                            "NHD",
+                            backend="auto",
+                            q_data_type=self.paged_q_data_type,
+                            kv_data_type=self.kv_cache_dtype,
+                            o_data_type=self.model_dtype,
+                            head_dim_qk=model_runner.model_config.head_dim,
+                            head_dim_vo=model_runner.model_config.head_dim,
+                            window_left=-1,
+                        )
+                    )
             else:
                 self.decode_wrappers.append(
                     BatchDecodeWithPagedKVCacheWrapper(
@@ -400,6 +416,9 @@ class FlashInferAttnBackend(AttentionBackend):
                 if self.decode_wrappers
                 else None
             )
+            decode_wrapper0 = (
+                self.decode_wrappers[0].__class__.__name__ if self.decode_wrappers else None
+            )
             print(
                 "[SGLANG][FlashInfer] init "
                 f"model_dtype={self.model_dtype} kv_cache_dtype={self.kv_cache_dtype} "
@@ -408,6 +427,8 @@ class FlashInferAttnBackend(AttentionBackend):
                 f"prefill_wrapper_backend0={prefill_backend0} "
                 f"verify_wrapper_backend0={verify_backend0} "
                 f"decode_use_tensor_cores={self.decode_use_tensor_cores} "
+                f"decode_sinks_wrapper={decode_sinks_wrapper} "
+                f"decode_wrapper0={decode_wrapper0} "
                 f"decode_wrapper_tc0={decode_tc0}",
                 flush=True,
             )
