@@ -841,12 +841,14 @@ class FlashInferAttnBackend(AttentionBackend):
                 seq_lens_sum,
                 prefix_lens=seq_lens - self.dllm_config.block_size,
                 prefill_wrappers=prefill_wrappers,
-                use_ragged=True,
+                use_ragged=(not self.requires_attention_sinks),
                 encoder_lens=encoder_lens,
                 spec_info=None,
             )
             self.prefill_cuda_graph_metadata[bs] = prefill_wrappers
-            self.forward_metadata = PrefillMetadata(prefill_wrappers, True, False)
+            self.forward_metadata = PrefillMetadata(
+                prefill_wrappers, (not self.requires_attention_sinks), False
+            )
         else:
             raise ValueError(f"Invalid mode: {forward_mode=}")
 
@@ -951,13 +953,15 @@ class FlashInferAttnBackend(AttentionBackend):
 
         q_reshaped = q.view(-1, layer.tp_q_head_num, layer.head_dim)
 
-        if self.forward_metadata.q_workspace_buffers is None:
-            self.forward_metadata.q_workspace_buffers = {}
+        q_workspace_buffers = getattr(self.forward_metadata, "q_workspace_buffers", None)
+        if q_workspace_buffers is None:
+            q_workspace_buffers = {}
+            setattr(self.forward_metadata, "q_workspace_buffers", q_workspace_buffers)
 
-        q_workspace = self.forward_metadata.q_workspace_buffers.get(layer.layer_id, None)
+        q_workspace = q_workspace_buffers.get(layer.layer_id, None)
         if q_workspace is None or q_workspace.shape != q_reshaped.shape or q_workspace.dtype != self.paged_q_data_type:
             q_workspace = torch.empty_like(q_reshaped, dtype=self.paged_q_data_type, device=q_reshaped.device)
-            self.forward_metadata.q_workspace_buffers[layer.layer_id] = q_workspace
+            q_workspace_buffers[layer.layer_id] = q_workspace
 
         if _SGLANG_FLASHINFER_NVTX and _has_nvtx:
             nvtx_range_q_copy = nvtx.range(f"flashinfer.prefill.q_copy_layer{layer.layer_id}")
@@ -971,93 +975,105 @@ class FlashInferAttnBackend(AttentionBackend):
 
         if _SGLANG_FLASHINFER_NVTX and _has_nvtx:
             nvtx_range_q.end()
-            if k is not None:
-                assert v is not None
-                if save_kv_cache:
-                    forward_batch.token_to_kv_pool.set_kv_buffer(
-                        layer, cache_loc, k, v, layer.k_scale, layer.v_scale
-                    )
-            if _SGLANG_FLASHINFER_NVTX and _has_nvtx:
-                nvtx_range_kv.end()
 
-            if _SGLANG_FLASHINFER_NVTX and _has_nvtx:
-                nvtx_range_attn = nvtx.range(f"flashinfer.prefill.attention_kernel_layer{layer.layer_id}")
-            o = prefill_wrapper_paged.forward(
-                q_workspace,
-                forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
-                causal=not layer.is_cross_attention,
-                sm_scale=layer.scaling,
-                # Disable sliding window attention for multi-item scoring:
-                # - Sliding window could cut across item boundaries, breaking semantic coherence
-                # - Multi-item sequences need full attention to properly handle delimiter tokens
-                # - Specialized multi-item parameters (prefix_len_ptr, token_pos_in_items_ptr)
-                #   provide more precise attention control than simple sliding windows
-                # - Item-aware masking takes precedence over window-based masking
-                window_left=window_left,
-                logits_soft_cap=logits_soft_cap,
-                # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
-                k_scale=layer.k_scale_float,
-                v_scale=layer.v_scale_float,
-                sinks=sinks,
-            )
-            if _SGLANG_FLASHINFER_NVTX and _has_nvtx:
-                nvtx_range_attn.end()
-        else:
-            if sinks is not None:
-                raise NotImplementedError(
-                    "FlashInfer ragged prefill does not support attention sinks; "
-                    "use the paged prefill path instead."
-                )
-            causal = True
-            if (
-                layer.is_cross_attention
-                or layer.attn_type == AttentionType.ENCODER_ONLY
-            ):
-                causal = False
-            if save_kv_cache and layer.attn_type == AttentionType.ENCODER_ONLY:
-                save_kv_cache = False
-
-            if self.forward_metadata.extend_no_prefix:
-                # NOTE: FlashInfer currently has limitations with head_dim = 32 or other dimensions
-                # The FlashInfer head_dim limitation itself is tracked here:
-                # https://github.com/flashinfer-ai/flashinfer/issues/1048
-                o = self.prefill_wrapper_ragged.forward(
-                    q_workspace,
-                    k.view(-1, layer.tp_k_head_num, layer.head_dim),
-                    v.view(-1, layer.tp_v_head_num, layer.head_dim),
-                    causal=causal,
-                    sm_scale=layer.scaling,
-                    logits_soft_cap=logits_soft_cap,
-                )
-
-            else:
-                if not self.is_dllm_model:
-                    # TODO: design a better interface
-                    # For other models, use causal attention for the ragged part as previously
-                    causal = True
-
-                o1, s1 = self.prefill_wrapper_ragged.forward_return_lse(
-                    q_workspace,
-                    k.view(-1, layer.tp_k_head_num, layer.head_dim),
-                    v.view(-1, layer.tp_v_head_num, layer.head_dim),
-                    causal=causal,
-                    sm_scale=layer.scaling,
-                    logits_soft_cap=logits_soft_cap,
-                )
-                o2, s2 = prefill_wrapper_paged.forward_return_lse(
-                    q_workspace,
-                    forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
-                    causal=False,
-                    sm_scale=layer.scaling,
-                    logits_soft_cap=logits_soft_cap,
-                )
-
-                o, _ = merge_state(o1, s1, o2, s2)
-
+        if k is not None:
+            assert v is not None
             if save_kv_cache:
+                nvtx_range_kv = None
+                if _SGLANG_FLASHINFER_NVTX and _has_nvtx:
+                    nvtx_range_kv = nvtx.range(
+                        f"flashinfer.prefill.set_kv_layer{layer.layer_id}"
+                    )
                 forward_batch.token_to_kv_pool.set_kv_buffer(
                     layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                 )
+                if nvtx_range_kv is not None:
+                    nvtx_range_kv.end()
+
+        nvtx_range_attn = None
+        if _SGLANG_FLASHINFER_NVTX and _has_nvtx:
+            nvtx_range_attn = nvtx.range(
+                f"flashinfer.prefill.attention_kernel_layer{layer.layer_id}"
+            )
+        o = prefill_wrapper_paged.forward(
+            q_workspace,
+            forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
+            causal=not layer.is_cross_attention,
+            sm_scale=layer.scaling,
+            # Disable sliding window attention for multi-item scoring:
+            # - Sliding window could cut across item boundaries, breaking semantic coherence
+            # - Multi-item sequences need full attention to properly handle delimiter tokens
+            # - Specialized multi-item parameters (prefix_len_ptr, token_pos_in_items_ptr)
+            #   provide more precise attention control than simple sliding windows
+            # - Item-aware masking takes precedence over window-based masking
+            window_left=window_left,
+            logits_soft_cap=logits_soft_cap,
+            # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
+            k_scale=layer.k_scale_float,
+            v_scale=layer.v_scale_float,
+            sinks=sinks,
+        )
+        if nvtx_range_attn is not None:
+            nvtx_range_attn.end()
+
+        # Default path: paged prefill (supports attention sinks).
+        # If sinks are present, always force the paged path even if the metadata
+        # suggests ragged, because ragged prefill does not support sinks.
+        if sinks is not None or not self.forward_metadata.use_ragged:
+            return o.view(-1, layer.tp_q_head_num * layer.head_dim)
+
+        # Ragged prefill path (used by specific modes like DLLM); sinks are unsupported here.
+        if sinks is not None:
+            raise NotImplementedError(
+                "FlashInfer ragged prefill does not support attention sinks; "
+                "use the paged prefill path instead."
+            )
+
+        causal = True
+        if layer.is_cross_attention or layer.attn_type == AttentionType.ENCODER_ONLY:
+            causal = False
+        if save_kv_cache and layer.attn_type == AttentionType.ENCODER_ONLY:
+            save_kv_cache = False
+
+        if self.forward_metadata.extend_no_prefix:
+            # NOTE: FlashInfer currently has limitations with head_dim = 32 or other dimensions
+            # The FlashInfer head_dim limitation itself is tracked here:
+            # https://github.com/flashinfer-ai/flashinfer/issues/1048
+            o = self.prefill_wrapper_ragged.forward(
+                q_workspace,
+                k.view(-1, layer.tp_k_head_num, layer.head_dim),
+                v.view(-1, layer.tp_v_head_num, layer.head_dim),
+                causal=causal,
+                sm_scale=layer.scaling,
+                logits_soft_cap=logits_soft_cap,
+            )
+        else:
+            if not self.is_dllm_model:
+                # TODO: design a better interface
+                # For other models, use causal attention for the ragged part as previously
+                causal = True
+
+            o1, s1 = self.prefill_wrapper_ragged.forward_return_lse(
+                q_workspace,
+                k.view(-1, layer.tp_k_head_num, layer.head_dim),
+                v.view(-1, layer.tp_v_head_num, layer.head_dim),
+                causal=causal,
+                sm_scale=layer.scaling,
+                logits_soft_cap=logits_soft_cap,
+            )
+            o2, s2 = prefill_wrapper_paged.forward_return_lse(
+                q_workspace,
+                forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
+                causal=False,
+                sm_scale=layer.scaling,
+                logits_soft_cap=logits_soft_cap,
+            )
+            o, _ = merge_state(o1, s1, o2, s2)
+
+        if save_kv_cache:
+            forward_batch.token_to_kv_pool.set_kv_buffer(
+                layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+            )
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
@@ -1574,7 +1590,7 @@ class FlashInferIndicesUpdaterPrefill:
         seq_lens: torch.Tensor,
         seq_lens_cpu: Optional[torch.Tensor],
         seq_lens_sum: int,
-        prefix_lens: torch.Tensor,
+        prefix_lens: Optional[torch.Tensor],
         prefill_wrappers: List[BatchPrefillWithPagedKVCacheWrapper],
         use_ragged: bool,
         encoder_lens: Optional[torch.Tensor],
@@ -1582,6 +1598,9 @@ class FlashInferIndicesUpdaterPrefill:
         fixed_split_size: Optional[int] = None,
         multi_item_params: Optional[MultiItemScoringParams] = None,
     ):
+        if prefix_lens is None:
+            prefix_lens = torch.zeros_like(seq_lens)
+
         for wrapper_id in range(2):
             if wrapper_id == 0:
                 # window attention use paged only
