@@ -68,7 +68,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.weight_utils import default_weight_loader, kv_cache_scales_loader
 from sglang.srt.models.utils import (
     create_fused_set_kv_buffer_arg,
     enable_fused_set_kv_buffer,
@@ -1039,6 +1039,58 @@ class GptOssForCausalLM(nn.Module):
     @property
     def end_layer(self):
         return self.model.end_layer
+
+    def load_kv_cache_scales(self, quantization_param_path: str) -> None:
+        tp_size = get_tensor_model_parallel_world_size()
+        tp_rank = get_tensor_model_parallel_rank()
+
+        for layer_idx, scaling_factor in kv_cache_scales_loader(
+            quantization_param_path,
+            tp_rank,
+            tp_size,
+            self.config.num_hidden_layers,
+            self.config.__class__.model_type,
+        ):
+            if layer_idx < self.start_layer or layer_idx >= self.end_layer:
+                continue
+
+            layer = self.model.layers[layer_idx]
+            if isinstance(layer, nn.Identity):
+                continue
+
+            # GPT-OSS attention variants:
+            # - Baseline: `layer.self_attn.attn` (RadixAttention)
+            # - TransMLA: `layer.self_attn.attn_mqa` / `layer.self_attn.attn_mha` (RadixAttention)
+            attn_modules: list[torch.nn.Module] = []
+            self_attn = getattr(layer, "self_attn", None)
+            if self_attn is None:
+                continue
+            maybe_attn = getattr(self_attn, "attn", None)
+            if maybe_attn is not None:
+                attn_modules.append(maybe_attn)
+            for name in ("attn_mqa", "attn_mha"):
+                m = getattr(self_attn, name, None)
+                if m is not None:
+                    attn_modules.append(m)
+            if not attn_modules:
+                raise RuntimeError(
+                    f"Could not find RadixAttention module(s) in self_attn for layer {layer_idx}."
+                )
+
+            scale = float(scaling_factor)
+            for layer_attn in attn_modules:
+                if not hasattr(layer_attn, "k_scale") or not hasattr(layer_attn, "v_scale"):
+                    continue
+
+                if isinstance(layer_attn.k_scale, torch.Tensor):
+                    layer_attn.k_scale.copy_(scale)
+                    layer_attn.v_scale.copy_(scale)
+                else:
+                    layer_attn.k_scale = scale
+                    layer_attn.v_scale = scale
+
+                layer_attn.k_scale_float = scale
+                layer_attn.v_scale_float = scale
 
     def _get_default_weight_mapping(self):
         """Generate default weight name mapping for GptOss safetensors."""

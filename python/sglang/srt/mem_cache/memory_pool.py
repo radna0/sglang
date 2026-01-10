@@ -38,7 +38,10 @@ KVCache actually holds the physical kv cache.
 """
 
 import abc
+import atexit
+import json
 import logging
+import os
 from contextlib import contextmanager, nullcontext
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
@@ -67,6 +70,103 @@ logger = logging.getLogger(__name__)
 GB = 1024 * 1024 * 1024
 _is_cuda = is_cuda()
 _is_npu = is_npu()
+
+_FP8_KV_CALIB_POOLS: list["MLATokenToKVPool"] = []
+_FP8_KV_CALIB_ATEXIT_REGISTERED = False
+
+
+def _dump_fp8_kv_calibration_for_pool(pool: "MLATokenToKVPool") -> bool:
+    """Write a QuantParamSchema JSON for FP8 KV-cache scales for TP=1.
+
+    Returns True if it wrote a file (or printed the JSON), False otherwise.
+    """
+    if os.getenv("SGLANG_FP8_KV_CALIBRATE", "0").lower() not in ("1", "true", "yes"):
+        return False
+
+    max_buf = getattr(pool, "_fp8_kv_calib_max", None)
+    if max_buf is None:
+        return False
+
+    try:
+        max_fp8 = float(torch.finfo(torch.float8_e4m3fn).max)
+        safety = float(os.getenv("SGLANG_FP8_KV_CALIB_SAFETY", "0.95"))
+        denom = max(max_fp8 * max(min(safety, 0.999), 0.5), 1e-9)
+
+        max_per_layer = max_buf.detach().float().cpu().tolist()
+        layer_scales: dict[int, float] = {}
+        for i, amax in enumerate(max_per_layer):
+            layer_idx = int(pool.start_layer + i)
+            if amax <= 0.0:
+                layer_scales[layer_idx] = 1.0
+            else:
+                # IMPORTANT: k/v_scale in SGLang KV-cache quantization is used as:
+                #   fp8 = x / scale   (write)
+                #   x   = fp8 * scale (read)
+                # For KV-cache saturation avoidance, we only need scale >= 1.0
+                # (i.e. scale-down on write). Scaling up (scale < 1) is optional
+                # but increases risk; keep calibration conservative.
+                layer_scales[layer_idx] = max(float(amax) / denom, 1.0)
+
+        # Resolve model_type from the local HF config if available.
+        model_type = None
+        num_hidden_layers = None
+        try:
+            from sglang.srt.server_args import get_global_server_args
+
+            model_path = getattr(get_global_server_args(), "model_path", None)
+            if model_path:
+                config_path = os.path.join(model_path, "config.json")
+                if os.path.exists(config_path):
+                    with open(config_path, encoding="utf-8") as f:
+                        cfg = json.load(f)
+                        model_type = cfg.get("model_type", None)
+                        num_hidden_layers = cfg.get("num_hidden_layers", None)
+        except Exception:
+            model_type = None
+
+        if model_type is None:
+            model_type = os.getenv("SGLANG_FP8_KV_CALIB_MODEL_TYPE", None)
+        if num_hidden_layers is None:
+            try:
+                num_hidden_layers = int(os.getenv("SGLANG_FP8_KV_CALIB_NUM_LAYERS", "0"))
+            except Exception:
+                num_hidden_layers = None
+
+        # Ensure the schema includes a scale for every layer index.
+        if isinstance(num_hidden_layers, int) and num_hidden_layers > 0:
+            full_layer_scales = {i: 1.0 for i in range(num_hidden_layers)}
+            full_layer_scales.update(layer_scales)
+            layer_scales = full_layer_scales
+
+        schema = {
+            "model_type": model_type,
+            "kv_cache": {
+                "dtype": "float8_e4m3fn",
+                "scaling_factor": {0: layer_scales},
+            },
+        }
+
+        out_path = os.getenv("SGLANG_FP8_KV_CALIB_OUT", "").strip()
+        if out_path:
+            out_dir = os.path.dirname(out_path)
+            if out_dir:
+                os.makedirs(out_dir, exist_ok=True)
+            with open(out_path, "w", encoding="utf-8") as f:
+                json.dump(schema, f, indent=2, sort_keys=True)
+            logger.warning("[FP8_KV_CALIB] wrote %s", out_path)
+        else:
+            logger.warning("[FP8_KV_CALIB] %s", json.dumps(schema, sort_keys=True))
+        return True
+    except Exception:
+        logger.exception("[FP8_KV_CALIB] failed to dump calibration")
+        return False
+
+
+def _maybe_dump_fp8_kv_calibration() -> None:
+    """Best-effort atexit fallback: dump calibration for the first registered pool."""
+    for pool in _FP8_KV_CALIB_POOLS:
+        if _dump_fp8_kv_calibration_for_pool(pool):
+            break
 
 
 def get_tensor_size_bytes(t: Union[torch.Tensor, List[torch.Tensor]]):
@@ -1323,6 +1423,23 @@ class MLATokenToKVPool(KVCache):
             # NSA will allocate indexer KV cache later and then log the total size
             self._finalize_allocation_log(size)
 
+        # Optional calibration: track per-layer max(|KV|) before FP8 casting,
+        # so we can derive per-layer scaling factors.
+        if (
+            self.dtype == torch.float8_e4m3fn
+            and os.getenv("SGLANG_FP8_KV_CALIBRATE", "0").lower() in ("1", "true", "yes")
+        ):
+            self._fp8_kv_calib_max = torch.zeros(
+                (self.layer_num,), dtype=torch.float32, device=self.device
+            )
+            self._fp8_kv_calib_updates = 0
+            self._fp8_kv_calib_written = False
+            _FP8_KV_CALIB_POOLS.append(self)
+            global _FP8_KV_CALIB_ATEXIT_REGISTERED
+            if not _FP8_KV_CALIB_ATEXIT_REGISTERED:
+                atexit.register(_maybe_dump_fp8_kv_calibration)
+                _FP8_KV_CALIB_ATEXIT_REGISTERED = True
+
     def _create_buffers(self):
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             with (
@@ -1428,6 +1545,63 @@ class MLATokenToKVPool(KVCache):
                 cache_k_rope_fp8,
             )
         else:
+            # Calibration: record the maximum absolute value per layer on the
+            # logical (pre-scaling) KV-cache tensors.
+            if getattr(self, "_fp8_kv_calib_max", None) is not None:
+                try:
+                    amax_nope = cache_k_nope.detach().abs().amax()
+                    amax_rope = cache_k_rope.detach().abs().amax()
+                    amax = torch.maximum(amax_nope, amax_rope).to(torch.float32)
+                    idx = int(layer_id - self.start_layer)
+                    self._fp8_kv_calib_max[idx] = torch.maximum(
+                        self._fp8_kv_calib_max[idx], amax
+                    )
+                    self._fp8_kv_calib_updates += 1
+
+                    # Write once during runtime (do not rely on atexit, since scheduler
+                    # processes may be long-lived).
+                    if (
+                        not self._fp8_kv_calib_written
+                        and os.getenv("SGLANG_FP8_KV_CALIB_OUT", "").strip()
+                    ):
+                        dump_after = int(
+                            os.getenv("SGLANG_FP8_KV_CALIB_DUMP_AFTER", "1024")
+                        )
+                        if self._fp8_kv_calib_updates >= max(dump_after, 1):
+                            self._fp8_kv_calib_written = _dump_fp8_kv_calibration_for_pool(
+                                self
+                            )
+                except Exception:
+                    logger.exception(
+                        "[FP8_KV_CALIB] update failed for layer_id=%d", layer_id
+                    )
+
+            # FP8 MLA KV-cache scaling:
+            # - `self.kv_buffer` stores the MLA KV-cache (latent + rope slice) as FP8 bytes.
+            # - When a per-layer scale is provided (layer.k_scale_float/v_scale_float),
+            #   store the scaled-down values (x / scale) to reduce FP8 saturation.
+            # - Attention backends must compensate for this scaling when consuming the cache.
+            if self.dtype == torch.float8_e4m3fn:
+                k_scale = getattr(layer, "k_scale_float", None)
+                v_scale = getattr(layer, "v_scale_float", None)
+                if k_scale is None:
+                    k_scale = 1.0
+                if v_scale is None:
+                    v_scale = k_scale
+                if float(k_scale) != float(v_scale):
+                    logger.warning(
+                        "MLA FP8 KV-cache expects a single shared scale, but got "
+                        "k_scale=%s v_scale=%s for layer_id=%d; using k_scale.",
+                        str(k_scale),
+                        str(v_scale),
+                        int(layer_id),
+                    )
+                k_scale_f = float(k_scale)
+                if k_scale_f != 1.0:
+                    inv_scale = 1.0 / k_scale_f
+                    cache_k_nope = cache_k_nope * inv_scale
+                    cache_k_rope = cache_k_rope * inv_scale
+
             if cache_k_nope.dtype != self.dtype:
                 cache_k_nope = cache_k_nope.to(self.dtype)
                 cache_k_rope = cache_k_rope.to(self.dtype)
@@ -1463,6 +1637,20 @@ class MLATokenToKVPool(KVCache):
             device=kv_buffer.device,
         )
         get_mla_kv_buffer_triton(kv_buffer, loc, cache_k_nope, cache_k_rope)
+
+        # If the cache was stored scaled-down for FP8, rescale the returned tensors
+        # to preserve the "logical" KV-cache values.
+        if self.dtype == torch.float8_e4m3fn:
+            k_scale = getattr(layer, "k_scale_float", None)
+            v_scale = getattr(layer, "v_scale_float", None)
+            if k_scale is None:
+                k_scale = 1.0
+            if v_scale is None:
+                v_scale = k_scale
+            k_scale_f = float(k_scale)
+            if k_scale_f != 1.0:
+                cache_k_nope = cache_k_nope * k_scale_f
+                cache_k_rope = cache_k_rope * k_scale_f
         return cache_k_nope, cache_k_rope
 
     def get_cpu_copy(self, indices):

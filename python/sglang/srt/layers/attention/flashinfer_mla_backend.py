@@ -10,6 +10,7 @@ More details can be found in https://docs.flashinfer.ai/api/mla.html
 """
 
 import os
+import logging
 from dataclasses import dataclass
 from functools import partial
 from typing import TYPE_CHECKING, Callable, Optional, Union
@@ -31,6 +32,8 @@ from sglang.srt.utils import (
     is_sm100_supported,
     next_power_of_2,
 )
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.flashinfer_mla_backend import (
@@ -202,6 +205,12 @@ class FlashInferMLAAttnBackend(AttentionBackend):
     ):
         super().__init__()
         self.model_runner = model_runner
+        self._debug_fp8_kv_scale = os.getenv("SGLANG_DEBUG_FP8_KV_SCALE", "0").lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+        self._fp8_kv_scale_logged_layers: set[int] = set()
         self._gptoss_transmla_force_mla = bool(
             getattr(getattr(model_runner.model_config, "hf_config", None), "architectures", None)
             and "GptOssForCausalLM" in model_runner.model_config.hf_config.architectures
@@ -868,21 +877,38 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                     qall[:, :, : layer.v_head_dim],
                     qall[:, :, layer.v_head_dim :],
                 )
+
+            # If the MLA KV-cache is stored as FP8 with a per-layer scale (i.e. values
+            # were written as x/scale), compensate by scaling queries and outputs.
+            fp8_kv_scale = 1.0
+            if getattr(getattr(forward_batch, "token_to_kv_pool", None), "dtype", None) == torch.float8_e4m3fn:
+                fp8_kv_scale = float(getattr(layer, "k_scale_float", 1.0) or 1.0)
+                if fp8_kv_scale != 1.0:
+                    if self._debug_fp8_kv_scale and layer.layer_id not in self._fp8_kv_scale_logged_layers:
+                        logger.warning(
+                            "[FP8_KV_SCALE] layer_id=%d scale=%s",
+                            int(layer.layer_id),
+                            str(fp8_kv_scale),
+                        )
+                        self._fp8_kv_scale_logged_layers.add(int(layer.layer_id))
+                    q = q * fp8_kv_scale
+                    q_rope = q_rope * fp8_kv_scale
             o = q.new_empty(q.shape)
+            kv_lora_rank = self.model_runner.model_config.kv_lora_rank
             if sinks is None:
                 o = prefill_wrapper_paged.run(
                     q,
                     q_rope,
-                    k_buf[:, :, : layer.v_head_dim],
-                    k_buf[:, :, layer.v_head_dim :],
+                    k_buf[:, :, : kv_lora_rank],
+                    k_buf[:, :, kv_lora_rank :],
                     out=o,
                 )
             else:
                 o, lse = prefill_wrapper_paged.run(
                     q,
                     q_rope,
-                    k_buf[:, :, : layer.v_head_dim],
-                    k_buf[:, :, layer.v_head_dim :],
+                    k_buf[:, :, : kv_lora_rank],
+                    k_buf[:, :, kv_lora_rank :],
                     out=o,
                     return_lse=True,
                 )
@@ -896,6 +922,9 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                     )
                 scale = 1.0 / (1.0 + torch.exp2(sinks_f * LOG2E - lse_f))
                 o = o * scale.to(o.dtype).unsqueeze(-1)
+
+            if fp8_kv_scale != 1.0:
+                o = o * fp8_kv_scale
 
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
@@ -963,10 +992,52 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                     )
 
         # Reshape inputs
+        kv_lora_rank = self.model_runner.model_config.kv_lora_rank
         if q_rope is not None:
-            q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+            q_nope = q.view(-1, layer.tp_q_head_num, kv_lora_rank)
             q_rope = q_rope.view(
-                -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
+                -1, layer.tp_q_head_num, layer.head_dim - kv_lora_rank
+            )
+        else:
+            reshaped_q = q.view(-1, layer.tp_q_head_num, layer.head_dim)
+            q_nope = reshaped_q[:, :, : kv_lora_rank]
+            q_rope = reshaped_q[:, :, kv_lora_rank :]
+
+        k_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id).to(
+            q.dtype
+        )
+
+        o = q_nope.new_empty(q_nope.shape)
+        fp8_kv_scale = 1.0
+        if getattr(getattr(forward_batch, "token_to_kv_pool", None), "dtype", None) == torch.float8_e4m3fn:
+            fp8_kv_scale = float(getattr(layer, "k_scale_float", 1.0) or 1.0)
+            if fp8_kv_scale != 1.0:
+                if self._debug_fp8_kv_scale and layer.layer_id not in self._fp8_kv_scale_logged_layers:
+                    logger.warning(
+                        "[FP8_KV_SCALE] layer_id=%d scale=%s",
+                        int(layer.layer_id),
+                        str(fp8_kv_scale),
+                    )
+                    self._fp8_kv_scale_logged_layers.add(int(layer.layer_id))
+                q_nope = q_nope * fp8_kv_scale
+                q_rope = q_rope * fp8_kv_scale
+        if sinks is None:
+            # Direct call to run without wrapper
+            o = decode_wrapper.run(
+                q_nope,
+                q_rope,
+                k_buffer[:, :, : kv_lora_rank],
+                k_buffer[:, :, kv_lora_rank :],
+                out=o,
+            )
+        else:
+            o, lse = decode_wrapper.run(
+                q_nope,
+                q_rope,
+                k_buffer[:, :, : kv_lora_rank],
+                k_buffer[:, :, kv_lora_rank :],
+                out=o,
+                return_lse=True,
             )
         else:
             reshaped_q = q.view(-1, layer.tp_q_head_num, layer.head_dim)
@@ -978,6 +1049,19 @@ class FlashInferMLAAttnBackend(AttentionBackend):
         )
 
         o = q_nope.new_empty(q_nope.shape)
+        fp8_kv_scale = 1.0
+        if getattr(getattr(forward_batch, "token_to_kv_pool", None), "dtype", None) == torch.float8_e4m3fn:
+            fp8_kv_scale = float(getattr(layer, "k_scale_float", 1.0) or 1.0)
+            if fp8_kv_scale != 1.0:
+                if self._debug_fp8_kv_scale and layer.layer_id not in self._fp8_kv_scale_logged_layers:
+                    logger.warning(
+                        "[FP8_KV_SCALE] layer_id=%d scale=%s",
+                        int(layer.layer_id),
+                        str(fp8_kv_scale),
+                    )
+                    self._fp8_kv_scale_logged_layers.add(int(layer.layer_id))
+                q_nope = q_nope * fp8_kv_scale
+                q_rope = q_rope * fp8_kv_scale
         if sinks is None:
             # Direct call to run without the wrapper
             o = decode_wrapper.run(
@@ -1006,6 +1090,9 @@ class FlashInferMLAAttnBackend(AttentionBackend):
                 )
             scale = 1.0 / (1.0 + torch.exp2(sinks_f * LOG2E - lse_f))
             o = o * scale.to(o.dtype).unsqueeze(-1)
+
+        if fp8_kv_scale != 1.0:
+            o = o * fp8_kv_scale
 
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
