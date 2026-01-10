@@ -103,6 +103,7 @@ class DecodeMetadata:
     decode_wrappers: List[
         BatchDecodeWithPagedKVCacheWrapper | BatchPrefillWithPagedKVCacheWrapper
     ]
+    q_workspace_buffers: Dict[int, torch.Tensor] = None  # Pre-allocated Q workspace per layer
 
 
 @dataclass
@@ -928,17 +929,27 @@ class FlashInferAttnBackend(AttentionBackend):
             nvtx_range_q = nvtx.range(f"flashinfer.prefill.q_transform_layer{layer.layer_id}")
 
         q_reshaped = q.view(-1, layer.tp_q_head_num, layer.head_dim)
-        q_for_kernel = q_reshaped.contiguous() if q_reshaped.is_contiguous() else q_reshaped
 
-        if not self.forward_metadata.use_ragged and q_for_kernel.dtype != self.paged_q_data_type:
-            q_for_kernel = q_for_kernel.to(self.paged_q_data_type)
+        if self.forward_metadata.q_workspace_buffers is None:
+            self.forward_metadata.q_workspace_buffers = {}
+
+        q_workspace = self.forward_metadata.q_workspace_buffers.get(layer.layer_id, None)
+        if q_workspace is None or q_workspace.shape != q_reshaped.shape or q_workspace.dtype != self.paged_q_data_type:
+            q_workspace = torch.empty_like(q_reshaped, dtype=self.paged_q_data_type, device=q_reshaped.device)
+            self.forward_metadata.q_workspace_buffers[layer.layer_id] = q_workspace
+
+        if _SGLANG_FLASHINFER_NVTX and _has_nvtx:
+            nvtx_range_q_copy = nvtx.range(f"flashinfer.prefill.q_copy_layer{layer.layer_id}")
+        if q_reshaped.is_contiguous():
+            q_workspace.copy_(q_reshaped)
+        else:
+            q_for_kernel = q_reshaped.contiguous()
+            q_workspace.copy_(q_for_kernel)
+        if _SGLANG_FLASHINFER_NVTX and _has_nvtx:
+            nvtx_range_q_copy.end()
 
         if _SGLANG_FLASHINFER_NVTX and _has_nvtx:
             nvtx_range_q.end()
-
-        if not self.forward_metadata.use_ragged:
-            if _SGLANG_FLASHINFER_NVTX and _has_nvtx:
-                nvtx_range_kv = nvtx.range(f"flashinfer.prefill.set_kv_layer{layer.layer_id}")
             if k is not None:
                 assert v is not None
                 if save_kv_cache:
@@ -951,7 +962,7 @@ class FlashInferAttnBackend(AttentionBackend):
             if _SGLANG_FLASHINFER_NVTX and _has_nvtx:
                 nvtx_range_attn = nvtx.range(f"flashinfer.prefill.attention_kernel_layer{layer.layer_id}")
             o = prefill_wrapper_paged.forward(
-                q_for_kernel,
+                q_workspace,
                 forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
                 causal=not layer.is_cross_attention,
                 sm_scale=layer.scaling,
@@ -990,7 +1001,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 # The FlashInfer head_dim limitation itself is tracked here:
                 # https://github.com/flashinfer-ai/flashinfer/issues/1048
                 o = self.prefill_wrapper_ragged.forward(
-                    q_for_kernel,
+                    q_workspace,
                     k.view(-1, layer.tp_k_head_num, layer.head_dim),
                     v.view(-1, layer.tp_v_head_num, layer.head_dim),
                     causal=causal,
@@ -1005,7 +1016,7 @@ class FlashInferAttnBackend(AttentionBackend):
                     causal = True
 
                 o1, s1 = self.prefill_wrapper_ragged.forward_return_lse(
-                    q_for_kernel,
+                    q_workspace,
                     k.view(-1, layer.tp_k_head_num, layer.head_dim),
                     v.view(-1, layer.tp_v_head_num, layer.head_dim),
                     causal=causal,
@@ -1013,7 +1024,7 @@ class FlashInferAttnBackend(AttentionBackend):
                     logits_soft_cap=logits_soft_cap,
                 )
                 o2, s2 = prefill_wrapper_paged.forward_return_lse(
-                    q_for_kernel,
+                    q_workspace,
                     forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
                     causal=False,
                     sm_scale=layer.scaling,
@@ -1059,15 +1070,28 @@ class FlashInferAttnBackend(AttentionBackend):
         if _SGLANG_FLASHINFER_NVTX and _has_nvtx:
             nvtx_range_kv.end()
 
-        # Call the wrapped function
         if _SGLANG_FLASHINFER_NVTX and _has_nvtx:
             nvtx_range_q = nvtx.range(f"flashinfer.decode.q_transform_layer{layer.layer_id}")
 
         q_reshaped = q.view(-1, layer.tp_q_head_num, layer.head_dim)
-        q_for_kernel = q_reshaped.contiguous() if q_reshaped.is_contiguous() else q_reshaped
 
-        if q_for_kernel.dtype != self.paged_q_data_type:
-            q_for_kernel = q_for_kernel.to(self.paged_q_data_type)
+        if self.forward_metadata.q_workspace_buffers is None:
+            self.forward_metadata.q_workspace_buffers = {}
+
+        q_workspace = self.forward_metadata.q_workspace_buffers.get(layer.layer_id, None)
+        if q_workspace is None or q_workspace.shape != q_reshaped.shape or q_workspace.dtype != self.paged_q_data_type:
+            q_workspace = torch.empty_like(q_reshaped, dtype=self.paged_q_data_type, device=q_reshaped.device)
+            self.forward_metadata.q_workspace_buffers[layer.layer_id] = q_workspace
+
+        if _SGLANG_FLASHINFER_NVTX and _has_nvtx:
+            nvtx_range_q_copy = nvtx.range(f"flashinfer.decode.q_copy_layer{layer.layer_id}")
+        if q_reshaped.is_contiguous():
+            q_workspace.copy_(q_reshaped)
+        else:
+            q_for_kernel = q_reshaped.contiguous()
+            q_workspace.copy_(q_for_kernel)
+        if _SGLANG_FLASHINFER_NVTX and _has_nvtx:
+            nvtx_range_q_copy.end()
 
         if _SGLANG_FLASHINFER_NVTX and _has_nvtx:
             nvtx_range_q.end()
@@ -1077,7 +1101,7 @@ class FlashInferAttnBackend(AttentionBackend):
 
         if isinstance(decode_wrapper, BatchDecodeWithPagedKVCacheWrapper):
             o = decode_wrapper.forward(
-                q_for_kernel,
+                q_workspace,
                 forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
                 sm_scale=layer.scaling,
                 logits_soft_cap=layer.logit_cap,
@@ -1088,7 +1112,7 @@ class FlashInferAttnBackend(AttentionBackend):
             )
         else:
             o = decode_wrapper.forward(
-                q_for_kernel,
+                q_workspace,
                 forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
                 causal=False,
                 sm_scale=layer.scaling,
