@@ -656,7 +656,27 @@ class GptOssDecoderLayer(nn.Module):
         else:
             self.sliding_window_size = sliding_window_size
 
-        if getattr(config, "use_transmla", False):
+        def _layer_uses_transmla(cfg: GptOssConfig, idx: int) -> bool:
+            if not getattr(cfg, "use_transmla", False):
+                return False
+            layer_ids = getattr(cfg, "transmla_layer_ids", None)
+            if isinstance(layer_ids, (list, tuple)) and layer_ids:
+                try:
+                    allowed = {int(x) for x in layer_ids}
+                    return int(idx) in allowed
+                except Exception:
+                    pass
+            layer_limit = getattr(cfg, "transmla_layer_limit", None)
+            if layer_limit is None:
+                layer_limit = getattr(cfg, "transmla_converted_layer_limit", None)
+            if layer_limit is None:
+                return True
+            try:
+                return int(idx) < int(layer_limit)
+            except Exception:
+                return True
+
+        if _layer_uses_transmla(config, layer_id):
             self.self_attn = GptOssTransMLAAttention(
                 config=config,
                 layer_id=layer_id,
