@@ -40,6 +40,7 @@ from sglang.srt.speculative.spec_utils import (
     get_target_cache_loc,
 )
 from sglang.srt.utils import is_cuda, next_power_of_2
+from sglang.srt.utils.common import get_bool_env_var, get_int_env_var
 
 if is_cuda():
     from sgl_kernel import (
@@ -390,6 +391,13 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         accept_index_cpu = accept_index.tolist()
         predict_cpu = predict.tolist()
         has_finished = False
+        debug_accept = get_bool_env_var("SGLANG_EAGLE_DEBUG_ACCEPT", "false")
+        assert_accept_ranges = get_bool_env_var(
+            "SGLANG_EAGLE_ASSERT_ACCEPT_RANGES", "false"
+        )
+        debug_every = get_int_env_var("SGLANG_EAGLE_DEBUG_EVERY", 0)
+        step_idx = getattr(batch.reqs[0], "spec_verify_ct", 0) if batch.reqs else 0
+        out_of_range_total = 0
 
         # Iterate every accepted token and check if req has finished after append the token
         # should be checked BEFORE free kv cache slots
@@ -398,6 +406,25 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             for j, idx in enumerate(accept_index_row):
                 if idx == -1:
                     break
+                # accept_index entries must point into this request's segment in the
+                # flattened (bs * draft_token_num) layout.
+                if idx < i * self.draft_token_num or idx >= (i + 1) * self.draft_token_num:
+                    out_of_range_total += 1
+                    if debug_accept:
+                        logger.error(
+                            "[EAGLE][verify] out-of-range accept_index: "
+                            f"{step_idx=} {i=} {j=} {idx=} "
+                            f"seg=[{i * self.draft_token_num}, {(i + 1) * self.draft_token_num}) "
+                            f"{self.draft_token_num=} {bs=}"
+                        )
+                        logger.error(
+                            "[EAGLE][verify] accept_index_row=%s",
+                            accept_index_row,
+                        )
+                    if assert_accept_ranges:
+                        raise RuntimeError(
+                            "EAGLE accept_index out-of-range (likely cross-request mixing)."
+                        )
                 num_accepted += 1
                 id = predict_cpu[idx]
                 req.output_ids.append(id)
@@ -428,6 +455,24 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             req.spec_verify_ct += 1
             req.spec_accepted_tokens += (
                 sum(1 for idx in accept_index_row if idx != -1) - 1
+            )
+
+        if debug_accept and (out_of_range_total > 0 or (debug_every and step_idx % debug_every == 0)):
+            try:
+                accept_len_dbg = ((accept_index != -1).sum(dim=1) - 1).tolist()
+            except Exception:
+                accept_len_dbg = []
+            logger.info(
+                "[EAGLE][verify] summary: %s",
+                {
+                    "step_idx": int(step_idx),
+                    "bs": int(bs),
+                    "draft_token_num": int(self.draft_token_num),
+                    "topk": int(self.topk),
+                    "spec_steps": int(self.spec_steps),
+                    "out_of_range_total": int(out_of_range_total),
+                    "accept_length": accept_len_dbg,
+                },
             )
 
         if has_finished:

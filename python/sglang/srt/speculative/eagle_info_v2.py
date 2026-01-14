@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -29,11 +30,20 @@ from sglang.srt.speculative.spec_utils import (
     SIMULATE_ACC_LEN,
     generate_simulated_accept_index,
 )
-from sglang.srt.utils.common import is_cuda, is_hip, is_npu, next_power_of_2
+from sglang.srt.utils.common import (
+    get_bool_env_var,
+    get_int_env_var,
+    is_cuda,
+    is_hip,
+    is_npu,
+    next_power_of_2,
+)
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.tp_worker import TpModelWorker
@@ -368,6 +378,57 @@ class EagleVerifyInputV2Mixin:
                 simulate_acc_len=SIMULATE_ACC_LEN,
                 bs=bs,
                 spec_steps=self.spec_steps,
+            )
+
+        debug_accept = get_bool_env_var("SGLANG_EAGLE_DEBUG_ACCEPT", "false")
+        assert_accept_ranges = get_bool_env_var(
+            "SGLANG_EAGLE_ASSERT_ACCEPT_RANGES", "false"
+        )
+        debug_every = get_int_env_var("SGLANG_EAGLE_DEBUG_EVERY", 0)
+        step_idx = getattr(batch.reqs[0], "spec_verify_ct", 0) if batch.reqs else 0
+
+        out_of_range_total = 0
+        if debug_accept or assert_accept_ranges:
+            accept_index_cpu = accept_index.tolist()
+            for i, row in enumerate(accept_index_cpu):
+                seg_lo = i * self.draft_token_num
+                seg_hi = (i + 1) * self.draft_token_num
+                for j, idx in enumerate(row):
+                    if idx == -1:
+                        break
+                    if idx < seg_lo or idx >= seg_hi:
+                        out_of_range_total += 1
+                        if debug_accept:
+                            logger.error(
+                                "[EAGLE][v2.sample] out-of-range accept_index: "
+                                f"{step_idx=} {i=} {j=} {idx=} seg=[{seg_lo}, {seg_hi}) "
+                                f"{self.draft_token_num=} {bs=}"
+                            )
+                            logger.error("[EAGLE][v2.sample] accept_index_row=%s", row)
+                        if assert_accept_ranges:
+                            raise RuntimeError(
+                                "EAGLE accept_index out-of-range in v2.sample "
+                                "(likely cross-request mixing)."
+                            )
+
+        if debug_accept and (
+            out_of_range_total > 0 or (debug_every and step_idx % debug_every == 0)
+        ):
+            try:
+                accept_len_dbg = ((accept_index != -1).sum(dim=1)).tolist()
+            except Exception:
+                accept_len_dbg = []
+            logger.warning(
+                "[EAGLE][v2.sample] summary: %s",
+                {
+                    "step_idx": int(step_idx),
+                    "bs": int(bs),
+                    "draft_token_num": int(self.draft_token_num),
+                    "topk": int(self.topk),
+                    "spec_steps": int(self.spec_steps),
+                    "out_of_range_total": int(out_of_range_total),
+                    "accept_length_including_bonus": accept_len_dbg,
+                },
             )
 
         # Include the bonus token

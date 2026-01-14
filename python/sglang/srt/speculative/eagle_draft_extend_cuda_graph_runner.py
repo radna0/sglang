@@ -59,6 +59,9 @@ class EAGLEDraftExtendCudaGraphRunner:
         self.tp_size = self.model_runner.tp_size
         self.dp_size = self.model_runner.dp_size
         self.speculative_num_steps = model_runner.server_args.speculative_num_steps
+        self.speculative_num_draft_tokens = (
+            model_runner.server_args.speculative_num_draft_tokens
+        )
         self.topk = model_runner.server_args.speculative_eagle_topk
         self.enable_profile_cuda_graph = (
             model_runner.server_args.enable_profile_cuda_graph
@@ -70,7 +73,13 @@ class EAGLEDraftExtendCudaGraphRunner:
         self.padded_static_len = -1
 
         # Attention backend
-        self.num_tokens_per_bs = self.speculative_num_steps + 1
+        #
+        # Overlap (V2) uses `num_draft_tokens` (tree token count) which is NOT
+        # necessarily `spec_steps+1` when topk>1 (e.g. 4-3-9).
+        if self.forward_mode == ForwardMode.DRAFT_EXTEND_V2:
+            self.num_tokens_per_bs = self.speculative_num_draft_tokens
+        else:
+            self.num_tokens_per_bs = self.speculative_num_steps + 1
         self.max_bs = max(self.capture_bs)
         self.max_num_token = self.max_bs * self.num_tokens_per_bs
 

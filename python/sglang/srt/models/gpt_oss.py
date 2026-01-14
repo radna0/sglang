@@ -17,6 +17,7 @@
 
 import logging
 import math
+import os
 from collections.abc import Iterable
 from functools import partial
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -254,15 +255,11 @@ class GptOssAttention(nn.Module):
             prefix=add_prefix("qkv_proj", prefix),
         )
 
-        # Choose dtype of sinks based on attention backend.
-        # FlashInfer's sinks API expects float32 (matches FlashInfer benchmarks); TRTLLM MHA
-        # also requires float32.
-        attn_backend = get_global_server_args().attention_backend
-        sinks_dtype = (
-            torch.float32
-            if attn_backend in ("flashinfer", "trtllm_mha")
-            else torch.bfloat16
-        )
+        # Use BF16 sinks by default so they are compatible with both FA3 and FlashInfer.
+        # FlashInfer kernels read sink values as scalars and do not require float32
+        # precision for correctness; using BF16 also enables hybrid backends that mix
+        # FA3 and FlashInfer.
+        sinks_dtype = torch.bfloat16
         self.sinks = nn.Parameter(
             torch.empty(self.num_heads, dtype=sinks_dtype), requires_grad=False
         )
@@ -332,6 +329,12 @@ class GptOssAttention(nn.Module):
         hidden_states, forward_batch, inner_state = intermediate_state
         if inner_state is None:
             return hidden_states
+        _gptoss_failfast_check_sinks(
+            self.sinks,
+            expected_heads=self.num_heads,
+            layer_id=self.layer_id,
+            tag="gqa",
+        )
         attn_output = self.attn(
             *inner_state,
             sinks=self.sinks,
@@ -375,6 +378,48 @@ def _is_mla_backend(attention_backend: str) -> bool:
     if attention_backend.endswith("_mla"):
         return True
     return attention_backend in {"flashmla", "flashinfer", "cutlass_mla", "trtllm_mla", "nsa"}
+
+
+def _gptoss_failfast_check_sinks(
+    sinks: torch.Tensor, *, expected_heads: int, layer_id: int, tag: str
+) -> None:
+    if os.getenv("SGLANG_GPTOSS_FAILFAST", "0") != "1" and os.getenv(
+        "SGLANG_FLASHINFER_FAILFAST", "0"
+    ) != "1":
+        return
+    if not isinstance(sinks, torch.Tensor):
+        raise TypeError(f"[GPTOSS_FAILFAST] {tag} sinks is not a Tensor: {type(sinks)}")
+    if sinks.dtype != torch.bfloat16:
+        raise RuntimeError(
+            f"[GPTOSS_FAILFAST] {tag} sinks dtype mismatch: {sinks.dtype} (expected torch.bfloat16) layer={layer_id}"
+        )
+    if sinks.ndim != 1 or int(sinks.numel()) != int(expected_heads):
+        raise RuntimeError(
+            f"[GPTOSS_FAILFAST] {tag} sinks shape mismatch: shape={tuple(sinks.shape)} numel={int(sinks.numel())} "
+            f"expected={int(expected_heads)} layer={layer_id}"
+        )
+    if sinks.device.type != "cuda":
+        raise RuntimeError(
+            f"[GPTOSS_FAILFAST] {tag} sinks not on CUDA: device={sinks.device} layer={layer_id}"
+        )
+    finite = torch.isfinite(sinks).all()
+    # CUDA graph capture disallows device->host sync like `.item()`.
+    try:
+        is_capturing = bool(torch.cuda.is_current_stream_capturing())
+    except Exception:
+        is_capturing = False
+    if is_capturing:
+        # Graph-safe fail-fast: inserts a device-side assertion into the graph.
+        if hasattr(torch, "_assert_async"):
+            torch._assert_async(
+                finite,
+                f"[GPTOSS_FAILFAST] {tag} sinks contains NaN/Inf layer={layer_id}",
+            )
+    else:
+        if not bool(finite.item()):
+            raise RuntimeError(
+                f"[GPTOSS_FAILFAST] {tag} sinks contains NaN/Inf layer={layer_id}"
+            )
 
 
 class GptOssTransMLAAttention(nn.Module):
@@ -449,13 +494,9 @@ class GptOssTransMLAAttention(nn.Module):
             prefix=add_prefix("kv_b_proj", prefix),
         )
 
-        # Choose dtype of sinks based on attention backend.
-        attn_backend = get_global_server_args().attention_backend
-        sinks_dtype = (
-            torch.float32
-            if attn_backend in ("flashinfer", "trtllm_mha")
-            else torch.bfloat16
-        )
+        # See `GPTOSSAttention.__init__` above: standardize sinks to BF16 for backend
+        # compatibility.
+        sinks_dtype = torch.bfloat16
         self.attention_sink = nn.Parameter(
             torch.empty(self.num_local_heads, dtype=sinks_dtype), requires_grad=False
         )
@@ -580,6 +621,12 @@ class GptOssTransMLAAttention(nn.Module):
         mode = inner_state[0]
         if mode == "mla":
             _, q_nope_out, q_pe, k_nope, k_pe, w_vc, forward_batch = inner_state
+            _gptoss_failfast_check_sinks(
+                self.attention_sink,
+                expected_heads=self.num_local_heads,
+                layer_id=getattr(self, "layer_id", -1),
+                tag="transmla_mla",
+            )
             attn_output = self.attn_mqa(
                 q_nope_out,
                 k_nope,
@@ -598,6 +645,12 @@ class GptOssTransMLAAttention(nn.Module):
 
         if mode == "mha":
             _, q, k, v, forward_batch = inner_state
+            _gptoss_failfast_check_sinks(
+                self.attention_sink,
+                expected_heads=self.num_local_heads,
+                layer_id=getattr(self, "layer_id", -1),
+                tag="transmla_mha",
+            )
             attn_output = self.attn_mha(
                 q,
                 k,
@@ -657,20 +710,25 @@ class GptOssDecoderLayer(nn.Module):
             self.sliding_window_size = sliding_window_size
 
         def _layer_uses_transmla(cfg: GptOssConfig, idx: int) -> bool:
-            if not getattr(cfg, "use_transmla", False):
-                return False
             layer_ids = getattr(cfg, "transmla_layer_ids", None)
+            layer_limit = getattr(cfg, "transmla_layer_limit", None)
+            if layer_limit is None:
+                layer_limit = getattr(cfg, "transmla_converted_layer_limit", None)
+
+            mixed_hint = bool(layer_ids) or (layer_limit is not None) or bool(
+                getattr(cfg, "use_transmla_partial", False)
+            )
+            if not (getattr(cfg, "use_transmla", False) or mixed_hint):
+                return False
             if isinstance(layer_ids, (list, tuple)) and layer_ids:
                 try:
                     allowed = {int(x) for x in layer_ids}
                     return int(idx) in allowed
                 except Exception:
                     pass
-            layer_limit = getattr(cfg, "transmla_layer_limit", None)
             if layer_limit is None:
-                layer_limit = getattr(cfg, "transmla_converted_layer_limit", None)
-            if layer_limit is None:
-                return True
+                # No explicit layer limit/ids; treat `use_transmla=true` as "all layers converted".
+                return bool(getattr(cfg, "use_transmla", False))
             try:
                 return int(idx) < int(layer_limit)
             except Exception:

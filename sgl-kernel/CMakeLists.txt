@@ -42,6 +42,10 @@ endif()
 find_package(Torch REQUIRED)
 clear_cuda_arches(CMAKE_FLAG)
 
+# Optional components (disable by default to keep SM90 FA3 builds small).
+option(SGL_KERNEL_BUILD_DEEP_GEMM            "Build DeepGEMM extension" OFF)
+option(SGL_KERNEL_ENABLE_MSCCLPP            "Enable MSCCLPP allreduce"  OFF)
+
 # Third Party repos
 # cutlass
 FetchContent_Declare(
@@ -53,13 +57,15 @@ FetchContent_Declare(
 FetchContent_Populate(repo-cutlass)
 
 # DeepGEMM
-FetchContent_Declare(
-    repo-deepgemm
-    GIT_REPOSITORY https://github.com/sgl-project/DeepGEMM
-    GIT_TAG        54f99a8af537b3c6eb4819b69907ccbe2b600792
-    GIT_SHALLOW    OFF
-)
-FetchContent_Populate(repo-deepgemm)
+if (SGL_KERNEL_BUILD_DEEP_GEMM)
+    FetchContent_Declare(
+        repo-deepgemm
+        GIT_REPOSITORY https://github.com/sgl-project/DeepGEMM
+        GIT_TAG        54f99a8af537b3c6eb4819b69907ccbe2b600792
+        GIT_SHALLOW    OFF
+    )
+    FetchContent_Populate(repo-deepgemm)
+endif()
 
 # fmt
 FetchContent_Declare(
@@ -98,13 +104,15 @@ FetchContent_Declare(
 FetchContent_Populate(repo-flash-attention)
 
 # mscclpp
-FetchContent_Declare(
-    repo-mscclpp
-    GIT_REPOSITORY https://github.com/microsoft/mscclpp.git
-    GIT_TAG        51eca89d20f0cfb3764ccd764338d7b22cd486a6
-    GIT_SHALLOW    OFF
-)
-FetchContent_Populate(repo-mscclpp)
+if (SGL_KERNEL_ENABLE_MSCCLPP)
+    FetchContent_Declare(
+        repo-mscclpp
+        GIT_REPOSITORY https://github.com/microsoft/mscclpp.git
+        GIT_TAG        51eca89d20f0cfb3764ccd764338d7b22cd486a6
+        GIT_SHALLOW    OFF
+    )
+    FetchContent_Populate(repo-mscclpp)
+endif()
 
 # fast-hadamard-transform
 FetchContent_Declare(
@@ -197,6 +205,8 @@ option(SGL_KERNEL_ENABLE_FP4              "Enable FP4"              OFF)
 option(SGL_KERNEL_ENABLE_FA3              "Enable FA3"              OFF)
 option(SGL_KERNEL_ENABLE_SM90A            "Enable SM90A"            OFF)
 option(SGL_KERNEL_ENABLE_SM100A           "Enable SM100A"           OFF)
+option(SGL_KERNEL_BUILD_SM100             "Build SM100 common ops"  ON)
+option(SGL_KERNEL_BUILD_SPARSE_FLASHATTN  "Build sparse flash-attn kernels" ON)
 
 if (SGL_KERNEL_ENABLE_BF16)
     list(APPEND SGL_KERNEL_CUDA_FLAGS
@@ -225,7 +235,7 @@ if (ENABLE_BELOW_SM90)
 
 endif()
 
-if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
+if (SGL_KERNEL_BUILD_SM100 AND ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A))
     list(APPEND SGL_KERNEL_CUDA_FLAGS
         "-gencode=arch=compute_100a,code=sm_100a"
         "-gencode=arch=compute_120a,code=sm_120a"
@@ -258,7 +268,7 @@ if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.4")
     )
 endif()
 
-if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_FP4)
+if (SGL_KERNEL_ENABLE_FP4)
     list(APPEND SGL_KERNEL_CUDA_FLAGS
         "-DENABLE_NVFP4=1"
     )
@@ -268,7 +278,6 @@ endif()
 # NOTE: Please sort the filenames alphabetically
 set(SOURCES
     "csrc/allreduce/custom_all_reduce.cu"
-    "csrc/allreduce/mscclpp_allreduce.cu"
     "csrc/attention/cascade.cu"
     "csrc/attention/cutlass_mla_kernel.cu"
     "csrc/attention/merge_attn_states.cu"
@@ -284,8 +293,6 @@ set(SOURCES
     "csrc/elementwise/topk.cu"
     "csrc/sgl_diffusion/elementwise/timestep_embedding.cu"
     "csrc/expert_specialization/es_fp8_blockwise.cu"
-    "csrc/expert_specialization/es_sm100_mxfp8_blockscaled.cu"
-    "csrc/expert_specialization/es_sm100_mxfp8_blockscaled_group_quant.cu"
 
     "csrc/gemm/awq_kernel.cu"
     "csrc/gemm/bmm_fp8.cu"
@@ -296,11 +303,6 @@ set(SOURCES
     "csrc/gemm/fp8_blockwise_gemm_kernel.cu"
     "csrc/gemm/fp8_gemm_kernel.cu"
     "csrc/gemm/int8_gemm_kernel.cu"
-    "csrc/gemm/nvfp4_expert_quant.cu"
-    "csrc/gemm/nvfp4_quant_entry.cu"
-    "csrc/gemm/nvfp4_quant_kernels.cu"
-    "csrc/gemm/nvfp4_scaled_mm_entry.cu"
-    "csrc/gemm/nvfp4_scaled_mm_kernels.cu"
     "csrc/gemm/per_tensor_quant_fp8.cu"
     "csrc/gemm/per_token_group_quant_8bit.cu"
     "csrc/gemm/per_token_group_quant_8bit_v2.cu"
@@ -330,7 +332,6 @@ set(SOURCES
     "csrc/moe/moe_sum_reduce.cu"
     "csrc/moe/moe_topk_softmax_kernels.cu"
     "csrc/moe/moe_topk_sigmoid_kernels.cu"
-    "csrc/moe/nvfp4_blockwise_moe.cu"
     "csrc/moe/fp8_blockwise_moe_kernel.cu"
     "csrc/moe/prepare_moe_input.cu"
 
@@ -346,24 +347,55 @@ set(SOURCES
 
     "${repo-fast-hadamard-transform_SOURCE_DIR}/csrc/fast_hadamard_transform_cuda.cu"
     "${repo-fast-hadamard-transform_SOURCE_DIR}/csrc/fast_hadamard_transform.cpp"
-
-    "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src/flash_fwd_sparse_hdim128_bf16_causal_sm80.cu"
-    "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src/flash_fwd_sparse_hdim128_bf16_sm80.cu"
-    "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src/flash_fwd_sparse_hdim128_fp16_causal_sm80.cu"
-    "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src/flash_fwd_sparse_hdim128_fp16_sm80.cu"
-    "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/flash_sparse_api.cpp"
 )
 
+if (SGL_KERNEL_ENABLE_MSCCLPP)
+    list(APPEND SOURCES "csrc/allreduce/mscclpp_allreduce.cu")
+endif()
+
+if (SGL_KERNEL_BUILD_SM100)
+    list(APPEND SOURCES
+        "csrc/expert_specialization/es_sm100_mxfp8_blockscaled.cu"
+        "csrc/expert_specialization/es_sm100_mxfp8_blockscaled_group_quant.cu"
+    )
+endif()
+
+if (SGL_KERNEL_ENABLE_FP4)
+    list(APPEND SOURCES
+        "csrc/gemm/nvfp4_expert_quant.cu"
+        "csrc/gemm/nvfp4_quant_entry.cu"
+        "csrc/gemm/nvfp4_quant_kernels.cu"
+        "csrc/gemm/nvfp4_scaled_mm_entry.cu"
+        "csrc/gemm/nvfp4_scaled_mm_kernels.cu"
+        "csrc/moe/nvfp4_blockwise_moe.cu"
+    )
+endif()
+
+if (SGL_KERNEL_BUILD_SPARSE_FLASHATTN)
+    list(APPEND SOURCES
+        "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src/flash_fwd_sparse_hdim128_bf16_causal_sm80.cu"
+        "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src/flash_fwd_sparse_hdim128_bf16_sm80.cu"
+        "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src/flash_fwd_sparse_hdim128_fp16_causal_sm80.cu"
+        "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src/flash_fwd_sparse_hdim128_fp16_sm80.cu"
+        "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/flash_sparse_api.cpp"
+    )
+endif()
+
 set(INCLUDES
+    ${TORCH_INCLUDE_DIRS}
+    ${CUDAToolkit_INCLUDE_DIRS}
     ${repo-cutlass_SOURCE_DIR}/include
     ${repo-cutlass_SOURCE_DIR}/tools/util/include
     ${repo-flashinfer_SOURCE_DIR}/include
     ${repo-flashinfer_SOURCE_DIR}/csrc
-    ${repo-mscclpp_SOURCE_DIR}/include
     ${repo-cutlass_SOURCE_DIR}/examples/77_blackwell_fmha
     ${repo-cutlass_SOURCE_DIR}/examples/common
     ${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src
 )
+
+if (SGL_KERNEL_ENABLE_MSCCLPP)
+    list(APPEND INCLUDES ${repo-mscclpp_SOURCE_DIR}/include)
+endif()
 
 # =========================== Common SM90 Build ============================= #
 # Build SM90 library with fast math optimization (same namespace, different directory)
@@ -379,19 +411,21 @@ set_target_properties(common_ops_sm90_build PROPERTIES
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/sm90"
 )
 
-# =========================== Common SM100+ Build ============================= #
-# Build SM100+ library with precise math (same namespace, different directory)
-Python_add_library(common_ops_sm100_build MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${SOURCES})
+if (SGL_KERNEL_BUILD_SM100)
+    # =========================== Common SM100+ Build ============================= #
+    # Build SM100+ library with precise math (same namespace, different directory)
+    Python_add_library(common_ops_sm100_build MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${SOURCES})
 
-target_compile_options(common_ops_sm100_build PRIVATE
-    $<$<COMPILE_LANGUAGE:CUDA>:${SGL_KERNEL_CUDA_FLAGS}>
-)
-target_include_directories(common_ops_sm100_build PRIVATE ${INCLUDES})
-# Set output name and separate build directory to avoid conflicts
-set_target_properties(common_ops_sm100_build PROPERTIES
-    OUTPUT_NAME "common_ops"
-    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/sm100"
-)
+    target_compile_options(common_ops_sm100_build PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:${SGL_KERNEL_CUDA_FLAGS}>
+    )
+    target_include_directories(common_ops_sm100_build PRIVATE ${INCLUDES})
+    # Set output name and separate build directory to avoid conflicts
+    set_target_properties(common_ops_sm100_build PROPERTIES
+        OUTPUT_NAME "common_ops"
+        LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/sm100"
+    )
+endif()
 
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 execute_process(
@@ -409,17 +443,21 @@ else()
     set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -D_GLIBCXX_USE_CXX11_ABI=1")
 endif()
 
-# mscclpp option
-set(MSCCLPP_USE_CUDA ON)
-set(MSCCLPP_BYPASS_GPU_CHECK ON)
-set(MSCCLPP_BUILD_TESTS OFF)
-add_subdirectory(
-    ${repo-mscclpp_SOURCE_DIR}
-    ${CMAKE_CURRENT_BINARY_DIR}/mscclpp-build
-)
+if (SGL_KERNEL_ENABLE_MSCCLPP)
+    # mscclpp option
+    set(MSCCLPP_USE_CUDA ON)
+    set(MSCCLPP_BYPASS_GPU_CHECK ON)
+    set(MSCCLPP_BUILD_TESTS OFF)
+    add_subdirectory(
+        ${repo-mscclpp_SOURCE_DIR}
+        ${CMAKE_CURRENT_BINARY_DIR}/mscclpp-build
+    )
 
-target_link_libraries(common_ops_sm90_build PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt mscclpp_static)
-target_link_libraries(common_ops_sm100_build PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt mscclpp_static)
+    target_link_libraries(common_ops_sm90_build PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt mscclpp_static)
+    if (SGL_KERNEL_BUILD_SM100)
+        target_link_libraries(common_ops_sm100_build PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt mscclpp_static)
+    endif()
+endif()
 
 # sparse flash attention
 target_compile_definitions(common_ops_sm90_build PRIVATE
@@ -427,17 +465,21 @@ target_compile_definitions(common_ops_sm90_build PRIVATE
     FLASHATTENTION_DISABLE_DROPOUT
     FLASHATTENTION_DISABLE_UNEVEN_K
 )
-target_compile_definitions(common_ops_sm100_build PRIVATE
-    FLASHATTENTION_DISABLE_BACKWARD
-    FLASHATTENTION_DISABLE_DROPOUT
-    FLASHATTENTION_DISABLE_UNEVEN_K
-)
+if (SGL_KERNEL_BUILD_SM100)
+    target_compile_definitions(common_ops_sm100_build PRIVATE
+        FLASHATTENTION_DISABLE_BACKWARD
+        FLASHATTENTION_DISABLE_DROPOUT
+        FLASHATTENTION_DISABLE_UNEVEN_K
+    )
+endif()
 
 # Install to different subdirectories
 # CMake will find the built libraries in their respective LIBRARY_OUTPUT_DIRECTORY locations
 # and install them to the specified destinations
 install(TARGETS common_ops_sm90_build LIBRARY DESTINATION sgl_kernel/sm90)
-install(TARGETS common_ops_sm100_build LIBRARY DESTINATION sgl_kernel/sm100)
+if (SGL_KERNEL_BUILD_SM100)
+    install(TARGETS common_ops_sm100_build LIBRARY DESTINATION sgl_kernel/sm100)
+endif()
 
 # ============================ Optional Install: FA3 ============================= #
 # set flash-attention sources file
@@ -542,50 +584,56 @@ install(TARGETS spatial_ops LIBRARY DESTINATION sgl_kernel)
 # ============================ Extra Install: FLashMLA ============================= #
 include(${CMAKE_CURRENT_LIST_DIR}/cmake/flashmla.cmake)
 
-# ============================ Extra Install: DeepGEMM (JIT) ============================= #
-# Create a separate library for DeepGEMM's Python API.
-# This keeps its compilation isolated from the main common_ops.
-set(DEEPGEMM_SOURCES
-    "${repo-deepgemm_SOURCE_DIR}/csrc/python_api.cpp"
-)
+if (SGL_KERNEL_BUILD_DEEP_GEMM)
+    if (NOT SGL_KERNEL_ENABLE_MSCCLPP)
+        message(FATAL_ERROR "SGL_KERNEL_BUILD_DEEP_GEMM=ON requires SGL_KERNEL_ENABLE_MSCCLPP=ON")
+    endif()
 
-Python_add_library(deep_gemm_cpp MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${DEEPGEMM_SOURCES})
+    # ============================ Extra Install: DeepGEMM (JIT) ============================= #
+    # Create a separate library for DeepGEMM's Python API.
+    # This keeps its compilation isolated from the main common_ops.
+    set(DEEPGEMM_SOURCES
+        "${repo-deepgemm_SOURCE_DIR}/csrc/python_api.cpp"
+    )
 
-# Link against necessary libraries, including nvrtc for JIT compilation.
-target_link_libraries(deep_gemm_cpp PRIVATE ${TORCH_LIBRARIES} c10 cuda nvrtc mscclpp_static)
+    Python_add_library(deep_gemm_cpp MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${DEEPGEMM_SOURCES})
 
-# Add include directories needed by DeepGEMM.
-target_include_directories(deep_gemm_cpp PRIVATE
-    ${repo-deepgemm_SOURCE_DIR}/deep_gemm/include
-    ${repo-cutlass_SOURCE_DIR}/include
-    ${repo-fmt_SOURCE_DIR}/include
-)
+    # Link against necessary libraries, including nvrtc for JIT compilation.
+    target_link_libraries(deep_gemm_cpp PRIVATE ${TORCH_LIBRARIES} c10 cuda nvrtc mscclpp_static)
 
-# Apply the same compile options as common_ops.
-target_compile_options(deep_gemm_cpp PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${SGL_KERNEL_CUDA_FLAGS}>)
+    # Add include directories needed by DeepGEMM.
+    target_include_directories(deep_gemm_cpp PRIVATE
+        ${repo-deepgemm_SOURCE_DIR}/deep_gemm/include
+        ${repo-cutlass_SOURCE_DIR}/include
+        ${repo-fmt_SOURCE_DIR}/include
+    )
 
-# Create an empty __init__.py to make `deepgemm` a Python package.
-file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/deepgemm_pkg_init.py "")
-install(
-    FILES ${CMAKE_CURRENT_BINARY_DIR}/deepgemm_pkg_init.py
-    DESTINATION deep_gemm
-    RENAME __init__.py
-)
+    # Apply the same compile options as common_ops.
+    target_compile_options(deep_gemm_cpp PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${SGL_KERNEL_CUDA_FLAGS}>)
 
-# Install the compiled DeepGEMM API library.
-install(TARGETS deep_gemm_cpp LIBRARY DESTINATION deep_gemm)
+    # Create an empty __init__.py to make `deepgemm` a Python package.
+    file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/deepgemm_pkg_init.py "")
+    install(
+        FILES ${CMAKE_CURRENT_BINARY_DIR}/deepgemm_pkg_init.py
+        DESTINATION deep_gemm
+        RENAME __init__.py
+    )
 
-# Install the source files required by DeepGEMM for runtime JIT compilation.
-install(
-    DIRECTORY ${repo-deepgemm_SOURCE_DIR}/deep_gemm/
-    DESTINATION deep_gemm
-)
+    # Install the compiled DeepGEMM API library.
+    install(TARGETS deep_gemm_cpp LIBRARY DESTINATION deep_gemm)
 
-install(DIRECTORY "${repo-cutlass_SOURCE_DIR}/include/cute/"
-        DESTINATION "deep_gemm/include/cute")
+    # Install the source files required by DeepGEMM for runtime JIT compilation.
+    install(
+        DIRECTORY ${repo-deepgemm_SOURCE_DIR}/deep_gemm/
+        DESTINATION deep_gemm
+    )
 
-install(DIRECTORY "${repo-cutlass_SOURCE_DIR}/include/cutlass/"
-        DESTINATION "deep_gemm/include/cutlass")
+    install(DIRECTORY "${repo-cutlass_SOURCE_DIR}/include/cute/"
+            DESTINATION "deep_gemm/include/cute")
+
+    install(DIRECTORY "${repo-cutlass_SOURCE_DIR}/include/cutlass/"
+            DESTINATION "deep_gemm/include/cutlass")
+endif()
 
 # ============================ Extra Install: triton kernels ============================= #
 install(DIRECTORY "${repo-triton_SOURCE_DIR}/python/triton_kernels/triton_kernels/"

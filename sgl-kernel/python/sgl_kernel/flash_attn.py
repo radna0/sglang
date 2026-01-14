@@ -1,7 +1,10 @@
 from functools import lru_cache
 from typing import Optional, Union
 
+import os
 import torch
+
+_SGL_FA3_DTYPE_LOGGED = False
 
 try:
     from sgl_kernel import flash_ops
@@ -70,6 +73,26 @@ def flash_attn_with_kvcache(
     sinks=None,
     ver=3,
 ):
+    global _SGL_FA3_DTYPE_LOGGED
+    if not _SGL_FA3_DTYPE_LOGGED and os.getenv("SGLANG_FA3_DEBUG_DTYPE", "0") == "1":
+        _SGL_FA3_DTYPE_LOGGED = True
+        try:
+            print(
+                "[FA3_DTYPE] "
+                f"ver={ver} causal={int(bool(causal))} window={window_size} "
+                f"sinks={int(sinks is not None)} "
+                f"q={getattr(q, 'dtype', None)} "
+                f"k_cache={getattr(k_cache, 'dtype', None)} "
+                f"v_cache={getattr(v_cache, 'dtype', None)} "
+                f"k={getattr(k, 'dtype', None) if k is not None else None} "
+                f"v={getattr(v, 'dtype', None) if v is not None else None} "
+                f"q_descale={getattr(q_descale, 'dtype', None) if q_descale is not None else None} "
+                f"k_descale={getattr(k_descale, 'dtype', None) if k_descale is not None else None} "
+                f"v_descale={getattr(v_descale, 'dtype', None) if v_descale is not None else None}",
+                flush=True,
+            )
+        except Exception:
+            pass
     """
     If k and v are not None, k_cache and v_cache will be updated *inplace* with the new values from
     k and v. This is useful for incremental decoding: you can pass in the cached keys/values from

@@ -2573,6 +2573,41 @@ class Scheduler(
         barrier()
         return RpcReqOutput(success, "" if not exec else str(exec))
 
+    # ----------------------------
+    # Engineer-B: FA3 timing hooks
+    # ----------------------------
+    def fa3_timing_enable(self, enabled: bool = True):
+        """Enable/disable FA3 timing inside this scheduler process."""
+        try:
+            from sglang.srt.layers.attention.flashattention_backend import (
+                set_fa3_timing_runtime_enabled,
+            )
+
+            set_fa3_timing_runtime_enabled(bool(enabled))
+        except Exception as e:
+            logger.error(f"fa3_timing_enable failed: {e}", exc_info=True)
+            raise
+
+    def fa3_timing_reset(self):
+        """Reset accumulated FA3 timing pairs inside this scheduler process."""
+        try:
+            from sglang.srt.layers.attention.flashattention_backend import reset_fa3_timing
+
+            reset_fa3_timing()
+        except Exception as e:
+            logger.error(f"fa3_timing_reset failed: {e}", exc_info=True)
+            raise
+
+    def fa3_timing_dump(self, tag: str = ""):
+        """Dump aggregated FA3 timing pairs into the per-run remote log."""
+        try:
+            from sglang.srt.layers.attention.flashattention_backend import dump_fa3_timing
+
+            dump_fa3_timing(tag=(tag or f"tp{getattr(self, 'tp_rank', 0)}"))
+        except Exception as e:
+            logger.error(f"fa3_timing_dump failed: {e}", exc_info=True)
+            raise
+
     def abort_request(self, recv_req: AbortReq):
         # Delete requests in the waiting queue
         to_del = []

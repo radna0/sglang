@@ -91,7 +91,11 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
         self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
 
         # For Attention Backend
-        self.num_tokens_per_bs = self.speculative_num_steps + 1 + step
+        #
+        # Overlap (V2) uses `speculative_num_draft_tokens` (tree token count)
+        # as the base stride; for multi-layer draft-extend we additionally pad
+        # by `step` (see select_index / assign_new_state_triton logic).
+        self.num_tokens_per_bs = self.speculative_num_draft_tokens + step
         self.max_bs = max(self.capture_bs)
         self.max_num_token = self.max_bs * self.num_tokens_per_bs
 

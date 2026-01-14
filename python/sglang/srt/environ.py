@@ -368,6 +368,9 @@ class Envs:
     # Overlap Spec V2
     SGLANG_ENABLE_SPEC_V2 = EnvBool(False)
     SGLANG_ENABLE_OVERLAP_PLAN_STREAM = EnvBool(False)
+    # Spec-v2 overlap scheduler currently restricts EAGLE/EAGLE3 to topk=1 upstream.
+    # We gate topk>1 support behind an explicit opt-in so we can iterate safely.
+    SGLANG_SPEC_V2_ALLOW_TOPK_GT1 = EnvBool(False)
 
     # Spec Config
     SGLANG_SPEC_ENABLE_STRICT_FILTER_CHECK = EnvBool(True)

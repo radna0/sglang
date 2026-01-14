@@ -17,6 +17,9 @@ from __future__ import annotations
 
 import dataclasses
 from dataclasses import dataclass
+import os
+import numbers
+import time
 from typing import List
 
 from sglang.srt.configs.mamba_utils import BaseLinearStateParams
@@ -67,6 +70,147 @@ logger = logging.getLogger(__name__)
 GB = 1024 * 1024 * 1024
 _is_cuda = is_cuda()
 _is_npu = is_npu()
+
+
+@triton.jit
+def _scatter_static_quant_fp8_to_kv_uint8_storage(
+    x_ptr,
+    kv_ptr,
+    loc_ptr,
+    scale_ptr,
+    x_stride,
+    kv_stride,
+    N,
+    fp8_min,
+    fp8_max,
+    BLOCK: tl.constexpr,
+):
+    """Fused: (x / scale) -> FP8 -> scatter store to KV rows given by `loc`.
+
+    x: [B, N] (row-major)
+    kv: [M, N] (row-major) but points to a float8 view of uint8 storage
+    loc: [B] indices into kv's first dim
+    scale: scalar (float32)
+    """
+    pid_b = tl.program_id(0)
+    pid_blk = tl.program_id(1)
+    loc = tl.load(loc_ptr + pid_b).to(tl.int64)
+
+    col0 = pid_blk * BLOCK
+    x_ptr += pid_b * x_stride + col0
+    kv_ptr += loc * kv_stride + col0
+
+    cols = col0 + tl.arange(0, BLOCK)
+    mask = cols < N
+
+    x = tl.load(x_ptr + tl.arange(0, BLOCK), mask=mask, other=0.0).to(tl.float32)
+    s = tl.load(scale_ptr).to(tl.float32)
+    x_q = tl.clamp(x * (1.0 / s), fp8_min, fp8_max).to(kv_ptr.dtype.element_ty)
+    tl.store(kv_ptr + tl.arange(0, BLOCK), x_q, mask=mask)
+
+
+@triton.jit
+def _scatter_static_quant_fp8_kvpair_to_kv_uint8_storage(
+    xk_ptr,
+    xv_ptr,
+    k_ptr,
+    v_ptr,
+    loc_ptr,
+    loc_stride,
+    k_scale_ptr,
+    v_scale_ptr,
+    x_stride,
+    kv_stride,
+    N,
+    fp8_min,
+    fp8_max,
+    BLOCK: tl.constexpr,
+):
+    """Fused: (K/scale_k -> FP8 -> scatter) + (V/scale_v -> FP8 -> scatter) in one kernel.
+
+    xk/xv: [B, N]
+    k/v:   [M, N] but points to a float8 view of uint8 storage
+    loc:   [B] indices into k/v's first dim
+    k_scale/v_scale: scalar (float32) pointers
+    """
+    pid_b = tl.program_id(0)
+    pid_blk = tl.program_id(1)
+    loc = tl.load(loc_ptr + pid_b * loc_stride).to(tl.int64)
+
+    col0 = pid_blk * BLOCK
+    xk_ptr += pid_b * x_stride + col0
+    xv_ptr += pid_b * x_stride + col0
+    k_ptr += loc * kv_stride + col0
+    v_ptr += loc * kv_stride + col0
+
+    cols = col0 + tl.arange(0, BLOCK)
+    mask = cols < N
+
+    k_inv = 1.0 / tl.load(k_scale_ptr).to(tl.float32)
+    v_inv = 1.0 / tl.load(v_scale_ptr).to(tl.float32)
+
+    xk = tl.load(xk_ptr + tl.arange(0, BLOCK), mask=mask, other=0.0).to(tl.float32)
+    xv = tl.load(xv_ptr + tl.arange(0, BLOCK), mask=mask, other=0.0).to(tl.float32)
+    k_q = tl.clamp(xk * k_inv, fp8_min, fp8_max).to(k_ptr.dtype.element_ty)
+    v_q = tl.clamp(xv * v_inv, fp8_min, fp8_max).to(v_ptr.dtype.element_ty)
+    tl.store(k_ptr + tl.arange(0, BLOCK), k_q, mask=mask)
+    tl.store(v_ptr + tl.arange(0, BLOCK), v_q, mask=mask)
+
+
+@triton.jit
+def _scatter_static_quant_fp8_kvpair_to_kv_uint8_storage_3d(
+    xk_ptr,
+    xv_ptr,
+    k_ptr,
+    v_ptr,
+    loc_ptr,
+    loc_stride,
+    k_scale_ptr,
+    v_scale_ptr,
+    x_stride_b,
+    x_stride_h,
+    x_stride_d,
+    kv_stride,
+    H,
+    D: tl.constexpr,
+    fp8_min,
+    fp8_max,
+    BLOCK: tl.constexpr,
+):
+    """Fused FP8 cast + scatter for strided (B,H,D) inputs.
+
+    Avoids `contiguous()`/flatten on decode where K/V tensors often have non-standard strides.
+    """
+    pid_b = tl.program_id(0)
+    pid_blk = tl.program_id(1)
+    loc = tl.load(loc_ptr + pid_b * loc_stride).to(tl.int64)
+
+    col0 = pid_blk * BLOCK
+    cols = col0 + tl.arange(0, BLOCK)
+    mask = cols < (H * D)
+
+    h = cols // D
+    d = cols - h * D
+
+    # Base pointers for this batch element.
+    xk_base = xk_ptr + pid_b * x_stride_b
+    xv_base = xv_ptr + pid_b * x_stride_b
+    k_base = k_ptr + loc * kv_stride + col0
+    v_base = v_ptr + loc * kv_stride + col0
+
+    k_inv = 1.0 / tl.load(k_scale_ptr).to(tl.float32)
+    v_inv = 1.0 / tl.load(v_scale_ptr).to(tl.float32)
+
+    xk = tl.load(xk_base + h * x_stride_h + d * x_stride_d, mask=mask, other=0.0).to(
+        tl.float32
+    )
+    xv = tl.load(xv_base + h * x_stride_h + d * x_stride_d, mask=mask, other=0.0).to(
+        tl.float32
+    )
+    k_q = tl.clamp(xk * k_inv, fp8_min, fp8_max).to(k_ptr.dtype.element_ty)
+    v_q = tl.clamp(xv * v_inv, fp8_min, fp8_max).to(v_ptr.dtype.element_ty)
+    tl.store(k_base + tl.arange(0, BLOCK), k_q, mask=mask)
+    tl.store(v_base + tl.arange(0, BLOCK), v_q, mask=mask)
 
 
 def get_tensor_size_bytes(t: Union[torch.Tensor, List[torch.Tensor]]):
@@ -867,6 +1011,7 @@ class MHATokenToKVPool(KVCache):
         k_scale: Optional[float] = None,
         v_scale: Optional[float] = None,
         layer_id_override: Optional[int] = None,
+        profile_events: Optional[dict] = None,
     ):
         from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 
@@ -874,17 +1019,711 @@ class MHATokenToKVPool(KVCache):
             layer_id = layer_id_override
         else:
             layer_id = layer.layer_id
+
+        do_profile = (
+            profile_events is not None
+            and cache_k is not None
+            and cache_v is not None
+            and cache_k.is_cuda
+            and cache_v.is_cuda
+            and torch.cuda.is_available()
+        )
+        profile_stream = None
+        if do_profile and isinstance(profile_events, dict):
+            # Optional: allow callers to force all nested CUDA events onto a single
+            # stream (avoids cross-stream timestamp artifacts in higher-level timing).
+            profile_stream = profile_events.get("__timing_stream", None)
+
+        debug_fp8_setkv = os.getenv("SGLANG_DEBUG_FP8_SETKV", "0") == "1"
+        if debug_fp8_setkv and not hasattr(self, "_fp8_setkv_debug_once_global"):
+            self._fp8_setkv_debug_once_global = False
+        if debug_fp8_setkv and not getattr(self, "_fp8_setkv_debug_once_global", False):
+            self._fp8_setkv_debug_once_global = True
+            try:
+                print(
+                    "[FP8_SETKV_DEBUG] entry "
+                    f"env={os.getenv('SGLANG_FP8_KV_SCATTER_QUANT', '0')} "
+                    f"dtype={self.dtype} store_dtype={self.store_dtype} "
+                    f"loc_ndim={int(getattr(loc, 'ndim', -1))} loc_shape={tuple(getattr(loc, 'shape', ())) if hasattr(loc, 'shape') else ()} "
+                    f"loc_dtype={getattr(loc, 'dtype', None)} loc_cuda={bool(getattr(loc, 'is_cuda', False))} "
+                    f"cache_k_dtype={getattr(cache_k, 'dtype', None)} cache_k_shape={tuple(getattr(cache_k, 'shape', ())) if hasattr(cache_k, 'shape') else ()} cache_k_contig={bool(getattr(cache_k, 'is_contiguous', lambda: False)())} "
+                    f"k_scale_type={type(k_scale).__name__} v_scale_type={type(v_scale).__name__}",
+                    flush=True,
+                )
+            except Exception:
+                pass
+
+        # Ultra-fast path for FP8 KV storage (GPT-OSS decode hot path):
+        # - FP8 KV buffers are stored as uint8 because Tensor.index_put is not implemented for float8.
+        # - Avoid (scale -> cast -> index_put) which is multiple kernels per layer per token.
+        # - Fuse (scale+cast+scatter) into a single Triton kernel per tensor (K and V).
+        if (
+            # Default-on: this fused FP8 (scale+cast+scatter) KV update is the only
+            # viable way to keep FP8 KV from becoming setkv-dominated on decode.
+            # Allow opt-out via `SGLANG_FP8_KV_SCATTER_QUANT=0`.
+            os.getenv("SGLANG_FP8_KV_SCATTER_QUANT", "1") == "1"
+            and
+            self.store_dtype == torch.uint8
+            and self.dtype == torch.float8_e4m3fn
+            and cache_k.is_cuda
+            and cache_v.is_cuda
+            and loc.is_cuda
+            and cache_k.dtype != self.dtype
+            and cache_v.dtype != self.dtype
+            and (k_scale is None or isinstance(k_scale, numbers.Real))
+            and (v_scale is None or isinstance(v_scale, numbers.Real))
+        ):
+            debug_fp8_setkv = os.getenv("SGLANG_DEBUG_FP8_SETKV", "0") == "1"
+            if debug_fp8_setkv and not hasattr(self, "_fp8_setkv_debug_once"):
+                self._fp8_setkv_debug_once = False
+            def _maybe_debug(msg: str) -> None:
+                if debug_fp8_setkv and not getattr(self, "_fp8_setkv_debug_once", False):
+                    self._fp8_setkv_debug_once = True
+                    print(msg, flush=True)
+
+            # Normalize shapes without forcing callers to pre-contiguous everything.
+            # If any invariants don't hold, fall back to the baseline path (never early-return
+            # without writing KV cache).
+            fast_ok = True
+            if loc.ndim == 0:
+                loc = loc.view(1)
+            elif loc.ndim != 1:
+                fast_ok = False
+
+            # Avoid forcing `loc.contiguous()` (it is a kernel launch); Triton kernels
+            # accept strided `loc` via `loc_stride`.
+
+            detailed_timing = os.getenv("SGLANG_FLASHINFER_TIMING_DETAILED", "0") == "1"
+            cpu_t0 = None
+            if detailed_timing and do_profile and isinstance(profile_events, dict):
+                cpu_t0 = time.perf_counter()
+
+            # Prefer a strided 3D kernel to avoid per-layer contiguous copies.
+            use_3d = fast_ok and cache_k.ndim == 3 and cache_v.ndim == 3
+            if use_3d and (
+                int(cache_k.shape[1]) != int(cache_v.shape[1])
+                or int(cache_k.shape[2]) != int(cache_v.shape[2])
+            ):
+                use_3d = False
+
+            if not use_3d:
+                # Fallback: materialize contiguous so we can treat input as (B, N).
+                if fast_ok and (not cache_k.is_contiguous()):
+                    ev = None
+                    if detailed_timing and do_profile and isinstance(profile_events, dict):
+                        stream = profile_stream or torch.cuda.current_stream()
+                        ev = (
+                            torch.cuda.Event(enable_timing=True),
+                            torch.cuda.Event(enable_timing=True),
+                        )
+                        ev[0].record(stream)
+                    cache_k = cache_k.contiguous()
+                    if ev is not None:
+                        ev[1].record(stream)
+                        profile_events["setkv_contig_k_ev"] = ev
+                if fast_ok and (not cache_v.is_contiguous()):
+                    ev = None
+                    if detailed_timing and do_profile and isinstance(profile_events, dict):
+                        stream = profile_stream or torch.cuda.current_stream()
+                        ev = (
+                            torch.cuda.Event(enable_timing=True),
+                            torch.cuda.Event(enable_timing=True),
+                        )
+                        ev[0].record(stream)
+                    cache_v = cache_v.contiguous()
+                    if ev is not None:
+                        ev[1].record(stream)
+                        profile_events["setkv_contig_v_ev"] = ev
+
+            allow_per_layer = os.getenv("SGLANG_ALLOW_PER_LAYER_KV_SHAPES", "").lower() in (
+                "1",
+                "true",
+                "yes",
+            )
+            idx = layer_id - self.start_layer
+            if allow_per_layer:
+                k_buf = self.k_buffer[idx]
+                v_buf = self.v_buffer[idx]
+                if (
+                    k_buf.ndim == 3
+                    and cache_k.ndim == 3
+                    and k_buf.shape[1:] != cache_k.shape[1:]
+                ) or (
+                    v_buf.ndim == 3
+                    and cache_v.ndim == 3
+                    and v_buf.shape[1:] != cache_v.shape[1:]
+                ):
+                    m = int(k_buf.shape[0])
+                    self.k_buffer[idx] = torch.empty(
+                        (m, int(cache_k.shape[1]), int(cache_k.shape[2])),
+                        dtype=k_buf.dtype,
+                        device=k_buf.device,
+                    )
+                    self.v_buffer[idx] = torch.empty(
+                        (m, int(cache_v.shape[1]), int(cache_v.shape[2])),
+                        dtype=v_buf.dtype,
+                        device=v_buf.device,
+                    )
+
+            if not hasattr(self, "_kv_cast_workspaces"):
+                self._kv_cast_workspaces = {}
+            ws = self._kv_cast_workspaces.get(idx)
+            if ws is None:
+                ws = {}
+                self._kv_cast_workspaces[idx] = ws
+
+            # Cache device-side scalar scale tensors per layer. These are constant for GPT-OSS,
+            # so avoid `fill_()` per token (it is a kernel launch and becomes significant when
+            # repeated across layers on decode).
+            k_scale_t = ws.get("k_scale_t")
+            v_scale_t = ws.get("v_scale_t")
+            k_scale_val = ws.get("k_scale_val")
+            v_scale_val = ws.get("v_scale_val")
+
+            if k_scale_t is None or k_scale_t.device != cache_k.device:
+                k_scale_t = torch.empty((), device=cache_k.device, dtype=torch.float32)
+                ws["k_scale_t"] = k_scale_t
+                k_scale_val = None
+                ws["k_scale_val"] = k_scale_val
+            if v_scale_t is None or v_scale_t.device != cache_v.device:
+                v_scale_t = torch.empty((), device=cache_v.device, dtype=torch.float32)
+                ws["v_scale_t"] = v_scale_t
+                v_scale_val = None
+                ws["v_scale_val"] = v_scale_val
+
+            k_scale_f = float(k_scale) if k_scale is not None else 1.0
+            v_scale_f = float(v_scale) if v_scale is not None else 1.0
+            if k_scale_val != k_scale_f:
+                ev = None
+                if detailed_timing and do_profile and isinstance(profile_events, dict):
+                    stream = profile_stream or torch.cuda.current_stream()
+                    ev = (
+                        torch.cuda.Event(enable_timing=True),
+                        torch.cuda.Event(enable_timing=True),
+                    )
+                    ev[0].record(stream)
+                k_scale_t.fill_(k_scale_f)
+                if ev is not None:
+                    ev[1].record(stream)
+                    profile_events["setkv_scale_fill_k_ev"] = ev
+                ws["k_scale_val"] = k_scale_f
+            if v_scale_val != v_scale_f:
+                ev = None
+                if detailed_timing and do_profile and isinstance(profile_events, dict):
+                    stream = profile_stream or torch.cuda.current_stream()
+                    ev = (
+                        torch.cuda.Event(enable_timing=True),
+                        torch.cuda.Event(enable_timing=True),
+                    )
+                    ev[0].record(stream)
+                v_scale_t.fill_(v_scale_f)
+                if ev is not None:
+                    ev[1].record(stream)
+                    profile_events["setkv_scale_fill_v_ev"] = ev
+                ws["v_scale_val"] = v_scale_f
+
+            B = int(loc.numel())
+            if fast_ok and (int(cache_k.shape[0]) != B or int(cache_v.shape[0]) != B):
+                fast_ok = False
+
+            # Cache output views per layer to avoid repeated view/reshape overhead.
+            k_buf = self.k_buffer[idx]
+            v_buf = self.v_buffer[idx]
+            k_out = ws.get("k_out_view")
+            v_out = ws.get("v_out_view")
+            if (
+                k_out is None
+                or int(k_out.data_ptr()) != int(k_buf.data_ptr())
+                or k_out.device != k_buf.device
+                or int(k_out.shape[0]) != int(k_buf.shape[0])
+                or int(k_out.numel()) != int(k_buf.numel())
+            ):
+                k_out = k_buf.view(self.dtype).view(int(k_buf.shape[0]), -1)
+                ws["k_out_view"] = k_out
+            if (
+                v_out is None
+                or int(v_out.data_ptr()) != int(v_buf.data_ptr())
+                or v_out.device != v_buf.device
+                or int(v_out.shape[0]) != int(v_buf.shape[0])
+                or int(v_out.numel()) != int(v_buf.numel())
+            ):
+                v_out = v_buf.view(self.dtype).view(int(v_buf.shape[0]), -1)
+                ws["v_out_view"] = v_out
+
+            if use_3d and fast_ok:
+                H = int(cache_k.shape[1])
+                D = int(cache_k.shape[2])
+                N = H * D
+                if N != int(k_out.shape[1]) or N != int(v_out.shape[1]):
+                    use_3d = False
+
+            # Cache common constants for the fused FP8 setkv kernels.
+            fp8_min = ws.get("setkv_fp8_min")
+            fp8_max = ws.get("setkv_fp8_max")
+            if fp8_min is None or fp8_max is None:
+                fp8_max = float(torch.finfo(self.dtype).max)
+                fp8_min = -fp8_max
+                ws["setkv_fp8_min"] = fp8_min
+                ws["setkv_fp8_max"] = fp8_max
+
+            # Prefer the CUDA extension for FP8 KV scatter-quantize when available:
+            # - avoids Triton compilation overhead on new profiles
+            # - keeps this hotpath graph-friendly (no runtime JIT)
+            # - fuses K+V into a single kernel
+            if fast_ok and os.getenv("SGLANG_FP8_KV_SCATTER_QUANT_EXT", "1") == "1":
+                try:
+                    from fa3_fp8_kv_scatter_ext import scatter_quant_kv_fp8
+
+                    scatter_quant_kv_fp8(
+                        loc,
+                        cache_k,
+                        cache_v,
+                        k_out,
+                        v_out,
+                        k_scale_f,
+                        v_scale_f,
+                        fp8_max,
+                    )
+                    _maybe_debug(
+                        "[FP8_SETKV_DEBUG] fast_path=1 kernel=cuda_ext "
+                        f"dtype={self.dtype} store_dtype={self.store_dtype} "
+                        f"loc_shape={tuple(loc.shape)} loc_dtype={loc.dtype} loc_contig={loc.is_contiguous()} "
+                        f"cache_k_dtype={cache_k.dtype} cache_k_shape={tuple(cache_k.shape)} cache_k_contig={cache_k.is_contiguous()} "
+                        f"k_scale_type={type(k_scale).__name__} v_scale_type={type(v_scale).__name__}"
+                    )
+                    return
+                except Exception as e:
+                    _maybe_debug(f"[FP8_SETKV_DEBUG] cuda_ext_failed={e!r} fallback=triton")
+
+            if use_3d and fast_ok:
+                cfg = ws.get("setkv_triton_3d_cfg")
+                tile = H * D
+                if (
+                    cfg is None
+                    or int(cfg.get("H", -1)) != H
+                    or int(cfg.get("D", -1)) != D
+                ):
+                    BLOCK = 1024 if tile >= 1024 else next_power_of_2(tile)
+                    grid1 = (tile + BLOCK - 1) // BLOCK
+                    num_warps = min(max(BLOCK // 256, 1), 8)
+                    cfg = {
+                        "H": H,
+                        "D": D,
+                        "BLOCK": BLOCK,
+                        "grid1": grid1,
+                        "num_warps": num_warps,
+                    }
+                    ws["setkv_triton_3d_cfg"] = cfg
+                else:
+                    BLOCK = int(cfg["BLOCK"])
+                    grid1 = int(cfg["grid1"])
+                    num_warps = int(cfg["num_warps"])
+
+                ev_scatter_start = ev_scatter_end = None
+                if do_profile and isinstance(profile_events, dict):
+                    stream = profile_stream or torch.cuda.current_stream()
+                    ev_scatter_start = torch.cuda.Event(enable_timing=True)
+                    ev_scatter_end = torch.cuda.Event(enable_timing=True)
+                    ev_scatter_start.record(stream)
+
+                cpu_t_before_kernel = None
+                if cpu_t0 is not None and isinstance(profile_events, dict):
+                    cpu_t_before_kernel = time.perf_counter()
+                _scatter_static_quant_fp8_kvpair_to_kv_uint8_storage_3d[(B, grid1)](
+                    cache_k,
+                    cache_v,
+                    k_out,
+                    v_out,
+                    loc,
+                    loc.stride(0),
+                    k_scale_t,
+                    v_scale_t,
+                    cache_k.stride(0),
+                    cache_k.stride(1),
+                    cache_k.stride(2),
+                    k_out.stride(0),
+                    H=H,
+                    D=D,
+                    fp8_min=fp8_min,
+                    fp8_max=fp8_max,
+                    BLOCK=BLOCK,
+                    num_warps=num_warps,
+                    num_stages=1,
+                )
+                cpu_t_after_kernel = None
+                if cpu_t0 is not None and isinstance(profile_events, dict):
+                    cpu_t_after_kernel = time.perf_counter()
+
+                if ev_scatter_start is not None:
+                    ev_scatter_end.record(stream)
+                    profile_events["setkv_scatter_ev"] = (
+                        ev_scatter_start,
+                        ev_scatter_end,
+                    )
+                if cpu_t0 is not None and isinstance(profile_events, dict):
+                    cpu_t_end = time.perf_counter()
+                    if cpu_t_before_kernel is not None:
+                        profile_events["setkv_cpu_prepare_ms"] = float(
+                            cpu_t_before_kernel - cpu_t0
+                        ) * 1000.0
+                    if cpu_t_before_kernel is not None and cpu_t_after_kernel is not None:
+                        profile_events["setkv_cpu_launch_ms"] = float(
+                            cpu_t_after_kernel - cpu_t_before_kernel
+                        ) * 1000.0
+                    if cpu_t_after_kernel is not None:
+                        profile_events["setkv_cpu_post_ms"] = float(
+                            cpu_t_end - cpu_t_after_kernel
+                        ) * 1000.0
+                    profile_events["setkv_cpu_total_ms"] = float(cpu_t_end - cpu_t0) * 1000.0
+                _maybe_debug(
+                    "[FP8_SETKV_DEBUG] fast_path=1 kernel=triton_3d "
+                    f"dtype={self.dtype} store_dtype={self.store_dtype} "
+                    f"loc_shape={tuple(loc.shape)} loc_dtype={loc.dtype} loc_contig={loc.is_contiguous()} "
+                    f"cache_k_dtype={cache_k.dtype} cache_k_shape={tuple(cache_k.shape)} cache_k_contig={cache_k.is_contiguous()} "
+                    f"k_scale_type={type(k_scale).__name__} v_scale_type={type(v_scale).__name__}"
+                )
+                return
+
+            # Fallback: flattened (B, N) kernel.
+            xk = cache_k.view(B, -1)
+            xv = cache_v.view(B, -1)
+            N = int(xk.shape[1])
+
+            if fast_ok and N == int(k_out.shape[1]) == int(v_out.shape[1]):
+                # Tile across the (head_num * head_dim) dimension to avoid huge per-program
+                # register pressure when N is large (e.g. 4096).
+                cfg = ws.get("setkv_triton_flat_cfg")
+                if cfg is None or int(cfg.get("N", -1)) != N:
+                    BLOCK = 1024 if N >= 1024 else next_power_of_2(N)
+                    grid1 = (N + BLOCK - 1) // BLOCK
+                    num_warps = min(max(BLOCK // 256, 1), 8)
+                    cfg = {
+                        "N": N,
+                        "BLOCK": BLOCK,
+                        "grid1": grid1,
+                        "num_warps": num_warps,
+                    }
+                    ws["setkv_triton_flat_cfg"] = cfg
+                else:
+                    BLOCK = int(cfg["BLOCK"])
+                    grid1 = int(cfg["grid1"])
+                    num_warps = int(cfg["num_warps"])
+
+                ev_scatter_start = ev_scatter_end = None
+                if do_profile and isinstance(profile_events, dict):
+                    stream = profile_stream or torch.cuda.current_stream()
+                    ev_scatter_start = torch.cuda.Event(enable_timing=True)
+                    ev_scatter_end = torch.cuda.Event(enable_timing=True)
+                    ev_scatter_start.record(stream)
+
+                cpu_t_before_kernel = None
+                if cpu_t0 is not None and isinstance(profile_events, dict):
+                    cpu_t_before_kernel = time.perf_counter()
+                _scatter_static_quant_fp8_kvpair_to_kv_uint8_storage[(B, grid1)](
+                    xk,
+                    xv,
+                    k_out,
+                    v_out,
+                    loc,
+                    loc.stride(0),
+                    k_scale_t,
+                    v_scale_t,
+                    xk.stride(0),
+                    k_out.stride(0),
+                    N=N,
+                    fp8_min=fp8_min,
+                    fp8_max=fp8_max,
+                    BLOCK=BLOCK,
+                    num_warps=num_warps,
+                    num_stages=1,
+                )
+                cpu_t_after_kernel = None
+                if cpu_t0 is not None and isinstance(profile_events, dict):
+                    cpu_t_after_kernel = time.perf_counter()
+
+                if ev_scatter_start is not None:
+                    ev_scatter_end.record(stream)
+                    profile_events["setkv_scatter_ev"] = (
+                        ev_scatter_start,
+                        ev_scatter_end,
+                    )
+                if cpu_t0 is not None and isinstance(profile_events, dict):
+                    cpu_t_end = time.perf_counter()
+                    if cpu_t_before_kernel is not None:
+                        profile_events["setkv_cpu_prepare_ms"] = float(
+                            cpu_t_before_kernel - cpu_t0
+                        ) * 1000.0
+                    if cpu_t_before_kernel is not None and cpu_t_after_kernel is not None:
+                        profile_events["setkv_cpu_launch_ms"] = float(
+                            cpu_t_after_kernel - cpu_t_before_kernel
+                        ) * 1000.0
+                    if cpu_t_after_kernel is not None:
+                        profile_events["setkv_cpu_post_ms"] = float(
+                            cpu_t_end - cpu_t_after_kernel
+                        ) * 1000.0
+                    profile_events["setkv_cpu_total_ms"] = float(cpu_t_end - cpu_t0) * 1000.0
+                _maybe_debug(
+                    "[FP8_SETKV_DEBUG] fast_path=1 kernel=triton_flat "
+                    f"dtype={self.dtype} store_dtype={self.store_dtype} "
+                    f"loc_shape={tuple(loc.shape)} loc_dtype={loc.dtype} loc_contig={loc.is_contiguous()} "
+                    f"cache_k_dtype={cache_k.dtype} cache_k_shape={tuple(cache_k.shape)} cache_k_contig={cache_k.is_contiguous()} "
+                    f"k_scale_type={type(k_scale).__name__} v_scale_type={type(v_scale).__name__}"
+                )
+                return
+
+            _maybe_debug(
+                "[FP8_SETKV_DEBUG] fast_path=0 "
+                f"fast_ok={int(bool(fast_ok))} "
+                f"dtype={self.dtype} store_dtype={self.store_dtype} "
+                f"loc_ndim={int(loc.ndim)} loc_shape={tuple(loc.shape)} loc_dtype={loc.dtype} loc_contig={loc.is_contiguous()} "
+                f"cache_k_dtype={cache_k.dtype} cache_k_shape={tuple(cache_k.shape)} cache_k_contig={cache_k.is_contiguous()} "
+                f"N={int(N)} k_out_cols={int(k_out.shape[1])} v_out_cols={int(v_out.shape[1])} "
+                f"k_scale_type={type(k_scale).__name__} v_scale_type={type(v_scale).__name__}"
+            )
+
+        ev_quant_start = ev_quant_end = None
+        if do_profile and cache_k.dtype != self.dtype:
+            stream = profile_stream or torch.cuda.current_stream()
+            ev_quant_start = torch.cuda.Event(enable_timing=True)
+            ev_quant_end = torch.cuda.Event(enable_timing=True)
+            ev_quant_start.record(stream)
+
         if cache_k.dtype != self.dtype:
-            if k_scale is not None:
-                cache_k.div_(k_scale)
-            if v_scale is not None:
-                cache_v.div_(v_scale)
-            cache_k = cache_k.to(self.dtype)
-            cache_v = cache_v.to(self.dtype)
+            # Avoid per-step allocations and in-place mutation of cache_k/cache_v.
+            # For FP8 KV cache, this path is on the critical decode hotpath.
+            if not hasattr(self, "_kv_cast_workspaces"):
+                self._kv_cast_workspaces = {}
+
+            idx = layer_id - self.start_layer
+            ws = self._kv_cast_workspaces.get(idx)
+            need_shape = cache_k.shape
+
+            if ws is None:
+                ws = {}
+                self._kv_cast_workspaces[idx] = ws
+
+            k_cast = ws.get("k_cast")
+            v_cast = ws.get("v_cast")
+
+            if k_cast is None or k_cast.shape != need_shape or k_cast.dtype != self.dtype:
+                k_cast = torch.empty_like(cache_k, dtype=self.dtype, device=cache_k.device)
+                ws["k_cast"] = k_cast
+            if v_cast is None or v_cast.shape != need_shape or v_cast.dtype != self.dtype:
+                v_cast = torch.empty_like(cache_v, dtype=self.dtype, device=cache_v.device)
+                ws["v_cast"] = v_cast
+
+            # Fast path: FP8 KV cache wants a fused scale+cast.
+            # Use SGLang's Triton static FP8 quant kernel (1 kernel per tensor) instead of:
+            #   mul/div -> cast -> scatter
+            # which costs multiple kernel launches per layer per token.
+            use_static_fp8 = (
+                self.dtype in (torch.float8_e4m3fn, getattr(torch, "float8_e4m3fnuz", torch.float8_e4m3fn))
+                and isinstance(k_scale, (float, int))
+                and isinstance(v_scale, (float, int))
+                and cache_k.is_cuda
+                and cache_v.is_cuda
+                and cache_k.is_contiguous()
+                and cache_v.is_contiguous()
+            )
+
+            if use_static_fp8:
+                try:
+                    from sglang.srt.layers.quantization import fp8_kernel as _fp8k
+
+                    if _fp8k.fp8_dtype == self.dtype:
+                        # Cache device-side scalar scale tensors per layer; avoid `fill_()` per token.
+                        k_scale_t = ws.get("k_scale_t")
+                        v_scale_t = ws.get("v_scale_t")
+                        k_scale_val = ws.get("k_scale_val")
+                        v_scale_val = ws.get("v_scale_val")
+
+                        if k_scale_t is None or k_scale_t.device != cache_k.device:
+                            k_scale_t = torch.empty((), device=cache_k.device, dtype=torch.float32)
+                            ws["k_scale_t"] = k_scale_t
+                            k_scale_val = None
+                            ws["k_scale_val"] = k_scale_val
+                        if v_scale_t is None or v_scale_t.device != cache_v.device:
+                            v_scale_t = torch.empty((), device=cache_v.device, dtype=torch.float32)
+                            ws["v_scale_t"] = v_scale_t
+                            v_scale_val = None
+                            ws["v_scale_val"] = v_scale_val
+
+                        k_scale_f = float(k_scale)
+                        v_scale_f = float(v_scale)
+                        if k_scale_val != k_scale_f:
+                            ev = None
+                            if (
+                                detailed_timing
+                                and do_profile
+                                and isinstance(profile_events, dict)
+                            ):
+                                stream = profile_stream or torch.cuda.current_stream()
+                                ev = (
+                                    torch.cuda.Event(enable_timing=True),
+                                    torch.cuda.Event(enable_timing=True),
+                                )
+                                ev[0].record(stream)
+                            k_scale_t.fill_(k_scale_f)
+                            if ev is not None:
+                                ev[1].record(stream)
+                                profile_events["setkv_scale_fill_k_ev"] = ev
+                            ws["k_scale_val"] = k_scale_f
+                        if v_scale_val != v_scale_f:
+                            ev = None
+                            if (
+                                detailed_timing
+                                and do_profile
+                                and isinstance(profile_events, dict)
+                            ):
+                                stream = profile_stream or torch.cuda.current_stream()
+                                ev = (
+                                    torch.cuda.Event(enable_timing=True),
+                                    torch.cuda.Event(enable_timing=True),
+                                )
+                                ev[0].record(stream)
+                            v_scale_t.fill_(v_scale_f)
+                            if ev is not None:
+                                ev[1].record(stream)
+                                profile_events["setkv_scale_fill_v_ev"] = ev
+                            ws["v_scale_val"] = v_scale_f
+
+                        # Flatten to 2D [M, N] for the Triton kernel.
+                        k2 = cache_k.view(-1, cache_k.shape[-1])
+                        v2 = cache_v.view(-1, cache_v.shape[-1])
+                        kq2 = k_cast.view(-1, k_cast.shape[-1])
+                        vq2 = v_cast.view(-1, v_cast.shape[-1])
+
+                        N = int(k2.shape[-1])
+                        M_k = int(k2.shape[0])
+                        M_v = int(v2.shape[0])
+                        # next_power_of_2(N)
+                        BLOCK = 1 << (max(1, N - 1)).bit_length()
+                        num_warps = min(max(BLOCK // 256, 1), 8)
+                        num_stages = 1
+
+                        _fp8k._static_quant_fp8[(M_k,)](
+                            k2,
+                            kq2,
+                            k_scale_t,
+                            None,
+                            N,
+                            N,
+                            fp8_min=_fp8k.fp8_min,
+                            fp8_max=_fp8k.fp8_max,
+                            BLOCK=BLOCK,
+                            REPEAT_SCALE=False,
+                            num_warps=num_warps,
+                            num_stages=num_stages,
+                        )
+                        _fp8k._static_quant_fp8[(M_v,)](
+                            v2,
+                            vq2,
+                            v_scale_t,
+                            None,
+                            N,
+                            N,
+                            fp8_min=_fp8k.fp8_min,
+                            fp8_max=_fp8k.fp8_max,
+                            BLOCK=BLOCK,
+                            REPEAT_SCALE=False,
+                            num_warps=num_warps,
+                            num_stages=num_stages,
+                        )
+
+                        cache_k = k_cast
+                        cache_v = v_cast
+                    else:
+                        use_static_fp8 = False
+                except Exception:
+                    use_static_fp8 = False
+
+            if not use_static_fp8:
+                # Fallback (still workspace-reusing): scale into tmp and cast.
+                k_tmp = ws.get("k_tmp")
+                v_tmp = ws.get("v_tmp")
+                if k_tmp is None or k_tmp.shape != need_shape or k_tmp.dtype != cache_k.dtype:
+                    k_tmp = torch.empty_like(cache_k, dtype=cache_k.dtype, device=cache_k.device)
+                    ws["k_tmp"] = k_tmp
+                if v_tmp is None or v_tmp.shape != need_shape or v_tmp.dtype != cache_v.dtype:
+                    v_tmp = torch.empty_like(cache_v, dtype=cache_v.dtype, device=cache_v.device)
+                    ws["v_tmp"] = v_tmp
+
+                if k_scale is not None:
+                    torch.mul(cache_k, 1.0 / float(k_scale), out=k_tmp)
+                else:
+                    k_tmp.copy_(cache_k)
+                if v_scale is not None:
+                    torch.mul(cache_v, 1.0 / float(v_scale), out=v_tmp)
+                else:
+                    v_tmp.copy_(cache_v)
+
+                k_cast.copy_(k_tmp)
+                v_cast.copy_(v_tmp)
+                cache_k = k_cast
+                cache_v = v_cast
+
+        if ev_quant_start is not None:
+            ev_quant_end.record(profile_stream or torch.cuda.current_stream())
+            profile_events["setkv_quant_ev"] = (ev_quant_start, ev_quant_end)
+
+        ev_pack_start = ev_pack_end = None
+        detailed_timing = os.getenv("SGLANG_FLASHINFER_TIMING_DETAILED", "0") == "1"
+        if detailed_timing and do_profile and self.store_dtype != self.dtype:
+            stream = profile_stream or torch.cuda.current_stream()
+            ev_pack_start = torch.cuda.Event(enable_timing=True)
+            ev_pack_end = torch.cuda.Event(enable_timing=True)
+            ev_pack_start.record(stream)
 
         if self.store_dtype != self.dtype:
             cache_k = cache_k.view(self.store_dtype)
             cache_v = cache_v.view(self.store_dtype)
+
+        if ev_pack_start is not None:
+            ev_pack_end.record(stream)
+            profile_events["setkv_pack_ev"] = (ev_pack_start, ev_pack_end)
+
+        # Experimental: allow mixed-layer KV-cache formats by resizing per-layer buffers
+        # on demand. This is required for partial-checkpoint evaluation where some layers
+        # cache baseline GPT-OSS (GQA) KV and other layers cache TransMLA materialized (MHA)
+        # KV with different head counts/head dims.
+        #
+        # Opt-in to avoid surprising memory behavior.
+        allow_per_layer = os.getenv("SGLANG_ALLOW_PER_LAYER_KV_SHAPES", "").lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+        if allow_per_layer:
+            idx = layer_id - self.start_layer
+            k_buf = self.k_buffer[idx]
+            v_buf = self.v_buffer[idx]
+            if (
+                k_buf.ndim == 3
+                and cache_k.ndim == 3
+                and k_buf.shape[1:] != cache_k.shape[1:]
+            ) or (
+                v_buf.ndim == 3
+                and cache_v.ndim == 3
+                and v_buf.shape[1:] != cache_v.shape[1:]
+            ):
+                m = int(k_buf.shape[0])
+                self.k_buffer[idx] = torch.empty(
+                    (m, int(cache_k.shape[1]), int(cache_k.shape[2])),
+                    dtype=k_buf.dtype,
+                    device=k_buf.device,
+                )
+                self.v_buffer[idx] = torch.empty(
+                    (m, int(cache_v.shape[1]), int(cache_v.shape[2])),
+                    dtype=v_buf.dtype,
+                    device=v_buf.device,
+                )
+
+        ev_scatter_start = ev_scatter_end = None
+        if do_profile:
+            stream = profile_stream or torch.cuda.current_stream()
+            ev_scatter_start = torch.cuda.Event(enable_timing=True)
+            ev_scatter_end = torch.cuda.Event(enable_timing=True)
+            ev_scatter_start.record(stream)
 
         if get_is_capture_mode() and self.alt_stream is not None:
             # Overlap the copy of K and V cache for small batch size
@@ -895,8 +1734,29 @@ class MHATokenToKVPool(KVCache):
                 self.v_buffer[layer_id - self.start_layer][loc] = cache_v
             current_stream.wait_stream(self.alt_stream)
         else:
-            self.k_buffer[layer_id - self.start_layer][loc] = cache_k
-            self.v_buffer[layer_id - self.start_layer][loc] = cache_v
+            if detailed_timing and do_profile:
+                ev_k_start = torch.cuda.Event(enable_timing=True)
+                ev_k_end = torch.cuda.Event(enable_timing=True)
+                ev_v_start = torch.cuda.Event(enable_timing=True)
+                ev_v_end = torch.cuda.Event(enable_timing=True)
+
+                ev_k_start.record(stream)
+                self.k_buffer[layer_id - self.start_layer][loc] = cache_k
+                ev_k_end.record(stream)
+
+                ev_v_start.record(stream)
+                self.v_buffer[layer_id - self.start_layer][loc] = cache_v
+                ev_v_end.record(stream)
+
+                profile_events["setkv_k_scatter_ev"] = (ev_k_start, ev_k_end)
+                profile_events["setkv_v_scatter_ev"] = (ev_v_start, ev_v_end)
+            else:
+                self.k_buffer[layer_id - self.start_layer][loc] = cache_k
+                self.v_buffer[layer_id - self.start_layer][loc] = cache_v
+
+        if ev_scatter_start is not None:
+            ev_scatter_end.record(stream)
+            profile_events["setkv_scatter_ev"] = (ev_scatter_start, ev_scatter_end)
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         if envs.SGLANG_NATIVE_MOVE_KV_CACHE.get():

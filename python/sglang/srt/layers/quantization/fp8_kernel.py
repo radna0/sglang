@@ -619,6 +619,41 @@ def _static_quant_fp8(
         tl.store(y_s_repeat_ptr, y_s)
 
 
+@triton.jit
+def _static_quant_fp8_scalar_scale(
+    # Pointers to inputs and output
+    y_ptr,
+    y_q_ptr,
+    # Scalar scale (passed by value, not via device memory)
+    y_s,
+    # Stride of input
+    y_stride,
+    # Columns of input
+    N,
+    # Information for float8
+    fp8_min,
+    fp8_max,
+    # Meta-parameters
+    BLOCK: tl.constexpr,
+):
+    """Static FP8 quantization using a scalar scale passed by value.
+
+    This avoids device-side scalar tensors + `fill_()` kernels when the scale is
+    known on the host (e.g. GPT-OSS per-layer k_scale/v_scale).
+    """
+    g_id = tl.program_id(0)
+    y_ptr += g_id * y_stride
+    y_q_ptr += g_id * y_stride
+
+    cols = tl.arange(0, BLOCK)  # N <= BLOCK
+    mask = cols < N
+
+    y = tl.load(y_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+    y_s_inv = 1.0 / y_s
+    y_q = tl.clamp(y * y_s_inv, fp8_min, fp8_max).to(y_q_ptr.dtype.element_ty)
+    tl.store(y_q_ptr + cols, y_q, mask=mask)
+
+
 def static_quant_fp8(
     x: torch.Tensor,
     x_s: torch.Tensor,

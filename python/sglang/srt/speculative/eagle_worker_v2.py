@@ -490,8 +490,10 @@ class EagleDraftWorker(BaseDraftWorker):
         # Batch 2: Draft extend
         draft_input = EagleDraftInput(
             hidden_states=batch_result.logits_output.hidden_states,
-            num_tokens_per_batch=self.speculative_num_steps + 1,
-            num_tokens_for_logprob_per_batch=self.speculative_num_steps + 1,
+            # In overlap mode, `next_token_ids` is padded with stride = speculative_num_draft_tokens.
+            # Do NOT assume `spec_steps + 1` (that only holds for topk=1 / certain configs).
+            num_tokens_per_batch=self.speculative_num_draft_tokens,
+            num_tokens_for_logprob_per_batch=self.speculative_num_draft_tokens,
         )
         select_index = (
             torch.arange(len(batch.seq_lens), device=self.device)
@@ -667,7 +669,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         # Parse args
         verify_input: EagleVerifyInput = batch.spec_info
-        verify_input.num_tokens_per_batch = self.speculative_num_steps + 1
+        # `next_token_ids` is padded with stride = speculative_num_draft_tokens in overlap mode.
+        verify_input.num_tokens_per_batch = self.speculative_num_draft_tokens
         bs = len(batch.seq_lens)
 
         # Batch 1: Target verify
@@ -749,14 +752,20 @@ class EAGLEWorkerV2(BaseSpecWorker):
         verify_done.record()
 
         if not batch.forward_mode.is_idle():
-            all_verified_id = predict[accept_index]
-            verified_id = torch.empty_like(accept_length, dtype=torch.int32)
-            fill_new_verified_id[(bs,)](
-                all_verified_id,
-                accept_length,
-                verified_id,
-                self.speculative_num_draft_tokens,
-            )
+            # `accept_index` is shaped (bs, spec_steps+1), but the stride/padding for
+            # overlap scheduling is `speculative_num_draft_tokens`. For topk>1, these
+            # are NOT equal, so the previous `predict[accept_index]` + fill_new_verified_id
+            # path could index out-of-bounds.
+            #
+            # We only need the final accepted token (including the bonus token) per
+            # request to seed the next draft step.
+            # `accept_length` includes the bonus token; clamp defensively to
+            # avoid out-of-bounds if a future sampler changes semantics.
+            max_pos = accept_index.shape[1] - 1
+            last_pos = (accept_length.to(torch.int64) - 1).clamp(min=0, max=max_pos)
+            row = torch.arange(bs, device=self.device, dtype=torch.int64)
+            last_accept_index = accept_index.to(torch.int64)[row, last_pos]
+            verified_id = predict.to(torch.int64)[last_accept_index].to(torch.int32)
         else:
             verified_id = torch.empty((0,), device=self.device, dtype=torch.int32)
 

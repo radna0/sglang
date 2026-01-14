@@ -2111,8 +2111,15 @@ class ServerArgs:
                     self.speculative_eagle_topk is not None
                     and self.speculative_eagle_topk > 1
                 ):
-                    raise ValueError(
-                        "Spec v2 currently only supports topk = 1 for speculative decoding."
+                    if not envs.SGLANG_SPEC_V2_ALLOW_TOPK_GT1.get():
+                        raise ValueError(
+                            "Spec v2 currently only supports topk = 1 for speculative decoding. "
+                            "To experiment with topk>1 overlap scheduling, set "
+                            "SGLANG_SPEC_V2_ALLOW_TOPK_GT1=True."
+                        )
+                    logger.warning(
+                        "Spec v2 topk>1 enabled via SGLANG_SPEC_V2_ALLOW_TOPK_GT1=True "
+                        "(experimental; validate correctness/quality)."
                     )
             else:
                 self.disable_overlap_schedule = True

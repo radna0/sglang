@@ -27,7 +27,6 @@ from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, Forw
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import BaseDraftWorker, BaseSpecWorker
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
-from sglang.srt.speculative.eagle_info_v2 import fill_new_verified_id
 from sglang.srt.speculative.eagle_utils import TreeMaskMode, build_tree_kernel_efficient
 from sglang.srt.speculative.multi_layer_eagle_draft_extend_cuda_graph_runner import (
     MultiLayerEagleMultiStepDraftExtendCudaGraphRunner,
@@ -411,7 +410,7 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
         # Batch 2: Draft extend
         draft_input = EagleDraftInput(
             hidden_states=batch_result.logits_output.hidden_states,
-            num_tokens_per_batch=self.speculative_num_steps + 1,
+            num_tokens_per_batch=self.speculative_num_draft_tokens,
             num_tokens_for_logprob_per_batch=1,
         )
 
@@ -680,14 +679,11 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
         verify_done.record()
 
         if not batch.forward_mode.is_idle():
-            all_verified_id = predict[accept_index]
-            verified_id = torch.empty_like(accept_length, dtype=torch.int32)
-            fill_new_verified_id[(bs,)](
-                all_verified_id,
-                accept_length,
-                verified_id,
-                self.speculative_num_draft_tokens,
-            )
+            max_pos = accept_index.shape[1] - 1
+            last_pos = (accept_length.to(torch.int64) - 1).clamp(min=0, max=max_pos)
+            row = torch.arange(bs, device=self.device, dtype=torch.int64)
+            last_accept_index = accept_index.to(torch.int64)[row, last_pos]
+            verified_id = predict.to(torch.int64)[last_accept_index].to(torch.int32)
         else:
             verified_id = torch.empty((0,), device=self.device, dtype=torch.int32)
 

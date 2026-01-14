@@ -9,6 +9,9 @@ Each backend supports two operators: extend (i.e. prefill with cached prefix) an
 
 import logging
 import os
+import shutil
+import time
+import sys
 from dataclasses import dataclass
 from enum import Enum, auto
 from functools import partial
@@ -24,6 +27,57 @@ except ImportError:
 
 _SGLANG_FLASHINFER_NVTX = os.environ.get("SGLANG_FLASHINFER_NVTX", "0") == "1"
 
+
+class _NVTXRangeCompat:
+    """Compatibility wrapper: torch.cuda.nvtx.range() returns a context manager, not an object with .end()."""
+
+    def __init__(self, name: str):
+        self._cm = nvtx.range(name)
+        self._cm.__enter__()
+
+    def end(self) -> None:
+        self._cm.__exit__(None, None, None)
+
+
+def _nvtx_range(name: str) -> "_NVTXRangeCompat | None":
+    if not (_SGLANG_FLASHINFER_NVTX and _has_nvtx):
+        return None
+    try:
+        return _NVTXRangeCompat(name)
+    except Exception:
+        return None
+
+# -----------------------------------------------------------------------------
+# FlashInfer decode attribution timing (graphs-OFF only; for profiling).
+# -----------------------------------------------------------------------------
+_sglang_flashinfer_timing_ctr = 0
+_fi_timing_step_ctr = 0
+_fi_timing_step_do = False
+_fi_timing_acc: Optional[dict] = None
+
+# FlashInfer prefill attribution timing (graphs-OFF only; for profiling).
+_sglang_flashinfer_prefill_timing_ctr = 0
+_fi_prefill_timing_step_ctr = 0
+_fi_prefill_timing_step_do = False
+_fi_prefill_timing_acc: Optional[dict] = None
+
+
+def _append_profile_log(line: str) -> None:
+    """Append a single line to a per-run profile log file if configured.
+
+    The benchmark harness sets `SGLANG_REMOTE_PROFILE_LOG=/logs/<file>.log` so
+    worker-process timing can be collected alongside the benchmark output.
+    """
+    path = os.environ.get("SGLANG_REMOTE_PROFILE_LOG", "").strip()
+    if not path:
+        return
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        # Never let profiling break inference.
+        return
+
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -32,7 +86,7 @@ from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.speculative.spec_info import SpecInput
+from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.utils import (
     get_bool_env_var,
     get_int_env_var,
@@ -47,20 +101,123 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_FLASHINFER_JIT_CACHE_INIT = False
+
+
+def _flashinfer_cache_root() -> str:
+    base = os.environ.get("FLASHINFER_WORKSPACE_BASE", "").strip()
+    if not base:
+        base = os.path.expanduser("~")
+    return os.path.join(base, ".cache", "flashinfer")
+
+
+def _flashinfer_build_fingerprint(flashinfer_mod) -> str:
+    version = getattr(flashinfer_mod, "__version__", "unknown")
+
+    ext_paths: list[str] = []
+    for attr in ("_C", "_flashinfer"):
+        try:
+            m = getattr(flashinfer_mod, attr)
+            p = getattr(m, "__file__", None)
+            if isinstance(p, str) and p:
+                ext_paths.append(p)
+        except Exception:
+            continue
+
+    parts: list[str] = [f"version={version}"]
+    for p in sorted(set(ext_paths)):
+        try:
+            st = os.stat(p)
+            parts.append(f"ext={p}|size={st.st_size}|mtime={int(st.st_mtime)}")
+        except Exception:
+            parts.append(f"ext={p}|stat=err")
+    return ";".join(parts)
+
+
+def _ensure_flashinfer_jit_cache_compatible(flashinfer_mod) -> None:
+    global _FLASHINFER_JIT_CACHE_INIT
+    if _FLASHINFER_JIT_CACHE_INIT:
+        return
+
+    cache_root = _flashinfer_cache_root()
+    sig_path = os.path.join(cache_root, ".sglang_flashinfer_fingerprint.txt")
+    manual_clear = get_bool_env_var("SGLANG_FLASHINFER_CLEAR_JIT_CACHE", "false")
+    fingerprint = _flashinfer_build_fingerprint(flashinfer_mod)
+
+    try:
+        prev = None
+        if os.path.exists(sig_path):
+            with open(sig_path, "r", encoding="utf-8") as rf:
+                prev = rf.read().strip()
+
+        has_unknown_existing_cache = False
+        if prev is None and os.path.isdir(cache_root):
+            try:
+                for ent in os.scandir(cache_root):
+                    if ent.name != os.path.basename(sig_path):
+                        has_unknown_existing_cache = True
+                        break
+            except Exception:
+                has_unknown_existing_cache = True
+
+        if manual_clear or has_unknown_existing_cache or (prev is not None and prev != fingerprint):
+            shutil.rmtree(cache_root, ignore_errors=True)
+            logger.warning("[FlashInfer] Cleared JIT cache: %s", cache_root)
+
+        os.makedirs(cache_root, exist_ok=True)
+        with open(sig_path, "w", encoding="utf-8") as wf:
+            wf.write(fingerprint + "\n")
+    except Exception as e:
+        logger.warning("[FlashInfer] JIT cache compatibility check failed: %s", e)
+
+    _FLASHINFER_JIT_CACHE_INIT = True
+
+
 if envs.SGLANG_ENABLE_TORCH_COMPILE.get():
     torch._logging.set_logs(dynamo=logging.ERROR)
     torch._dynamo.config.suppress_errors = True
 
 
 if is_flashinfer_available():
-    from flashinfer import (
-        BatchDecodeWithPagedKVCacheWrapper,
-        BatchPrefillWithPagedKVCacheWrapper,
-        BatchPrefillWithRaggedKVCacheWrapper,
-        fast_decode_plan,
-    )
+    def _import_flashinfer_rtld_global():
+        # FlashInfer's JITed cached_ops may dlopen shared objects that expect to
+        # resolve symbols from already-loaded FlashInfer extension modules. On
+        # some setups this requires importing FlashInfer with RTLD_GLOBAL.
+        if sys.platform == "win32":
+            import flashinfer as m
+            return m
+
+        if not get_bool_env_var("SGLANG_FLASHINFER_RTLD_GLOBAL", "true"):
+            import flashinfer as m
+            return m
+
+        try:
+            import ctypes
+
+            old_flags = sys.getdlopenflags()
+            sys.setdlopenflags(old_flags | ctypes.RTLD_GLOBAL)
+            import flashinfer as m
+            sys.setdlopenflags(old_flags)
+            return m
+        except Exception:
+            import flashinfer as m
+            return m
+
+    _flashinfer_mod = _import_flashinfer_rtld_global()
+
+    BatchDecodeWithPagedKVCacheWrapper = _flashinfer_mod.BatchDecodeWithPagedKVCacheWrapper
+    BatchPrefillWithPagedKVCacheWrapper = _flashinfer_mod.BatchPrefillWithPagedKVCacheWrapper
+    BatchPrefillWithRaggedKVCacheWrapper = _flashinfer_mod.BatchPrefillWithRaggedKVCacheWrapper
+    fast_decode_plan = _flashinfer_mod.fast_decode_plan
+
+    _ensure_flashinfer_jit_cache_compatible(_flashinfer_mod)
     from flashinfer.attention import BatchAttentionWithAttentionSinkWrapper
     from flashinfer.cascade import merge_state
+    from flashinfer.jit.attention.modules import (
+        get_batch_decode_attention_sink_uri,
+        get_batch_prefill_attention_sink_uri,
+    )
+    from flashinfer.jit.attention.variants import attention_sink_decl
 
 
 class WrapperDispatch(Enum):
@@ -104,6 +261,15 @@ class DecodeMetadata:
         BatchDecodeWithPagedKVCacheWrapper | BatchPrefillWithPagedKVCacheWrapper
     ]
     q_workspace_buffers: Dict[int, torch.Tensor] = None  # Pre-allocated Q workspace per layer
+    # Cache fp32-cast sinks tensors (keyed by (data_ptr, numel)) to avoid per-step
+    # allocations and to keep CUDA-graph capture stable when using the decode wrapper.
+    sinks_fp32_cache: Dict[tuple[int, int], torch.Tensor] = None
+    # Cache XQA-formatted sinks tensors (keyed by (data_ptr, numel)).
+    #
+    # GPT-OSS stores sinks as *log* values per Q head. FlashInfer's XQA decode path
+    # expects sinks as a *linear* additive term in the softmax denominator (per KV
+    # head group), so we precompute `exp(sinks_log)` once and reuse it.
+    sinks_xqa_cache: Dict[tuple[int, int], torch.Tensor] = None
 
 
 @dataclass
@@ -135,24 +301,75 @@ class FlashInferAttnBackend(AttentionBackend):
     ):
         super().__init__()
 
+        # Keep a reference for runtime decisions (e.g. sliding-window size).
+        self.model_runner = model_runner
         self.model_dtype = model_runner.dtype
         self.kv_cache_dtype = model_runner.kv_cache_dtype
         self.head_dim = model_runner.model_config.head_dim
+
+        # Default-enable the fused FP8 KV update path for FlashInfer FP8 KV cache.
+        # This avoids a multi-kernel (scale/cast/scatter) sequence on the decode hotpath.
+        if self.kv_cache_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+            if os.environ.get("SGLANG_FP8_KV_SCATTER_QUANT") is None:
+                os.environ["SGLANG_FP8_KV_SCATTER_QUANT"] = "1"
+                logger.info(
+                    "[FlashInfer] Enabling SGLANG_FP8_KV_SCATTER_QUANT=1 by default for FP8 KV cache."
+                )
 
         hf_config = model_runner.model_config.hf_config
         self.requires_attention_sinks = (
             getattr(hf_config, "model_type", None) == "gpt_oss"
             or "GptOssForCausalLM" in (getattr(hf_config, "architectures", None) or [])
         )
+        self._diag_disable_sinks = False
+        if self.requires_attention_sinks and get_bool_env_var(
+            "SGLANG_GPTOSS_DIAG_DISABLE_SINKS", "false"
+        ):
+            logger.warning(
+                "[FlashInfer] DIAG: disabling GPT-OSS attention sinks via "
+                "SGLANG_GPTOSS_DIAG_DISABLE_SINKS=1 (A/B validation only)."
+            )
+            self._diag_disable_sinks = True
+            self.requires_attention_sinks = False
 
-        # NOTE: On SM90, the FA3 AttentionSink kernels require Q/K to be the same
-        # tensorcore type. When KV cache is FP8, BF16Q×FP8K has no eligible GMMA op
-        # and FlashInfer JIT compilation fails. Use FP8 Q whenever KV cache is FP8.
-        self.paged_q_data_type = (
-            self.kv_cache_dtype
-            if self.kv_cache_dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
-            else self.model_dtype
+        # NOTE: On SM90, the AttentionSink FP8 path (Hopper GMMA) effectively requires
+        # Q and KV to share a tensorcore dtype. BF16Q×FP8KV has no eligible GMMA op and
+        # can fail JIT compilation when CUDA graphs are enabled.
+        #
+        # Workaround (opt-in, correctness must be validated):
+        # Force Q to FP8 for BOTH prefill and decode in the sink-wrapper path when
+        # KV cache is FP8, and route sinks to the FA3 backend (which supports FP8 Q
+        # via the fp8-enabled Hopper templates).
+        #
+        # Controlled by:
+        #   SGLANG_FLASHINFER_PREFILL_FP8Q_WITH_FP8KV=1  (default: 1)
+        #
+        # If disabled, Q stays in model dtype and FP8 sinks may still fail to compile
+        # on SM90 due to BF16Q×FP8KV limitations.
+        force_sinks_fp8_q = (
+            self.requires_attention_sinks
+            and get_bool_env_var("SGLANG_FLASHINFER_PREFILL_FP8Q_WITH_FP8KV", "true")
+            and self.kv_cache_dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
         )
+
+        if self.requires_attention_sinks:
+            self.paged_q_data_type = self.kv_cache_dtype if force_sinks_fp8_q else self.model_dtype
+        else:
+            self.paged_q_data_type = (
+                self.kv_cache_dtype
+                if self.kv_cache_dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+                else self.model_dtype
+            )
+
+        self.prefill_q_data_type = self.kv_cache_dtype if force_sinks_fp8_q else self.model_dtype
+        self._sinks_force_fp8_q = bool(force_sinks_fp8_q)
+        if self._sinks_force_fp8_q:
+            logger.warning(
+                "[FlashInfer] GPT-OSS sinks + FP8 KV: forcing Q dtype to %s for prefill+decode "
+                "and preferring FA3 sinks backend "
+                "(SGLANG_FLASHINFER_PREFILL_FP8Q_WITH_FP8KV=1)",
+                str(self.kv_cache_dtype),
+            )
 
         # Store multi-item scoring delimiter for efficient access
         self.multi_item_scoring_delimiter = (
@@ -198,6 +415,8 @@ class FlashInferAttnBackend(AttentionBackend):
         self.skip_prefill = skip_prefill
         self.is_multimodal = model_runner.model_config.is_multimodal
         # NOTE: hf_config + requires_attention_sinks are initialized above.
+        self._logged_prefill_dispatch_key = False
+        self._logged_decode_dispatch_key = False
 
         assert not (
             model_runner.sliding_window_size is not None
@@ -313,32 +532,118 @@ class FlashInferAttnBackend(AttentionBackend):
         self.prefill_wrappers_paged = []
         self.prefill_wrappers_verify = []
         self.decode_wrappers = []
+
+        # IMPORTANT (GPT-OSS sinks + speculative / custom masks):
+        # FlashInfer selects different kernel implementations depending on whether custom masks
+        # are enabled. For EAGLE3, FlashInfer uses a flattened `custom_mask` for speculative
+        # prefill/verify. If we instantiate the AttentionSink wrapper without `custom_mask_buf`,
+        # it can route to a non-custom-mask specialization and yield severe quality regressions.
+        #
+        # Allocate small persistent buffers to ensure the custom-mask-capable path is selected.
+        # The actual mask is still provided dynamically via `begin_forward(custom_mask=...)`.
+        needs_sink_custom_mask = bool(
+            self.requires_attention_sinks
+            and (
+                getattr(model_runner.server_args, "speculative_algorithm", None) is not None
+                or model_runner.server_args.multi_item_scoring_delimiter is not None
+            )
+        )
+        self._sink_custom_mask_buf: Optional[torch.Tensor] = None
+        self._sink_mask_indptr_buf: Optional[torch.Tensor] = None
+        if needs_sink_custom_mask:
+            # Only the presence (not the size) of these buffers affects kernel selection
+            # when CUDA graphs are disabled. Keep them minimal to reduce memory overhead.
+            self._sink_custom_mask_buf = torch.empty(
+                (1,), dtype=torch.uint8, device=model_runner.device
+            )
+            self._sink_mask_indptr_buf = torch.empty(
+                (model_runner.server_args.max_running_requests + 1,),
+                dtype=torch.int32,
+                device=model_runner.device,
+            )
+        sink_backend = os.environ.get("SGLANG_FLASHINFER_SINK_BACKEND", "auto").lower()
+        if sink_backend == "cutlass":
+            # FlashInfer (0.6.x) does not accept "cutlass" as a sink backend.
+            # Keep the env for forward-compat experiments, but remap to "auto" today.
+            logger.warning(
+                "[FlashInfer] SGLANG_FLASHINFER_SINK_BACKEND=cutlass is not supported by this "
+                "FlashInfer build; falling back to auto."
+            )
+            sink_backend = "auto"
+        if sink_backend not in ("auto", "fa2", "fa3"):
+            logger.warning(
+                "[FlashInfer] Unknown SGLANG_FLASHINFER_SINK_BACKEND=%s; using auto.",
+                sink_backend,
+            )
+            sink_backend = "auto"
+        if sink_backend == "auto" and self.requires_attention_sinks:
+            if self._sinks_force_fp8_q:
+                # Required to hit FlashInfer's FP8-enabled Hopper sink templates.
+                sink_backend = "fa3"
+            elif needs_sink_custom_mask:
+                # Multi-item scoring / speculative verification workloads may require sink mask
+                # modes that are not yet stable on SM90 FA3. Prefer the slower but stable FA2 path
+                # in these cases.
+                sink_backend = "fa2"
+            else:
+                # Empirically (GPT-OSS-20B long-KV, SM90), FA3 sink kernels can be slower than
+                # FA2 when we are not using the tensor-core decode path (decode_use_tensor_cores=False).
+                # Prefer FA2 in that case; otherwise default to FA3.
+                sink_backend = "fa3" if self.decode_use_tensor_cores else "fa2"
+        # Persist for later (e.g. CUDA-graph TARGET_VERIFY wrapper creation).
+        self.sink_backend = sink_backend
         decode_sinks_wrapper = os.environ.get(
             "SGLANG_FLASHINFER_DECODE_SINKS_WRAPPER", "sink"
         ).lower()
         use_decode_wrapper_for_sinks = decode_sinks_wrapper in ("decode", "paged")
-        prefill_paged_backend = (
-            "fa3"
-            if self.paged_q_data_type in (torch.float8_e4m3fn, torch.float8_e5m2)
-            else "fa2"
-        )
+        # Persist selection for CUDA-graph capture and debugging.
+        self.decode_sinks_wrapper = decode_sinks_wrapper
+        # GPT-OSS requires AttentionSinks for correctness. The "decode-wrapper" sinks mode
+        # is implemented by building a custom AttentionSink JIT module and running it via
+        # `BatchDecodeWithPagedKVCacheWrapper(use_tensor_cores=True)` (FlashInfer's TC decode
+        # wrapper path reuses prefill kernels). This path MUST use tensor cores; the non-TC
+        # decode module does not implement the same AttentionSink variant interface.
+        if self.requires_attention_sinks and use_decode_wrapper_for_sinks and (not self.decode_use_tensor_cores):
+            raise ValueError(
+                "FlashInfer decode-wrapper sinks requires decode_use_tensor_cores=True. "
+                "Set SGLANG_FLASHINFER_DECODE_TC_WITH_SINKS=1 (default) and ensure tensor cores are enabled."
+            )
+        self.use_decode_wrapper_for_sinks = use_decode_wrapper_for_sinks
+        # Prefill backend for paged (supports sinks). For FP8 sinks runs where we
+        # force Q to FP8, we must use FA3 to enable the FP8 Hopper templates.
+        prefill_paged_backend = "fa3" if self._sinks_force_fp8_q else "fa2"
         self.prefill_paged_backend = prefill_paged_backend
         for wrapper_id in range(self.num_wrappers):
             if not skip_prefill:
                 if self.requires_attention_sinks:
                     init_window_left = -1
                     if self.dispatch_reason == WrapperDispatch.SLIDING_WINDOW:
-                        init_window_left = (
-                            model_runner.sliding_window_size if wrapper_id == 0 else -1
-                        )
+                        # For sinks models with FP8 KV, FlashInfer's "full attention" (use_swa=False)
+                        # AttentionSink prefill specialization can fail to compile on SM90 for some
+                        # BF16Q×FP8KV configurations. We don't need a separate full-attn wrapper for
+                        # GPT-OSS: SWA with a large enough window is equivalent when seq_len <= window.
+                        #
+                        # Force SWA for all wrappers in this specific case to avoid compiling the
+                        # failing use_swa=False variant.
+                        if self.kv_cache_dtype in (
+                            torch.float8_e4m3fn,
+                            torch.float8_e5m2,
+                        ):
+                            init_window_left = model_runner.sliding_window_size
+                        else:
+                            init_window_left = (
+                                model_runner.sliding_window_size if wrapper_id == 0 else -1
+                            )
                     kwargs = dict(
-                        backend="auto",
-                        q_data_type=self.paged_q_data_type,
+                        backend=sink_backend,
+                        q_data_type=self.prefill_q_data_type,
                         kv_data_type=self.kv_cache_dtype,
                         o_data_type=self.model_dtype,
                         head_dim_qk=model_runner.model_config.head_dim,
                         head_dim_vo=model_runner.model_config.head_dim,
                         window_left=init_window_left,
+                        custom_mask_buf=self._sink_custom_mask_buf,
+                        mask_indptr_buf=self._sink_mask_indptr_buf,
                     )
                     self.prefill_wrappers_paged.append(
                         BatchAttentionWithAttentionSinkWrapper(
@@ -350,6 +655,37 @@ class FlashInferAttnBackend(AttentionBackend):
                             self.workspace_buffer, "NHD", **kwargs
                         )
                     )
+                    if os.environ.get("SGLANG_FLASHINFER_LOG_DISPATCH", "0") == "1":
+                        try:
+                            uri_hint = None
+                            try:
+                                uri_hint = get_batch_prefill_attention_sink_uri(
+                                    backend=kwargs.get("backend", sink_backend),
+                                    dtype_q=kwargs.get("q_data_type", self.prefill_q_data_type),
+                                    dtype_kv=kwargs.get("kv_data_type", self.kv_cache_dtype),
+                                    dtype_o=kwargs.get("o_data_type", self.model_dtype),
+                                    dtype_idx=torch.int32,
+                                    head_dim_qk=model_runner.model_config.head_dim,
+                                    head_dim_vo=model_runner.model_config.head_dim,
+                                    pos_encoding_mode=0,
+                                    use_sliding_window=(int(kwargs.get("window_left", -1)) != -1),
+                                )
+                            except Exception:
+                                uri_hint = None
+                            msg = (
+                                "[FI_DISPATCH] mode=prefill "
+                                f"wrapper_id={wrapper_id} "
+                                "sinks=1 "
+                                f"backend={kwargs.get('backend')} "
+                                f"q_dtype={kwargs.get('q_data_type')} kv_dtype={kwargs.get('kv_data_type')} "
+                                f"o_dtype={kwargs.get('o_data_type')} head_dim={kwargs.get('head_dim_qk')} "
+                                f"window_left={kwargs.get('window_left')} "
+                                f"uri_hint={uri_hint}"
+                            )
+                            print(msg, flush=True)
+                            _append_profile_log(msg)
+                        except Exception:
+                            pass
                 else:
                     self.prefill_wrappers_paged.append(
                         BatchPrefillWithPagedKVCacheWrapper(
@@ -367,30 +703,191 @@ class FlashInferAttnBackend(AttentionBackend):
                     )
             if self.requires_attention_sinks:
                 if use_decode_wrapper_for_sinks:
-                    # Experimental: use the dedicated decode wrapper (often faster)
-                    # even for GPT-OSS sinks, if FlashInfer supports sinks in this path.
+                    # Decode-wrapper path for GPT-OSS sinks (often faster), but it MUST be
+                    # sink-aware. The stock tensor-core decode wrapper reuses the standard
+                    # prefill module, whose fa2/fa3 paged_run wrapper ignores `sinks`.
+                    # Build a custom AttentionSink JIT module and pass (sink, sm_scale)
+                    # via positional args at runtime.
+                    if sink_backend == "auto":
+                        raise ValueError(
+                            "FlashInfer sinks decode-wrapper requires explicit sink_backend (fa2/fa3)."
+                        )
+
+                    init_window_left = -1
+                    if (
+                        self.dispatch_reason == WrapperDispatch.SLIDING_WINDOW
+                        and model_runner.sliding_window_size is not None
+                    ):
+                        # Keep the module specialization aligned with wrapper dispatch:
+                        # - wrapper_id=0 => SWA (window_left = sliding_window_size)
+                        # - wrapper_id=1 => full attention (window_left = -1)
+                        init_window_left = (
+                            model_runner.sliding_window_size if wrapper_id == 0 else -1
+                        )
+                    use_sliding_window = init_window_left != -1
+                    o_dtype = self.model_dtype
+                    if o_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+                        o_dtype = torch.bfloat16
+                    fp8_enabled = sink_backend == "fa3" and self.paged_q_data_type in (
+                        torch.float8_e4m3fn,
+                        torch.float8_e5m2,
+                    )
+                    uri_prefill = get_batch_prefill_attention_sink_uri(
+                        backend=sink_backend,
+                        dtype_q=self.paged_q_data_type,
+                        dtype_kv=self.kv_cache_dtype,
+                        dtype_o=o_dtype,
+                        dtype_idx=torch.int32,
+                        head_dim_qk=model_runner.model_config.head_dim,
+                        head_dim_vo=model_runner.model_config.head_dim,
+                        pos_encoding_mode=0,
+                        use_sliding_window=use_sliding_window,
+                    )
+                    uri_decode = get_batch_decode_attention_sink_uri(
+                        backend=sink_backend,
+                        dtype_q=self.paged_q_data_type,
+                        dtype_kv=self.kv_cache_dtype,
+                        dtype_o=o_dtype,
+                        dtype_idx=torch.int32,
+                        head_dim_qk=model_runner.model_config.head_dim,
+                        head_dim_vo=model_runner.model_config.head_dim,
+                        pos_encoding_mode=0,
+                        use_sliding_window=use_sliding_window,
+                        use_logits_soft_cap=False,
+                    )
+                    jit_args = [
+                        # NOTE: The first JIT arg is the module URI. For `use_tensor_cores=True`,
+                        # FlashInfer's BatchDecode wrapper uses the *prefill* module generator; for
+                        # `use_tensor_cores=False`, it uses the *decode* module generator. These
+                        # must not collide in the JIT cache.
+                        uri_prefill,
+                        self.paged_q_data_type,  # dtype_q
+                        self.kv_cache_dtype,  # dtype_kv
+                        o_dtype,  # dtype_o
+                        torch.int32,  # idtype
+                        model_runner.model_config.head_dim,  # head_dim_qk
+                        model_runner.model_config.head_dim,  # head_dim_vo
+                        ["sink"],  # additional_tensor_names
+                        ["__nv_bfloat16"],  # additional_tensor_dtypes
+                        ["sm_scale"],  # additional_scalar_names
+                        ["double"],  # additional_scalar_dtypes
+                        "AttentionSink",
+                        attention_sink_decl[sink_backend],
+                        0,  # pos_encoding_mode
+                        use_sliding_window,
+                        False,  # use_logits_soft_cap
+                        False,  # use_fp16_qk_reduction
+                        fp8_enabled,
+                    ]
+                    # IMPORTANT: When using the "decode-wrapper" sinks path for GPT-OSS,
+                    # constructing `BatchDecodeWithPagedKVCacheWrapper` with
+                    # `use_tensor_cores=True` selects FlashInfer's prefill-JIT module
+                    # path (see FlashInfer wrapper implementation). This is intentional:
+                    # it provides the fastest decode-throughput path on SM90, and the
+                    # custom module is responsible for correctly applying sinks.
+                    use_tc = bool(self.decode_use_tensor_cores)
+                    if not use_tc:
+                        raise ValueError(
+                            "decode-wrapper sinks requires tensor cores, but decode_use_tensor_cores=False"
+                        )
+                    jit_args_for_wrapper = jit_args
                     self.decode_wrappers.append(
                         BatchDecodeWithPagedKVCacheWrapper(
                             self.workspace_buffer,
                             "NHD",
-                            use_tensor_cores=self.decode_use_tensor_cores,
+                            use_tensor_cores=use_tc,
+                            backend=sink_backend,
+                            jit_args=jit_args_for_wrapper,
                         )
                     )
+                    try:
+                        # Fail-fast marker: sinks + decode-wrapper must be sink-aware.
+                        self.decode_wrappers[-1]._fi_sink_uri = uri_prefill  # type: ignore[attr-defined]
+                        self.decode_wrappers[-1]._fi_sink_backend = sink_backend  # type: ignore[attr-defined]
+                        self.decode_wrappers[-1]._fi_sink_use_swa = bool(use_sliding_window)  # type: ignore[attr-defined]
+                        self.decode_wrappers[-1]._fi_sink_q_dtype = self.paged_q_data_type  # type: ignore[attr-defined]
+                        self.decode_wrappers[-1]._fi_sink_kv_dtype = self.kv_cache_dtype  # type: ignore[attr-defined]
+                        self.decode_wrappers[-1]._fi_sink_o_dtype = o_dtype  # type: ignore[attr-defined]
+                        self.decode_wrappers[-1]._fi_sink_fp8_enabled = bool(fp8_enabled)  # type: ignore[attr-defined]
+                    except Exception:
+                        pass
+                    if os.environ.get("SGLANG_FLASHINFER_LOG_DISPATCH", "0") == "1":
+                        try:
+                            msg = (
+                                "[FI_DISPATCH] mode=decode "
+                                f"wrapper_id={wrapper_id} "
+                                "sinks=1 "
+                                "wrapper=BatchDecodeWithPagedKVCacheWrapper "
+                                f"tc={int(bool(use_tc))} "
+                                f"backend={sink_backend} "
+                                f"q_dtype={self.paged_q_data_type} kv_dtype={self.kv_cache_dtype} o_dtype={o_dtype} "
+                                f"use_swa={int(bool(use_sliding_window))} fp8_enabled={int(bool(fp8_enabled))} "
+                                f"jit_args_n={len(jit_args_for_wrapper)} "
+                                f"uri={uri_prefill}"
+                            )
+                            print(msg, flush=True)
+                            _append_profile_log(msg)
+                        except Exception:
+                            pass
                 else:
                     # Default: use the attention-sink wrapper (prefill-style kernels).
+                    init_window_left = -1
+                    if self.dispatch_reason == WrapperDispatch.SLIDING_WINDOW:
+                        # Same rationale as prefill: avoid compiling the use_swa=False sink wrapper
+                        # variant for FP8 KV on SM90 (can fail GMMA operator selection).
+                        if self.kv_cache_dtype in (
+                            torch.float8_e4m3fn,
+                            torch.float8_e5m2,
+                        ):
+                            init_window_left = model_runner.sliding_window_size
+                        else:
+                            init_window_left = (
+                                model_runner.sliding_window_size if wrapper_id == 0 else -1
+                            )
                     self.decode_wrappers.append(
                         BatchAttentionWithAttentionSinkWrapper(
                             self.workspace_buffer,
                             "NHD",
-                            backend="auto",
+                            backend=sink_backend,
                             q_data_type=self.paged_q_data_type,
                             kv_data_type=self.kv_cache_dtype,
                             o_data_type=self.model_dtype,
                             head_dim_qk=model_runner.model_config.head_dim,
                             head_dim_vo=model_runner.model_config.head_dim,
-                            window_left=-1,
+                            window_left=init_window_left,
                         )
                     )
+                    if os.environ.get("SGLANG_FLASHINFER_LOG_DISPATCH", "0") == "1":
+                        try:
+                            uri_hint = None
+                            try:
+                                uri_hint = get_batch_prefill_attention_sink_uri(
+                                    backend=sink_backend,
+                                    dtype_q=self.paged_q_data_type,
+                                    dtype_kv=self.kv_cache_dtype,
+                                    dtype_o=self.model_dtype,
+                                    dtype_idx=torch.int32,
+                                    head_dim_qk=model_runner.model_config.head_dim,
+                                    head_dim_vo=model_runner.model_config.head_dim,
+                                    pos_encoding_mode=0,
+                                    use_sliding_window=(int(init_window_left) != -1),
+                                )
+                            except Exception:
+                                uri_hint = None
+                            msg = (
+                                "[FI_DISPATCH] mode=decode "
+                                f"wrapper_id={wrapper_id} "
+                                "sinks=1 "
+                                "wrapper=BatchAttentionWithAttentionSinkWrapper "
+                                f"backend={sink_backend} q_dtype={self.paged_q_data_type} kv_dtype={self.kv_cache_dtype} "
+                                f"o_dtype={self.model_dtype} head_dim={model_runner.model_config.head_dim} "
+                                f"window_left={init_window_left} "
+                                f"uri_hint={uri_hint}"
+                            )
+                            print(msg, flush=True)
+                            _append_profile_log(msg)
+                        except Exception:
+                            pass
             else:
                 self.decode_wrappers.append(
                     BatchDecodeWithPagedKVCacheWrapper(
@@ -399,6 +896,19 @@ class FlashInferAttnBackend(AttentionBackend):
                         use_tensor_cores=self.decode_use_tensor_cores,
                     )
                 )
+                if os.environ.get("SGLANG_FLASHINFER_LOG_DISPATCH", "0") == "1":
+                    try:
+                        msg = (
+                            "[FI_DISPATCH] mode=decode "
+                            f"wrapper_id={wrapper_id} "
+                            f"sinks={int(bool(self.requires_attention_sinks))} "
+                            "wrapper=BatchDecodeWithPagedKVCacheWrapper "
+                            f"tc={int(bool(self.decode_use_tensor_cores))}"
+                        )
+                        print(msg, flush=True)
+                        _append_profile_log(msg)
+                    except Exception:
+                        pass
 
         if os.environ.get("SGLANG_DEBUG_FLASHINFER_BACKEND", "0") == "1":
             prefill_backend0 = (
@@ -707,7 +1217,9 @@ class FlashInferAttnBackend(AttentionBackend):
         if forward_mode.is_decode_or_idle():
             decode_wrappers = []
             for i in range(self.num_wrappers):
-                if self.requires_attention_sinks:
+                if self.requires_attention_sinks and not getattr(
+                    self, "use_decode_wrapper_for_sinks", False
+                ):
                     decode_wrappers.append(
                         BatchAttentionWithAttentionSinkWrapper(
                             self.workspace_buffer,
@@ -726,19 +1238,87 @@ class FlashInferAttnBackend(AttentionBackend):
                         )
                     )
                 else:
-                    decode_wrappers.append(
-                        BatchDecodeWithPagedKVCacheWrapper(
-                            self.workspace_buffer,
-                            "NHD",
-                            use_cuda_graph=True,
-                            use_tensor_cores=self.decode_use_tensor_cores,
-                            paged_kv_indptr_buffer=self.kv_indptr[i][: num_tokens + 1],
-                            paged_kv_indices_buffer=self.cuda_graph_kv_indices[i],
-                            paged_kv_last_page_len_buffer=self.kv_last_page_len[
-                                :num_tokens
-                            ],
+                    if self.requires_attention_sinks and getattr(
+                        self, "use_decode_wrapper_for_sinks", False
+                    ):
+                        sink_backend = getattr(self, "sink_backend", "auto")
+                        if sink_backend == "auto":
+                            raise ValueError(
+                                "FlashInfer sinks decode-wrapper requires explicit sink_backend (fa2/fa3)."
+                            )
+
+                        init_window_left = -1
+                        if (
+                            self.dispatch_reason == WrapperDispatch.SLIDING_WINDOW
+                            and self.model_runner.sliding_window_size is not None
+                        ):
+                            init_window_left = (
+                                self.model_runner.sliding_window_size if i == 0 else -1
+                            )
+                        use_sliding_window = init_window_left != -1
+
+                        o_dtype = self.model_dtype
+                        if o_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+                            o_dtype = torch.bfloat16
+                        fp8_enabled = sink_backend == "fa3" and self.paged_q_data_type in (
+                            torch.float8_e4m3fn,
+                            torch.float8_e5m2,
                         )
-                    )
+                        jit_args = [
+                            get_batch_prefill_attention_sink_uri(
+                                backend=sink_backend,
+                                dtype_q=self.paged_q_data_type,
+                                dtype_kv=self.kv_cache_dtype,
+                                dtype_o=o_dtype,
+                                dtype_idx=torch.int32,
+                                head_dim_qk=self.head_dim,
+                                head_dim_vo=self.head_dim,
+                                pos_encoding_mode=0,
+                                use_sliding_window=use_sliding_window,
+                            ),
+                            self.paged_q_data_type,  # dtype_q
+                            self.kv_cache_dtype,  # dtype_kv
+                            o_dtype,  # dtype_o
+                            torch.int32,  # idtype
+                            self.head_dim,  # head_dim_qk
+                            self.head_dim,  # head_dim_vo
+                            ["sink"],  # additional_tensor_names
+                            ["__nv_bfloat16"],  # additional_tensor_dtypes
+                            ["sm_scale"],  # additional_scalar_names
+                            ["double"],  # additional_scalar_dtypes
+                            "AttentionSink",
+                            attention_sink_decl[sink_backend],
+                            0,  # pos_encoding_mode
+                            use_sliding_window,
+                            False,  # use_logits_soft_cap
+                            False,  # use_fp16_qk_reduction
+                            fp8_enabled,
+                        ]
+                        decode_wrappers.append(
+                            BatchDecodeWithPagedKVCacheWrapper(
+                                self.workspace_buffer,
+                                "NHD",
+                                use_cuda_graph=True,
+                                use_tensor_cores=True,
+                                backend=sink_backend,
+                                jit_args=jit_args,
+                                paged_kv_indptr_buffer=self.kv_indptr[i][: num_tokens + 1],
+                                paged_kv_indices_buffer=self.cuda_graph_kv_indices[i],
+                                paged_kv_last_page_len_buffer=self.kv_last_page_len[:num_tokens],
+                            )
+                        )
+                    else:
+                        decode_wrappers.append(
+                            BatchDecodeWithPagedKVCacheWrapper(
+                                self.workspace_buffer,
+                                "NHD",
+                                use_cuda_graph=True,
+                                use_tensor_cores=self.decode_use_tensor_cores,
+                                paged_kv_indptr_buffer=self.kv_indptr[i][: num_tokens + 1],
+                                paged_kv_indices_buffer=self.cuda_graph_kv_indices[i],
+                                paged_kv_last_page_len_buffer=self.kv_last_page_len[:num_tokens],
+                            )
+                        )
             seq_lens_sum = seq_lens.sum().item()
             self.indices_updater_decode.update(
                 req_pool_indices,
@@ -761,19 +1341,46 @@ class FlashInferAttnBackend(AttentionBackend):
         elif forward_mode.is_target_verify():
             prefill_wrappers = []
             for i in range(self.num_wrappers):
-                prefill_wrappers.append(
-                    BatchPrefillWithPagedKVCacheWrapper(
-                        self.workspace_buffer,
-                        "NHD",
-                        use_cuda_graph=True,
-                        qo_indptr_buf=self.cuda_graph_qo_indptr[i][: bs + 1],
-                        paged_kv_indptr_buf=self.kv_indptr[i][: bs + 1],
-                        paged_kv_indices_buf=self.cuda_graph_kv_indices[i],
-                        paged_kv_last_page_len_buf=self.kv_last_page_len[:bs],
-                        custom_mask_buf=self.cuda_graph_custom_mask,
-                        mask_indptr_buf=self.cuda_graph_qk_indptr[i][: bs + 1],
+                if self.requires_attention_sinks:
+                    # IMPORTANT (GPT-OSS + EAGLE TARGET_VERIFY):
+                    # TARGET_VERIFY must run with the same attention-sinks semantics as normal
+                    # GPT-OSS attention. Capturing the CUDA graph with the non-sink prefill wrapper
+                    # leads to severe quality collapse under EAGLE (bs>1).
+                    prefill_wrappers.append(
+                        BatchAttentionWithAttentionSinkWrapper(
+                            self.workspace_buffer,
+                            "NHD",
+                            backend=getattr(self, "sink_backend", "auto"),
+                            use_cuda_graph=True,
+                            qo_indptr_buf=self.cuda_graph_qo_indptr[i][: bs + 1],
+                            paged_kv_indptr_buf=self.kv_indptr[i][: bs + 1],
+                            paged_kv_indices_buf=self.cuda_graph_kv_indices[i],
+                            paged_kv_last_page_len_buf=self.kv_last_page_len[:bs],
+                            custom_mask_buf=self.cuda_graph_custom_mask,
+                            mask_indptr_buf=self.cuda_graph_qk_indptr[i][: bs + 1],
+                            q_data_type=self.prefill_q_data_type,
+                            kv_data_type=self.kv_cache_dtype,
+                            o_data_type=self.model_dtype,
+                            head_dim_qk=self.head_dim,
+                            head_dim_vo=self.head_dim,
+                            # Compile the SWA-enabled specialization for GPT-OSS.
+                            window_left=self.model_runner.sliding_window_size,
+                        )
                     )
-                )
+                else:
+                    prefill_wrappers.append(
+                        BatchPrefillWithPagedKVCacheWrapper(
+                            self.workspace_buffer,
+                            "NHD",
+                            use_cuda_graph=True,
+                            qo_indptr_buf=self.cuda_graph_qo_indptr[i][: bs + 1],
+                            paged_kv_indptr_buf=self.kv_indptr[i][: bs + 1],
+                            paged_kv_indices_buf=self.cuda_graph_kv_indices[i],
+                            paged_kv_last_page_len_buf=self.kv_last_page_len[:bs],
+                            custom_mask_buf=self.cuda_graph_custom_mask,
+                            mask_indptr_buf=self.cuda_graph_qk_indptr[i][: bs + 1],
+                        )
+                    )
             seq_lens_sum = seq_lens.sum().item()
             self.indices_updater_prefill.update(
                 req_pool_indices,
@@ -927,6 +1534,119 @@ class FlashInferAttnBackend(AttentionBackend):
         save_kv_cache=True,
         **kwargs,
     ):
+        global _sglang_flashinfer_prefill_timing_ctr
+        global _fi_prefill_timing_step_ctr, _fi_prefill_timing_step_do, _fi_prefill_timing_acc
+
+        do_timing = False
+        timing_enabled = os.environ.get("SGLANG_FLASHINFER_TIMING_PREFILL", "0") == "1"
+        try:
+            timing_layer = int(os.environ.get("SGLANG_FLASHINFER_TIMING_LAYER", "0"))
+        except Exception:
+            timing_layer = 0
+        try:
+            sample_every = int(os.environ.get("SGLANG_FLASHINFER_TIMING_SAMPLE_EVERY", "64"))
+        except Exception:
+            sample_every = 64
+
+        timing_all_layers = timing_layer == -1
+        if timing_enabled and (timing_all_layers or layer.layer_id == timing_layer):
+            if not getattr(self.forward_metadata, "_fi_prefill_timing_banner", False):
+                setattr(self.forward_metadata, "_fi_prefill_timing_banner", True)
+                banner = (
+                    "[FI_TIMING] prefill enabled "
+                    f"pid={os.getpid()} layer={timing_layer} sample_every={sample_every}"
+                )
+                print(banner, flush=True)
+                _append_profile_log(banner)
+
+            if timing_all_layers and layer.layer_id == 0:
+                # Flush any previous step if we didn't observe the final layer (best-effort).
+                if _fi_prefill_timing_acc is not None and _fi_prefill_timing_acc.get("do", False):
+                    gpu_total_ms = float(_fi_prefill_timing_acc.get("gpu_total_ms", 0.0) or 0.0)
+                    qcopy_ms = float(_fi_prefill_timing_acc.get("qcopy_ms", 0.0) or 0.0)
+                    setkv_ms = float(_fi_prefill_timing_acc.get("setkv_ms", 0.0) or 0.0)
+                    attn_ms = float(_fi_prefill_timing_acc.get("attn_ms", 0.0) or 0.0)
+                    other_ms = float(_fi_prefill_timing_acc.get("other_ms", 0.0) or 0.0)
+
+                    def _pct(x: float, denom: float) -> float:
+                        return (100.0 * x / denom) if denom > 0 else 0.0
+
+                    agg_line = (
+                        "[FI_TIMING_AGG] "
+                        "mode=prefill "
+                        f"step={_fi_prefill_timing_acc.get('step', -1)} "
+                        f"layers={_fi_prefill_timing_acc.get('layers', 0)} "
+                        f"q_tokens={_fi_prefill_timing_acc.get('q_tokens', -1)} "
+                        f"qcopy_ms_sum={qcopy_ms:.3f} "
+                        f"setkv_ms_sum={setkv_ms:.3f} "
+                        f"attn_ms_sum={attn_ms:.3f} "
+                        f"other_ms_sum={other_ms:.3f} "
+                        f"gpu_total_ms_sum={gpu_total_ms:.3f} "
+                        f"share_qcopy_pct={_pct(qcopy_ms, gpu_total_ms):.1f} "
+                        f"share_setkv_pct={_pct(setkv_ms, gpu_total_ms):.1f} "
+                        f"share_attn_pct={_pct(attn_ms, gpu_total_ms):.1f} "
+                        f"share_other_pct={_pct(other_ms, gpu_total_ms):.1f} "
+                        f"cpu_total_ms_sum={_fi_prefill_timing_acc.get('cpu_total_ms', 0.0):.3f}"
+                    )
+                    print(agg_line, flush=True)
+                    _append_profile_log(agg_line)
+
+                _fi_prefill_timing_step_ctr += 1
+                _fi_prefill_timing_step_do = (_fi_prefill_timing_step_ctr % max(1, sample_every)) == 0
+                _fi_prefill_timing_acc = {
+                    "do": bool(_fi_prefill_timing_step_do),
+                    "step": _fi_prefill_timing_step_ctr,
+                    "layers": 0,
+                    "q_tokens": -1,
+                    "qcopy_ms": 0.0,
+                    "setkv_ms": 0.0,
+                    "attn_ms": 0.0,
+                    "other_ms": 0.0,
+                    "gpu_total_ms": 0.0,
+                    "cpu_total_ms": 0.0,
+                }
+
+            if timing_all_layers:
+                do_timing = bool(_fi_prefill_timing_step_do)
+            else:
+                _sglang_flashinfer_prefill_timing_ctr += 1
+                do_timing = (_sglang_flashinfer_prefill_timing_ctr % max(1, sample_every)) == 0
+
+        # Best-effort last-layer detection so we can emit an aggregate line even if
+        # there is only one prefill/extend call.
+        last_layer_id = -1
+        try:
+            last_layer_id = int(getattr(self.model_runner.model_config, "num_hidden_layers", -1)) - 1
+        except Exception:
+            last_layer_id = -1
+        if last_layer_id < 0:
+            try:
+                last_layer_id = int(getattr(self.model_runner.model_config, "num_layers", -1)) - 1
+            except Exception:
+                last_layer_id = -1
+        is_last_layer = bool(last_layer_id >= 0 and layer.layer_id == last_layer_id)
+
+        if do_timing and torch.cuda.is_available():
+            torch.cuda.synchronize()
+            cpu_t0 = time.perf_counter()
+            timing_stream = torch.cuda.current_stream()
+            ev_total_start = torch.cuda.Event(enable_timing=True)
+            ev_total_end = torch.cuda.Event(enable_timing=True)
+            ev_total_start.record(timing_stream)
+            ev_qcopy_start = torch.cuda.Event(enable_timing=True)
+            ev_qcopy_end = torch.cuda.Event(enable_timing=True)
+            ev_setkv_start = torch.cuda.Event(enable_timing=True)
+            ev_setkv_end = torch.cuda.Event(enable_timing=True)
+            ev_attn_start = torch.cuda.Event(enable_timing=True)
+            ev_attn_end = torch.cuda.Event(enable_timing=True)
+        else:
+            cpu_t0 = None
+            timing_stream = None
+            ev_total_start = ev_total_end = None
+            ev_qcopy_start = ev_qcopy_end = None
+            ev_setkv_start = ev_setkv_end = None
+            ev_attn_start = ev_attn_end = None
+
         prefill_wrapper_paged = self.forward_metadata.prefill_wrappers[
             self._get_wrapper_idx(layer)
         ]
@@ -939,19 +1659,61 @@ class FlashInferAttnBackend(AttentionBackend):
         logits_soft_cap = layer.logit_cap
 
         sinks = kwargs.get("sinks", None)
-        window_left = (
-            layer.sliding_window_size
-            if not (
-                self.forward_metadata.multi_item_params
-                and self.forward_metadata.multi_item_params.is_enabled()
-            )
-            else -1
+        if self._diag_disable_sinks:
+            sinks = None
+        multi_item_enabled = bool(
+            self.forward_metadata.multi_item_params
+            and self.forward_metadata.multi_item_params.is_enabled()
         )
+        # IMPORTANT for GPT-OSS:
+        # GPT-OSS uses sliding-window attention as part of its trained semantics. Disabling SWA
+        # for multi-item scoring changes the model and has shown severe quality regressions in
+        # speculative/EAGLE bs>1 workloads.
+        #
+        # For models without GPT-OSS sinks, we keep the old behavior (disable SWA for multi-item
+        # scoring) unless the caller explicitly requests otherwise via the model config.
+        if (
+            multi_item_enabled
+            and not self.requires_attention_sinks
+            and not self._diag_disable_sinks
+        ):
+            window_left = -1
+        else:
+            window_left = layer.sliding_window_size
 
-        if _SGLANG_FLASHINFER_NVTX and _has_nvtx:
-            nvtx_range_q = nvtx.range(f"flashinfer.prefill.q_transform_layer{layer.layer_id}")
+        # Log the effective prefill dispatch key once (otherwise it can spam logs and
+        # distort throughput in long-decode benchmarks).
+        if (
+            (not self._logged_prefill_dispatch_key)
+            and os.environ.get("SGLANG_FLASHINFER_LOG_DISPATCH", "0") == "1"
+        ):
+            self._logged_prefill_dispatch_key = True
+            wrapper_backend = getattr(prefill_wrapper_paged, "_backend", None)
+            if wrapper_backend is None:
+                wrapper_backend = (
+                    getattr(self, "sink_backend", None)
+                    if self.requires_attention_sinks
+                    else self.prefill_paged_backend
+                )
+            uri = getattr(prefill_wrapper_paged, "_fi_sink_uri", None)
+            jit_name = getattr(prefill_wrapper_paged, "_jit_module_name", None)
+            _append_profile_log(
+                "[FI_DISPATCH] prefill "
+                f"wrapper={prefill_wrapper_paged.__class__.__name__} "
+                f"q_dtype={self.prefill_q_data_type} kv_dtype={self.kv_cache_dtype} o_dtype={self.model_dtype} "
+                f"sinks={int(sinks is not None)} window_left={int(window_left)} "
+                f"multi_item={int(multi_item_enabled)} backend={wrapper_backend} uri={uri} jit_module_name={jit_name}"
+            )
+
+        nvtx_range_q = _nvtx_range(f"flashinfer.prefill.q_transform_layer{layer.layer_id}")
 
         q_reshaped = q.view(-1, layer.tp_q_head_num, layer.head_dim)
+        if timing_enabled and timing_all_layers and layer.layer_id == 0:
+            if _fi_prefill_timing_acc is not None and _fi_prefill_timing_acc.get("do", False):
+                try:
+                    _fi_prefill_timing_acc["q_tokens"] = int(q_reshaped.shape[0])
+                except Exception:
+                    pass
 
         q_workspace_buffers = getattr(self.forward_metadata, "q_workspace_buffers", None)
         if q_workspace_buffers is None:
@@ -959,42 +1721,54 @@ class FlashInferAttnBackend(AttentionBackend):
             setattr(self.forward_metadata, "q_workspace_buffers", q_workspace_buffers)
 
         q_workspace = q_workspace_buffers.get(layer.layer_id, None)
-        if q_workspace is None or q_workspace.shape != q_reshaped.shape or q_workspace.dtype != self.paged_q_data_type:
-            q_workspace = torch.empty_like(q_reshaped, dtype=self.paged_q_data_type, device=q_reshaped.device)
+        if (
+            q_workspace is None
+            or q_workspace.shape != q_reshaped.shape
+            or q_workspace.dtype != self.prefill_q_data_type
+        ):
+            q_workspace = torch.empty_like(
+                q_reshaped, dtype=self.prefill_q_data_type, device=q_reshaped.device
+            )
             q_workspace_buffers[layer.layer_id] = q_workspace
 
-        if _SGLANG_FLASHINFER_NVTX and _has_nvtx:
-            nvtx_range_q_copy = nvtx.range(f"flashinfer.prefill.q_copy_layer{layer.layer_id}")
+        nvtx_range_q_copy = _nvtx_range(f"flashinfer.prefill.q_copy_layer{layer.layer_id}")
+        if ev_qcopy_start is not None:
+            ev_qcopy_start.record(timing_stream)
         if q_reshaped.is_contiguous():
             q_workspace.copy_(q_reshaped)
         else:
             q_for_kernel = q_reshaped.contiguous()
             q_workspace.copy_(q_for_kernel)
-        if _SGLANG_FLASHINFER_NVTX and _has_nvtx:
+        if ev_qcopy_end is not None:
+            ev_qcopy_end.record(timing_stream)
+        if nvtx_range_q_copy is not None:
             nvtx_range_q_copy.end()
 
-        if _SGLANG_FLASHINFER_NVTX and _has_nvtx:
+        if nvtx_range_q is not None:
             nvtx_range_q.end()
 
+        if ev_setkv_start is not None:
+            ev_setkv_start.record(timing_stream)
         if k is not None:
             assert v is not None
             if save_kv_cache:
-                nvtx_range_kv = None
-                if _SGLANG_FLASHINFER_NVTX and _has_nvtx:
-                    nvtx_range_kv = nvtx.range(
-                        f"flashinfer.prefill.set_kv_layer{layer.layer_id}"
-                    )
+                nvtx_range_kv = _nvtx_range(f"flashinfer.prefill.set_kv_layer{layer.layer_id}")
                 forward_batch.token_to_kv_pool.set_kv_buffer(
-                    layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+                    layer,
+                    cache_loc,
+                    k,
+                    v,
+                    layer.k_scale,
+                    layer.v_scale,
                 )
                 if nvtx_range_kv is not None:
                     nvtx_range_kv.end()
+        if ev_setkv_end is not None:
+            ev_setkv_end.record(timing_stream)
 
-        nvtx_range_attn = None
-        if _SGLANG_FLASHINFER_NVTX and _has_nvtx:
-            nvtx_range_attn = nvtx.range(
-                f"flashinfer.prefill.attention_kernel_layer{layer.layer_id}"
-            )
+        nvtx_range_attn = _nvtx_range(f"flashinfer.prefill.attention_kernel_layer{layer.layer_id}")
+        if ev_attn_start is not None:
+            ev_attn_start.record(timing_stream)
         o = prefill_wrapper_paged.forward(
             q_workspace,
             forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
@@ -1013,8 +1787,95 @@ class FlashInferAttnBackend(AttentionBackend):
             v_scale=layer.v_scale_float,
             sinks=sinks,
         )
+        if ev_attn_end is not None:
+            ev_attn_end.record(timing_stream)
         if nvtx_range_attn is not None:
             nvtx_range_attn.end()
+
+        if ev_total_end is not None:
+            ev_total_end.record(timing_stream)
+            torch.cuda.synchronize()
+            cpu_t1 = time.perf_counter()
+            qcopy_ms = (
+                ev_qcopy_start.elapsed_time(ev_qcopy_end) if ev_qcopy_start is not None else 0.0
+            )
+            setkv_ms = (
+                ev_setkv_start.elapsed_time(ev_setkv_end) if ev_setkv_start is not None else 0.0
+            )
+            attn_ms = (
+                ev_attn_start.elapsed_time(ev_attn_end) if ev_attn_start is not None else 0.0
+            )
+            total_ms = (
+                ev_total_start.elapsed_time(ev_total_end) if ev_total_start is not None else 0.0
+            )
+            cpu_ms = (cpu_t1 - cpu_t0) * 1000.0 if cpu_t0 is not None else 0.0
+            other_ms = max(
+                0.0, float(total_ms) - float(qcopy_ms) - float(setkv_ms) - float(attn_ms)
+            )
+
+            sample_id = (
+                _fi_prefill_timing_step_ctr
+                if timing_all_layers
+                else _sglang_flashinfer_prefill_timing_ctr
+            )
+            try:
+                q_tokens = int(q_reshaped.shape[0])
+            except Exception:
+                q_tokens = -1
+
+            timing_line = (
+                "[FI_TIMING] "
+                f"mode=prefill layer={layer.layer_id} sample={sample_id} "
+                f"wrapper={prefill_wrapper_paged.__class__.__name__} "
+                f"kv_cache_dtype={self.kv_cache_dtype} q_dtype={self.prefill_q_data_type} "
+                f"q_tokens={q_tokens} "
+                f"qcopy_ms={qcopy_ms:.3f} setkv_ms={setkv_ms:.3f} attn_ms={attn_ms:.3f} "
+                f"other_ms={other_ms:.3f} gpu_total_ms={total_ms:.3f} cpu_total_ms={cpu_ms:.3f}"
+            )
+            print(timing_line, flush=True)
+            _append_profile_log(timing_line)
+
+            if timing_all_layers and _fi_prefill_timing_acc is not None and _fi_prefill_timing_acc.get("do", False):
+                _fi_prefill_timing_acc["layers"] += 1
+                _fi_prefill_timing_acc["qcopy_ms"] += float(qcopy_ms)
+                _fi_prefill_timing_acc["setkv_ms"] += float(setkv_ms)
+                _fi_prefill_timing_acc["attn_ms"] += float(attn_ms)
+                _fi_prefill_timing_acc["other_ms"] += float(other_ms)
+                _fi_prefill_timing_acc["gpu_total_ms"] += float(total_ms)
+                _fi_prefill_timing_acc["cpu_total_ms"] += float(cpu_ms)
+                if _fi_prefill_timing_acc.get("q_tokens", -1) < 0 and q_tokens >= 0:
+                    _fi_prefill_timing_acc["q_tokens"] = int(q_tokens)
+
+                if is_last_layer:
+                    gpu_total_ms = float(_fi_prefill_timing_acc.get("gpu_total_ms", 0.0) or 0.0)
+                    qcopy_ms_sum = float(_fi_prefill_timing_acc.get("qcopy_ms", 0.0) or 0.0)
+                    setkv_ms_sum = float(_fi_prefill_timing_acc.get("setkv_ms", 0.0) or 0.0)
+                    attn_ms_sum = float(_fi_prefill_timing_acc.get("attn_ms", 0.0) or 0.0)
+                    other_ms_sum = float(_fi_prefill_timing_acc.get("other_ms", 0.0) or 0.0)
+
+                    def _pct(x: float, denom: float) -> float:
+                        return (100.0 * x / denom) if denom > 0 else 0.0
+
+                    agg_line = (
+                        "[FI_TIMING_AGG] "
+                        "mode=prefill "
+                        f"step={_fi_prefill_timing_acc.get('step', -1)} "
+                        f"layers={_fi_prefill_timing_acc.get('layers', 0)} "
+                        f"q_tokens={_fi_prefill_timing_acc.get('q_tokens', -1)} "
+                        f"qcopy_ms_sum={qcopy_ms_sum:.3f} "
+                        f"setkv_ms_sum={setkv_ms_sum:.3f} "
+                        f"attn_ms_sum={attn_ms_sum:.3f} "
+                        f"other_ms_sum={other_ms_sum:.3f} "
+                        f"gpu_total_ms_sum={gpu_total_ms:.3f} "
+                        f"share_qcopy_pct={_pct(qcopy_ms_sum, gpu_total_ms):.1f} "
+                        f"share_setkv_pct={_pct(setkv_ms_sum, gpu_total_ms):.1f} "
+                        f"share_attn_pct={_pct(attn_ms_sum, gpu_total_ms):.1f} "
+                        f"share_other_pct={_pct(other_ms_sum, gpu_total_ms):.1f} "
+                        f"cpu_total_ms_sum={_fi_prefill_timing_acc.get('cpu_total_ms', 0.0):.3f}"
+                    )
+                    print(agg_line, flush=True)
+                    _append_profile_log(agg_line)
+                    _fi_prefill_timing_acc = None
 
         # Default path: paged prefill (supports attention sinks).
         # If sinks are present, always force the paged path even if the metadata
@@ -1072,7 +1933,12 @@ class FlashInferAttnBackend(AttentionBackend):
 
         if save_kv_cache:
             forward_batch.token_to_kv_pool.set_kv_buffer(
-                layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+                layer,
+                cache_loc,
+                k,
+                v,
+                layer.k_scale,
+                layer.v_scale,
             )
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
@@ -1087,6 +1953,150 @@ class FlashInferAttnBackend(AttentionBackend):
         save_kv_cache=True,
         **kwargs,
     ):
+        global _sglang_flashinfer_timing_ctr
+        global _fi_timing_step_ctr, _fi_timing_step_do, _fi_timing_acc
+
+        do_timing = False
+        timing_enabled = os.environ.get("SGLANG_FLASHINFER_TIMING", "0") == "1"
+        failfast = os.environ.get("SGLANG_FLASHINFER_FAILFAST", "0") == "1"
+        try:
+            timing_layer = int(os.environ.get("SGLANG_FLASHINFER_TIMING_LAYER", "0"))
+        except Exception:
+            timing_layer = 0
+        try:
+            sample_every = int(os.environ.get("SGLANG_FLASHINFER_TIMING_SAMPLE_EVERY", "64"))
+        except Exception:
+            sample_every = 64
+
+        timing_all_layers = timing_layer == -1
+        if timing_enabled and (timing_all_layers or layer.layer_id == timing_layer):
+            if not getattr(self.forward_metadata, "_fi_timing_banner", False):
+                setattr(self.forward_metadata, "_fi_timing_banner", True)
+                banner = (
+                    "[FI_TIMING] enabled "
+                    f"pid={os.getpid()} layer={timing_layer} sample_every={sample_every}"
+                )
+                print(banner, flush=True)
+                _append_profile_log(banner)
+
+            if timing_all_layers:
+                # Aggregate across all layers for one token step. Use layer0 as the
+                # token-step boundary (it is the first decode layer).
+                if layer.layer_id == 0:
+                    if _fi_timing_acc is not None and _fi_timing_acc.get("do", False):
+                        gpu_total_ms = float(_fi_timing_acc.get("gpu_total_ms", 0.0) or 0.0)
+                        setkv_ms = float(_fi_timing_acc.get("setkv_ms", 0.0) or 0.0)
+                        qcopy_ms = float(_fi_timing_acc.get("qcopy_ms", 0.0) or 0.0)
+                        attn_ms = float(_fi_timing_acc.get("attn_ms", 0.0) or 0.0)
+                        other_ms = float(_fi_timing_acc.get("other_ms", 0.0) or 0.0)
+
+                        def _pct(x: float, denom: float) -> float:
+                            return (100.0 * x / denom) if denom > 0 else 0.0
+
+                        agg_line = (
+                            "[FI_TIMING_AGG] "
+                            f"token_step={_fi_timing_acc.get('step', -1)} "
+                            f"layers={_fi_timing_acc.get('layers', 0)} "
+                            f"pre_setkv_ms_sum={_fi_timing_acc.get('pre_setkv_ms', 0.0):.3f} "
+                            f"setkv_ms_sum={setkv_ms:.3f} "
+                            f"setkv_quant_ms_sum={_fi_timing_acc.get('setkv_quant_ms', 0.0):.3f} "
+                            f"setkv_scatter_ms_sum={_fi_timing_acc.get('setkv_scatter_ms', 0.0):.3f} "
+                            f"setkv_other_ms_sum={_fi_timing_acc.get('setkv_other_ms', 0.0):.3f} "
+                            f"setkv_pre_scatter_ms_sum={_fi_timing_acc.get('setkv_pre_scatter_ms', 0.0):.3f} "
+                            f"setkv_post_scatter_ms_sum={_fi_timing_acc.get('setkv_post_scatter_ms', 0.0):.3f} "
+                            f"setkv_contig_k_ms_sum={_fi_timing_acc.get('setkv_contig_k_ms', 0.0):.3f} "
+                            f"setkv_contig_v_ms_sum={_fi_timing_acc.get('setkv_contig_v_ms', 0.0):.3f} "
+                            f"setkv_scale_fill_k_ms_sum={_fi_timing_acc.get('setkv_scale_fill_k_ms', 0.0):.3f} "
+                            f"setkv_scale_fill_v_ms_sum={_fi_timing_acc.get('setkv_scale_fill_v_ms', 0.0):.3f} "
+                            f"setkv_misc_ms_sum={_fi_timing_acc.get('setkv_misc_ms', 0.0):.3f} "
+                            f"setkv_cpu_total_ms_sum={_fi_timing_acc.get('setkv_cpu_total_ms', 0.0):.3f} "
+                            f"setkv_cpu_prepare_ms_sum={_fi_timing_acc.get('setkv_cpu_prepare_ms', 0.0):.3f} "
+                            f"setkv_cpu_launch_ms_sum={_fi_timing_acc.get('setkv_cpu_launch_ms', 0.0):.3f} "
+                            f"setkv_cpu_post_ms_sum={_fi_timing_acc.get('setkv_cpu_post_ms', 0.0):.3f} "
+                            f"setkv_pack_ms_sum={_fi_timing_acc.get('setkv_pack_ms', 0.0):.3f} "
+                            f"setkv_k_scatter_ms_sum={_fi_timing_acc.get('setkv_k_scatter_ms', 0.0):.3f} "
+                            f"setkv_v_scatter_ms_sum={_fi_timing_acc.get('setkv_v_scatter_ms', 0.0):.3f} "
+                            f"between_setkv_qcopy_ms_sum={_fi_timing_acc.get('between_setkv_qcopy_ms', 0.0):.3f} "
+                            f"qcopy_ms_sum={qcopy_ms:.3f} "
+                            f"between_qcopy_attn_ms_sum={_fi_timing_acc.get('between_qcopy_attn_ms', 0.0):.3f} "
+                            f"attn_ms_sum={attn_ms:.3f} "
+                            f"post_attn_ms_sum={_fi_timing_acc.get('post_attn_ms', 0.0):.3f} "
+                            f"other_ms_sum={other_ms:.3f} "
+                            f"gpu_total_ms_sum={gpu_total_ms:.3f} "
+                            f"share_setkv_pct={_pct(setkv_ms, gpu_total_ms):.1f} "
+                            f"share_qcopy_pct={_pct(qcopy_ms, gpu_total_ms):.1f} "
+                            f"share_attn_pct={_pct(attn_ms, gpu_total_ms):.1f} "
+                            f"share_other_pct={_pct(other_ms, gpu_total_ms):.1f} "
+                            f"cpu_total_ms_sum={_fi_timing_acc.get('cpu_total_ms', 0.0):.3f}"
+                        )
+                        print(agg_line, flush=True)
+                        _append_profile_log(agg_line)
+
+                    _fi_timing_step_ctr += 1
+                    _fi_timing_step_do = (_fi_timing_step_ctr % max(1, sample_every)) == 0
+                    _fi_timing_acc = {
+                        "do": _fi_timing_step_do,
+                        "step": _fi_timing_step_ctr,
+                        "layers": 0,
+                        "pre_setkv_ms": 0.0,
+                        "between_setkv_qcopy_ms": 0.0,
+                        "between_qcopy_attn_ms": 0.0,
+                        "post_attn_ms": 0.0,
+                        "setkv_ms": 0.0,
+                        "setkv_quant_ms": 0.0,
+                        "setkv_scatter_ms": 0.0,
+                        "setkv_other_ms": 0.0,
+                        "setkv_pre_scatter_ms": 0.0,
+                        "setkv_post_scatter_ms": 0.0,
+                        "setkv_contig_k_ms": 0.0,
+                        "setkv_contig_v_ms": 0.0,
+                        "setkv_scale_fill_k_ms": 0.0,
+                        "setkv_scale_fill_v_ms": 0.0,
+                        "setkv_misc_ms": 0.0,
+                        "setkv_cpu_total_ms": 0.0,
+                        "setkv_cpu_prepare_ms": 0.0,
+                        "setkv_cpu_launch_ms": 0.0,
+                        "setkv_cpu_post_ms": 0.0,
+                        "setkv_pack_ms": 0.0,
+                        "setkv_k_scatter_ms": 0.0,
+                        "setkv_v_scatter_ms": 0.0,
+                        "qcopy_ms": 0.0,
+                        "attn_ms": 0.0,
+                        "other_ms": 0.0,
+                        "gpu_total_ms": 0.0,
+                        "cpu_total_ms": 0.0,
+                    }
+                do_timing = bool(_fi_timing_step_do)
+            else:
+                _sglang_flashinfer_timing_ctr += 1
+                do_timing = (_sglang_flashinfer_timing_ctr % max(1, sample_every)) == 0
+
+        if do_timing and torch.cuda.is_available():
+            torch.cuda.synchronize()
+            cpu_t0 = time.perf_counter()
+            # Record all timing events on a single, explicit stream to avoid
+            # cross-stream timestamp artifacts (which can inflate the "other_ms"
+            # bucket and make setkv/attn attribution unreliable).
+            timing_stream = torch.cuda.current_stream()
+            ev_total_start = torch.cuda.Event(enable_timing=True)
+            ev_total_end = torch.cuda.Event(enable_timing=True)
+            ev_total_start.record(timing_stream)
+            ev_setkv_start = torch.cuda.Event(enable_timing=True)
+            ev_setkv_end = torch.cuda.Event(enable_timing=True)
+            ev_qcopy_start = torch.cuda.Event(enable_timing=True)
+            ev_qcopy_end = torch.cuda.Event(enable_timing=True)
+            ev_attn_start = torch.cuda.Event(enable_timing=True)
+            ev_attn_end = torch.cuda.Event(enable_timing=True)
+        else:
+            cpu_t0 = None
+            timing_stream = None
+            ev_total_start = ev_total_end = None
+            ev_setkv_start = ev_setkv_end = None
+            ev_qcopy_start = ev_qcopy_end = None
+            ev_attn_start = ev_attn_end = None
+
+        setkv_profile = {"__timing_stream": timing_stream} if do_timing else None
+
         decode_wrapper = self.forward_metadata.decode_wrappers[
             self._get_wrapper_idx(layer)
         ]
@@ -1096,60 +2106,225 @@ class FlashInferAttnBackend(AttentionBackend):
             else forward_batch.encoder_out_cache_loc
         )
 
-        if _SGLANG_FLASHINFER_NVTX and _has_nvtx:
-            nvtx_range_kv = nvtx.range(f"flashinfer.decode.set_kv_layer{layer.layer_id}")
+        nvtx_range_kv = _nvtx_range(f"flashinfer.decode.set_kv_layer{layer.layer_id}")
+        if ev_setkv_start is not None:
+            ev_setkv_start.record(timing_stream)
         if k is not None:
             assert v is not None
             if save_kv_cache:
                 forward_batch.token_to_kv_pool.set_kv_buffer(
-                    layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+                    layer,
+                    cache_loc,
+                    k,
+                    v,
+                    layer.k_scale,
+                    layer.v_scale,
+                    profile_events=setkv_profile,
                 )
-        if _SGLANG_FLASHINFER_NVTX and _has_nvtx:
+        if ev_setkv_end is not None:
+            ev_setkv_end.record(timing_stream)
+        if nvtx_range_kv is not None:
             nvtx_range_kv.end()
 
-        if _SGLANG_FLASHINFER_NVTX and _has_nvtx:
-            nvtx_range_q = nvtx.range(f"flashinfer.decode.q_transform_layer{layer.layer_id}")
+        nvtx_range_q = _nvtx_range(f"flashinfer.decode.q_transform_layer{layer.layer_id}")
 
         q_reshaped = q.view(-1, layer.tp_q_head_num, layer.head_dim)
 
-        if self.forward_metadata.q_workspace_buffers is None:
-            self.forward_metadata.q_workspace_buffers = {}
+        # Fast path: if Q is already contiguous and dtype matches the kernel, avoid
+        # an extra device-to-device copy into q_workspace.
+        needs_q_workspace = not (q_reshaped.is_contiguous() and q_reshaped.dtype == self.paged_q_data_type)
+        if needs_q_workspace:
+            if self.forward_metadata.q_workspace_buffers is None:
+                self.forward_metadata.q_workspace_buffers = {}
 
-        q_workspace = self.forward_metadata.q_workspace_buffers.get(layer.layer_id, None)
-        if q_workspace is None or q_workspace.shape != q_reshaped.shape or q_workspace.dtype != self.paged_q_data_type:
-            q_workspace = torch.empty_like(q_reshaped, dtype=self.paged_q_data_type, device=q_reshaped.device)
-            self.forward_metadata.q_workspace_buffers[layer.layer_id] = q_workspace
+            q_workspace = self.forward_metadata.q_workspace_buffers.get(layer.layer_id, None)
+            if (
+                q_workspace is None
+                or q_workspace.shape != q_reshaped.shape
+                or q_workspace.dtype != self.paged_q_data_type
+            ):
+                q_workspace = torch.empty_like(
+                    q_reshaped, dtype=self.paged_q_data_type, device=q_reshaped.device
+                )
+                self.forward_metadata.q_workspace_buffers[layer.layer_id] = q_workspace
 
-        if _SGLANG_FLASHINFER_NVTX and _has_nvtx:
-            nvtx_range_q_copy = nvtx.range(f"flashinfer.decode.q_copy_layer{layer.layer_id}")
-        if q_reshaped.is_contiguous():
-            q_workspace.copy_(q_reshaped)
+            nvtx_range_q_copy = _nvtx_range(f"flashinfer.decode.q_copy_layer{layer.layer_id}")
+            if ev_qcopy_start is not None:
+                ev_qcopy_start.record(timing_stream)
+            if q_reshaped.is_contiguous():
+                q_workspace.copy_(q_reshaped)
+            else:
+                q_workspace.copy_(q_reshaped.contiguous())
+            if ev_qcopy_end is not None:
+                ev_qcopy_end.record(timing_stream)
+            if nvtx_range_q_copy is not None:
+                nvtx_range_q_copy.end()
+
+            q_for_kernel = q_workspace
         else:
-            q_for_kernel = q_reshaped.contiguous()
-            q_workspace.copy_(q_for_kernel)
-        if _SGLANG_FLASHINFER_NVTX and _has_nvtx:
-            nvtx_range_q_copy.end()
+            if ev_qcopy_start is not None:
+                ev_qcopy_start.record(timing_stream)
+            if ev_qcopy_end is not None:
+                ev_qcopy_end.record(timing_stream)
+            q_for_kernel = q_reshaped
 
-        if _SGLANG_FLASHINFER_NVTX and _has_nvtx:
+        if nvtx_range_q is not None:
             nvtx_range_q.end()
 
-        if _SGLANG_FLASHINFER_NVTX and _has_nvtx:
-            nvtx_range_attn = nvtx.range(f"flashinfer.decode.attention_kernel_layer{layer.layer_id}")
+        nvtx_range_attn = _nvtx_range(f"flashinfer.decode.attention_kernel_layer{layer.layer_id}")
+        if (layer.layer_id == 0) and (not self._logged_decode_dispatch_key):
+            self._logged_decode_dispatch_key = True
+            sinks = None if self._diag_disable_sinks else kwargs.get("sinks", None)
+            window_left = -1
+            if self.dispatch_reason == WrapperDispatch.SLIDING_WINDOW:
+                try:
+                    window_left = int(layer.sliding_window_size)
+                except Exception:
+                    window_left = int(self.model_runner.sliding_window_size or -1)
+            wrapper_backend = getattr(decode_wrapper, "_backend", None)
+            uri = getattr(decode_wrapper, "_fi_sink_uri", None)
+            jit_name = getattr(decode_wrapper, "_jit_module_name", None)
+            _append_profile_log(
+                "[FI_DISPATCH] decode "
+                f"wrapper={decode_wrapper.__class__.__name__} "
+                f"q_dtype={self.paged_q_data_type} kv_dtype={self.kv_cache_dtype} o_dtype={self.model_dtype} "
+                f"sinks={int(sinks is not None)} window_left={int(window_left)} "
+                f"decode_use_tensor_cores={int(bool(self.decode_use_tensor_cores))} "
+                f"decode_sinks_wrapper={getattr(self, 'decode_sinks_wrapper', 'unknown')} "
+                f"backend={wrapper_backend} uri={uri} jit_module_name={jit_name}"
+            )
+        if ev_attn_start is not None:
+            ev_attn_start.record(timing_stream)
 
         if isinstance(decode_wrapper, BatchDecodeWithPagedKVCacheWrapper):
-            o = decode_wrapper.forward(
-                q_workspace,
-                forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
-                sm_scale=layer.scaling,
-                logits_soft_cap=layer.logit_cap,
-                # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
-                k_scale=layer.k_scale_float,
-                v_scale=layer.v_scale_float,
-                sinks=kwargs.get("sinks", None),
-            )
+            # NOTE: `BatchDecodeWithPagedKVCacheWrapper.forward` is deprecated and
+            # can overwrite plan-time invariants (e.g. `window_left`). Use `run()`
+            # and only mutate the truly per-call scalars.
+            try:
+                decode_wrapper._sm_scale = layer.scaling
+                decode_wrapper._logits_soft_cap = layer.logit_cap
+            except Exception:
+                pass
+            sinks = None if self._diag_disable_sinks else kwargs.get("sinks", None)
+            kv_buf = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+            if sinks is not None:
+                # Decode-wrapper sinks MUST use the AttentionSink JIT module; otherwise sinks are
+                # silently ignored in the underlying fa2/fa3 paged_run wrapper and long-context
+                # quality collapses catastrophically.
+                if getattr(decode_wrapper, "_jit_module", None) is None:
+                    raise RuntimeError(
+                        "FlashInfer decode-wrapper is missing the AttentionSink JIT module; "
+                        "this path ignores sinks and will destroy long-context quality. "
+                        "Use SGLANG_FLASHINFER_DECODE_SINKS_WRAPPER=sink or rebuild decode wrappers with JIT."
+                    )
+
+                # Prefer robust sink-awareness detection from the FlashInfer wrapper itself
+                # (stored at construction-time) rather than relying only on SGLang-side
+                # monkey-patched markers, which may be absent on some wrapper instances
+                # (e.g. CUDA graph capture/replay paths).
+                sink_aware = False
+                try:
+                    if hasattr(decode_wrapper, "_fi_sink_uri"):
+                        sink_aware = True
+                    elif bool(getattr(decode_wrapper, "_jit_is_attention_sink", False)):
+                        sink_aware = True
+                    else:
+                        name = str(getattr(decode_wrapper, "_jit_module_name", "") or "")
+                        if "attention_sink" in name.lower():
+                            sink_aware = True
+                except Exception:
+                    sink_aware = False
+
+                if not sink_aware:
+                    raise RuntimeError(
+                        "FlashInfer sinks decode-wrapper selected, but wrapper does not appear sink-aware. "
+                        "This likely means sinks would be ignored (silent quality collapse). "
+                        f"jit_module_name={getattr(decode_wrapper, '_jit_module_name', None)!r} "
+                        f"has_fi_sink_uri={int(hasattr(decode_wrapper, '_fi_sink_uri'))}"
+                    )
+
+                # AttentionSink semantics: sinks is bf16 log-sink per Q head.
+                num_q_heads = int(layer.tp_q_head_num)
+                if sinks.numel() != num_q_heads:
+                    raise ValueError(
+                        "FlashInfer decode-wrapper sinks mismatch: expected sinks per Q head. "
+                        f"got numel={int(sinks.numel())} expected={num_q_heads} "
+                        f"(layer_id={layer.layer_id} num_q_heads={num_q_heads})"
+                    )
+                if sinks.dtype != torch.bfloat16:
+                    raise TypeError(
+                        "FlashInfer decode-wrapper (AttentionSink) requires bf16 sinks. "
+                        f"got dtype={sinks.dtype} (layer_id={layer.layer_id})"
+                    )
+                if failfast:
+                    finite = torch.isfinite(sinks).all()
+                    try:
+                        is_capturing = bool(torch.cuda.is_current_stream_capturing())
+                    except Exception:
+                        is_capturing = False
+                    if is_capturing:
+                        if hasattr(torch, "_assert_async"):
+                            torch._assert_async(finite, "[FI_FAILFAST] sinks contains NaN/Inf")
+                    else:
+                        try:
+                            if not bool(finite.item()):
+                                raise RuntimeError("sinks contains NaN/Inf")
+                        except Exception as e:
+                            msg = (
+                                "[FI_FAILFAST] sinks_invalid "
+                                f"layer={layer.layer_id} "
+                                f"sinks_shape={tuple(getattr(sinks, 'shape', ())) if hasattr(sinks, 'shape') else None} "
+                                f"sinks_dtype={getattr(sinks, 'dtype', None)} "
+                                f"err={e}"
+                            )
+                            _append_profile_log(msg)
+                            raise
+
+                sm_scale_val = (
+                    float(layer.scaling)
+                    if layer.scaling is not None
+                    else float(q_for_kernel.size(-1)) ** -0.5
+                )
+                if layer.k_scale_float is not None:
+                    sm_scale_val *= float(layer.k_scale_float)
+
+                window_left_for_run = -1
+                try:
+                    window_left_for_run = int(layer.sliding_window_size)
+                except Exception:
+                    try:
+                        window_left_for_run = int(self.model_runner.sliding_window_size or -1)
+                    except Exception:
+                        window_left_for_run = -1
+
+                # Pass (sinks, sm_scale) via positional args to the custom JIT module.
+                o = decode_wrapper.run(
+                    q_for_kernel,
+                    kv_buf,
+                    sinks,
+                    sm_scale_val,
+                    window_left=window_left_for_run,
+                    # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
+                    k_scale=None,
+                    v_scale=layer.v_scale_float,
+                )
+            else:
+                o = decode_wrapper.run(
+                    q_for_kernel,
+                    kv_buf,
+                    # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
+                    k_scale=layer.k_scale_float,
+                    v_scale=layer.v_scale_float,
+                    sinks=None,
+                )
         else:
+            # When using the AttentionSink wrapper path, pass `window_left` explicitly so
+            # the runtime behavior matches the wrapper specialization compiled in __init__.
+            window_left = -1
+            if self.dispatch_reason == WrapperDispatch.SLIDING_WINDOW:
+                window_left = self.model_runner.sliding_window_size
             o = decode_wrapper.forward(
-                q_workspace,
+                q_for_kernel,
                 forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
                 causal=False,
                 sm_scale=layer.scaling,
@@ -1157,10 +2332,292 @@ class FlashInferAttnBackend(AttentionBackend):
                 # Must use _float to avoid device-to-host copy that breaks cuda graph capture.
                 k_scale=layer.k_scale_float,
                 v_scale=layer.v_scale_float,
-                sinks=kwargs.get("sinks", None),
+                sinks=None if self._diag_disable_sinks else kwargs.get("sinks", None),
+                window_left=window_left,
             )
-        if _SGLANG_FLASHINFER_NVTX and _has_nvtx:
+        if nvtx_range_attn is not None:
             nvtx_range_attn.end()
+
+        if failfast:
+            finite = torch.isfinite(o).all()
+            try:
+                is_capturing = bool(torch.cuda.is_current_stream_capturing())
+            except Exception:
+                is_capturing = False
+            if is_capturing:
+                if hasattr(torch, "_assert_async"):
+                    torch._assert_async(
+                        finite, "[FI_FAILFAST] attention output contains NaN/Inf"
+                    )
+            else:
+                try:
+                    if not bool(finite.item()):
+                        raise RuntimeError("attention output contains NaN/Inf")
+                except Exception as e:
+                    msg = (
+                        "[FI_FAILFAST] attn_output_invalid "
+                        f"layer={layer.layer_id} "
+                        f"o_shape={tuple(o.shape)} o_dtype={o.dtype} "
+                        f"q_dtype={q_for_kernel.dtype} kv_dtype={self.kv_cache_dtype} "
+                        f"wrapper={decode_wrapper.__class__.__name__} "
+                        f"err={e}"
+                    )
+                    _append_profile_log(msg)
+                    raise
+
+        if ev_attn_end is not None:
+            ev_attn_end.record(timing_stream)
+        if ev_total_end is not None:
+            ev_total_end.record(timing_stream)
+            torch.cuda.synchronize()
+            cpu_t1 = time.perf_counter()
+            setkv_ms = (
+                ev_setkv_start.elapsed_time(ev_setkv_end) if ev_setkv_start is not None else 0.0
+            )
+            qcopy_ms = (
+                ev_qcopy_start.elapsed_time(ev_qcopy_end) if ev_qcopy_start is not None else 0.0
+            )
+            attn_ms = (
+                ev_attn_start.elapsed_time(ev_attn_end) if ev_attn_start is not None else 0.0
+            )
+            total_ms = (
+                ev_total_start.elapsed_time(ev_total_end) if ev_total_start is not None else 0.0
+            )
+            cpu_ms = (cpu_t1 - cpu_t0) * 1000.0 if cpu_t0 is not None else 0.0
+            other_ms = max(0.0, float(total_ms) - float(setkv_ms) - float(qcopy_ms) - float(attn_ms))
+            sample_id = _fi_timing_step_ctr if timing_all_layers else _sglang_flashinfer_timing_ctr
+
+            pre_setkv_ms = 0.0
+            between_setkv_qcopy_ms = 0.0
+            between_qcopy_attn_ms = 0.0
+            post_attn_ms = 0.0
+            if (
+                ev_total_start is not None
+                and ev_setkv_start is not None
+                and ev_setkv_end is not None
+                and ev_qcopy_start is not None
+                and ev_qcopy_end is not None
+                and ev_attn_start is not None
+                and ev_attn_end is not None
+            ):
+                # These gaps (GPU time) explain `other_ms` for decode: they cover all
+                # work that happens outside the explicit setkv/qcopy/attn buckets.
+                pre_setkv_ms = float(ev_total_start.elapsed_time(ev_setkv_start))
+                between_setkv_qcopy_ms = float(
+                    ev_setkv_end.elapsed_time(ev_qcopy_start)
+                )
+                between_qcopy_attn_ms = float(ev_qcopy_end.elapsed_time(ev_attn_start))
+                post_attn_ms = float(ev_attn_end.elapsed_time(ev_total_end))
+
+            setkv_quant_ms = 0.0
+            setkv_scatter_ms = 0.0
+            setkv_pre_scatter_ms = 0.0
+            setkv_post_scatter_ms = 0.0
+            setkv_contig_k_ms = 0.0
+            setkv_contig_v_ms = 0.0
+            setkv_scale_fill_k_ms = 0.0
+            setkv_scale_fill_v_ms = 0.0
+            setkv_pack_ms = 0.0
+            setkv_k_scatter_ms = 0.0
+            setkv_v_scatter_ms = 0.0
+            setkv_cpu_total_ms = 0.0
+            setkv_cpu_prepare_ms = 0.0
+            setkv_cpu_launch_ms = 0.0
+            setkv_cpu_post_ms = 0.0
+            if isinstance(setkv_profile, dict):
+                qev = setkv_profile.get("setkv_quant_ev", None)
+                sev = setkv_profile.get("setkv_scatter_ev", None)
+                ckev = setkv_profile.get("setkv_contig_k_ev", None)
+                cvev = setkv_profile.get("setkv_contig_v_ev", None)
+                sfkev = setkv_profile.get("setkv_scale_fill_k_ev", None)
+                sfvev = setkv_profile.get("setkv_scale_fill_v_ev", None)
+                pev = setkv_profile.get("setkv_pack_ev", None)
+                kev = setkv_profile.get("setkv_k_scatter_ev", None)
+                vev = setkv_profile.get("setkv_v_scatter_ev", None)
+                has_quant_ev = (
+                    isinstance(qev, tuple)
+                    and len(qev) == 2
+                    and qev[0] is not None
+                    and qev[1] is not None
+                )
+                has_scatter_ev = (
+                    isinstance(sev, tuple)
+                    and len(sev) == 2
+                    and sev[0] is not None
+                    and sev[1] is not None
+                )
+                has_pack_ev = (
+                    isinstance(pev, tuple)
+                    and len(pev) == 2
+                    and pev[0] is not None
+                    and pev[1] is not None
+                )
+                has_contig_k_ev = (
+                    isinstance(ckev, tuple)
+                    and len(ckev) == 2
+                    and ckev[0] is not None
+                    and ckev[1] is not None
+                )
+                has_contig_v_ev = (
+                    isinstance(cvev, tuple)
+                    and len(cvev) == 2
+                    and cvev[0] is not None
+                    and cvev[1] is not None
+                )
+                has_scale_fill_k_ev = (
+                    isinstance(sfkev, tuple)
+                    and len(sfkev) == 2
+                    and sfkev[0] is not None
+                    and sfkev[1] is not None
+                )
+                has_scale_fill_v_ev = (
+                    isinstance(sfvev, tuple)
+                    and len(sfvev) == 2
+                    and sfvev[0] is not None
+                    and sfvev[1] is not None
+                )
+                has_k_scatter_ev = (
+                    isinstance(kev, tuple)
+                    and len(kev) == 2
+                    and kev[0] is not None
+                    and kev[1] is not None
+                )
+                has_v_scatter_ev = (
+                    isinstance(vev, tuple)
+                    and len(vev) == 2
+                    and vev[0] is not None
+                    and vev[1] is not None
+                )
+                try:
+                    setkv_cpu_total_ms = float(
+                        setkv_profile.get("setkv_cpu_total_ms", 0.0) or 0.0
+                    )
+                except Exception:
+                    setkv_cpu_total_ms = 0.0
+                try:
+                    setkv_cpu_prepare_ms = float(
+                        setkv_profile.get("setkv_cpu_prepare_ms", 0.0) or 0.0
+                    )
+                except Exception:
+                    setkv_cpu_prepare_ms = 0.0
+                try:
+                    setkv_cpu_launch_ms = float(
+                        setkv_profile.get("setkv_cpu_launch_ms", 0.0) or 0.0
+                    )
+                except Exception:
+                    setkv_cpu_launch_ms = 0.0
+                try:
+                    setkv_cpu_post_ms = float(
+                        setkv_profile.get("setkv_cpu_post_ms", 0.0) or 0.0
+                    )
+                except Exception:
+                    setkv_cpu_post_ms = 0.0
+                if has_quant_ev:
+                    setkv_quant_ms = float(qev[0].elapsed_time(qev[1]))
+                if has_scatter_ev:
+                    setkv_scatter_ms = float(sev[0].elapsed_time(sev[1]))
+                    # Additional breakdown (helps debug fused FP8 setkv): isolate time before/after
+                    # the scatter region inside the setkv envelope.
+                    try:
+                        if ev_setkv_start is not None:
+                            setkv_pre_scatter_ms = float(
+                                ev_setkv_start.elapsed_time(sev[0])
+                            )
+                        if ev_setkv_end is not None:
+                            setkv_post_scatter_ms = float(
+                                sev[1].elapsed_time(ev_setkv_end)
+                            )
+                    except Exception:
+                        setkv_pre_scatter_ms = 0.0
+                        setkv_post_scatter_ms = 0.0
+                elif has_quant_ev:
+                    # Fallback: if we failed to isolate scatter on-stream, approximate it
+                    # as the remainder of setkv time after quantization.
+                    setkv_scatter_ms = max(0.0, float(setkv_ms) - float(setkv_quant_ms))
+                else:
+                    setkv_scatter_ms = float(setkv_ms)
+
+                if has_pack_ev:
+                    setkv_pack_ms = float(pev[0].elapsed_time(pev[1]))
+                if has_contig_k_ev:
+                    setkv_contig_k_ms = float(ckev[0].elapsed_time(ckev[1]))
+                if has_contig_v_ev:
+                    setkv_contig_v_ms = float(cvev[0].elapsed_time(cvev[1]))
+                if has_scale_fill_k_ev:
+                    setkv_scale_fill_k_ms = float(sfkev[0].elapsed_time(sfkev[1]))
+                if has_scale_fill_v_ev:
+                    setkv_scale_fill_v_ms = float(sfvev[0].elapsed_time(sfvev[1]))
+                if has_k_scatter_ev:
+                    setkv_k_scatter_ms = float(kev[0].elapsed_time(kev[1]))
+                if has_v_scatter_ev:
+                    setkv_v_scatter_ms = float(vev[0].elapsed_time(vev[1]))
+            setkv_other_ms = max(
+                0.0, float(setkv_ms) - float(setkv_quant_ms) - float(setkv_scatter_ms)
+            )
+            setkv_misc_ms = max(
+                0.0,
+                float(setkv_ms)
+                - float(setkv_quant_ms)
+                - float(setkv_scatter_ms)
+                - float(setkv_contig_k_ms)
+                - float(setkv_contig_v_ms)
+                - float(setkv_scale_fill_k_ms)
+                - float(setkv_scale_fill_v_ms),
+            )
+
+            timing_line = (
+                "[FI_TIMING] "
+                f"mode=decode layer={layer.layer_id} sample={sample_id} "
+                f"wrapper={decode_wrapper.__class__.__name__} "
+                f"kv_cache_dtype={self.kv_cache_dtype} q_dtype={self.paged_q_data_type} "
+                f"pre_setkv_ms={pre_setkv_ms:.3f} between_setkv_qcopy_ms={between_setkv_qcopy_ms:.3f} "
+                f"between_qcopy_attn_ms={between_qcopy_attn_ms:.3f} post_attn_ms={post_attn_ms:.3f} "
+                f"setkv_ms={setkv_ms:.3f} setkv_quant_ms={setkv_quant_ms:.3f} setkv_scatter_ms={setkv_scatter_ms:.3f} "
+                f"setkv_other_ms={setkv_other_ms:.3f} "
+                f"setkv_pre_scatter_ms={setkv_pre_scatter_ms:.3f} setkv_post_scatter_ms={setkv_post_scatter_ms:.3f} "
+                f"setkv_contig_k_ms={setkv_contig_k_ms:.3f} setkv_contig_v_ms={setkv_contig_v_ms:.3f} "
+                f"setkv_scale_fill_k_ms={setkv_scale_fill_k_ms:.3f} setkv_scale_fill_v_ms={setkv_scale_fill_v_ms:.3f} "
+                f"setkv_misc_ms={setkv_misc_ms:.3f} "
+                f"setkv_cpu_total_ms={setkv_cpu_total_ms:.3f} "
+                f"setkv_cpu_prepare_ms={setkv_cpu_prepare_ms:.3f} "
+                f"setkv_cpu_launch_ms={setkv_cpu_launch_ms:.3f} "
+                f"setkv_cpu_post_ms={setkv_cpu_post_ms:.3f} "
+                f"setkv_pack_ms={setkv_pack_ms:.3f} setkv_k_scatter_ms={setkv_k_scatter_ms:.3f} setkv_v_scatter_ms={setkv_v_scatter_ms:.3f} "
+                f"qcopy_ms={qcopy_ms:.3f} attn_ms={attn_ms:.3f} "
+                f"other_ms={other_ms:.3f} gpu_total_ms={total_ms:.3f} cpu_total_ms={cpu_ms:.3f}"
+            )
+            print(timing_line, flush=True)
+            _append_profile_log(timing_line)
+
+            if timing_all_layers and _fi_timing_acc is not None and _fi_timing_acc.get("do", False):
+                _fi_timing_acc["layers"] += 1
+                _fi_timing_acc["pre_setkv_ms"] += float(pre_setkv_ms)
+                _fi_timing_acc["between_setkv_qcopy_ms"] += float(between_setkv_qcopy_ms)
+                _fi_timing_acc["between_qcopy_attn_ms"] += float(between_qcopy_attn_ms)
+                _fi_timing_acc["post_attn_ms"] += float(post_attn_ms)
+                _fi_timing_acc["setkv_ms"] += float(setkv_ms)
+                _fi_timing_acc["setkv_quant_ms"] += float(setkv_quant_ms)
+                _fi_timing_acc["setkv_scatter_ms"] += float(setkv_scatter_ms)
+                _fi_timing_acc["setkv_other_ms"] += float(setkv_other_ms)
+                _fi_timing_acc["setkv_pre_scatter_ms"] += float(setkv_pre_scatter_ms)
+                _fi_timing_acc["setkv_post_scatter_ms"] += float(setkv_post_scatter_ms)
+                _fi_timing_acc["setkv_contig_k_ms"] += float(setkv_contig_k_ms)
+                _fi_timing_acc["setkv_contig_v_ms"] += float(setkv_contig_v_ms)
+                _fi_timing_acc["setkv_scale_fill_k_ms"] += float(setkv_scale_fill_k_ms)
+                _fi_timing_acc["setkv_scale_fill_v_ms"] += float(setkv_scale_fill_v_ms)
+                _fi_timing_acc["setkv_misc_ms"] += float(setkv_misc_ms)
+                _fi_timing_acc["setkv_cpu_total_ms"] += float(setkv_cpu_total_ms)
+                _fi_timing_acc["setkv_cpu_prepare_ms"] += float(setkv_cpu_prepare_ms)
+                _fi_timing_acc["setkv_cpu_launch_ms"] += float(setkv_cpu_launch_ms)
+                _fi_timing_acc["setkv_cpu_post_ms"] += float(setkv_cpu_post_ms)
+                _fi_timing_acc["setkv_pack_ms"] += float(setkv_pack_ms)
+                _fi_timing_acc["setkv_k_scatter_ms"] += float(setkv_k_scatter_ms)
+                _fi_timing_acc["setkv_v_scatter_ms"] += float(setkv_v_scatter_ms)
+                _fi_timing_acc["qcopy_ms"] += float(qcopy_ms)
+                _fi_timing_acc["attn_ms"] += float(attn_ms)
+                _fi_timing_acc["other_ms"] += float(other_ms)
+                _fi_timing_acc["gpu_total_ms"] += float(total_ms)
+                _fi_timing_acc["cpu_total_ms"] += float(cpu_ms)
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
@@ -1191,7 +2648,10 @@ class FlashInferIndicesUpdaterDecode:
         self.o_data_type = model_runner.dtype
         self.sliding_window_size = model_runner.sliding_window_size
         self.attn_backend = attn_backend
-        self._use_prefill_wrapper_for_decode = attn_backend.requires_attention_sinks
+        self._use_prefill_wrapper_for_decode = bool(
+            attn_backend.requires_attention_sinks
+            and not getattr(attn_backend, "use_decode_wrapper_for_sinks", False)
+        )
         self._qo_indptr = None
         self._qo_indptr_range = None
         if self._use_prefill_wrapper_for_decode:
@@ -1398,6 +2858,12 @@ class FlashInferIndicesUpdaterDecode:
             kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
             bs = kv_indptr.shape[0] - 1
 
+        if use_sliding_window_kv_pool and spec_info is not None:
+            # Diagnostic toggle: if set, skip SWA translation for speculative runs.
+            # (Kept off by default; correctness investigation only.)
+            if os.getenv("SGLANG_FLASHINFER_SPEC_SKIP_SWA_TRANSLATE", "0") == "1":
+                use_sliding_window_kv_pool = False
+
         if use_sliding_window_kv_pool:
             kv_last_index = kv_indptr[-1]
             kv_indices[:kv_last_index] = (
@@ -1415,6 +2881,15 @@ class FlashInferIndicesUpdaterDecode:
             global_override_indptr_cpu[1 : bs + 1] = torch.cumsum(seq_lens_cpu, dim=0)
 
         if isinstance(wrapper, BatchDecodeWithPagedKVCacheWrapper):
+            window_left = -1
+            if (
+                getattr(self.attn_backend, "dispatch_reason", None)
+                == WrapperDispatch.SLIDING_WINDOW
+                and kv_start_idx is not None
+                and self.sliding_window_size is not None
+            ):
+                window_left = int(self.sliding_window_size)
+
             # Check if this specific wrapper's begin_forward has been replaced with fast_decode_plan
             # by checking if it's a partial function with fast_decode_plan as the func
             wrapper_uses_fast_decode_plan = (
@@ -1434,6 +2909,8 @@ class FlashInferIndicesUpdaterDecode:
                     1,
                     data_type=self.data_type,
                     q_data_type=self.q_data_type,
+                    o_data_type=self.o_data_type,
+                    window_left=window_left,
                     non_blocking=True,
                     fixed_split_size=fixed_split_size,
                     disable_split_kv=(
@@ -1453,6 +2930,7 @@ class FlashInferIndicesUpdaterDecode:
                     1,
                     data_type=self.data_type,
                     q_data_type=self.q_data_type,
+                    window_left=window_left,
                     o_data_type=self.o_data_type,
                     non_blocking=True,
                     fixed_split_size=fixed_split_size,
@@ -1506,7 +2984,7 @@ class FlashInferIndicesUpdaterPrefill:
         self.head_dim = model_runner.model_config.head_dim
         self.data_type = model_runner.kv_cache_dtype
         self.q_data_type_ragged = model_runner.dtype
-        self.q_data_type_paged = attn_backend.paged_q_data_type
+        self.q_data_type_paged = attn_backend.prefill_q_data_type
         self.o_data_type = model_runner.dtype
         self.sliding_window_size = model_runner.sliding_window_size
         self.attn_backend = attn_backend
@@ -1721,14 +3199,60 @@ class FlashInferIndicesUpdaterPrefill:
             custom_mask = None
         else:
             assert isinstance(spec_info, SpecInput)
+            paged_kernel_lens_for_spec = paged_kernel_lens
+            paged_kernel_lens_sum_for_spec = paged_kernel_lens_sum
+            # IMPORTANT (EAGLE verify + SWA):
+            # Some scheduler paths pass `seq_lens` that already includes the verify tokens
+            # (i.e. `seq_lens - prefix_lens == draft_token_num`). EagleVerifyInput's
+            # `generate_attn_arg_prefill()` adds `draft_token_num` internally, so passing a
+            # lens that already includes them will double-count and mis-size the custom mask.
+            if spec_info.spec_input_type == SpecInputType.EAGLE_VERIFY:
+                draft_token_num = int(getattr(spec_info, "draft_token_num", 0) or 0)
+                if draft_token_num > 0:
+                    extend_lens = (seq_lens - prefix_lens)[:bs]
+                    if torch.all(extend_lens == draft_token_num):
+                        paged_kernel_lens_for_spec = paged_kernel_lens - draft_token_num
+                        paged_kernel_lens_sum_for_spec = paged_kernel_lens_sum - (
+                            draft_token_num * bs
+                        )
+                        if not getattr(self, "_logged_eagle_verify_len_fix", False):
+                            self._logged_eagle_verify_len_fix = True
+                            _append_profile_log(
+                                "[FI_EAGLE_VERIFY] Adjust paged_kernel_lens to exclude "
+                                f"draft_token_num={draft_token_num} (avoid double-count)."
+                            )
             kv_indices, kv_indptr, qo_indptr, custom_mask = (
                 spec_info.generate_attn_arg_prefill(
                     req_pool_indices,
-                    paged_kernel_lens,
-                    paged_kernel_lens_sum,
+                    paged_kernel_lens_for_spec,
+                    paged_kernel_lens_sum_for_spec,
                     self.req_to_token,
                 )
             )
+            # IMPORTANT (SWA + speculative/EAGLE):
+            # When sliding-window attention is active, `kv_start_idx` must be applied so
+            # that the KV indices correspond to the *tail window* (plus any newly-extended
+            # tokens) rather than the prefix window [0..window). Some SpecInput
+            # implementations generate KV indices assuming full-context; for SWA wrappers
+            # we must rebuild KV indices using `kv_start_idx`.
+            if kv_start_idx is not None:
+                kv_total = int(kv_indptr[-1].item())
+                kv_lens = (kv_indptr[1 : bs + 1] - kv_indptr[:bs]).to(
+                    dtype=paged_kernel_lens.dtype, device=req_pool_indices.device
+                )
+                kv_indices_swa = torch.empty(
+                    kv_total + 256, dtype=torch.int32, device=req_pool_indices.device
+                )
+                create_flashinfer_kv_indices_triton[(bs,)](
+                    self.req_to_token,
+                    req_pool_indices,
+                    kv_lens,
+                    kv_indptr,
+                    kv_start_idx,
+                    kv_indices_swa,
+                    self.req_to_token.shape[1],
+                )
+                kv_indices = kv_indices_swa
 
         # extend part
         if use_ragged:
@@ -1741,6 +3265,12 @@ class FlashInferIndicesUpdaterPrefill:
                 q_data_type=self.q_data_type_ragged,
             )
 
+        if use_sliding_window_kv_pool and spec_info is not None:
+            # Diagnostic toggle: if set, skip SWA translation for speculative runs.
+            # (Use for correctness triage only; keep off by default.)
+            if os.getenv("SGLANG_FLASHINFER_SPEC_SKIP_SWA_TRANSLATE", "0") == "1":
+                use_sliding_window_kv_pool = False
+
         if use_sliding_window_kv_pool:
             kv_last_index = kv_indptr[-1]
             kv_indices[:kv_last_index] = (
@@ -1750,16 +3280,28 @@ class FlashInferIndicesUpdaterPrefill:
             )
 
         # cached part
-        # Conditionally set multi-item parameters
-        if multi_item_params is not None and multi_item_params.is_enabled():
-            # Multi-item scoring is active - use specialized parameters and disable generic custom_mask
+        # Conditionally set multi-item parameters.
+        #
+        # IMPORTANT for GPT-OSS sinks + EAGLE:
+        # FlashInfer's MaskMode::kMultiItemScoring path has shown severe quality regressions
+        # for speculative decoding when GPT-OSS attention sinks are enabled (bs>1). Until we
+        # establish parity, force the custom-mask path for speculative runs and sinks models.
+        multi_item_enabled = bool(multi_item_params is not None and multi_item_params.is_enabled())
+        allow_multi_item_with_sinks = get_bool_env_var(
+            "SGLANG_FLASHINFER_ALLOW_MULTI_ITEM_WITH_SINKS", "false"
+        )
+        force_custom_mask = bool(
+            spec_info is not None
+            and self.attn_backend.requires_attention_sinks
+            and not allow_multi_item_with_sinks
+        )
+        if multi_item_enabled and not force_custom_mask:
             use_custom_mask = None
             prefix_len_ptr = multi_item_params.prefix_len_ptr
             token_pos_in_items_ptr = multi_item_params.token_pos_in_items_ptr
             token_pos_in_items_len = multi_item_params.token_pos_in_items_len
             max_item_len_ptr = multi_item_params.max_item_len_ptr
         else:
-            # No multi-item scoring - use standard parameters
             use_custom_mask = custom_mask
             prefix_len_ptr = None
             token_pos_in_items_ptr = None
@@ -1866,8 +3408,33 @@ class FlashInferMultiStepDraftBackend:
         assert forward_batch.spec_info is not None
         assert forward_batch.spec_info.is_draft_input()
 
-        # Copy the kv_indptr once to avoid multiple device-to-host copies in flashinfer's plan.
-        indptr_cpu_whole = self.kv_indptr[:, : bs + 1].cpu()
+        # IMPORTANT (CUDA graphs):
+        # Avoid any device->host copies here (e.g. `.cpu()` on a CUDA tensor). In CUDA-graph
+        # replay this can trigger illegal memory access / MMU faults (XID 31) on H100.
+        #
+        # For draft decode, kv_indptr is a pure prefix-sum over per-sequence KV lengths.
+        # We can reconstruct the exact CPU indptr deterministically from seq_lens_cpu and
+        # the speculative step index, without touching CUDA memory.
+        seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
+        indptr_cpu_whole = None
+        if seq_lens_cpu is not None:
+            # seq_lens_cpu: (num_seqs,) -> expand to (bs,) by repeating per topk beam.
+            expanded_seq_lens = seq_lens_cpu[:num_seqs].repeat_interleave(self.topk)
+            indptr_cpu_whole = torch.empty(
+                (self.speculative_num_steps, bs + 1),
+                dtype=self.kv_indptr.dtype,
+                device="cpu",
+            )
+            indptr_cpu_whole.zero_()
+            for step_i in range(self.speculative_num_steps - 1):
+                # At speculative step_i, each beam has (base_len + (step_i + 1)) KV items.
+                indptr_cpu_whole[step_i, 0] = 0
+                indptr_cpu_whole[step_i, 1 : bs + 1] = torch.cumsum(
+                    expanded_seq_lens + (step_i + 1), dim=0
+                )
+        else:
+            # Fallback (non-graph / debugging): materialize from CUDA.
+            indptr_cpu_whole = self.kv_indptr[:, : bs + 1].cpu()
         global global_override_indptr_cpu
 
         for i in range(self.speculative_num_steps - 1):
@@ -1902,8 +3469,14 @@ class FlashInferMultiStepDraftBackend:
         self.common_template(forward_batch, kv_indices, call_fn)
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
+        # `max_bs` is the number of sequences (requests) captured by the EAGLE draft runner.
+        # In EAGLE, the draft model processes `topk` beams per sequence, so the draft-decode
+        # "token batch size" is `max_num_tokens = max_bs * topk`.
+        #
+        # The KV-indices buffer is indexed by (spec_step, token_batch, max_context_len),
+        # so it must be sized by `max_num_tokens * max_context_len`, not `max_bs * max_context_len`.
         self.cuda_graph_kv_indices = torch.zeros(
-            (self.speculative_num_steps, max_bs * self.max_context_len),
+            (self.speculative_num_steps, max_num_tokens * self.max_context_len),
             dtype=torch.int32,
             device="cuda",
         )

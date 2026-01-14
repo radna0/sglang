@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import json
+import threading
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
@@ -8,6 +10,11 @@ import numpy as np
 import torch
 import triton
 import triton.language as tl
+
+try:
+    import fa3_fp8_qscale_ext as _fa3_fp8_qscale_ext
+except Exception:
+    _fa3_fp8_qscale_ext = None
 
 try:
     import torch.cuda.nvtx as nvtx
@@ -300,6 +307,153 @@ def merge_state_v2_wrapper(o, s_a, o_exp, s_b):
     return merge_state_v2(o, s_a, o_exp, s_b)
 
 
+class _FA3Timing:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._attn_pairs: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
+        self._setkv_pairs: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
+
+    @staticmethod
+    def _enabled() -> bool:
+        # IMPORTANT: scheduler/model execution runs in subprocesses. For profiling we
+        # must be able to enable timing at runtime (e.g., after CUDA graph capture)
+        # via an RPC call executed inside the scheduler process.
+        override = globals().get("_FA3_TIMING_RUNTIME_ENABLED", None)
+        if override is not None:
+            return bool(override)
+        return os.getenv("SGLANG_FA3_TIMING", "0") == "1"
+
+    @staticmethod
+    def _log_path() -> str:
+        return os.getenv("SGLANG_REMOTE_PROFILE_LOG", "")
+
+    @staticmethod
+    def _log(msg: str) -> None:
+        path = _FA3Timing._log_path()
+        if path:
+            try:
+                with open(path, "a", encoding="utf-8", errors="replace") as wf:
+                    wf.write(msg.rstrip() + "\n")
+                return
+            except Exception:
+                pass
+        try:
+            print(msg, flush=True)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _record_pair(
+        store: list[tuple[torch.cuda.Event, torch.cuda.Event]],
+        start: torch.cuda.Event,
+    ) -> None:
+        end = torch.cuda.Event(enable_timing=True)
+        end.record()
+        store.append((start, end))
+
+    def start(self) -> torch.cuda.Event | None:
+        if not self._enabled():
+            return None
+        e = torch.cuda.Event(enable_timing=True)
+        e.record()
+        return e
+
+    def end_attn(self, start: torch.cuda.Event | None) -> None:
+        if start is None or not self._enabled():
+            return
+        with self._lock:
+            self._record_pair(self._attn_pairs, start)
+
+    def end_setkv(self, start: torch.cuda.Event | None) -> None:
+        if start is None or not self._enabled():
+            return
+        with self._lock:
+            self._record_pair(self._setkv_pairs, start)
+
+    def dump_and_reset(self, tag: str) -> dict[str, float]:
+        if not self._enabled():
+            return {}
+        with self._lock:
+            attn_pairs = self._attn_pairs
+            setkv_pairs = self._setkv_pairs
+            self._attn_pairs = []
+            self._setkv_pairs = []
+
+        if not attn_pairs and not setkv_pairs:
+            return {}
+
+        torch.cuda.synchronize()
+
+        def _sum_ms(pairs: list[tuple[torch.cuda.Event, torch.cuda.Event]]) -> float:
+            total = 0.0
+            for s, e in pairs:
+                try:
+                    total += float(s.elapsed_time(e))
+                except Exception:
+                    continue
+            return total
+
+        attn_ms = _sum_ms(attn_pairs)
+        setkv_ms = _sum_ms(setkv_pairs)
+        total_ms = attn_ms + setkv_ms
+
+        payload = {
+            "tag": tag,
+            "attn_ms": attn_ms,
+            "setkv_ms": setkv_ms,
+            "total_ms": total_ms,
+            "attn_share": (attn_ms / total_ms) if total_ms > 0 else 0.0,
+            "setkv_share": (setkv_ms / total_ms) if total_ms > 0 else 0.0,
+            "attn_pairs": float(len(attn_pairs)),
+            "setkv_pairs": float(len(setkv_pairs)),
+        }
+        self._log("[FA3_TIMING_AGG] " + json.dumps(payload, sort_keys=True))
+        return payload
+
+
+_fa3_timing = _FA3Timing()
+
+_FA3_TIMING_RUNTIME_ENABLED: bool | None = None
+
+
+def set_fa3_timing_runtime_enabled(enabled: bool) -> None:
+    global _FA3_TIMING_RUNTIME_ENABLED
+    _FA3_TIMING_RUNTIME_ENABLED = bool(enabled)
+    _FA3Timing._log(f"[FA3_TIMING_CTRL] runtime_enabled={int(bool(enabled))}")
+
+
+def reset_fa3_timing() -> None:
+    if not _FA3Timing._enabled():
+        return
+    with _fa3_timing._lock:
+        _fa3_timing._attn_pairs = []
+        _fa3_timing._setkv_pairs = []
+    _FA3Timing._log("[FA3_TIMING_CTRL] reset=1")
+
+
+def dump_fa3_timing(tag: str) -> dict[str, float]:
+    enabled = _FA3Timing._enabled()
+    payload = _fa3_timing.dump_and_reset(tag)
+    if payload:
+        payload["enabled"] = float(1 if enabled else 0)
+        return payload
+    # Return a non-empty payload even if timing is disabled or no pairs were recorded,
+    # so the caller can distinguish "not enabled" vs "enabled but zero samples".
+    payload = {
+        "tag": tag,
+        "enabled": float(1 if enabled else 0),
+        "attn_ms": 0.0,
+        "setkv_ms": 0.0,
+        "total_ms": 0.0,
+        "attn_share": 0.0,
+        "setkv_share": 0.0,
+        "attn_pairs": 0.0,
+        "setkv_pairs": 0.0,
+    }
+    _FA3Timing._log(f"[FA3_TIMING_AGG] {json.dumps(payload, sort_keys=True)}")
+    return payload
+
+
 class FlashAttentionBackend(AttentionBackend):
     """FlashAttention backend implementation.
 
@@ -365,6 +519,15 @@ class FlashAttentionBackend(AttentionBackend):
         self.speculative_step_id = speculative_step_id
 
         self.fa_impl_ver = fa_impl_ver
+        # Cache small constant tensors to avoid per-step allocations (important for CUDA graphs).
+        # Keyed by (batch_size, kv_heads, device).
+        self._fp8_q_descale_cache: dict[tuple[int, int, torch.device], torch.Tensor] = {}
+        # Cache FP8 Q buffers to avoid per-step allocations (important for CUDA graphs).
+        # Keyed by (total_q, q_heads, head_dim, dtype, device).
+        self._fp8_q_fp8_cache: dict[
+            tuple[int, int, int, torch.dtype, torch.device], torch.Tensor
+        ] = {}
+        self._fa3_fp8_qscale_logged = False
 
         # Local attention settings
         self.has_local_attention = model_runner.model_config.is_local_attention_model
@@ -387,6 +550,135 @@ class FlashAttentionBackend(AttentionBackend):
         self.num_splits = (
             1 if model_runner.server_args.enable_deterministic_inference else 0
         )
+
+    def _fa3_quantize_q_fp8_fixed_stride(
+        self,
+        q: torch.Tensor,
+        *,
+        cu_seqlens_q: Optional[torch.Tensor],
+        max_seqlen_q: Optional[int],
+        q_heads: int,
+        kv_heads: int,
+    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """
+        Prepare scaled FP8 Q for FA3 FP8 paths.
+
+        Returns `(q_fp8, q_descale)` where `q_descale` has shape `(batch, kv_heads)` and
+        `q_fp8 * q_descale` approximates the original Q values.
+
+        This helper only handles the CUDA-graph-friendly "fixed stride" layout where each
+        sequence has exactly `max_seqlen_q` query tokens and `q` is laid out as:
+          (batch * max_seqlen_q, q_heads, head_dim)
+
+        If the layout doesn't match, returns `(None, None)` and the caller should fall back.
+        """
+        if (
+            not str(self.kv_cache_dtype_str).startswith("fp8")
+            or self.kv_cache_dtype is None
+            or cu_seqlens_q is None
+            or max_seqlen_q is None
+            or max_seqlen_q <= 0
+        ):
+            return None, None
+
+        if q_heads % kv_heads != 0:
+            return None, None
+
+        batch = int(cu_seqlens_q.numel() - 1)
+        total_q = int(q.shape[0])
+        if total_q != batch * int(max_seqlen_q):
+            return None, None
+
+        group = int(q_heads // kv_heads)
+        try:
+            fp8_max = float(torch.finfo(self.kv_cache_dtype).max)
+        except Exception:
+            fp8_max = 448.0
+
+        denom = total_q * int(q_heads)
+        if denom <= 0 or (int(q.numel()) % denom) != 0:
+            return None, None
+        head_dim = int(int(q.numel()) // denom)
+        if head_dim <= 0:
+            return None, None
+
+        q_3d = q.contiguous().view(total_q, int(q_heads), head_dim)
+        q_descale = self._get_fp8_q_descale(batch, kv_heads, q.device)
+        q_fp8 = self._get_fp8_q_fp8(total_q, q_heads, head_dim, q.device, self.kv_cache_dtype)
+
+        if _fa3_fp8_qscale_ext is not None:
+            try:
+                _fa3_fp8_qscale_ext.quantize_q_fp8_fixed_stride(
+                    q_3d,
+                    q_fp8,
+                    q_descale,
+                    int(max_seqlen_q),
+                    int(q_heads),
+                    int(kv_heads),
+                    float(fp8_max),
+                )
+            except Exception:
+                return None, None
+        else:
+            q_view = q_3d.view(batch, int(max_seqlen_q), q_heads, -1)
+            q_grouped = q_view.view(batch, int(max_seqlen_q), kv_heads, group, -1)
+
+            maxabs = q_grouped.abs().to(torch.float32).amax(dim=(1, 3, 4))
+            q_descale = (maxabs / fp8_max).to(torch.float32)
+
+            q_descale_broadcast = q_descale[:, None, :, None, None]
+            scale_inv = torch.where(
+                q_descale_broadcast > 0, 1.0 / q_descale_broadcast, 0.0
+            )
+            q_scaled = (q_grouped.to(torch.float32) * scale_inv).clamp(-fp8_max, fp8_max)
+            q_fp8.copy_(
+                q_scaled.to(self.kv_cache_dtype).view(batch * int(max_seqlen_q), q_heads, -1)
+            )
+
+        if (not self._fa3_fp8_qscale_logged) and (
+            os.getenv("SGLANG_FA3_FP8_QSCALE", "0") == "1"
+            or os.getenv("SGLANG_FA3_FP8_QSCALE_LOG", "0") == "1"
+        ):
+            self._fa3_fp8_qscale_logged = True
+            try:
+                print(
+                    "[FA3_FP8_QSCALE] "
+                    f"batch={batch} max_seqlen_q={int(max_seqlen_q)} "
+                    f"q_heads={q_heads} kv_heads={kv_heads} "
+                    f"q_in={q.dtype} q_out={q_fp8.dtype} q_descale={q_descale.dtype} "
+                    f"impl={'ext' if _fa3_fp8_qscale_ext is not None else 'torch'} "
+                    f"env_qscale={os.getenv('SGLANG_FA3_FP8_QSCALE', '')} "
+                    f"env_log={os.getenv('SGLANG_FA3_FP8_QSCALE_LOG', '')}",
+                    flush=True,
+                )
+            except Exception:
+                pass
+        return q_fp8, q_descale
+
+    def _get_fp8_q_descale(
+        self, batch_size: int, kv_heads: int, device: torch.device
+    ) -> torch.Tensor:
+        key = (int(batch_size), int(kv_heads), device)
+        cached = self._fp8_q_descale_cache.get(key)
+        if cached is None:
+            cached = torch.ones((batch_size, kv_heads), dtype=torch.float32, device=device)
+            self._fp8_q_descale_cache[key] = cached
+        return cached
+
+    def _get_fp8_q_fp8(
+        self,
+        total_q: int,
+        q_heads: int,
+        head_dim: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        key = (int(total_q), int(q_heads), int(head_dim), dtype, device)
+        cached = self._fp8_q_fp8_cache.get(key)
+        if cached is None:
+            cached = torch.empty((total_q, q_heads, head_dim), dtype=dtype, device=device)
+            self._fp8_q_fp8_cache[key] = cached
+        return cached
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize forward metadata hence all layers in the forward pass can reuse it."""
@@ -745,16 +1037,25 @@ class FlashAttentionBackend(AttentionBackend):
                     else forward_batch.encoder_out_cache_loc
                 )
                 if not self.use_mla:
+                    _t_setkv = _fa3_timing.start()
                     forward_batch.token_to_kv_pool.set_kv_buffer(
-                        layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+                        layer,
+                        cache_loc,
+                        k,
+                        v,
+                        getattr(layer, "k_scale_float", None),
+                        getattr(layer, "v_scale_float", None),
                     )
+                    _fa3_timing.end_setkv(_t_setkv)
                 else:
+                    _t_setkv = _fa3_timing.start()
                     forward_batch.token_to_kv_pool.set_mla_kv_buffer(
                         layer,
                         cache_loc,
                         k,
                         k_rope,
                     )
+                    _fa3_timing.end_setkv(_t_setkv)
 
         # Use precomputed metadata across all layers
         metadata = self.forward_metadata
@@ -766,7 +1067,10 @@ class FlashAttentionBackend(AttentionBackend):
             layer.sliding_window_size is not None and layer.sliding_window_size > -1
         )
         window_size = (layer.sliding_window_size, 0) if is_swa_layer else (-1, -1)
-        k_descale, v_descale = None, None
+        q_descale, k_descale, v_descale = None, None, None
+        q_descale_precomputed: Optional[torch.Tensor] = None
+        need_descales = False
+        need_fp8_q_descale = False
         # only use kv scaling if: 1) fp8 kv is explicitly enabled, 2) RadixAttention
         # has corresponding quantization method so that layer.k_scale is not None,
         # 3) layer.head_dim <= 256 since fa3 kernel require fp16 and bf16 data type in this case,
@@ -776,13 +1080,12 @@ class FlashAttentionBackend(AttentionBackend):
             and layer.head_dim <= 256
             and self.fa_impl_ver != 4
         ):
-            if layer.k_scale is not None:
-                descale_shape = (forward_batch.batch_size, layer.tp_k_head_num)
-                k_descale = layer.k_scale.expand(descale_shape)
-                v_descale = layer.v_scale.expand(descale_shape)
-            q = q.to(self.kv_cache_dtype)
-            q_rope = q_rope.to(self.kv_cache_dtype) if q_rope is not None else None
-            k_rope = k_rope.to(self.kv_cache_dtype) if k_rope is not None else None
+            need_descales = True
+            need_fp8_q_descale = str(self.kv_cache_dtype_str).startswith("fp8")
+            if (not need_fp8_q_descale) or os.getenv("SGLANG_FA3_FP8_QSCALE", "1") != "1":
+                q = q.to(self.kv_cache_dtype)
+                q_rope = q_rope.to(self.kv_cache_dtype) if q_rope is not None else None
+                k_rope = k_rope.to(self.kv_cache_dtype) if k_rope is not None else None
         causal = True
         if layer.is_cross_attention or layer.attn_type == AttentionType.ENCODER_ONLY:
             causal = False
@@ -840,6 +1143,79 @@ class FlashAttentionBackend(AttentionBackend):
             max_seqlen_q = metadata.max_seq_len_q
             cu_seqlens_k = metadata.cu_seqlens_k
 
+        if (
+            need_descales
+            and need_fp8_q_descale
+            and (not self.use_mla)
+            and os.getenv("SGLANG_FA3_FP8_QSCALE", "1") == "1"
+        ):
+            q_fp8, q_descale_precomputed = self._fa3_quantize_q_fp8_fixed_stride(
+                q,
+                cu_seqlens_q=cu_seqlens_q,
+                max_seqlen_q=max_seqlen_q,
+                q_heads=int(layer.tp_q_head_num),
+                kv_heads=int(layer.tp_k_head_num),
+            )
+            if q_fp8 is not None and q_descale_precomputed is not None:
+                q = q_fp8
+            else:
+                q = q.to(self.kv_cache_dtype)
+            q_rope = q_rope.to(self.kv_cache_dtype) if q_rope is not None else None
+            k_rope = k_rope.to(self.kv_cache_dtype) if k_rope is not None else None
+ 
+        def _descales_for_cu_seqlens_q(
+            cu_seqlens_q_tensor: Optional[torch.Tensor],
+        ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+            if not need_descales:
+                return None, None, None
+            try:
+                descale_b = (
+                    int(cu_seqlens_q_tensor.numel() - 1)
+                    if cu_seqlens_q_tensor is not None
+                    else int(forward_batch.batch_size)
+                )
+            except Exception:
+                descale_b = int(forward_batch.batch_size)
+
+            descale_hk = int(layer.tp_k_head_num)
+            q_descale_local: Optional[torch.Tensor] = None
+            k_descale_local: Optional[torch.Tensor] = None
+            v_descale_local: Optional[torch.Tensor] = None
+
+            if need_fp8_q_descale:
+                tokens_per_seq = int(max_seqlen_q or 1)
+                if (
+                    q_descale_precomputed is not None
+                    and q_descale_precomputed.shape == (descale_b, descale_hk)
+                ):
+                    q_descale_local = q_descale_precomputed
+                elif (
+                    q_descale_precomputed is not None
+                    and q_descale_precomputed.shape[1] == descale_hk
+                    and tokens_per_seq > 0
+                    and q_descale_precomputed.shape[0] * tokens_per_seq == descale_b
+                ):
+                    q_descale_local = (
+                        q_descale_precomputed[:, None, :]
+                        .expand(
+                            q_descale_precomputed.shape[0],
+                            tokens_per_seq,
+                            q_descale_precomputed.shape[1],
+                        )
+                        .reshape(descale_b, descale_hk)
+                    )
+                else:
+                    q_descale_local = self._get_fp8_q_descale(
+                        descale_b, descale_hk, q.device
+                    )
+            if layer.k_scale is not None:
+                descale_shape = (descale_b, descale_hk)
+                k_descale_local = layer.k_scale.expand(descale_shape)
+                v_descale_local = layer.v_scale.expand(descale_shape)
+            return q_descale_local, k_descale_local, v_descale_local
+
+        q_descale, k_descale, v_descale = _descales_for_cu_seqlens_q(cu_seqlens_q)
+
         # Use Flash Attention for prefill
         if not self.use_mla:
             # Do multi-head attention
@@ -858,6 +1234,7 @@ class FlashAttentionBackend(AttentionBackend):
                 cu_seqlens_k = metadata.encoder_cu_seqlens_k
                 window_size = (-1, -1)
 
+            _t_attn = _fa3_timing.start()
             result = flash_attn_with_kvcache(
                 q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                 k_cache=key_cache,
@@ -867,6 +1244,7 @@ class FlashAttentionBackend(AttentionBackend):
                 cu_seqlens_q=cu_seqlens_q,
                 cu_seqlens_k_new=cu_seqlens_k if not use_local_attn else None,
                 max_seqlen_q=max_seqlen_q,
+                q_descale=q_descale,
                 softmax_scale=layer.scaling,
                 causal=False if use_cascade_attn else causal,
                 window_size=window_size,
@@ -877,9 +1255,16 @@ class FlashAttentionBackend(AttentionBackend):
                 num_splits=self.num_splits,
                 **kwargs,
             )
+            _fa3_timing.end_attn(_t_attn)
 
             if use_cascade_attn:
                 o, softmax_lse, *rest = result
+                q_descale_expand, k_descale_expand, v_descale_expand = (
+                    _descales_for_cu_seqlens_q(
+                        self.forward_metadata_spec_decode_expand.cu_seqlens_q
+                    )
+                )
+                _t_attn = _fa3_timing.start()
                 o_expand, softmax_lse_expand, *rest_expand = flash_attn_with_kvcache(
                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                     # Here metadata_expand.page_table is not divided with page_size.
@@ -894,16 +1279,18 @@ class FlashAttentionBackend(AttentionBackend):
                     cu_seqlens_q=self.forward_metadata_spec_decode_expand.cu_seqlens_q,
                     cu_seqlens_k_new=self.forward_metadata_spec_decode_expand.cu_seqlens_k,
                     max_seqlen_q=self.forward_metadata_spec_decode_expand.max_seq_len_q,
+                    q_descale=q_descale_expand,
                     softmax_scale=layer.scaling,
                     causal=False,
                     window_size=window_size,
                     softcap=layer.logit_cap,
-                    k_descale=k_descale,
-                    v_descale=v_descale,
+                    k_descale=k_descale_expand,
+                    v_descale=v_descale_expand,
                     return_softmax_lse=True,
                     num_splits=self.num_splits,
                     **kwargs,
                 )
+                _fa3_timing.end_attn(_t_attn)
                 o, _ = merge_state_v2_wrapper(
                     o,
                     softmax_lse.T.contiguous(),
@@ -1000,6 +1387,7 @@ class FlashAttentionBackend(AttentionBackend):
                     q_nope = q_all[:, :, : layer.v_head_dim]
                     q_rope = q_all[:, :, layer.v_head_dim :]
 
+                _t_attn = _fa3_timing.start()
                 result = flash_attn_with_kvcache(
                     q=q_rope,
                     k_cache=k_rope_cache,
@@ -1010,6 +1398,7 @@ class FlashAttentionBackend(AttentionBackend):
                     cu_seqlens_q=cu_seqlens_q,
                     cu_seqlens_k_new=cu_seqlens_k if not use_local_attn else None,
                     max_seqlen_q=max_seqlen_q,
+                    q_descale=q_descale,
                     softmax_scale=layer.scaling,
                     causal=False if use_cascade_attn else causal,
                     window_size=window_size,
@@ -1020,8 +1409,15 @@ class FlashAttentionBackend(AttentionBackend):
                     num_splits=self.num_splits,
                     **kwargs,
                 )
+                _fa3_timing.end_attn(_t_attn)
                 if use_cascade_attn:
                     o, softmax_lse, *rest = result
+                    q_descale_expand, k_descale_expand, v_descale_expand = (
+                        _descales_for_cu_seqlens_q(
+                            self.forward_metadata_spec_decode_expand.cu_seqlens_q
+                        )
+                    )
+                    _t_attn = _fa3_timing.start()
                     o_expand, softmax_lse_expand, *rest_expand = (
                         flash_attn_with_kvcache(
                             q=q_rope,
@@ -1033,17 +1429,19 @@ class FlashAttentionBackend(AttentionBackend):
                             cu_seqlens_q=self.forward_metadata_spec_decode_expand.cu_seqlens_q,
                             cu_seqlens_k_new=self.forward_metadata_spec_decode_expand.cu_seqlens_k,
                             max_seqlen_q=self.forward_metadata_spec_decode_expand.max_seq_len_q,
+                            q_descale=q_descale_expand,
                             softmax_scale=layer.scaling,
                             causal=False,
                             window_size=window_size,
                             softcap=layer.logit_cap,
-                            k_descale=k_descale,
-                            v_descale=v_descale,
+                            k_descale=k_descale_expand,
+                            v_descale=v_descale_expand,
                             return_softmax_lse=True,
                             num_splits=self.num_splits,
                             **kwargs,
                         )
                     )
+                    _fa3_timing.end_attn(_t_attn)
                     o, _ = merge_state_v2_wrapper(
                         o,
                         softmax_lse.T.contiguous(),
@@ -1080,16 +1478,25 @@ class FlashAttentionBackend(AttentionBackend):
                     else forward_batch.encoder_out_cache_loc
                 )
                 if not self.use_mla:
+                    _t_setkv = _fa3_timing.start()
                     forward_batch.token_to_kv_pool.set_kv_buffer(
-                        layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+                        layer,
+                        cache_loc,
+                        k,
+                        v,
+                        getattr(layer, "k_scale_float", None),
+                        getattr(layer, "v_scale_float", None),
                     )
+                    _fa3_timing.end_setkv(_t_setkv)
                 else:
+                    _t_setkv = _fa3_timing.start()
                     forward_batch.token_to_kv_pool.set_mla_kv_buffer(
                         layer,
                         cache_loc,
                         k,
                         k_rope,
                     )
+                    _fa3_timing.end_setkv(_t_setkv)
         if _SGLANG_FA3_NVTX and _has_nvtx:
             nvtx_range_kv.end()
 
@@ -1129,16 +1536,34 @@ class FlashAttentionBackend(AttentionBackend):
 
         if _SGLANG_FA3_NVTX and _has_nvtx:
             nvtx_range_q = nvtx.range(f"fa3.decode.q_transform_layer{layer.layer_id}")
-        k_descale, v_descale = None, None
+        q_descale, k_descale, v_descale = None, None, None
+        q_descale_precomputed: Optional[torch.Tensor] = None
+        need_descales = False
+        need_fp8_q_descale = False
         # only use kv scaling if: 1) fp8 kv is explicitly enabled, 2) RadixAttention
         # has corresponding quantization method so that layer.k_scale is not None,
         # 3) layer.head_dim <= 256 since fa3 kernel require fp16 and bf16 data type in this case.
         if self.kv_cache_dtype_str != "auto" and layer.head_dim <= 256:
-            if layer.k_scale is not None:
-                descale_shape = (forward_batch.batch_size, layer.tp_k_head_num)
-                k_descale = layer.k_scale.expand(descale_shape)
-                v_descale = layer.v_scale.expand(descale_shape)
-            q = q.to(self.kv_cache_dtype)
+            need_descales = True
+            need_fp8_q_descale = str(self.kv_cache_dtype_str).startswith("fp8")
+            if (
+                need_fp8_q_descale
+                and (not self.use_mla)
+                and os.getenv("SGLANG_FA3_FP8_QSCALE", "1") == "1"
+            ):
+                q_fp8, q_descale_precomputed = self._fa3_quantize_q_fp8_fixed_stride(
+                    q,
+                    cu_seqlens_q=metadata.cu_seqlens_q,
+                    max_seqlen_q=metadata.max_seq_len_q,
+                    q_heads=int(layer.tp_q_head_num),
+                    kv_heads=int(layer.tp_k_head_num),
+                )
+                if q_fp8 is not None and q_descale_precomputed is not None:
+                    q = q_fp8
+                else:
+                    q = q.to(self.kv_cache_dtype)
+            else:
+                q = q.to(self.kv_cache_dtype)
             q_rope = q_rope.to(self.kv_cache_dtype) if q_rope is not None else None
             k_rope = k_rope.to(self.kv_cache_dtype) if k_rope is not None else None
         if _SGLANG_FA3_NVTX and _has_nvtx:
@@ -1160,7 +1585,25 @@ class FlashAttentionBackend(AttentionBackend):
             if _SGLANG_FA3_NVTX and _has_nvtx:
                 nvtx_range_attn = nvtx.range(f"fa3.decode.attention_kernel_layer{layer.layer_id}")
             if layer.is_cross_attention:
+                if need_descales:
+                    descale_b = int(metadata.cu_seqlens_q.numel() - 1) if metadata.cu_seqlens_q is not None else int(forward_batch.batch_size)
+                    descale_hk = int(layer.tp_k_head_num)
+                    if need_fp8_q_descale:
+                        if (
+                            q_descale_precomputed is not None
+                            and q_descale_precomputed.shape == (descale_b, descale_hk)
+                        ):
+                            q_descale = q_descale_precomputed
+                        else:
+                            q_descale = self._get_fp8_q_descale(
+                                descale_b, descale_hk, q.device
+                            )
+                    if layer.k_scale is not None:
+                        descale_shape = (descale_b, descale_hk)
+                        k_descale = layer.k_scale.expand(descale_shape)
+                        v_descale = layer.v_scale.expand(descale_shape)
                 # Always use non-chunked logic for cross-attention
+                _t_attn = _fa3_timing.start()
                 o = flash_attn_with_kvcache(
                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                     k_cache=key_cache,
@@ -1170,6 +1613,7 @@ class FlashAttentionBackend(AttentionBackend):
                     cu_seqlens_q=metadata.cu_seqlens_q,
                     cu_seqlens_k_new=metadata.encoder_cu_seqlens_k,
                     max_seqlen_q=1,
+                    q_descale=q_descale,
                     softmax_scale=layer.scaling,
                     causal=False,
                     window_size=(-1, -1),
@@ -1179,8 +1623,27 @@ class FlashAttentionBackend(AttentionBackend):
                     num_splits=self.num_splits,
                     **kwargs,
                 )
+                _fa3_timing.end_attn(_t_attn)
             elif use_local_attn:
+                if need_descales:
+                    descale_b = int(local_attn_metadata.local_query_start_loc.numel() - 1) if local_attn_metadata is not None else int(forward_batch.batch_size)
+                    descale_hk = int(layer.tp_k_head_num)
+                    if need_fp8_q_descale:
+                        if (
+                            q_descale_precomputed is not None
+                            and q_descale_precomputed.shape == (descale_b, descale_hk)
+                        ):
+                            q_descale = q_descale_precomputed
+                        else:
+                            q_descale = self._get_fp8_q_descale(
+                                descale_b, descale_hk, q.device
+                            )
+                    if layer.k_scale is not None:
+                        descale_shape = (descale_b, descale_hk)
+                        k_descale = layer.k_scale.expand(descale_shape)
+                        v_descale = layer.v_scale.expand(descale_shape)
                 # Use chunked (local) attention batching for self-attention
+                _t_attn = _fa3_timing.start()
                 o = flash_attn_with_kvcache(
                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                     k_cache=key_cache,
@@ -1190,6 +1653,7 @@ class FlashAttentionBackend(AttentionBackend):
                     cu_seqlens_q=local_attn_metadata.local_query_start_loc,
                     cu_seqlens_k_new=None,
                     max_seqlen_q=local_attn_metadata.local_max_query_len,
+                    q_descale=q_descale,
                     softmax_scale=layer.scaling,
                     causal=True,
                     window_size=(-1, -1),
@@ -1199,7 +1663,25 @@ class FlashAttentionBackend(AttentionBackend):
                     num_splits=self.num_splits,
                     **kwargs,
                 )
+                _fa3_timing.end_attn(_t_attn)
             else:
+                if need_descales:
+                    descale_b = int(metadata.cu_seqlens_q.numel() - 1) if metadata.cu_seqlens_q is not None else int(forward_batch.batch_size)
+                    descale_hk = int(layer.tp_k_head_num)
+                    if need_fp8_q_descale:
+                        if (
+                            q_descale_precomputed is not None
+                            and q_descale_precomputed.shape == (descale_b, descale_hk)
+                        ):
+                            q_descale = q_descale_precomputed
+                        else:
+                            q_descale = self._get_fp8_q_descale(
+                                descale_b, descale_hk, q.device
+                            )
+                    if layer.k_scale is not None:
+                        descale_shape = (descale_b, descale_hk)
+                        k_descale = layer.k_scale.expand(descale_shape)
+                        v_descale = layer.v_scale.expand(descale_shape)
                 page_table = metadata.page_table
                 if is_swa_layer and self.use_sliding_window_kv_pool:
                     if metadata.swa_page_table is not None:
@@ -1218,6 +1700,7 @@ class FlashAttentionBackend(AttentionBackend):
                 )
 
                 # Default: single-token self-attention
+                _t_attn = _fa3_timing.start()
                 result = flash_attn_with_kvcache(
                     q=q_reshaped,
                     k_cache=key_cache,
@@ -1226,6 +1709,7 @@ class FlashAttentionBackend(AttentionBackend):
                     cache_seqlens=cache_seqlens,
                     cu_seqlens_q=metadata.cu_seqlens_q,
                     max_seqlen_q=max_seqlen_q,
+                    q_descale=q_descale,
                     softmax_scale=layer.scaling,
                     causal=False if use_cascade_attn else causal,
                     window_size=window_size,
@@ -1236,8 +1720,52 @@ class FlashAttentionBackend(AttentionBackend):
                     num_splits=self.num_splits,
                     **kwargs,
                 )
+                _fa3_timing.end_attn(_t_attn)
                 if use_cascade_attn:
                     o, softmax_lse, *rest = result
+                    q_descale_expand, k_descale_expand, v_descale_expand = (
+                        q_descale,
+                        k_descale,
+                        v_descale,
+                    )
+                    if need_descales:
+                        descale_b = (
+                            int(
+                                self.forward_metadata_spec_decode_expand.cu_seqlens_q.numel()
+                                - 1
+                            )
+                            if self.forward_metadata_spec_decode_expand.cu_seqlens_q
+                            is not None
+                            else int(forward_batch.batch_size)
+                        )
+                        descale_hk = int(layer.tp_k_head_num)
+                        if need_fp8_q_descale:
+                            tokens_per_seq = int(metadata.max_seq_len_q or 1)
+                            if (
+                                q_descale_precomputed is not None
+                                and q_descale_precomputed.shape[1] == descale_hk
+                                and tokens_per_seq > 0
+                                and q_descale_precomputed.shape[0] * tokens_per_seq
+                                == descale_b
+                            ):
+                                q_descale_expand = (
+                                    q_descale_precomputed[:, None, :]
+                                    .expand(
+                                        q_descale_precomputed.shape[0],
+                                        tokens_per_seq,
+                                        q_descale_precomputed.shape[1],
+                                    )
+                                    .reshape(descale_b, descale_hk)
+                                )
+                            else:
+                                q_descale_expand = self._get_fp8_q_descale(
+                                    descale_b, descale_hk, q.device
+                                )
+                        if layer.k_scale is not None:
+                            descale_shape = (descale_b, descale_hk)
+                            k_descale_expand = layer.k_scale.expand(descale_shape)
+                            v_descale_expand = layer.v_scale.expand(descale_shape)
+                    _t_attn = _fa3_timing.start()
                     o_expand, softmax_lse_expand, *rest_expand = (
                         flash_attn_with_kvcache(
                             q=q_reshaped,
@@ -1248,17 +1776,19 @@ class FlashAttentionBackend(AttentionBackend):
                             cu_seqlens_q=self.forward_metadata_spec_decode_expand.cu_seqlens_q,
                             cu_seqlens_k_new=self.forward_metadata_spec_decode_expand.cu_seqlens_k,
                             max_seqlen_q=self.forward_metadata_spec_decode_expand.max_seq_len_q,
+                            q_descale=q_descale_expand,
                             softmax_scale=layer.scaling,
                             causal=False,
                             window_size=window_size,
                             softcap=layer.logit_cap,
-                            k_descale=k_descale,
-                            v_descale=v_descale,
+                            k_descale=k_descale_expand,
+                            v_descale=v_descale_expand,
                             return_softmax_lse=True,
                             num_splits=self.num_splits,
                             **kwargs,
                         )
                     )
+                    _fa3_timing.end_attn(_t_attn)
                     o, _ = merge_state_v2(
                         o,
                         softmax_lse.T.contiguous(),
@@ -1297,6 +1827,7 @@ class FlashAttentionBackend(AttentionBackend):
                 q_rope = q_all[:, :, layer.v_head_dim :]
             max_seqlen_q = metadata.max_seq_len_q
 
+            _t_attn = _fa3_timing.start()
             result = flash_attn_with_kvcache(
                 q=q_rope,
                 k_cache=k_rope_cache,
@@ -1307,6 +1838,7 @@ class FlashAttentionBackend(AttentionBackend):
                 cu_seqlens_q=metadata.cu_seqlens_q,
                 cu_seqlens_k_new=metadata.cu_seqlens_k,
                 max_seqlen_q=max_seqlen_q,
+                q_descale=q_descale,
                 softmax_scale=layer.scaling,
                 causal=False if use_cascade_attn else causal,
                 window_size=window_size,
@@ -1317,8 +1849,30 @@ class FlashAttentionBackend(AttentionBackend):
                 num_splits=self.num_splits,
                 **kwargs,
             )
+            _fa3_timing.end_attn(_t_attn)
             if use_cascade_attn:
                 o, softmax_lse, *rest = result
+                q_descale_expand, k_descale_expand, v_descale_expand = (
+                    q_descale,
+                    k_descale,
+                    v_descale,
+                )
+                if need_descales:
+                    descale_b = (
+                        int(self.forward_metadata_spec_decode_expand.cu_seqlens_q.numel() - 1)
+                        if self.forward_metadata_spec_decode_expand.cu_seqlens_q is not None
+                        else int(forward_batch.batch_size)
+                    )
+                    descale_hk = int(layer.tp_k_head_num)
+                    if need_fp8_q_descale:
+                        q_descale_expand = self._get_fp8_q_descale(
+                            descale_b, descale_hk, q.device
+                        )
+                    if layer.k_scale is not None:
+                        descale_shape = (descale_b, descale_hk)
+                        k_descale_expand = layer.k_scale.expand(descale_shape)
+                        v_descale_expand = layer.v_scale.expand(descale_shape)
+                _t_attn = _fa3_timing.start()
                 o_expand, softmax_lse_expand, *rest_expand = flash_attn_with_kvcache(
                     q=q_rope,
                     k_cache=k_rope_cache,
@@ -1329,16 +1883,18 @@ class FlashAttentionBackend(AttentionBackend):
                     cu_seqlens_q=self.forward_metadata_spec_decode_expand.cu_seqlens_q,
                     cu_seqlens_k_new=self.forward_metadata_spec_decode_expand.cu_seqlens_k,
                     max_seqlen_q=self.forward_metadata_spec_decode_expand.max_seq_len_q,
+                    q_descale=q_descale_expand,
                     softmax_scale=layer.scaling,
                     causal=False,
                     window_size=window_size,
                     softcap=layer.logit_cap,
-                    k_descale=k_descale,
-                    v_descale=v_descale,
+                    k_descale=k_descale_expand,
+                    v_descale=v_descale_expand,
                     return_softmax_lse=True,
                     num_splits=self.num_splits,
                     **kwargs,
                 )
+                _fa3_timing.end_attn(_t_attn)
                 o, _ = merge_state_v2(
                     o,
                     softmax_lse.T.contiguous(),
