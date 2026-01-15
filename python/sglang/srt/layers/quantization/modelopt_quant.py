@@ -1509,6 +1509,19 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 assert (
                     weight_scale.shape[-1] == expected_blocks[name]
                 ), f"Expected {name}_weight_scale.dim(2) == {expected_blocks[name]}, got {weight_scale.shape[-1]}"
+                # Some ModelOpt NVFP4 checkpoints store block scales in bf16/fp16.
+                # FlashInfer TRTLLM kernels require FP8-E4M3 scales; cast if needed.
+                if weight_scale.dtype != torch.float8_e4m3fn:
+                    try:
+                        weight_scale = weight_scale.to(torch.float8_e4m3fn)
+                        if name == "w13":
+                            layer.w13_weight_scale = weight_scale
+                        else:
+                            layer.w2_weight_scale = weight_scale
+                    except Exception as e:
+                        raise AssertionError(
+                            f"{name} Weight Blockscale must be representable as FP8-E4M3; got {weight_scale.dtype}"
+                        ) from e
             else:
                 if weight_scale.shape[assert_dim] % 4 != 0:
                     logger.warning(
