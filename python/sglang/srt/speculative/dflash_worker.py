@@ -281,6 +281,16 @@ class DFlashWorker:
         block_ids[:, 0].copy_(draft_input.verified_id.to(torch.long))
 
         noise_embedding = embed_module(block_ids)
+        # If the draft checkpoint provides a learned mask embedding (common for
+        # GPT-OSS where we use pad_token_id as "mask"), override the masked
+        # positions to match the training regime: token0 is the anchor, tokens
+        # 1..B-1 are masked.
+        try:
+            m = getattr(self.draft_model, "mask_embedding", None)
+            if m is not None:
+                noise_embedding[:, 1:, :] = m.to(noise_embedding.dtype)[None, None, :]
+        except Exception:
+            pass
         input_embeds = noise_embedding.view(-1, noise_embedding.shape[-1])
 
         # For spec-v1, the draft KV cache is always materialized to the current target

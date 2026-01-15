@@ -285,6 +285,11 @@ class DFlashDraftModel(nn.Module):
             self.num_context_features * hidden_size, hidden_size, bias=False
         )
         self.hidden_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
+        # Optional learned mask embedding for models/tokenizers without a dedicated
+        # mask token (e.g., GPT-OSS). When present in the checkpoint, the DFlash
+        # worker can replace the noise-token embeddings with this vector to match
+        # the training regime used by our HF DFlash checkpoints.
+        self.mask_embedding = nn.Parameter(torch.zeros(hidden_size))
 
         dflash_block_size = dflash_cfg_dict.get("block_size", None)
 
