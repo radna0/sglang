@@ -7,13 +7,6 @@ import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
 from sglang.srt.layers.amx_utils import _amx_process_weight_after_loading
-from sglang.srt.layers.moe import (
-    MoeRunner,
-    MoeRunnerBackend,
-    MoeRunnerConfig,
-    get_moe_runner_backend,
-)
-from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     LinearMethodBase,
@@ -31,6 +24,8 @@ from sglang.srt.utils import (
 )
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.moe import MoeRunnerConfig
+
     from sglang.srt.layers.moe.token_dispatcher import (
         CombineInput,
         StandardDispatchOutput,
@@ -150,6 +145,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         self, use_triton_kernels: bool = False, use_flashinfer_trtllm_moe: bool = False
     ):
         super().__init__()
+        # Import MoE runner lazily so importing unquantized layers doesn't
+        # pull in the full MoE stack (and its optional deps) for non-MoE models.
+        from sglang.srt.layers.moe import get_moe_runner_backend
+
         self.use_flashinfer_cutlass = get_moe_runner_backend().is_flashinfer_cutlass()
         self.use_triton_kernels = use_triton_kernels
         self.with_bias = False
@@ -298,9 +297,9 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
 
         return
 
-    def create_moe_runner(
-        self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
-    ):
+    def create_moe_runner(self, layer: torch.nn.Module, moe_runner_config):
+        from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend
+
         self.moe_runner_config = moe_runner_config
         backend = (
             MoeRunnerBackend.TRITON_KERNELS

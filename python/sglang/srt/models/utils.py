@@ -17,20 +17,20 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Optional, Tuple
+import sys
 
 import numpy as np
 import torch
 
 from sglang.jit_kernel.norm import can_use_fused_inplace_qknorm, fused_inplace_qknorm
 from sglang.srt.environ import envs
-from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils import get_current_device_stream_fast, is_cuda
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
     from sglang.srt.layers.layernorm import RMSNorm
+    from sglang.srt.layers.radix_attention import RadixAttention
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 _is_cuda = is_cuda()
 
@@ -245,7 +245,7 @@ def apply_qk_norm(
         )
         return q, k
 
-    if alt_stream is not None and get_is_capture_mode():
+    if alt_stream is not None and _get_is_capture_mode():
         current_stream = get_current_device_stream_fast()
         alt_stream.wait_stream(current_stream)
         q_by_head = q.reshape(-1, head_dim)
@@ -262,6 +262,22 @@ def apply_qk_norm(
     q = q_by_head.view(q.shape)
     k = k_by_head.view(k.shape)
     return q, k
+
+
+def _get_is_capture_mode() -> bool:
+    # Avoid importing cuda_graph_runner (and its heavy dependencies) at module
+    # import time. If it's already loaded (e.g. when running the full SGLang
+    # server), consult it; otherwise treat as not-in-capture-mode.
+    mod = sys.modules.get("sglang.srt.model_executor.cuda_graph_runner")
+    if mod is None:
+        return False
+    fn = getattr(mod, "get_is_capture_mode", None)
+    if fn is None:
+        return False
+    try:
+        return bool(fn())
+    except Exception:
+        return False
 
 
 # Register the inplace op

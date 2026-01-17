@@ -10,7 +10,6 @@ from sglang.srt.layers.deep_gemm_wrapper.configurer import (  # noqa: F401
     DEEPGEMM_SCALE_UE8M0,
     ENABLE_JIT_DEEPGEMM,
 )
-from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_bool_env_var
 
 logger = logging.getLogger(__name__)
@@ -102,7 +101,7 @@ def gemm_nt_f8f8bf16(
         )
 
 
-def update_deep_gemm_config(gpu_id: int, server_args: ServerArgs):
+def update_deep_gemm_config(gpu_id: int, server_args):
     compile_utils.update_deep_gemm_config(gpu_id, server_args)
 
 

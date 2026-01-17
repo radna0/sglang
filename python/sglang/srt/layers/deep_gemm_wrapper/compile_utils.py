@@ -7,13 +7,8 @@ from typing import Dict, List, Tuple
 import torch
 from tqdm import tqdm
 
-from sglang.srt.distributed.device_communicators.pynccl_allocator import (
-    disable_symmetric_memory_context,
-    restore_symmetric_memory_context,
-)
 from sglang.srt.environ import envs
 from sglang.srt.layers.deep_gemm_wrapper.configurer import ENABLE_JIT_DEEPGEMM
-from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import ceil_div, get_available_gpu_memory
 
 logger = logging.getLogger(__name__)
@@ -39,7 +34,7 @@ os.environ["DG_JIT_CACHE_DIR"] = os.getenv(
 os.environ["DG_JIT_USE_NVRTC"] = os.getenv("SGL_DG_USE_NVRTC", "0")
 
 
-def update_deep_gemm_config(gpu_id: int, server_args: ServerArgs):
+def update_deep_gemm_config(gpu_id: int, server_args):
     global _BUILTIN_M_LIST
     global _DO_COMPILE_ALL
     global _IS_FIRST_RANK_ON_NODE
@@ -124,6 +119,12 @@ def _compile_deep_gemm_one_type_all(
     num_groups: int,
     m_list: List[int],
 ) -> None:
+    # Import only when compilation is actually invoked.
+    from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+        disable_symmetric_memory_context,
+        restore_symmetric_memory_context,
+    )
+
     # Symmetric memory allocation performs a collective operation across all the GPUs.
     # Temporary disable symmetric memory during compilation since it only runs on the first rank.
     saved_context = disable_symmetric_memory_context()

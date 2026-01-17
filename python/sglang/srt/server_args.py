@@ -63,7 +63,6 @@ from sglang.srt.utils.common import (
     wait_port_available,
     xpu_has_xmx_support,
 )
-from sglang.srt.utils.hf_transformers_utils import check_gguf_file
 from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
@@ -2354,6 +2353,10 @@ class ServerArgs:
                 )
 
     def _handle_load_format(self):
+        # Lazy import to avoid importing HF Transformers (and its optional deps)
+        # during lightweight module imports / smoke tests.
+        from sglang.srt.utils.hf_transformers_utils import check_gguf_file
+
         if (
             self.load_format == "auto" or self.load_format == "gguf"
         ) and check_gguf_file(self.model_path):

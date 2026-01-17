@@ -15,21 +15,19 @@
 
 import logging
 import math
-from typing import Optional
+import sys
+from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import PretrainedConfig
 
 from sglang.srt.distributed import (
     divide,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
-from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.utils import MultiPlatformOp
-from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cpu,
@@ -40,6 +38,10 @@ from sglang.srt.utils import (
     set_weight_attrs,
 )
 from sglang.utils import resolve_obj_by_qualname
+
+if TYPE_CHECKING:
+    from transformers import PretrainedConfig
+    from sglang.srt.layers.quantization.base_config import QuantizationConfig
 
 _is_cuda = is_cuda()
 _is_npu = is_npu()
@@ -59,10 +61,26 @@ if is_npu():
 logger = logging.getLogger(__name__)
 
 
+def _get_rl_on_policy_target_if_loaded() -> Optional[str]:
+    # Importing `sglang.srt.server_args` is heavy and can drag in optional deps.
+    # For lightweight use-cases, only consult it if already loaded.
+    mod = sys.modules.get("sglang.srt.server_args")
+    if mod is None:
+        return None
+    get_args = getattr(mod, "get_global_server_args", None)
+    if get_args is None:
+        return None
+    try:
+        args = get_args()
+        return getattr(args, "rl_on_policy_target", None)
+    except Exception:
+        return None
+
+
 class SiluAndMul(MultiPlatformOp):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        if get_global_server_args().rl_on_policy_target is not None:
+        if _get_rl_on_policy_target_if_loaded() is not None:
             self._forward_method = self.forward_native
 
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:
@@ -340,7 +358,7 @@ _ACTIVATION_REGISTRY = {
 
 def get_act_fn(
     act_fn_name: str,
-    quant_config: Optional[QuantizationConfig] = None,
+    quant_config: Optional["QuantizationConfig"] = None,
     intermediate_size: Optional[int] = None,
     input_is_parallel: bool = True,
     params_dtype: Optional[torch.dtype] = None,
@@ -363,7 +381,7 @@ def get_act_fn(
     return act_fn
 
 
-def get_cross_encoder_activation_function(config: PretrainedConfig):
+def get_cross_encoder_activation_function(config: Any):
     if (
         hasattr(config, "sbert_ce_default_activation_function")
         and config.sbert_ce_default_activation_function is not None

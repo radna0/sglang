@@ -14,6 +14,7 @@
 """Fused operators for normalization layers."""
 
 import logging
+import sys
 from typing import Optional, Tuple, Union
 
 import torch
@@ -25,7 +26,6 @@ from sglang.srt.batch_invariant_ops import (
     rms_norm_batch_invariant,
 )
 from sglang.srt.layers.utils import MultiPlatformOp
-from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -76,6 +76,22 @@ if _is_npu:
     import torch_npu
 
 
+def _get_rl_on_policy_target_if_loaded() -> Optional[str]:
+    # Importing `sglang.srt.server_args` is heavy and can drag in optional deps.
+    # For lightweight use-cases, only consult it if already loaded.
+    mod = sys.modules.get("sglang.srt.server_args")
+    if mod is None:
+        return None
+    get_args = getattr(mod, "get_global_server_args", None)
+    if get_args is None:
+        return None
+    try:
+        args = get_args()
+        return getattr(args, "rl_on_policy_target", None)
+    except Exception:
+        return None
+
+
 class RMSNorm(MultiPlatformOp):
     def __init__(
         self,
@@ -111,9 +127,10 @@ class RMSNorm(MultiPlatformOp):
         if self.variance_size_override is not None:
             return self.forward_native(x, residual, **kwargs)
         if is_batch_invariant_mode_enabled():
+            rl_target = _get_rl_on_policy_target_if_loaded()
             if (
                 residual is not None
-                or get_global_server_args().rl_on_policy_target == "fsdp"
+                or rl_target == "fsdp"
             ):
                 return self.forward_native(x, residual, **kwargs)
             return rms_norm_batch_invariant(

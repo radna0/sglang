@@ -5,7 +5,6 @@ import torch
 
 from sglang.srt.batch_overlap import operations
 from sglang.srt.batch_overlap.operations import Operation
-from sglang.srt.layers.moe.token_dispatcher import DeepEPConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
 
@@ -80,6 +79,8 @@ def _compute_moe_deepseek_layer_operations_strategy_tbo(
 
 
 def _compute_moe_deepseek_blog_prefill(layer):
+    from sglang.srt.layers.moe.token_dispatcher import DeepEPConfig
+
     device_properties = torch.cuda.get_device_properties(device="cuda")
     total_num_sms = device_properties.multi_processor_count
     deep_gemm_num_sms = total_num_sms - DeepEPConfig.get_instance().num_sms
@@ -157,6 +158,8 @@ def _compute_moe_qwen3_layer_operations_strategy_tbo(
 
 
 def _compute_moe_qwen3_prefill(layer):
+    from sglang.srt.layers.moe.token_dispatcher import DeepEPConfig
+
     device_properties = torch.cuda.get_device_properties(device="cuda")
     total_num_sms = device_properties.multi_processor_count
     deep_gemm_num_sms = total_num_sms - DeepEPConfig.get_instance().num_sms

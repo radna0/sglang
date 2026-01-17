@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import itertools
 import math
+import sys
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -12,7 +13,6 @@ import triton
 import triton.language as tl
 
 from sglang.srt.layers.utils import MultiPlatformOp
-from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -45,6 +45,23 @@ if is_npu():
 
     NPU_ROTARY_MUL_MAX_NUM_HEADS = 1000
     NPU_ROTARY_MUL_MAX_HEAD_SIZE = 896
+
+
+def _get_rl_on_policy_target_if_loaded() -> Optional[str]:
+    # Importing `sglang.srt.server_args` is heavy and can drag in optional deps.
+    # For lightweight use-cases (e.g. draft-model smoke tests), only consult it if
+    # already loaded by the caller.
+    mod = sys.modules.get("sglang.srt.server_args")
+    if mod is None:
+        return None
+    get_args = getattr(mod, "get_global_server_args", None)
+    if get_args is None:
+        return None
+    try:
+        args = get_args()
+        return getattr(args, "rl_on_policy_target", None)
+    except Exception:
+        return None
 
 
 def _rotate_neox(x: torch.Tensor) -> torch.Tensor:
@@ -134,7 +151,7 @@ class RotaryEmbedding(MultiPlatformOp):
 
         self._apply_rotary_emb_wrapped = _apply_rotary_emb
 
-        if get_global_server_args().rl_on_policy_target is not None:
+        if _get_rl_on_policy_target_if_loaded() is not None:
             self._forward_method = self.forward_native
             self._apply_rotary_emb_wrapped = torch.compile(dynamic=True)(
                 self._apply_rotary_emb_wrapped
@@ -148,7 +165,7 @@ class RotaryEmbedding(MultiPlatformOp):
         # create the cache on GPU for faster initialization. This may cause
         # a slight numerical difference between the HF implementation and ours.
         init_device = (
-            "cpu" if get_global_server_args().rl_on_policy_target is not None else None
+            "cpu" if _get_rl_on_policy_target_if_loaded() is not None else None
         )
         inv_freq = 1.0 / (
             base
@@ -159,7 +176,7 @@ class RotaryEmbedding(MultiPlatformOp):
                 / self.rotary_dim
             )
         )
-        if get_global_server_args().rl_on_policy_target is not None:
+        if _get_rl_on_policy_target_if_loaded() is not None:
             inv_freq = inv_freq.cuda()
         return inv_freq
 
@@ -1459,7 +1476,7 @@ class MRotaryEmbedding(RotaryEmbedding):
                     f"Corrected mrope_section: {self.mrope_section} (sum={sum(self.mrope_section)})"
                 )
 
-        if get_global_server_args().rl_on_policy_target is not None:
+        if _get_rl_on_policy_target_if_loaded() is not None:
             self._forward_method = self.forward_native
 
     def _match_cos_sin_cache_dtype(self, query: torch.Tensor) -> None:

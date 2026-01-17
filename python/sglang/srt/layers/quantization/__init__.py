@@ -1,88 +1,158 @@
-# Adapted from https://raw.githubusercontent.com/vllm-project/vllm/v0.5.5/vllm/model_executor/layers/quantization/__init__.py
+# Adapted from vLLM/SGLang quantization registry, but made lazy to keep imports
+# lightweight (especially on notebook environments like Kaggle that may have
+# optional deps with binary incompatibilities).
+
 from __future__ import annotations
 
 import builtins
-import inspect
-from typing import TYPE_CHECKING, Dict, Optional, Type
+import importlib
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Dict, Iterable, Iterator, Optional, Tuple, Type
 
 import torch
 
+from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.utils import is_cuda, is_hip, is_npu, mxfp_supported
 
-# Define empty classes as placeholders when vllm is not available
+if TYPE_CHECKING:
+    from sglang.srt.layers.moe.topk import TopKOutput
+
+
 class DummyConfig:
     def override_quantization_method(self, *args, **kwargs):
         return None
 
 
-CompressedTensorsConfig = DummyConfig
-
-from sglang.srt.layers.quantization.auto_round import AutoRoundConfig
-from sglang.srt.layers.quantization.awq import AWQConfig, AWQMarlinConfig
-from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.quantization.blockwise_int8 import BlockInt8Config
-from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
-    CompressedTensorsConfig,
-)
-from sglang.srt.layers.quantization.fp8 import Fp8Config
-from sglang.srt.layers.quantization.fpgemm_fp8 import FBGEMMFp8Config
-from sglang.srt.layers.quantization.gguf import GGUFConfig
-from sglang.srt.layers.quantization.gptq import GPTQConfig, GPTQMarlinConfig
-from sglang.srt.layers.quantization.modelopt_quant import (
-    ModelOptFp4Config,
-    ModelOptFp8Config,
-)
-from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
-from sglang.srt.layers.quantization.moe_wna16 import MoeWNA16Config
-from sglang.srt.layers.quantization.mxfp4 import Mxfp4Config
-from sglang.srt.layers.quantization.petit import PetitNvFp4Config
-from sglang.srt.layers.quantization.qoq import QoQConfig
-from sglang.srt.layers.quantization.quark.quark import QuarkConfig
-from sglang.srt.layers.quantization.quark_int4fp8_moe import QuarkInt4Fp8Config
-from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config
-from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8Config
-from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8Config
-from sglang.srt.utils import is_cuda, is_hip, is_npu, mxfp_supported
-
-_is_mxfp_supported = mxfp_supported()
-
-if TYPE_CHECKING:
-    from sglang.srt.layers.moe.topk import TopKOutput
-
-# Base quantization methods
-BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
-    "fp8": Fp8Config,
-    "blockwise_int8": BlockInt8Config,
-    "modelopt": ModelOptFp8Config,  # Auto-detect, defaults to FP8
-    "modelopt_fp8": ModelOptFp8Config,
-    "modelopt_fp4": ModelOptFp4Config,
-    "w8a8_int8": W8A8Int8Config,
-    "w8a8_fp8": W8A8Fp8Config,
-    "awq": AWQConfig,
-    "awq_marlin": AWQMarlinConfig,
-    "gguf": GGUFConfig,
-    "gptq": GPTQConfig,
-    "gptq_marlin": GPTQMarlinConfig,
-    "moe_wna16": MoeWNA16Config,
-    "compressed-tensors": CompressedTensorsConfig,
-    "qoq": QoQConfig,
-    "w4afp8": W4AFp8Config,
-    "petit_nvfp4": PetitNvFp4Config,
-    "fbgemm_fp8": FBGEMMFp8Config,
-    "quark": QuarkConfig,
-    "auto-round": AutoRoundConfig,
-    "modelslim": ModelSlimConfig,
-    "quark_int4fp8_moe": QuarkInt4Fp8Config,
-}
+@dataclass(frozen=True)
+class _LazySpec:
+    module: str
+    attr: str
 
 
-if is_cuda() or (_is_mxfp_supported and is_hip()):
-    BASE_QUANTIZATION_METHODS.update(
-        {
-            "mxfp4": Mxfp4Config,
-        }
-    )
+def _specs() -> Dict[str, _LazySpec]:
+    # Keep keys stable (used for CLI validation / help text). Values load lazily.
+    out: Dict[str, _LazySpec] = {
+        "fp8": _LazySpec("sglang.srt.layers.quantization.fp8", "Fp8Config"),
+        "blockwise_int8": _LazySpec(
+            "sglang.srt.layers.quantization.blockwise_int8", "BlockInt8Config"
+        ),
+        "modelopt": _LazySpec(
+            "sglang.srt.layers.quantization.modelopt_quant", "ModelOptFp8Config"
+        ),
+        "modelopt_fp8": _LazySpec(
+            "sglang.srt.layers.quantization.modelopt_quant", "ModelOptFp8Config"
+        ),
+        "modelopt_fp4": _LazySpec(
+            "sglang.srt.layers.quantization.modelopt_quant", "ModelOptFp4Config"
+        ),
+        "w8a8_int8": _LazySpec(
+            "sglang.srt.layers.quantization.w8a8_int8", "W8A8Int8Config"
+        ),
+        "w8a8_fp8": _LazySpec(
+            "sglang.srt.layers.quantization.w8a8_fp8", "W8A8Fp8Config"
+        ),
+        "awq": _LazySpec("sglang.srt.layers.quantization.awq", "AWQConfig"),
+        "awq_marlin": _LazySpec("sglang.srt.layers.quantization.awq", "AWQMarlinConfig"),
+        "gguf": _LazySpec("sglang.srt.layers.quantization.gguf", "GGUFConfig"),
+        "gptq": _LazySpec("sglang.srt.layers.quantization.gptq", "GPTQConfig"),
+        "gptq_marlin": _LazySpec(
+            "sglang.srt.layers.quantization.gptq", "GPTQMarlinConfig"
+        ),
+        "moe_wna16": _LazySpec(
+            "sglang.srt.layers.quantization.moe_wna16", "MoeWNA16Config"
+        ),
+        "compressed-tensors": _LazySpec(
+            "sglang.srt.layers.quantization.compressed_tensors.compressed_tensors",
+            "CompressedTensorsConfig",
+        ),
+        "qoq": _LazySpec("sglang.srt.layers.quantization.qoq", "QoQConfig"),
+        "w4afp8": _LazySpec("sglang.srt.layers.quantization.w4afp8", "W4AFp8Config"),
+        "petit_nvfp4": _LazySpec(
+            "sglang.srt.layers.quantization.petit", "PetitNvFp4Config"
+        ),
+        "fbgemm_fp8": _LazySpec(
+            "sglang.srt.layers.quantization.fpgemm_fp8", "FBGEMMFp8Config"
+        ),
+        "quark": _LazySpec(
+            "sglang.srt.layers.quantization.quark.quark", "QuarkConfig"
+        ),
+        "auto-round": _LazySpec(
+            "sglang.srt.layers.quantization.auto_round", "AutoRoundConfig"
+        ),
+        "modelslim": _LazySpec(
+            "sglang.srt.layers.quantization.modelslim.modelslim", "ModelSlimConfig"
+        ),
+        "quark_int4fp8_moe": _LazySpec(
+            "sglang.srt.layers.quantization.quark_int4fp8_moe", "QuarkInt4Fp8Config"
+        ),
+    }
+    if is_cuda() or (mxfp_supported() and is_hip()):
+        out["mxfp4"] = _LazySpec("sglang.srt.layers.quantization.mxfp4", "Mxfp4Config")
+    return out
 
-QUANTIZATION_METHODS = {**BASE_QUANTIZATION_METHODS}
+
+class _LazyQuantizationMethods(Dict[str, Type[QuantizationConfig]]):
+    def __init__(self, specs: Dict[str, _LazySpec]):
+        super().__init__()
+        self._specs = dict(specs)
+
+    def _load_one(self, key: str) -> Optional[Type[QuantizationConfig]]:
+        # IMPORTANT: our `__contains__` is overridden to reflect spec availability,
+        # not whether we've already loaded/cached the class. Use the base dict
+        # membership check here.
+        if super().__contains__(key):
+            return super().__getitem__(key)
+        spec = self._specs.get(key)
+        if spec is None:
+            return None
+        try:
+            mod = importlib.import_module(spec.module)
+            cls = getattr(mod, spec.attr)
+        except Exception:
+            # Some optional quantization methods may fail to import in certain envs.
+            # Preserve behavior by returning a DummyConfig for those methods, but
+            # only for the compressed-tensors key (others should error when used).
+            if key == "compressed-tensors":
+                cls = DummyConfig  # type: ignore[assignment]
+            else:
+                raise
+        super().__setitem__(key, cls)
+        return cls
+
+    def __contains__(self, key: object) -> bool:
+        return bool(isinstance(key, str) and key in self._specs)
+
+    def __getitem__(self, key: str):
+        cls = self._load_one(key)
+        if cls is None:
+            raise KeyError(key)
+        return cls
+
+    def get(self, key: str, default=None):
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._specs.keys())
+
+    def keys(self) -> Iterable[str]:  # type: ignore[override]
+        return self._specs.keys()
+
+    def items(self) -> Iterable[Tuple[str, Type[QuantizationConfig]]]:  # type: ignore[override]
+        for k in self._specs.keys():
+            yield k, self[k]
+
+    def values(self) -> Iterable[Type[QuantizationConfig]]:  # type: ignore[override]
+        for k in self._specs.keys():
+            yield self[k]
+
+    def __len__(self) -> int:
+        return len(self._specs)
+
+
+QUANTIZATION_METHODS = _LazyQuantizationMethods(_specs())
 
 
 def get_quantization_config(quantization: str) -> Type[QuantizationConfig]:
@@ -91,8 +161,4 @@ def get_quantization_config(quantization: str) -> Type[QuantizationConfig]:
             f"Invalid quantization method: {quantization}. "
             f"Available methods: {list(QUANTIZATION_METHODS.keys())}"
         )
-
     return QUANTIZATION_METHODS[quantization]
-
-
-original_isinstance = builtins.isinstance

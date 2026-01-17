@@ -7,7 +7,6 @@ from packaging import version
 from torch.cuda.memory import CUDAPluggableAllocator
 
 from sglang.srt.distributed.parallel_state import GroupCoordinator
-from sglang.srt.server_args import get_global_server_args
 
 after_2_8_0 = version.parse(torch.__version__) >= version.parse("2.8.0")
 
@@ -66,8 +65,12 @@ _active_symmetric_memory_context = None
 
 def is_symmetric_memory_enabled():
     try:
+        from sglang.srt.server_args import get_global_server_args
+
         return get_global_server_args().enable_symm_mem
     except ValueError:
+        return False
+    except Exception:
         return False
 
 

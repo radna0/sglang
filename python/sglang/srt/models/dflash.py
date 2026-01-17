@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Iterable, Optional, Tuple
+from typing import TYPE_CHECKING, Iterable, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -23,12 +23,22 @@ from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.speculative.dflash_utils import get_dflash_config
 
+if TYPE_CHECKING:
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
 logger = logging.getLogger(__name__)
+
+
+def default_weight_loader(param: torch.nn.Parameter, loaded_weight: torch.Tensor, shard_id=None):
+    # Minimal fallback loader for non-parallel parameters.
+    # Parallel / fused parameters (QKV, merged MLP) define their own `weight_loader`.
+    if hasattr(param, "data"):
+        param.data.copy_(loaded_weight)
+    else:  # pragma: no cover
+        param.copy_(loaded_weight)
 
 
 class DFlashAttention(nn.Module):
@@ -65,6 +75,14 @@ class DFlashAttention(nn.Module):
 
         attention_bias = bool(getattr(config, "attention_bias", False))
         rms_norm_eps = float(getattr(config, "rms_norm_eps", 1e-6))
+        dflash_cfg = get_dflash_config(config)
+        use_qk_norm = bool(
+            dflash_cfg.get("use_qk_norm", False)
+            or getattr(config, "use_qk_norm", False)
+            or getattr(config, "qk_layernorm", False)
+            or getattr(config, "qk_norm", False)
+        )
+        self.use_qk_norm = bool(use_qk_norm)
 
         self.qkv_proj = QKVParallelLinear(
             hidden_size=hidden_size,
@@ -81,9 +99,14 @@ class DFlashAttention(nn.Module):
             prefix="o_proj",
         )
 
-        # Per-head Q/K RMSNorm, matching HF Qwen3.
-        self.q_norm = RMSNorm(head_dim, eps=rms_norm_eps)
-        self.k_norm = RMSNorm(head_dim, eps=rms_norm_eps)
+        # Per-head Q/K RMSNorm is model-specific (e.g. Qwen3). GPT-OSS-style
+        # checkpoints do not include these weights, so keep it optional.
+        if self.use_qk_norm:
+            self.q_norm = RMSNorm(head_dim, eps=rms_norm_eps)
+            self.k_norm = RMSNorm(head_dim, eps=rms_norm_eps)
+        else:
+            self.q_norm = None
+            self.k_norm = None
 
         rope_theta = float(getattr(config, "rope_theta", 1000000))
         rope_scaling = getattr(config, "rope_scaling", None)
@@ -116,13 +139,15 @@ class DFlashAttention(nn.Module):
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
-        q, k = apply_qk_norm(
-            q=q,
-            k=k,
-            q_norm=self.q_norm,
-            k_norm=self.k_norm,
-            head_dim=self.head_dim,
-        )
+        if self.use_qk_norm:
+            assert self.q_norm is not None and self.k_norm is not None
+            q, k = apply_qk_norm(
+                q=q,
+                k=k,
+                q_norm=self.q_norm,
+                k_norm=self.k_norm,
+                head_dim=self.head_dim,
+            )
         q, k = self.rotary_emb(positions, q, k)
 
         attn_output = self.attn(q, k, v, forward_batch)
@@ -150,6 +175,9 @@ class DFlashAttention(nn.Module):
         return k, v
 
     def apply_k_norm(self, k: torch.Tensor) -> torch.Tensor:
+        if not self.use_qk_norm:
+            return k
+        assert self.k_norm is not None
         k_by_head = k.reshape(-1, self.head_dim)
         k_by_head = self.k_norm(k_by_head)
         return k_by_head.view_as(k)
@@ -169,17 +197,20 @@ class DFlashMLP(nn.Module):
         if intermediate_size <= 0:
             raise ValueError(f"Invalid intermediate_size={intermediate_size} for DFlash MLP.")
 
+        dflash_cfg = get_dflash_config(config)
+        mlp_bias = bool(dflash_cfg.get("mlp_bias", False) or getattr(config, "mlp_bias", False))
+
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
             [intermediate_size] * 2,
-            bias=False,
+            bias=mlp_bias,
             quant_config=quant_config,
             prefix="gate_up_proj" if not prefix else f"{prefix}.gate_up_proj",
         )
         self.down_proj = RowParallelLinear(
             intermediate_size,
             hidden_size,
-            bias=False,
+            bias=mlp_bias,
             quant_config=quant_config,
             prefix="down_proj" if not prefix else f"{prefix}.down_proj",
         )
@@ -281,9 +312,8 @@ class DFlashDraftModel(nn.Module):
             num_context_features = len(target_layer_ids)
 
         self.num_context_features = int(num_context_features)
-        self.fc = nn.Linear(
-            self.num_context_features * hidden_size, hidden_size, bias=False
-        )
+        fc_bias = bool(dflash_cfg_dict.get("fc_bias", False) or getattr(config, "fc_bias", False))
+        self.fc = nn.Linear(self.num_context_features * hidden_size, hidden_size, bias=fc_bias)
         self.hidden_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
         # Optional learned mask embedding for models/tokenizers without a dedicated
         # mask token (e.g., GPT-OSS). When present in the checkpoint, the DFlash

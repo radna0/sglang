@@ -34,7 +34,6 @@ else:
     from transformers import AutoConfig, GenerationConfig
 
 from transformers import (
-    AutoProcessor,
     AutoTokenizer,
     PretrainedConfig,
     PreTrainedTokenizer,
@@ -100,6 +99,15 @@ _CONFIG_REGISTRY = {
 for name, cls in _CONFIG_REGISTRY.items():
     with contextlib.suppress(ValueError):
         AutoConfig.register(name, cls)
+
+
+def _lazy_auto_processor():
+    # Importing AutoProcessor can indirectly import heavyweight optional deps
+    # (tensorflow/sklearn) in some environments. Keep it lazy so pure-text
+    # inference paths (e.g. GPT-OSS) don't pay that cost.
+    from transformers import AutoProcessor
+
+    return AutoProcessor
 
 
 def download_from_hf(
@@ -568,7 +576,7 @@ def get_processor(
                     **kwargs,
                 )
             else:
-                processor = AutoProcessor.from_pretrained(
+                processor = _lazy_auto_processor().from_pretrained(
                     tokenizer_name,
                     *args,
                     trust_remote_code=trust_remote_code,
@@ -583,7 +591,7 @@ def get_processor(
                 f"Processor {tokenizer_name} does not have a slow version. Automatically use fast version"
             )
             kwargs["use_fast"] = True
-            processor = AutoProcessor.from_pretrained(
+            processor = _lazy_auto_processor().from_pretrained(
                 tokenizer_name,
                 *args,
                 trust_remote_code=trust_remote_code,

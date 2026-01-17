@@ -2,7 +2,6 @@ from typing import TYPE_CHECKING, Callable, List, Optional
 
 import torch
 
-from sglang.srt.batch_overlap import two_batch_overlap
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.speculative.spec_info import SpecInput
 
@@ -119,6 +118,8 @@ class TboAttnBackend(AttentionBackend):
         replay_seq_lens_sum: int = None,
         replay_seq_lens_cpu: Optional[torch.Tensor] = None,
     ):
+        from sglang.srt.batch_overlap import two_batch_overlap
+
         token_num_per_seq = two_batch_overlap.get_token_num_per_seq(
             forward_mode=forward_mode, spec_info=spec_info
         )
@@ -206,6 +207,8 @@ def _init_forward_metadata_cuda_graph_split(
     replay_seq_lens_sum: int = None,
     replay_seq_lens_cpu: Optional[torch.Tensor] = None,
 ):
+    from sglang.srt.batch_overlap import two_batch_overlap
+
     token_num_per_seq = two_batch_overlap.get_token_num_per_seq(
         forward_mode=forward_mode, spec_info=spec_info
     )
