@@ -2088,6 +2088,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         else:
             lora_ids = None
 
+        # Use CPU copy to avoid GPU sync.
+        if buffers.seq_lens_cpu is not None:
+            seq_lens_sum = int(buffers.seq_lens_cpu.sum().item())
+        else:
+            seq_lens_sum = int(buffers.seq_lens.sum().item())
+
         forward_batch = ForwardBatch(
             forward_mode=capture_forward_mode,
             batch_size=batch_size,
@@ -2101,7 +2107,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             token_to_kv_pool=self.token_to_kv_pool,
             attn_backend=self.attn_backend,
             out_cache_loc=buffers.out_cache_loc,
-            seq_lens_sum=buffers.seq_lens.sum().item(),
+            seq_lens_sum=seq_lens_sum,
             encoder_lens=buffers.encoder_lens,
             return_logprob=False,
             positions=buffers.positions,
