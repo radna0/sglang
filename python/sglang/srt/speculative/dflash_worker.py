@@ -53,6 +53,11 @@ class DFlashWorker:
         moe_ep_rank: int,
         nccl_port: int,
         target_worker: TpModelWorker,
+        # Newer scheduler code may pass additional kwargs to draft workers
+        # (e.g. attn_cp_rank for attention context parallel). DFLASH spec-v1
+        # doesn't use them; accept for forward compatibility.
+        attn_cp_rank: Optional[int] = None,
+        **_unused_kwargs,
     ):
         self.server_args = server_args
         self.gpu_id = gpu_id
@@ -65,6 +70,7 @@ class DFlashWorker:
         self.tp_rank = tp_rank
         self.page_size = server_args.page_size
         self.device = target_worker.device
+        self.attn_cp_rank = attn_cp_rank
 
         self._warned_forced_greedy = False
         self._logged_first_verify = False
