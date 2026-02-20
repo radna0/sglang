@@ -57,3 +57,7 @@ python -m sglang.launch_server \
 For GPT-OSS-120B on a single H100 80GB, very long decodes can exceed KV-cache
 capacity (especially for DFlash). If you need 16k+ decode reliably, use `--tp-size 8`.
 
+If you must stay on TP=1, try reducing KV memory pressure:
+
+- Lower `--max-total-tokens` to the smallest value that still fits your decode target.
+- Consider `--kv-cache-dtype=fp8_e4m3` or `--kv-cache-dtype=fp8_e5m2` if acceptable for your use case.
