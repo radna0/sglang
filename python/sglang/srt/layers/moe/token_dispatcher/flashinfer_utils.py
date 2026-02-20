@@ -1,15 +1,14 @@
 import torch.distributed as dist
 
-from sglang.srt.utils import is_flashinfer_available
+try:
+    # FlashInfer may be installed but broken due to missing/incorrect cuda-python.
+    # Never hard-fail SGLang import on that; only require it when the FlashInfer
+    # token dispatcher is actually selected at runtime.
+    from flashinfer.comm.mnnvl import CommBackend  # type: ignore
+except Exception:
 
-if is_flashinfer_available():
-    from flashinfer.comm.mnnvl import CommBackend
-else:
-
-    class CommBackend:
-        """
-        Placeholder base class when flashinfer is not available
-        """
+    class CommBackend:  # type: ignore
+        """Placeholder base class when FlashInfer is not available."""
 
         pass
 

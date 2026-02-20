@@ -2469,11 +2469,36 @@ class ServerArgs:
                             draft_hf_config=draft_hf_config,
                             default=None,
                         )
+                        draft_model_type = getattr(draft_hf_config, "model_type", None)
                     except Exception as e:
                         logger.warning(
                             "Failed to infer DFLASH block_size from transformers config loader; "
                             "defaulting speculative_num_draft_tokens to 16. Error: %s",
                             e,
+                        )
+                        draft_model_type = None
+                else:
+                    # If we inferred from raw config.json, try to read model_type from it.
+                    draft_model_type = None
+                    try:
+                        if "draft_config_json" in locals():
+                            draft_model_type = (draft_config_json or {}).get("model_type")
+                    except Exception:
+                        draft_model_type = None
+
+                # GPT-OSS requires attention sink behavior; enforce FA3 for both target and draft.
+                if draft_model_type == "gpt_oss":
+                    if self.attention_backend != "fa3":
+                        raise ValueError(
+                            "GPT-OSS DFLASH requires --attention-backend=fa3 (FlashAttention3). "
+                            f"Got attention_backend={self.attention_backend!r}."
+                        )
+                    if self.speculative_draft_attention_backend is None:
+                        self.speculative_draft_attention_backend = "fa3"
+                    elif self.speculative_draft_attention_backend != "fa3":
+                        raise ValueError(
+                            "GPT-OSS DFLASH requires --speculative-draft-attention-backend=fa3. "
+                            f"Got speculative_draft_attention_backend={self.speculative_draft_attention_backend!r}."
                         )
 
                 if inferred_block_size is None:

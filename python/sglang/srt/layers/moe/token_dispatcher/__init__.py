@@ -16,10 +16,24 @@ from sglang.srt.layers.moe.token_dispatcher.deepep import (
     DeepEPNormalCombineInput,
     DeepEPNormalDispatchOutput,
 )
-from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
-    FlashinferDispatcher,
-    FlashinferDispatchOutput,
-)
+try:
+    # FlashInfer can be absent or partially broken (e.g. missing cuda-python).
+    # Keep import-time robust; raise only if user selects the FlashInfer backend.
+    from sglang.srt.layers.moe.token_dispatcher.flashinfer import (  # type: ignore
+        FlashinferDispatcher,
+        FlashinferDispatchOutput,
+    )
+except Exception:  # pragma: no cover
+
+    class _FlashinferUnavailable:
+        def __init__(self, *args, **kwargs):
+            raise ImportError(
+                "Flashinfer token dispatcher is unavailable. "
+                "Install a working flashinfer + cuda-python stack, or select a non-flashinfer backend."
+            )
+
+    FlashinferDispatcher = _FlashinferUnavailable  # type: ignore
+    FlashinferDispatchOutput = _FlashinferUnavailable  # type: ignore
 from sglang.srt.layers.moe.token_dispatcher.fuseep import NpuFuseEPDispatcher
 from sglang.srt.layers.moe.token_dispatcher.mooncake import (
     MooncakeCombineInput,

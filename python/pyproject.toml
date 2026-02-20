@@ -24,7 +24,6 @@ dependencies = [
   "build",
   "compressed-tensors",
   "cuda-python==12.9",
-  "decord2",
   "datasets",
   "einops",
   "fastapi",
@@ -100,6 +99,7 @@ torch = [
 
 [project.optional-dependencies]
 checkpoint-engine = ["checkpoint-engine==0.1.2"]
+multimodal = ["decord2"]
 diffusion = [
   "PyYAML==6.0.1",
   "cloudpickle",
