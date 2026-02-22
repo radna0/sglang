@@ -289,9 +289,25 @@ class CudaGraphRunner:
                 if not self.model_runner.spec_algorithm.is_dflash():
                     raise RuntimeError("This should not happen")
             self.capture_forward_mode = ForwardMode.TARGET_VERIFY
-            self.num_tokens_per_bs = (
-                self.model_runner.server_args.speculative_num_draft_tokens
-            )
+            # For DFLASH_TREE, `speculative_num_draft_tokens` is repurposed to mean
+            # "verify-node budget" (num_verify_tokens). The draft worker still runs
+            # fixed-size draft blocks of length `block_size`, so its cuda-graph
+            # token-per-batch must stay aligned with `block_size` (otherwise replay
+            # sees shape mismatches when copying `input_ids`).
+            from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+            if (
+                self.model_runner.is_draft_worker
+                and self.model_runner.spec_algorithm == SpeculativeAlgorithm.DFLASH_TREE
+            ):
+                self.num_tokens_per_bs = int(
+                    self.model_runner.server_args.speculative_dflash_block_size
+                    or self.model_runner.server_args.speculative_num_draft_tokens
+                )
+            else:
+                self.num_tokens_per_bs = int(
+                    self.model_runner.server_args.speculative_num_draft_tokens
+                )
         elif self.is_dllm:
             self.capture_forward_mode = ForwardMode.DLLM_EXTEND
             self.num_tokens_per_bs = self.dllm_config.block_size
