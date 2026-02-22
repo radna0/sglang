@@ -146,6 +146,17 @@ class DFlashTreeWorker:
         draft_server_args.context_length = (
             target_worker.model_runner.model_config.context_len
         )
+        # IMPORTANT: for DFLASH_TREE we overload `speculative_num_draft_tokens` to
+        # mean "verify-node budget" (num_verify_tokens). The draft worker,
+        # however, always runs a fixed-size `block_size` forward (same as DFLASH),
+        # and SGLang's cuda-graph capture for DFlash relies on
+        # `speculative_num_draft_tokens == block_size` to size buffers + build
+        # DFlashVerifyInput correctly. So configure the *draft worker* with DFLASH
+        # semantics to keep graph capture safe and shape-stable.
+        draft_server_args.speculative_algorithm = "DFLASH"
+        draft_server_args.speculative_num_draft_tokens = int(self.block_size)
+        draft_server_args.speculative_num_steps = 1
+        draft_server_args.speculative_eagle_topk = 1
 
         self.draft_worker = TpModelWorker(
             server_args=draft_server_args,
@@ -700,7 +711,7 @@ class DFlashTreeWorker:
                 token_to_kv_pool=self.draft_model_runner.token_to_kv_pool,
                 attn_backend=self.draft_model_runner.attn_backend,
                 input_embeds=input_embeds,
-                spec_algorithm=SpeculativeAlgorithm.DFLASH_TREE,
+                spec_algorithm=SpeculativeAlgorithm.DFLASH,
                 spec_info=self._draft_block_spec_info,
                 capture_hidden_mode=CaptureHiddenMode.NULL,
             )
