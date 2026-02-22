@@ -19,7 +19,6 @@ import json
 import os
 import pickle
 import random
-import resource
 import shutil
 import sys
 import time
@@ -43,12 +42,22 @@ from datasets import load_dataset
 from PIL import Image
 from tqdm.asyncio import tqdm
 from transformers import (
-    AutoProcessor,
     AutoTokenizer,
     PreTrainedTokenizer,
     PreTrainedTokenizerBase,
     PreTrainedTokenizerFast,
 )
+
+try:
+    # Optional: pulls in vision deps (torchvision) on some installations.
+    from transformers import AutoProcessor  # type: ignore
+except Exception:  # pragma: no cover
+    AutoProcessor = None  # type: ignore
+
+try:
+    import resource  # POSIX-only
+except ModuleNotFoundError:  # pragma: no cover
+    resource = None
 
 ASSISTANT_SUFFIX = "Assistant:"
 _ROUTING_KEY_HEADER = "X-SMG-Routing-Key"
@@ -2982,6 +2991,8 @@ def run_benchmark(args_: argparse.Namespace):
 
 
 def set_ulimit(target_soft_limit=65535):
+    if resource is None:
+        return
     resource_type = resource.RLIMIT_NOFILE
     current_soft, current_hard = resource.getrlimit(resource_type)
 

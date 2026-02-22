@@ -33,7 +33,11 @@ import pickle
 import platform
 import random
 import re
-import resource
+try:
+    import resource  # type: ignore
+except ModuleNotFoundError:  # pragma: no cover
+    # Windows does not provide the POSIX `resource` module.
+    resource = None
 import shutil
 import signal
 import socket
@@ -1180,6 +1184,9 @@ def monkey_patch_p2p_access_check():
 
 
 def set_ulimit(target_soft_limit=65535):
+    if resource is None:  # pragma: no cover
+        return
+
     # number of open files
     resource_type = resource.RLIMIT_NOFILE
     current_soft, current_hard = resource.getrlimit(resource_type)

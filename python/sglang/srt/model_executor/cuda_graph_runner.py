@@ -953,48 +953,86 @@ class CudaGraphRunner:
                     seq_lens_sum=None,
                     seq_lens_cpu=None,
                 )
-        elif self.model_runner.spec_algorithm.is_dflash():
-            from sglang.srt.speculative.dflash_info import DFlashVerifyInput
+        else:
+            from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
-            backend_name = type(self.model_runner.attn_backend).__name__
-            # Avoid enabling custom-mask modes during graph capture for backends that
-            # can express DFLASH verify via their built-in causal path.
-            skip_custom_mask = backend_name in {
-                "FlashInferAttnBackend",
-                "FlashInferMLAAttnBackend",
-                "FlashAttentionBackend",
-                "TRTLLMHAAttnBackend",
-                "TRTLLMMLABackend",
-            }
-            spec_info = DFlashVerifyInput(
-                draft_token=None,
-                positions=None,
-                draft_token_num=self.model_runner.server_args.speculative_num_draft_tokens,
-                custom_mask=(
-                    None
-                    if (self.model_runner.is_draft_worker or skip_custom_mask)
-                    else self.buffers.custom_mask
-                ),
-                capture_hidden_mode=(
-                    CaptureHiddenMode.NULL
-                    if self.model_runner.is_draft_worker
-                    else CaptureHiddenMode.FULL
-                ),
-            )
+            if self.model_runner.spec_algorithm == SpeculativeAlgorithm.DFLASH_TREE:
+                # DFLASH_TREE uses EAGLE-style tree verification on the target, but still runs a fixed-size
+                # DFlash block forward on the draft model. CUDA graph capture must match those spec_info types.
+                if self.model_runner.is_draft_worker:
+                    from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 
-        elif self.model_runner.spec_algorithm.is_ngram():
-            from sglang.srt.speculative.ngram_info import NgramVerifyInput
+                    draft_block_size = int(
+                        self.model_runner.server_args.speculative_dflash_block_size
+                        or self.model_runner.server_args.speculative_num_draft_tokens
+                    )
+                    spec_info = DFlashVerifyInput(
+                        draft_token=None,
+                        positions=None,
+                        draft_token_num=draft_block_size,
+                        custom_mask=None,
+                        capture_hidden_mode=CaptureHiddenMode.NULL,
+                    )
+                else:
+                    from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
-            spec_info = NgramVerifyInput(
-                draft_token=None,
-                tree_mask=self.buffers.custom_mask,
-                positions=None,
-                retrive_index=None,
-                retrive_next_token=None,
-                retrive_next_sibling=None,
-                draft_token_num=self.num_tokens_per_bs,
-            )
-            spec_info.capture_hidden_mode = CaptureHiddenMode.NULL
+                    spec_info = EagleVerifyInput(
+                        draft_token=None,
+                        custom_mask=self.buffers.custom_mask,
+                        positions=None,
+                        retrive_index=None,
+                        retrive_next_token=None,
+                        retrive_next_sibling=None,
+                        retrive_cum_len=None,
+                        spec_steps=self.model_runner.server_args.speculative_num_steps,
+                        topk=self.model_runner.server_args.speculative_eagle_topk,
+                        draft_token_num=self.model_runner.server_args.speculative_num_draft_tokens,
+                        capture_hidden_mode=CaptureHiddenMode.FULL,
+                        seq_lens_sum=None,
+                        seq_lens_cpu=None,
+                    )
+            elif self.model_runner.spec_algorithm.is_dflash():
+                from sglang.srt.speculative.dflash_info import DFlashVerifyInput
+
+                backend_name = type(self.model_runner.attn_backend).__name__
+                # Avoid enabling custom-mask modes during graph capture for backends that
+                # can express DFLASH verify via their built-in causal path.
+                skip_custom_mask = backend_name in {
+                    "FlashInferAttnBackend",
+                    "FlashInferMLAAttnBackend",
+                    "FlashAttentionBackend",
+                    "TRTLLMHAAttnBackend",
+                    "TRTLLMMLABackend",
+                }
+                spec_info = DFlashVerifyInput(
+                    draft_token=None,
+                    positions=None,
+                    draft_token_num=self.model_runner.server_args.speculative_num_draft_tokens,
+                    custom_mask=(
+                        None
+                        if (self.model_runner.is_draft_worker or skip_custom_mask)
+                        else self.buffers.custom_mask
+                    ),
+                    capture_hidden_mode=(
+                        CaptureHiddenMode.NULL
+                        if self.model_runner.is_draft_worker
+                        else CaptureHiddenMode.FULL
+                    ),
+                )
+
+            elif self.model_runner.spec_algorithm.is_ngram():
+                from sglang.srt.speculative.ngram_info import NgramVerifyInput
+
+                spec_info = NgramVerifyInput(
+                    draft_token=None,
+                    tree_mask=self.buffers.custom_mask,
+                    positions=None,
+                    retrive_index=None,
+                    retrive_next_token=None,
+                    retrive_next_sibling=None,
+                    draft_token_num=self.num_tokens_per_bs,
+                )
+                spec_info.capture_hidden_mode = CaptureHiddenMode.NULL
 
         return spec_info
 

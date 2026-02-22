@@ -1053,7 +1053,7 @@ class ServerArgs:
                 if self.speculative_algorithm == "STANDALONE":
                     # standalonedraft model and cuda graphs
                     reserved_mem += 6 * 1024
-                elif self.speculative_algorithm == "DFLASH":
+                elif self.speculative_algorithm in ("DFLASH", "DFLASH_TREE"):
                     # dflash draft model and cuda graphs
                     reserved_mem += 6 * 1024
                 elif self.speculative_algorithm != "NGRAM":
@@ -2524,6 +2524,156 @@ class ServerArgs:
                 self.enable_mixed_chunk = False
                 logger.warning(
                     "Mixed chunked prefill is disabled because of using dflash speculative decoding."
+                )
+
+        elif self.speculative_algorithm == "DFLASH_TREE":
+            if self.enable_dp_attention:
+                raise ValueError(
+                    "Currently DFLASH_TREE speculative decoding does not support dp attention."
+                )
+
+            if self.pp_size != 1:
+                raise ValueError(
+                    "Currently DFLASH_TREE speculative decoding only supports pp_size == 1."
+                )
+
+            if self.page_size != 1:
+                raise ValueError(
+                    "Currently DFLASH_TREE speculative decoding requires page_size == 1. "
+                    f"Got page_size={self.page_size}."
+                )
+
+            if self.speculative_draft_model_path is None:
+                raise ValueError(
+                    "DFLASH_TREE speculative decoding requires setting --speculative-draft-model-path."
+                )
+
+            if self.speculative_eagle_topk is None:
+                self.speculative_eagle_topk = 4
+
+            if self.speculative_dflash_block_size is not None and int(
+                self.speculative_dflash_block_size
+            ) <= 0:
+                raise ValueError(
+                    "DFLASH_TREE requires --speculative-dflash-block-size to be positive, "
+                    f"got {self.speculative_dflash_block_size}."
+                )
+
+            if self.speculative_dflash_block_size is None:
+                from sglang.srt.speculative.dflash_utils import (
+                    resolve_dflash_block_size,
+                )
+
+                model_override_args = json.loads(self.json_model_override_args)
+                inferred_block_size = None
+                draft_model_type = None
+                try:
+                    from sglang.srt.utils.hf_transformers_utils import download_from_hf
+
+                    config_root = (
+                        self.speculative_draft_model_path
+                        if os.path.isdir(self.speculative_draft_model_path)
+                        else download_from_hf(
+                            self.speculative_draft_model_path,
+                            revision=self.speculative_draft_model_revision,
+                            filename="",
+                            tokens={"token": os.environ.get("HF_TOKEN")},
+                        )
+                    )
+                    config_path = os.path.join(config_root, "config.json")
+                    with open(config_path, "r", encoding="utf-8") as f:
+                        draft_config_json = json.load(f)
+                    inferred_block_size = resolve_dflash_block_size(
+                        draft_config_json=draft_config_json,
+                        draft_hf_config=None,
+                        default=None,
+                    )
+                    draft_model_type = (draft_config_json or {}).get("model_type")
+                except Exception as e:
+                    logger.warning(
+                        "Failed to infer DFLASH block_size from draft config.json; "
+                        "falling back to transformers config loader. Error: %s",
+                        e,
+                    )
+
+                if inferred_block_size is None:
+                    try:
+                        from sglang.srt.utils.hf_transformers_utils import get_config
+
+                        draft_hf_config = get_config(
+                            self.speculative_draft_model_path,
+                            trust_remote_code=self.trust_remote_code,
+                            revision=self.speculative_draft_model_revision,
+                            model_override_args=model_override_args,
+                        )
+                        inferred_block_size = resolve_dflash_block_size(
+                            draft_hf_config=draft_hf_config,
+                            default=None,
+                        )
+                        draft_model_type = getattr(draft_hf_config, "model_type", None)
+                    except Exception as e:
+                        logger.warning(
+                            "Failed to infer DFLASH block_size from transformers config loader; "
+                            "defaulting speculative_dflash_block_size to 16. Error: %s",
+                            e,
+                        )
+
+                # GPT-OSS requires attention sink behavior; enforce FA3 for both target and draft.
+                if draft_model_type == "gpt_oss":
+                    if self.attention_backend != "fa3":
+                        raise ValueError(
+                            "GPT-OSS DFLASH_TREE requires --attention-backend=fa3 (FlashAttention3). "
+                            f"Got attention_backend={self.attention_backend!r}."
+                        )
+                    if self.speculative_draft_attention_backend is None:
+                        self.speculative_draft_attention_backend = "fa3"
+                    elif self.speculative_draft_attention_backend != "fa3":
+                        raise ValueError(
+                            "GPT-OSS DFLASH_TREE requires --speculative-draft-attention-backend=fa3. "
+                            f"Got speculative_draft_attention_backend={self.speculative_draft_attention_backend!r}."
+                        )
+
+                if inferred_block_size is None:
+                    inferred_block_size = 16
+                    logger.warning(
+                        "speculative_dflash_block_size is not set; defaulting to %d for DFLASH_TREE.",
+                        inferred_block_size,
+                    )
+                self.speculative_dflash_block_size = inferred_block_size
+
+            if self.speculative_num_steps is None:
+                self.speculative_num_steps = int(self.speculative_dflash_block_size) - 1
+            if int(self.speculative_num_steps) <= 0:
+                raise ValueError(
+                    "DFLASH_TREE requires speculative_num_steps to be positive. "
+                    f"Got speculative_num_steps={self.speculative_num_steps}."
+                )
+            if int(self.speculative_num_steps) >= int(self.speculative_dflash_block_size):
+                raise ValueError(
+                    "DFLASH_TREE requires speculative_num_steps <= speculative_dflash_block_size - 1. "
+                    f"Got speculative_num_steps={self.speculative_num_steps}, "
+                    f"speculative_dflash_block_size={self.speculative_dflash_block_size}."
+                )
+
+            if self.speculative_num_draft_tokens is None:
+                # Verify-node budget defaults to the draft window length.
+                self.speculative_num_draft_tokens = int(self.speculative_dflash_block_size)
+
+            if self.max_running_requests is None:
+                self.max_running_requests = 48
+                logger.warning(
+                    "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
+                )
+
+            self.disable_overlap_schedule = True
+            logger.warning(
+                "Overlap scheduler is disabled when using DFLASH_TREE speculative decoding (spec v2 is not supported yet)."
+            )
+
+            if self.enable_mixed_chunk:
+                self.enable_mixed_chunk = False
+                logger.warning(
+                    "Mixed chunked prefill is disabled because of using DFLASH_TREE speculative decoding."
                 )
 
         if self.speculative_algorithm in ("EAGLE", "EAGLE3", "STANDALONE"):
@@ -4098,7 +4248,15 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-algorithm",
             type=str,
-            choices=["DFLASH", "EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "NGRAM"],
+            choices=[
+                "DFLASH",
+                "DFLASH_TREE",
+                "EAGLE",
+                "EAGLE3",
+                "NEXTN",
+                "STANDALONE",
+                "NGRAM",
+            ],
             help="Speculative algorithm.",
         )
         parser.add_argument(
@@ -4145,7 +4303,7 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-dflash-block-size",
             type=int,
-            help="DFLASH only. Block size (verify window length). Alias of --speculative-num-draft-tokens for DFLASH.",
+            help="DFLASH/DFLASH_TREE only. Draft block size (verify window length). For DFLASH, this is an alias of --speculative-num-draft-tokens.",
             default=ServerArgs.speculative_dflash_block_size,
         )
         parser.add_argument(
