@@ -974,6 +974,7 @@ class MHATokenToKVPool(KVCache):
             if (
                 (k_scale is None or v_scale is None)
                 and self.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+                and layer is not None
                 and getattr(layer, "k_scale", None) is None
                 and getattr(layer, "v_scale", None) is None
             ):

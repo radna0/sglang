@@ -165,7 +165,7 @@ class SWAKVPool(KVCache):
                     loc = self.translate_loc_from_full_to_swa(loc)
 
             self.swa_kv_pool.set_kv_buffer(
-                None,
+                layer,
                 loc,
                 cache_k,
                 cache_v,
@@ -175,7 +175,7 @@ class SWAKVPool(KVCache):
             )
         else:
             self.full_kv_pool.set_kv_buffer(
-                None,
+                layer,
                 loc,
                 cache_k,
                 cache_v,
