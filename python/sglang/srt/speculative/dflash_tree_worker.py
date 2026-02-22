@@ -157,13 +157,9 @@ class DFlashTreeWorker:
             attn_cp_rank=attn_cp_rank,
             moe_dp_rank=moe_dp_rank,
             nccl_port=nccl_port,
-            shared_req_to_token_pool=shared_req_to_token_pool,
-            shared_token_to_kv_pool_allocator=shared_token_to_kv_pool_allocator,
             is_draft_worker=True,
-            draft_model_idx=0,
-            draft_model_path=server_args.speculative_draft_model_path,
-            draft_model_revision=server_args.speculative_draft_model_revision,
-            draft_model_quantization=server_args.speculative_draft_model_quantization,
+            req_to_token_pool=shared_req_to_token_pool,
+            token_to_kv_pool_allocator=shared_token_to_kv_pool_allocator,
         )
         self.draft_model_runner = self.draft_worker.model_runner
         self.draft_model = self.draft_model_runner.model
