@@ -1719,7 +1719,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         return True
 
     def configure_kv_cache_dtype(self):
-        if self.server_args.kv_cache_dtype == "auto":
+        kv_cache_dtype_req = self.server_args.kv_cache_dtype
+        if (
+            self.is_draft_worker
+            and self.server_args.speculative_draft_kv_cache_dtype is not None
+        ):
+            kv_cache_dtype_req = self.server_args.speculative_draft_kv_cache_dtype
+
+        if kv_cache_dtype_req == "auto":
             quant_config = getattr(self.model, "quant_config", None)
             kv_cache_quant_algo = getattr(quant_config, "kv_cache_quant_algo", None)
             if (
@@ -1728,29 +1735,33 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             ):
                 if _is_hip:
                     self.kv_cache_dtype = fp8_dtype
-                    self.server_args.kv_cache_dtype = TORCH_DTYPE_TO_KV_CACHE_STR[
-                        self.kv_cache_dtype
-                    ]
+                    if kv_cache_dtype_req == self.server_args.kv_cache_dtype:
+                        self.server_args.kv_cache_dtype = TORCH_DTYPE_TO_KV_CACHE_STR[
+                            self.kv_cache_dtype
+                        ]
                 else:
                     self.kv_cache_dtype = torch.float8_e4m3fn
-                    self.server_args.kv_cache_dtype = TORCH_DTYPE_TO_KV_CACHE_STR[
-                        self.kv_cache_dtype
-                    ]
+                    if kv_cache_dtype_req == self.server_args.kv_cache_dtype:
+                        self.server_args.kv_cache_dtype = TORCH_DTYPE_TO_KV_CACHE_STR[
+                            self.kv_cache_dtype
+                        ]
+                kv_cache_dtype_req = TORCH_DTYPE_TO_KV_CACHE_STR[self.kv_cache_dtype]
             else:
                 self.kv_cache_dtype = self.dtype
-        elif self.server_args.kv_cache_dtype == "fp8_e5m2":
+                kv_cache_dtype_req = TORCH_DTYPE_TO_KV_CACHE_STR[self.kv_cache_dtype]
+        elif kv_cache_dtype_req == "fp8_e5m2":
             if _is_hip:  # Using natively supported format
                 self.kv_cache_dtype = fp8_dtype
             else:
                 self.kv_cache_dtype = torch.float8_e5m2
-        elif self.server_args.kv_cache_dtype == "fp8_e4m3":
+        elif kv_cache_dtype_req == "fp8_e4m3":
             if _is_hip:  # Using natively supported format
                 self.kv_cache_dtype = fp8_dtype
             else:
                 self.kv_cache_dtype = torch.float8_e4m3fn
-        elif self.server_args.kv_cache_dtype in ("bf16", "bfloat16"):
+        elif kv_cache_dtype_req in ("bf16", "bfloat16"):
             self.kv_cache_dtype = torch.bfloat16
-        elif self.server_args.kv_cache_dtype == "fp4_e2m1":
+        elif kv_cache_dtype_req == "fp4_e2m1":
             if hasattr(torch, "float4_e2m1fn_x2"):
                 self.kv_cache_dtype = torch.float4_e2m1fn_x2
                 logger.warning(f"FP4 (E2M1) KV Cache might lead to a accuracy drop!")
@@ -1759,12 +1770,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     f"--kv-cache-dtype falls back to 'auto' because this torch version does not support torch.float4_e2m1fn_x2"
                 )
                 self.kv_cache_dtype = self.dtype
+                kv_cache_dtype_req = TORCH_DTYPE_TO_KV_CACHE_STR[self.kv_cache_dtype]
         else:
             raise ValueError(
-                f"Unsupported kv_cache_dtype: {self.server_args.kv_cache_dtype}."
+                f"Unsupported kv_cache_dtype: {kv_cache_dtype_req}."
             )
 
         log_info_on_rank0(logger, f"Using KV cache dtype: {self.kv_cache_dtype}")
+        self.kv_cache_dtype_str = kv_cache_dtype_req
 
     def init_cublas(self):
         """We need to run a small matmul to init cublas. Otherwise, it will raise some errors later."""

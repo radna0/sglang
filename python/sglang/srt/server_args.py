@@ -477,6 +477,7 @@ class ServerArgs:
     speculative_token_map: Optional[str] = None
     speculative_attention_mode: str = "prefill"
     speculative_draft_attention_backend: Optional[str] = None
+    speculative_draft_kv_cache_dtype: Optional[str] = None
     speculative_moe_runner_backend: Optional[str] = None
     speculative_moe_a2a_backend: Optional[str] = None
     speculative_draft_model_quantization: Optional[str] = None
@@ -4336,6 +4337,14 @@ class ServerArgs:
             type=str,
             help="Attention backend for speculative decoding drafting.",
             default=ServerArgs.speculative_draft_attention_backend,
+        )
+        parser.add_argument(
+            "--speculative-draft-kv-cache-dtype",
+            type=str,
+            default=ServerArgs.speculative_draft_kv_cache_dtype,
+            choices=["auto", "fp8_e5m2", "fp8_e4m3", "bf16", "bfloat16", "fp4_e2m1"],
+            help="Override KV cache dtype for the draft model in speculative decoding. "
+            "If unset, the draft uses the same KV cache dtype as the target (--kv-cache-dtype).",
         )
         parser.add_argument(
             "--speculative-moe-runner-backend",
