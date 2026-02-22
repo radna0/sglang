@@ -963,6 +963,38 @@ class MHATokenToKVPool(KVCache):
         else:
             layer_id = layer.layer_id
         if cache_k.dtype != self.dtype:
+            # If FP8 KV cache is enabled but the model didn't provide scaling factors
+            # (common for non-quantized checkpoints), defaulting to scale=1.0 can
+            # cause severe numeric drift (and kills speculative accept_len).
+            #
+            # Best-effort auto-calibration: compute a per-layer per-tensor scale
+            # once, on first write, and reuse it for the rest of the process.
+            # This keeps the KV cache internally consistent (a fixed scale is
+            # required because we do not store per-token scales).
+            if (
+                (k_scale is None or v_scale is None)
+                and self.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+                and getattr(layer, "k_scale", None) is None
+                and getattr(layer, "v_scale", None) is None
+            ):
+                # Use max(|K|, |V|) to avoid clipping either tensor.
+                # Add headroom to reduce the chance of later clipping.
+                max_fp8 = float(torch.finfo(self.dtype).max)
+                with torch.no_grad():
+                    amax_k = cache_k.detach().abs().amax()
+                    amax_v = cache_v.detach().abs().amax()
+                    amax = torch.maximum(amax_k, amax_v).to(torch.float32)
+                    # scale = amax / (max_fp8 * 0.95). Clamp to avoid div-by-0.
+                    scale = (amax / (max_fp8 * 0.95)).clamp(min=1e-6)
+                # Store as 0-dim tensors so `.expand()` works in FA3 backend.
+                scale_t = scale.to(device=cache_k.device, dtype=torch.float32)
+                layer.k_scale = scale_t
+                layer.v_scale = scale_t
+                layer.k_scale_float = float(scale.item())
+                layer.v_scale_float = float(scale.item())
+                k_scale = scale_t
+                v_scale = scale_t
+
             if k_scale is not None:
                 cache_k.div_(k_scale)
             if v_scale is not None:

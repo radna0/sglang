@@ -775,7 +775,7 @@ class FlashAttentionBackend(AttentionBackend):
             layer.sliding_window_size is not None and layer.sliding_window_size > -1
         )
         window_size = (layer.sliding_window_size, 0) if is_swa_layer else (-1, -1)
-        k_descale, v_descale = None, None
+        q_descale, k_descale, v_descale = None, None, None
         # only use kv scaling if: 1) fp8 kv is explicitly enabled, 2) RadixAttention
         # has corresponding quantization method so that layer.k_scale is not None,
         # 3) layer.head_dim <= 256 since fa3 kernel require fp16 and bf16 data type in this case,
@@ -787,11 +787,31 @@ class FlashAttentionBackend(AttentionBackend):
         ):
             if layer.k_scale is not None:
                 descale_shape = (forward_batch.batch_size, layer.tp_k_head_num)
+                q_descale = layer.k_scale.expand(descale_shape)
                 k_descale = layer.k_scale.expand(descale_shape)
                 v_descale = layer.v_scale.expand(descale_shape)
-            q = q.to(self.kv_cache_dtype)
-            q_rope = q_rope.to(self.kv_cache_dtype) if q_rope is not None else None
-            k_rope = k_rope.to(self.kv_cache_dtype) if k_rope is not None else None
+
+                # Quantize Q with the same per-layer scale used for KV cache so we
+                # can use FA3 FP8 path without losing too much precision.
+                q = (q / layer.k_scale).to(self.kv_cache_dtype)
+                q_rope = (
+                    (q_rope / layer.k_scale).to(self.kv_cache_dtype)
+                    if q_rope is not None
+                    else None
+                )
+                k_rope = (
+                    (k_rope / layer.k_scale).to(self.kv_cache_dtype)
+                    if k_rope is not None
+                    else None
+                )
+            else:
+                q = q.to(self.kv_cache_dtype)
+                q_rope = (
+                    q_rope.to(self.kv_cache_dtype) if q_rope is not None else None
+                )
+                k_rope = (
+                    k_rope.to(self.kv_cache_dtype) if k_rope is not None else None
+                )
         causal = True
         if layer.is_cross_attention or layer.attn_type == AttentionType.ENCODER_ONLY:
             causal = False
@@ -891,6 +911,7 @@ class FlashAttentionBackend(AttentionBackend):
                 causal=False if use_cascade_attn else causal,
                 window_size=window_size,
                 softcap=layer.logit_cap,
+                q_descale=q_descale,
                 k_descale=k_descale,
                 v_descale=v_descale,
                 return_softmax_lse=use_cascade_attn,
@@ -918,6 +939,7 @@ class FlashAttentionBackend(AttentionBackend):
                     causal=False,
                     window_size=window_size,
                     softcap=layer.logit_cap,
+                    q_descale=q_descale,
                     k_descale=k_descale,
                     v_descale=v_descale,
                     return_softmax_lse=True,
@@ -1033,6 +1055,7 @@ class FlashAttentionBackend(AttentionBackend):
                     softmax_scale=layer.scaling,
                     causal=False if use_cascade_attn else causal,
                     softcap=layer.logit_cap,
+                    q_descale=q_descale,
                     k_descale=k_descale,
                     v_descale=v_descale,
                     return_softmax_lse=use_cascade_attn,
@@ -1055,6 +1078,7 @@ class FlashAttentionBackend(AttentionBackend):
                             causal=False,
                             window_size=window_size,
                             softcap=layer.logit_cap,
+                            q_descale=q_descale,
                             k_descale=k_descale,
                             v_descale=v_descale,
                             return_softmax_lse=True,
@@ -1136,18 +1160,36 @@ class FlashAttentionBackend(AttentionBackend):
         if sinks is not None:
             kwargs["sinks"] = sinks
 
-        k_descale, v_descale = None, None
+        q_descale, k_descale, v_descale = None, None, None
         # only use kv scaling if: 1) fp8 kv is explicitly enabled, 2) RadixAttention
         # has corresponding quantization method so that layer.k_scale is not None,
-        # 3) layer.head_dim <= 256 since fa3 kernel require fp16 and bf16 data type in this case.
+        # 3) layer.head_dim <= 256 since FA3 kernel requires fp16/bf16 inputs for larger head dims.
         if self.kv_cache_dtype_str != "auto" and layer.head_dim <= 256:
             if layer.k_scale is not None:
                 descale_shape = (forward_batch.batch_size, layer.tp_k_head_num)
+                q_descale = layer.k_scale.expand(descale_shape)
                 k_descale = layer.k_scale.expand(descale_shape)
                 v_descale = layer.v_scale.expand(descale_shape)
-            q = q.to(self.kv_cache_dtype)
-            q_rope = q_rope.to(self.kv_cache_dtype) if q_rope is not None else None
-            k_rope = k_rope.to(self.kv_cache_dtype) if k_rope is not None else None
+
+                q = (q / layer.k_scale).to(self.kv_cache_dtype)
+                q_rope = (
+                    (q_rope / layer.k_scale).to(self.kv_cache_dtype)
+                    if q_rope is not None
+                    else None
+                )
+                k_rope = (
+                    (k_rope / layer.k_scale).to(self.kv_cache_dtype)
+                    if k_rope is not None
+                    else None
+                )
+            else:
+                q = q.to(self.kv_cache_dtype)
+                q_rope = (
+                    q_rope.to(self.kv_cache_dtype) if q_rope is not None else None
+                )
+                k_rope = (
+                    k_rope.to(self.kv_cache_dtype) if k_rope is not None else None
+                )
         if not self.use_mla:
             # Do multi-head attention
 
@@ -1176,6 +1218,7 @@ class FlashAttentionBackend(AttentionBackend):
                     causal=False,
                     window_size=(-1, -1),
                     softcap=layer.logit_cap,
+                    q_descale=q_descale,
                     k_descale=k_descale,
                     v_descale=v_descale,
                     num_splits=self.num_splits,
@@ -1196,6 +1239,7 @@ class FlashAttentionBackend(AttentionBackend):
                     causal=True,
                     window_size=(-1, -1),
                     softcap=layer.logit_cap,
+                    q_descale=q_descale,
                     k_descale=k_descale,
                     v_descale=v_descale,
                     num_splits=self.num_splits,
@@ -1232,6 +1276,7 @@ class FlashAttentionBackend(AttentionBackend):
                     causal=False if use_cascade_attn else causal,
                     window_size=window_size,
                     softcap=layer.logit_cap,
+                    q_descale=q_descale,
                     k_descale=k_descale,
                     v_descale=v_descale,
                     return_softmax_lse=use_cascade_attn,
@@ -1254,6 +1299,7 @@ class FlashAttentionBackend(AttentionBackend):
                             causal=False,
                             window_size=window_size,
                             softcap=layer.logit_cap,
+                            q_descale=q_descale,
                             k_descale=k_descale,
                             v_descale=v_descale,
                             return_softmax_lse=True,
@@ -1310,6 +1356,7 @@ class FlashAttentionBackend(AttentionBackend):
                 softmax_scale=layer.scaling,
                 causal=False if use_cascade_attn else causal,
                 softcap=layer.logit_cap,
+                q_descale=q_descale,
                 k_descale=k_descale,
                 v_descale=v_descale,
                 return_softmax_lse=use_cascade_attn,  # softmax_lse is needed for merge states
@@ -1331,6 +1378,7 @@ class FlashAttentionBackend(AttentionBackend):
                     causal=False,
                     window_size=window_size,
                     softcap=layer.logit_cap,
+                    q_descale=q_descale,
                     k_descale=k_descale,
                     v_descale=v_descale,
                     return_softmax_lse=True,
