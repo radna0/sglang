@@ -27,6 +27,7 @@ KVCache actually holds the physical kv cache.
 import abc
 import dataclasses
 import logging
+import os
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
@@ -982,14 +983,21 @@ class MHATokenToKVPool(KVCache):
                 # significantly reduce quantization error vs a single global scale.
                 # Add headroom to reduce the chance of later clipping.
                 max_fp8 = float(torch.finfo(self.dtype).max)
+                scale_mult_env = (os.environ.get("SGLANG_FP8_KV_SCALE_MULT") or "").strip()
+                try:
+                    scale_mult = float(scale_mult_env) if scale_mult_env else 1.0
+                except Exception:
+                    scale_mult = 1.0
+                if not (scale_mult > 0.0):
+                    scale_mult = 1.0
                 with torch.no_grad():
                     if cache_k.ndim == 3 and cache_v.ndim == 3 and cache_k.shape[1] == cache_v.shape[1]:
                         # cache_{k,v}: [num_tokens, num_kv_heads, head_dim]
                         # scale_{k,v}_h: [num_kv_heads]
                         amax_k_h = cache_k.detach().abs().amax(dim=(0, 2)).to(torch.float32)
                         amax_v_h = cache_v.detach().abs().amax(dim=(0, 2)).to(torch.float32)
-                        scale_k_h = (amax_k_h / (max_fp8 * 0.95)).clamp(min=1e-6)
-                        scale_v_h = (amax_v_h / (max_fp8 * 0.95)).clamp(min=1e-6)
+                        scale_k_h = (amax_k_h / (max_fp8 * 0.95)).clamp(min=1e-6) * scale_mult
+                        scale_v_h = (amax_v_h / (max_fp8 * 0.95)).clamp(min=1e-6) * scale_mult
 
                         k_scale_vec = scale_k_h.to(device=cache_k.device, dtype=torch.float32)
                         v_scale_vec = scale_v_h.to(device=cache_k.device, dtype=torch.float32)
@@ -1016,7 +1024,7 @@ class MHATokenToKVPool(KVCache):
                         amax_v = cache_v.detach().abs().amax()
                         amax = torch.maximum(amax_k, amax_v).to(torch.float32)
                         # scale = amax / (max_fp8 * 0.95). Clamp to avoid div-by-0.
-                        scale = (amax / (max_fp8 * 0.95)).clamp(min=1e-6)
+                        scale = (amax / (max_fp8 * 0.95)).clamp(min=1e-6) * scale_mult
                         # Store as 0-dim tensors so `.expand(...)` works in FA3 backend.
                         scale_t = scale.to(device=cache_k.device, dtype=torch.float32)
                         layer.k_scale = scale_t
