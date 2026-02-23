@@ -82,6 +82,11 @@ class RadixAttention(nn.Module):
         self.use_irope = use_irope
         self.k_scale = None
         self.v_scale = None
+        # Optional per-head KV cache scales (shape: [num_kv_heads]).
+        # When present, FA3 can use these via k_descale/v_descale (shape: [bs, num_kv_heads])
+        # to reduce FP8 KV numeric drift without requiring per-token scales.
+        self.k_scale_vec = None
+        self.v_scale_vec = None
         self.k_scale_float = None
         self.v_scale_float = None
         self.quant_method = None

@@ -757,8 +757,14 @@ class FlashAttentionBackend(AttentionBackend):
                     else forward_batch.encoder_out_cache_loc
                 )
                 if not self.use_mla:
+                    k_scale = getattr(layer, 'k_scale_vec', None)
+                    v_scale = getattr(layer, 'v_scale_vec', None)
+                    if k_scale is None:
+                        k_scale = layer.k_scale
+                    if v_scale is None:
+                        v_scale = layer.v_scale
                     forward_batch.token_to_kv_pool.set_kv_buffer(
-                        layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+                        layer, cache_loc, k, v, k_scale, v_scale
                     )
                 else:
                     forward_batch.token_to_kv_pool.set_mla_kv_buffer(
@@ -790,8 +796,14 @@ class FlashAttentionBackend(AttentionBackend):
         ):
             if layer.k_scale is not None:
                 descale_shape = (forward_batch.batch_size, layer.tp_k_head_num)
-                k_descale = layer.k_scale.expand(descale_shape)
-                v_descale = layer.v_scale.expand(descale_shape)
+                k_scale = getattr(layer, 'k_scale_vec', None)
+                v_scale = getattr(layer, 'v_scale_vec', None)
+                if k_scale is None:
+                    k_scale = layer.k_scale
+                if v_scale is None:
+                    v_scale = layer.v_scale
+                k_descale = k_scale.expand(descale_shape)
+                v_descale = v_scale.expand(descale_shape)
 
                 # Optional accuracy mode: keep Q in bf16 while KV cache is FP8.
                 # This can reduce numeric drift (and improve speculative accept_len),
@@ -1155,8 +1167,14 @@ class FlashAttentionBackend(AttentionBackend):
                     else forward_batch.encoder_out_cache_loc
                 )
                 if not self.use_mla:
+                    k_scale = getattr(layer, 'k_scale_vec', None)
+                    v_scale = getattr(layer, 'v_scale_vec', None)
+                    if k_scale is None:
+                        k_scale = layer.k_scale
+                    if v_scale is None:
+                        v_scale = layer.v_scale
                     forward_batch.token_to_kv_pool.set_kv_buffer(
-                        layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+                        layer, cache_loc, k, v, k_scale, v_scale
                     )
                 else:
                     forward_batch.token_to_kv_pool.set_mla_kv_buffer(
@@ -1178,7 +1196,7 @@ class FlashAttentionBackend(AttentionBackend):
 
         # When Spec Decode enabled, forward_decode would be called with two mode:
         # 1. DRAFT_DECODE: we enable cascade attention when top_k > 1
-        # 2. IDLE: we don’t need cascade attention, spec_info will be none in this case
+        # 2. IDLE: we donâ€™t need cascade attention, spec_info will be none in this case
         use_cascade_attn = forward_batch.spec_info is not None and self.topk > 1
 
         # Calculate window size (can be moved to metadata if layer properties don't change)
@@ -1204,8 +1222,14 @@ class FlashAttentionBackend(AttentionBackend):
         if self.kv_cache_dtype_str != "auto" and layer.head_dim <= 256:
             if layer.k_scale is not None:
                 descale_shape = (forward_batch.batch_size, layer.tp_k_head_num)
-                k_descale = layer.k_scale.expand(descale_shape)
-                v_descale = layer.v_scale.expand(descale_shape)
+                k_scale = getattr(layer, 'k_scale_vec', None)
+                v_scale = getattr(layer, 'v_scale_vec', None)
+                if k_scale is None:
+                    k_scale = layer.k_scale
+                if v_scale is None:
+                    v_scale = layer.v_scale
+                k_descale = k_scale.expand(descale_shape)
+                v_descale = v_scale.expand(descale_shape)
 
                 keep_q_bf16 = (os.environ.get("SGLANG_FP8_KEEP_Q_BF16") or "").strip().lower() in (
                     "1",

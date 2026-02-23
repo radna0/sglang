@@ -978,21 +978,53 @@ class MHATokenToKVPool(KVCache):
                 and getattr(layer, "k_scale", None) is None
                 and getattr(layer, "v_scale", None) is None
             ):
-                # Use max(|K|, |V|) to avoid clipping either tensor.
+                # Best-effort scales for FP8 KV cache. For FA3, per-head scales can
+                # significantly reduce quantization error vs a single global scale.
                 # Add headroom to reduce the chance of later clipping.
                 max_fp8 = float(torch.finfo(self.dtype).max)
                 with torch.no_grad():
-                    amax_k = cache_k.detach().abs().amax()
-                    amax_v = cache_v.detach().abs().amax()
-                    amax = torch.maximum(amax_k, amax_v).to(torch.float32)
-                    # scale = amax / (max_fp8 * 0.95). Clamp to avoid div-by-0.
-                    scale = (amax / (max_fp8 * 0.95)).clamp(min=1e-6)
-                # Store as 0-dim tensors so `.expand()` works in FA3 backend.
-                scale_t = scale.to(device=cache_k.device, dtype=torch.float32)
-                layer.k_scale = scale_t
-                layer.v_scale = scale_t
-                layer.k_scale_float = float(scale.item())
-                layer.v_scale_float = float(scale.item())
+                    if cache_k.ndim == 3 and cache_v.ndim == 3 and cache_k.shape[1] == cache_v.shape[1]:
+                        # cache_{k,v}: [num_tokens, num_kv_heads, head_dim]
+                        # scale_{k,v}_h: [num_kv_heads]
+                        amax_k_h = cache_k.detach().abs().amax(dim=(0, 2)).to(torch.float32)
+                        amax_v_h = cache_v.detach().abs().amax(dim=(0, 2)).to(torch.float32)
+                        scale_k_h = (amax_k_h / (max_fp8 * 0.95)).clamp(min=1e-6)
+                        scale_v_h = (amax_v_h / (max_fp8 * 0.95)).clamp(min=1e-6)
+
+                        k_scale_vec = scale_k_h.to(device=cache_k.device, dtype=torch.float32)
+                        v_scale_vec = scale_v_h.to(device=cache_k.device, dtype=torch.float32)
+
+                        # Keep scalar fallbacks for backends that only support a single scale.
+                        k_scale_scalar = k_scale_vec.max()
+                        v_scale_scalar = v_scale_vec.max()
+
+                        layer.k_scale_vec = k_scale_vec
+                        layer.v_scale_vec = v_scale_vec
+
+                        # 0-dim tensors for `.expand(...)` and scalar-only kernels.
+                        layer.k_scale = k_scale_scalar
+                        layer.v_scale = v_scale_scalar
+                        layer.k_scale_float = float(k_scale_scalar.item())
+                        layer.v_scale_float = float(v_scale_scalar.item())
+
+                        # Use per-head scales for this write.
+                        k_scale = k_scale_vec
+                        v_scale = v_scale_vec
+                    else:
+                        # Fallback: one global scale shared across K/V.
+                        amax_k = cache_k.detach().abs().amax()
+                        amax_v = cache_v.detach().abs().amax()
+                        amax = torch.maximum(amax_k, amax_v).to(torch.float32)
+                        # scale = amax / (max_fp8 * 0.95). Clamp to avoid div-by-0.
+                        scale = (amax / (max_fp8 * 0.95)).clamp(min=1e-6)
+                        # Store as 0-dim tensors so `.expand(...)` works in FA3 backend.
+                        scale_t = scale.to(device=cache_k.device, dtype=torch.float32)
+                        layer.k_scale = scale_t
+                        layer.v_scale = scale_t
+                        layer.k_scale_float = float(scale.item())
+                        layer.v_scale_float = float(scale.item())
+                        k_scale = scale_t
+                        v_scale = scale_t
 
                 # Optional: dump the computed per-layer scale to a QuantParamSchema
                 # JSON file for later reuse via --quantization-param-path.
@@ -1003,13 +1035,26 @@ class MHATokenToKVPool(KVCache):
                 except Exception:
                     pass
 
-                k_scale = scale_t
-                v_scale = scale_t
-
             if k_scale is not None:
-                cache_k.div_(k_scale)
+                if (
+                    isinstance(k_scale, torch.Tensor)
+                    and k_scale.ndim == 1
+                    and cache_k.ndim == 3
+                    and k_scale.numel() == cache_k.shape[1]
+                ):
+                    cache_k.div_(k_scale.view(1, -1, 1))
+                else:
+                    cache_k.div_(k_scale)
             if v_scale is not None:
-                cache_v.div_(v_scale)
+                if (
+                    isinstance(v_scale, torch.Tensor)
+                    and v_scale.ndim == 1
+                    and cache_v.ndim == 3
+                    and v_scale.numel() == cache_v.shape[1]
+                ):
+                    cache_v.div_(v_scale.view(1, -1, 1))
+                else:
+                    cache_v.div_(v_scale)
             cache_k = cache_k.to(self.dtype)
             cache_v = cache_v.to(self.dtype)
 
