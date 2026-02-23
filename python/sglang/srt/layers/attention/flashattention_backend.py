@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
 import numpy as np
+import os
 import torch
 import triton
 import triton.language as tl
@@ -789,23 +790,57 @@ class FlashAttentionBackend(AttentionBackend):
         ):
             if layer.k_scale is not None:
                 descale_shape = (forward_batch.batch_size, layer.tp_k_head_num)
-                q_descale = layer.k_scale.expand(descale_shape)
                 k_descale = layer.k_scale.expand(descale_shape)
                 v_descale = layer.v_scale.expand(descale_shape)
 
-                # Quantize Q with the same per-layer scale used for KV cache so we
-                # can use FA3 FP8 path without losing too much precision.
-                q = (q / layer.k_scale).to(self.kv_cache_dtype)
-                q_rope = (
-                    (q_rope / layer.k_scale).to(self.kv_cache_dtype)
-                    if q_rope is not None
-                    else None
+                # Optional accuracy mode: keep Q in bf16 while KV cache is FP8.
+                # This can reduce numeric drift (and improve speculative accept_len),
+                # at the cost of not taking the full FP8-Q path.
+                keep_q_bf16 = (os.environ.get("SGLANG_FP8_KEEP_Q_BF16") or "").strip().lower() in (
+                    "1",
+                    "true",
+                    "yes",
                 )
-                k_rope = (
-                    (k_rope / layer.k_scale).to(self.kv_cache_dtype)
-                    if k_rope is not None
-                    else None
-                )
+                if not keep_q_bf16:
+                    dynamic_q_scale = (os.environ.get("SGLANG_FP8_DYNAMIC_Q_SCALE") or "").strip().lower() in (
+                        "1",
+                        "true",
+                        "yes",
+                    )
+                    if dynamic_q_scale:
+                        # Use a per-call (per-layer) Q scale instead of reusing KV scale.
+                        # This improves Q utilization of the FP8 range when |Q| << |K,V|.
+                        max_fp8 = float(torch.finfo(self.kv_cache_dtype).max)
+                        with torch.no_grad():
+                            amax_q = q.detach().abs().amax().to(torch.float32)
+                            q_scale = (amax_q / (max_fp8 * 0.95)).clamp(min=1e-6)
+                        q_descale = q_scale.expand(descale_shape)
+                        q = (q / q_scale).to(self.kv_cache_dtype)
+                        q_rope = (
+                            (q_rope / q_scale).to(self.kv_cache_dtype)
+                            if q_rope is not None
+                            else None
+                        )
+                        k_rope = (
+                            (k_rope / layer.k_scale).to(self.kv_cache_dtype)
+                            if k_rope is not None
+                            else None
+                        )
+                    else:
+                        q_descale = layer.k_scale.expand(descale_shape)
+                        # Quantize Q with the same per-layer scale used for KV cache so we
+                        # can use FA3 FP8 path without losing too much precision.
+                        q = (q / layer.k_scale).to(self.kv_cache_dtype)
+                        q_rope = (
+                            (q_rope / layer.k_scale).to(self.kv_cache_dtype)
+                            if q_rope is not None
+                            else None
+                        )
+                        k_rope = (
+                            (k_rope / layer.k_scale).to(self.kv_cache_dtype)
+                            if k_rope is not None
+                            else None
+                        )
             else:
                 q = q.to(self.kv_cache_dtype)
                 q_rope = (
@@ -1169,21 +1204,50 @@ class FlashAttentionBackend(AttentionBackend):
         if self.kv_cache_dtype_str != "auto" and layer.head_dim <= 256:
             if layer.k_scale is not None:
                 descale_shape = (forward_batch.batch_size, layer.tp_k_head_num)
-                q_descale = layer.k_scale.expand(descale_shape)
                 k_descale = layer.k_scale.expand(descale_shape)
                 v_descale = layer.v_scale.expand(descale_shape)
 
-                q = (q / layer.k_scale).to(self.kv_cache_dtype)
-                q_rope = (
-                    (q_rope / layer.k_scale).to(self.kv_cache_dtype)
-                    if q_rope is not None
-                    else None
+                keep_q_bf16 = (os.environ.get("SGLANG_FP8_KEEP_Q_BF16") or "").strip().lower() in (
+                    "1",
+                    "true",
+                    "yes",
                 )
-                k_rope = (
-                    (k_rope / layer.k_scale).to(self.kv_cache_dtype)
-                    if k_rope is not None
-                    else None
-                )
+                if not keep_q_bf16:
+                    dynamic_q_scale = (os.environ.get("SGLANG_FP8_DYNAMIC_Q_SCALE") or "").strip().lower() in (
+                        "1",
+                        "true",
+                        "yes",
+                    )
+                    if dynamic_q_scale:
+                        max_fp8 = float(torch.finfo(self.kv_cache_dtype).max)
+                        with torch.no_grad():
+                            amax_q = q.detach().abs().amax().to(torch.float32)
+                            q_scale = (amax_q / (max_fp8 * 0.95)).clamp(min=1e-6)
+                        q_descale = q_scale.expand(descale_shape)
+                        q = (q / q_scale).to(self.kv_cache_dtype)
+                        q_rope = (
+                            (q_rope / q_scale).to(self.kv_cache_dtype)
+                            if q_rope is not None
+                            else None
+                        )
+                        k_rope = (
+                            (k_rope / layer.k_scale).to(self.kv_cache_dtype)
+                            if k_rope is not None
+                            else None
+                        )
+                    else:
+                        q_descale = layer.k_scale.expand(descale_shape)
+                        q = (q / layer.k_scale).to(self.kv_cache_dtype)
+                        q_rope = (
+                            (q_rope / layer.k_scale).to(self.kv_cache_dtype)
+                            if q_rope is not None
+                            else None
+                        )
+                        k_rope = (
+                            (k_rope / layer.k_scale).to(self.kv_cache_dtype)
+                            if k_rope is not None
+                            else None
+                        )
             else:
                 q = q.to(self.kv_cache_dtype)
                 q_rope = (
