@@ -1047,9 +1047,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.pyt_hooks.register_hooks(self.model, module_prefix="model")
 
         # NOTE: KV cache dtype can be overridden for the draft worker via
-        # --speculative-draft-kv-cache-dtype. Use the resolved dtype for this
-        # ModelRunner instance, not the global server_args.kv_cache_dtype.
-        if getattr(self, "kv_cache_dtype_str", self.server_args.kv_cache_dtype) == "fp8_e4m3":
+        # --speculative-draft-kv-cache-dtype. At this point (during load_model),
+        # kv_cache_dtype_str may not be initialized yet, so recompute the
+        # effective dtype from server_args + is_draft_worker.
+        kv_cache_dtype_req = self.server_args.kv_cache_dtype
+        if (
+            self.is_draft_worker
+            and getattr(self.server_args, "speculative_draft_kv_cache_dtype", None)
+            is not None
+        ):
+            kv_cache_dtype_req = self.server_args.speculative_draft_kv_cache_dtype
+
+        if kv_cache_dtype_req == "fp8_e4m3":
             if self.server_args.quantization_param_path is not None:
                 if callable(getattr(self.model, "load_kv_cache_scales", None)):
                     self.model.load_kv_cache_scales(
