@@ -993,6 +993,16 @@ class MHATokenToKVPool(KVCache):
                 layer.v_scale = scale_t
                 layer.k_scale_float = float(scale.item())
                 layer.v_scale_float = float(scale.item())
+
+                # Optional: dump the computed per-layer scale to a QuantParamSchema
+                # JSON file for later reuse via --quantization-param-path.
+                try:
+                    from sglang.srt.utils.kv_scale_dump import record_kv_scale
+
+                    record_kv_scale(layer_id, layer.k_scale_float)
+                except Exception:
+                    pass
+
                 k_scale = scale_t
                 v_scale = scale_t
 
