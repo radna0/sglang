@@ -19,6 +19,7 @@ from __future__ import annotations
 import atexit
 import json
 import os
+import signal
 from pathlib import Path
 from typing import Dict
 
@@ -71,3 +72,16 @@ def _write_schema() -> None:
 if _OUT_PATH:
     atexit.register(_write_schema)
 
+    def _handle_term(signum, frame):  # pragma: no cover
+        # Best-effort: write scales even if the server is terminated via SIGTERM.
+        try:
+            _write_schema()
+        finally:
+            raise SystemExit(0)
+
+    try:
+        signal.signal(signal.SIGTERM, _handle_term)
+        signal.signal(signal.SIGINT, _handle_term)
+    except Exception:
+        # Some runtimes may restrict signal usage; atexit remains as fallback.
+        pass
