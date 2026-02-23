@@ -69,7 +69,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.weight_utils import default_weight_loader, kv_cache_scales_loader
 from sglang.srt.models.utils import (
     create_fused_set_kv_buffer_arg,
     enable_fused_set_kv_buffer,
@@ -505,6 +505,7 @@ class GptOssModel(nn.Module):
         decoder_layer_type: type[nn.Module] = GptOssDecoderLayer,
     ) -> None:
         super().__init__()
+        self.config = config
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
         self.pp_group = get_pp_group()
@@ -589,6 +590,47 @@ class GptOssModel(nn.Module):
 
         return hidden_states, aux_hidden_states
 
+    # If this function is called, it should always initialize KV cache scale
+    # factors (or else raise an exception). Thus, handled exceptions should
+    # make sure to leave KV cache scale factors in a known good (dummy) state.
+    def load_kv_cache_scales(self, quantization_param_path: str) -> None:
+        tp_size = get_tensor_model_parallel_world_size()
+        tp_rank = get_tensor_model_parallel_rank()
+        for layer_idx, scaling_factor in kv_cache_scales_loader(
+            quantization_param_path,
+            tp_rank,
+            tp_size,
+            self.config.num_hidden_layers,
+            self.config.__class__.model_type,
+        ):
+            layer = self.layers[layer_idx]
+            if isinstance(layer, nn.Identity) or isinstance(layer, PPMissingLayer):
+                # Not a local layer on this PP rank.
+                continue
+
+            layer_self_attn = getattr(layer, "self_attn", None)
+            if layer_self_attn is None or not hasattr(layer_self_attn, "attn"):
+                raise RuntimeError(
+                    f"Layer {layer_idx} has no self_attn.attn; cannot set KV scales."
+                )
+
+            attn = layer_self_attn.attn
+            if not hasattr(attn, "k_scale"):
+                raise RuntimeError(
+                    "Self attention has no KV cache scaling factor attribute!"
+                )
+
+            # FA3 backend expects k_scale/v_scale to be a Tensor so it can `.expand(...)`.
+            # Keep *_float for backends that read a Python float.
+            scaling_factor = float(scaling_factor)
+            attn.k_scale_float = scaling_factor
+            attn.v_scale_float = scaling_factor
+
+            device = next(layer_self_attn.parameters()).device
+            scale_t = torch.tensor(scaling_factor, dtype=torch.float32, device=device)
+            attn.k_scale = scale_t
+            attn.v_scale = scale_t
+
 
 class GptOssForCausalLM(nn.Module):
     fall_back_to_pt_during_load = False
@@ -667,6 +709,9 @@ class GptOssForCausalLM(nn.Module):
     @property
     def end_layer(self):
         return self.model.end_layer
+
+    def load_kv_cache_scales(self, quantization_param_path: str) -> None:
+        self.model.load_kv_cache_scales(quantization_param_path)
 
     def _get_default_weight_mapping(self):
         """Generate default weight name mapping for GptOss safetensors."""
