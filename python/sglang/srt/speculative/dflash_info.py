@@ -496,6 +496,7 @@ class DFlashVerifyInput(SpecInput):
 
         # Update req-level KV cache accounting.
         for req, commit_len in zip(batch.reqs, commit_lens_cpu, strict=True):
+            req.decode_batch_idx += commit_len
             req.kv_committed_len += commit_len
             req.kv_allocated_len = req.kv_committed_len
 

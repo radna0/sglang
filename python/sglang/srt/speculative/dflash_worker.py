@@ -401,6 +401,8 @@ class DFlashWorker:
                 "DFLASH does not support grammar-constrained decoding yet."
             )
 
+        batch.maybe_evict_swa()
+
         bs = batch.batch_size()
         device = self.model_runner.device
 
