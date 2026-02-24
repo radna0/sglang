@@ -963,6 +963,50 @@ class MHATokenToKVPool(KVCache):
             layer_id = layer_id_override
         else:
             layer_id = layer.layer_id
+
+        # Optional: dump FP8-e4m3 KV cache scales by *probing* a BF16 run.
+        # This avoids having to run an unstable FP8-e4m3 server with missing scales.
+        dump_from_bf16 = (
+            (os.environ.get("SGLANG_FP8_KV_SCALE_DUMP_FROM_BF16") or "")
+            .strip()
+            .lower()
+            in ("1", "true", "yes")
+        )
+        dump_min_tokens_env = (os.environ.get("SGLANG_FP8_KV_SCALE_DUMP_MIN_TOKENS") or "").strip()
+        try:
+            dump_min_tokens = int(dump_min_tokens_env) if dump_min_tokens_env else 128
+        except Exception:
+            dump_min_tokens = 128
+        if dump_min_tokens < 1:
+            dump_min_tokens = 1
+        if (
+            dump_from_bf16
+            and layer is not None
+            and not bool(getattr(layer, "_fp8_kv_scale_dumped_from_bf16", False))
+            and (cache_k.size(0) if cache_k.ndim >= 1 else 0) >= dump_min_tokens
+            and cache_k.dtype == self.dtype
+            and self.dtype in (torch.bfloat16, torch.float16)
+        ):
+            try:
+                max_fp8 = float(torch.finfo(torch.float8_e4m3fn).max)
+                with torch.no_grad():
+                    if cache_k.ndim == 3 and cache_v.ndim == 3 and cache_k.shape[1] == cache_v.shape[1]:
+                        amax_k_h = cache_k.detach().abs().nan_to_num(0.0).amax(dim=(0, 2)).to(torch.float32)
+                        amax_v_h = cache_v.detach().abs().nan_to_num(0.0).amax(dim=(0, 2)).to(torch.float32)
+                        amax = torch.maximum(amax_k_h.max(), amax_v_h.max())
+                    else:
+                        amax_k = cache_k.detach().abs().nan_to_num(0.0).amax()
+                        amax_v = cache_v.detach().abs().nan_to_num(0.0).amax()
+                        amax = torch.maximum(amax_k, amax_v).to(torch.float32)
+                    scale = (amax / (max_fp8 * 0.95)).clamp(min=1e-6)
+                    scale_f = float(scale.item())
+                from sglang.srt.utils.kv_scale_dump import record_kv_scale
+
+                record_kv_scale(layer_id, scale_f)
+                layer._fp8_kv_scale_dumped_from_bf16 = True
+            except Exception:
+                # Never let debug dumping affect inference.
+                pass
         if cache_k.dtype != self.dtype:
             # If FP8 KV cache is enabled but the model didn't provide scaling factors
             # (common for non-quantized checkpoints), defaulting to scale=1.0 can
@@ -972,12 +1016,31 @@ class MHATokenToKVPool(KVCache):
             # once, on first write, and reuse it for the rest of the process.
             # This keeps the KV cache internally consistent (a fixed scale is
             # required because we do not store per-token scales).
-            if (
+            force_auto_scale = (
+                (os.environ.get("SGLANG_FP8_FORCE_AUTO_KV_SCALE") or "")
+                .strip()
+                .lower()
+                in ("1", "true", "yes")
+            )
+            # IMPORTANT: KV cache scales must be fixed for the entire process (we do not store
+            # per-token scales). Recomputing scales on every write will corrupt previously
+            # stored tokens (old tokens were quantized with old scales, but reads would use
+            # new scales). Therefore, any auto-calibration must run at most once per layer.
+            already_calibrated = bool(getattr(layer, "_fp8_kv_scale_calibrated", False))
+            need_auto_scale = (
                 (k_scale is None or v_scale is None)
+                or (force_auto_scale and not already_calibrated)
+                or (
+                    force_auto_scale
+                    and (getattr(layer, "k_scale_float", None) in (None, 1.0))
+                    and (getattr(layer, "v_scale_float", None) in (None, 1.0))
+                )
+            )
+            if (
+                need_auto_scale
                 and self.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
                 and layer is not None
-                and getattr(layer, "k_scale", None) is None
-                and getattr(layer, "v_scale", None) is None
+                and not already_calibrated
             ):
                 # Best-effort scales for FP8 KV cache. For FA3, per-head scales can
                 # significantly reduce quantization error vs a single global scale.
@@ -1010,8 +1073,20 @@ class MHATokenToKVPool(KVCache):
                         layer.v_scale_vec = v_scale_vec
 
                         # 0-dim tensors for `.expand(...)` and scalar-only kernels.
-                        layer.k_scale = k_scale_scalar
-                        layer.v_scale = v_scale_scalar
+                        try:
+                            if getattr(layer, "k_scale", None) is not None:
+                                layer.k_scale.copy_(k_scale_scalar)  # type: ignore[attr-defined]
+                            else:
+                                layer.k_scale = k_scale_scalar
+                        except Exception:
+                            layer.k_scale = k_scale_scalar
+                        try:
+                            if getattr(layer, "v_scale", None) is not None:
+                                layer.v_scale.copy_(v_scale_scalar)  # type: ignore[attr-defined]
+                            else:
+                                layer.v_scale = v_scale_scalar
+                        except Exception:
+                            layer.v_scale = v_scale_scalar
                         layer.k_scale_float = float(k_scale_scalar.item())
                         layer.v_scale_float = float(v_scale_scalar.item())
 
@@ -1027,12 +1102,26 @@ class MHATokenToKVPool(KVCache):
                         scale = (amax / (max_fp8 * 0.95)).clamp(min=1e-6) * scale_mult
                         # Store as 0-dim tensors so `.expand(...)` works in FA3 backend.
                         scale_t = scale.to(device=cache_k.device, dtype=torch.float32)
-                        layer.k_scale = scale_t
-                        layer.v_scale = scale_t
+                        try:
+                            if getattr(layer, "k_scale", None) is not None:
+                                layer.k_scale.copy_(scale_t)  # type: ignore[attr-defined]
+                            else:
+                                layer.k_scale = scale_t
+                        except Exception:
+                            layer.k_scale = scale_t
+                        try:
+                            if getattr(layer, "v_scale", None) is not None:
+                                layer.v_scale.copy_(scale_t)  # type: ignore[attr-defined]
+                            else:
+                                layer.v_scale = scale_t
+                        except Exception:
+                            layer.v_scale = scale_t
                         layer.k_scale_float = float(scale.item())
                         layer.v_scale_float = float(scale.item())
                         k_scale = scale_t
                         v_scale = scale_t
+
+                layer._fp8_kv_scale_calibrated = True
 
                 # Optional: dump the computed per-layer scale to a QuantParamSchema
                 # JSON file for later reuse via --quantization-param-path.
