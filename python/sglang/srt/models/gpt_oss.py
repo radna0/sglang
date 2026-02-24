@@ -1157,6 +1157,50 @@ class GptOssForCausalLM(nn.Module):
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
 
+    # If this function is called, it should always initialize KV cache scale
+    # factors (or else raise an exception). Thus, handled exceptions should
+    # make sure to leave KV cache scale factors in a known good (dummy) state.
+    #
+    # Note: SGLang's FA3 FP8 path expects `attn.k_scale` / `attn.v_scale` to be
+    # tensors (so `.expand()` works). The QuantParamSchema stores Python floats,
+    # so we materialize 0-dim float32 tensors on the model device.
+    def load_kv_cache_scales(self, quantization_param_path: str) -> None:
+        tp_size = get_tensor_model_parallel_world_size()
+        tp_rank = get_tensor_model_parallel_rank()
+        device = next(self.parameters()).device
+
+        for layer_idx, scaling_factor in kv_cache_scales_loader(
+            quantization_param_path,
+            tp_rank,
+            tp_size,
+            self.config.num_hidden_layers,
+            self.config.__class__.model_type,
+        ):
+            if layer_idx < self.model.start_layer or layer_idx >= self.model.end_layer:
+                continue
+            layer = self.model.layers[layer_idx]
+            attn = getattr(getattr(layer, "self_attn", None), "attn", None)
+            if attn is None:
+                continue
+
+            scale_f = float(scaling_factor)
+            scale_t = torch.tensor(scale_f, dtype=torch.float32, device=device)
+
+            for name in ("k_scale", "v_scale"):
+                cur = getattr(attn, name, None)
+                if isinstance(cur, torch.nn.Parameter):
+                    cur.data.copy_(scale_t)  # 0-dim
+                elif isinstance(cur, torch.Tensor):
+                    try:
+                        cur.copy_(scale_t)
+                    except Exception:
+                        setattr(attn, name, scale_t)
+                else:
+                    setattr(attn, name, scale_t)
+
+            attn.k_scale_float = scale_f
+            attn.v_scale_float = scale_f
+
     def set_embed_and_head(self, embed, head):
         del self.model.embed_tokens.weight
         del self.lm_head.weight
