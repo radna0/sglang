@@ -400,13 +400,6 @@ class DFlashWorker:
             raise ValueError(
                 "DFLASH does not support grammar-constrained decoding yet."
             )
-        if batch.sampling_info is not None and not batch.sampling_info.is_all_greedy:
-            if not self._warned_forced_greedy and self.tp_rank == 0:
-                logger.warning(
-                    "DFLASH currently supports greedy verification only; "
-                    "ignoring non-greedy sampling params (e.g. temperature/top_p/top_k) and using argmax."
-                )
-                self._warned_forced_greedy = True
 
         bs = batch.batch_size()
         device = self.model_runner.device

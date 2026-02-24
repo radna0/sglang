@@ -7,6 +7,7 @@ import torch
 
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.sampler import apply_custom_logit_processor
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
@@ -17,6 +18,15 @@ from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.speculative.dflash_utils import compute_dflash_accept_len_and_bonus
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
+from sglang.srt.utils import is_cuda
+
+if is_cuda():
+    from sgl_kernel import (
+        min_p_sampling_from_probs,
+        top_k_renorm_prob,
+        top_k_top_p_sampling_from_probs,
+        top_p_renorm_prob,
+    )
 
 
 @dataclass
@@ -281,7 +291,7 @@ class DFlashVerifyInput(SpecInput):
         logits_output: LogitsProcessorOutput,
         page_size: int,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[int]]:
-        """Greedy DFlash verification.
+        """DFlash verification (greedy or sampling).
 
         Returns:
             new_verified_id: int64 tensor [bs] (the new current token per request)
@@ -297,9 +307,76 @@ class DFlashVerifyInput(SpecInput):
         device = logits_output.next_token_logits.device
 
         candidates = self.draft_token.view(bs, self.draft_token_num)
-        target_predict = torch.argmax(logits_output.next_token_logits, dim=-1).view(
-            bs, self.draft_token_num
-        )
+        sampling_info = batch.sampling_info
+
+        if sampling_info is not None:
+            if sampling_info.has_custom_logit_processor:
+                apply_custom_logit_processor(
+                    logits_output.next_token_logits,
+                    sampling_info,
+                    num_tokens_in_batch=self.draft_token_num,
+                )
+
+            if (
+                sampling_info.penalizer_orchestrator is not None
+                and sampling_info.penalizer_orchestrator.is_required
+            ) or sampling_info.logit_bias is not None:
+                # Relaxed penalties: treat the bias/penalty as constant within the verify block.
+                linear_penalty = torch.zeros(
+                    (bs, logits_output.next_token_logits.shape[1]),
+                    dtype=torch.float32,
+                    device=device,
+                )
+                sampling_info.apply_logits_bias(linear_penalty)
+                logits_output.next_token_logits.add_(
+                    torch.repeat_interleave(
+                        linear_penalty, self.draft_token_num, dim=0
+                    )
+                )
+
+        if sampling_info is None or sampling_info.is_all_greedy:
+            target_predict = torch.argmax(logits_output.next_token_logits, dim=-1).view(
+                bs, self.draft_token_num
+            )
+        else:
+            # Target-only speculative sampling: sample target tokens for each verify position
+            # and accept draft tokens only while they match the sampled target tokens.
+            #
+            # This produces the exact target distribution (same as baseline) without requiring
+            # draft probabilities q(token).
+            logits = logits_output.next_token_logits
+            expanded_temperature = torch.repeat_interleave(
+                sampling_info.temperatures, self.draft_token_num, dim=0
+            )
+            logits.div_(expanded_temperature)
+            logits[:] = torch.softmax(logits, dim=-1)
+            probs = logits
+
+            expanded_top_ks = torch.repeat_interleave(
+                sampling_info.top_ks, self.draft_token_num, dim=0
+            )
+            expanded_top_ps = torch.repeat_interleave(
+                sampling_info.top_ps, self.draft_token_num, dim=0
+            )
+
+            if sampling_info.need_min_p_sampling:
+                expanded_min_ps = torch.repeat_interleave(
+                    sampling_info.min_ps, self.draft_token_num, dim=0
+                )
+                probs = top_k_renorm_prob(probs, expanded_top_ks)
+                probs = top_p_renorm_prob(probs, expanded_top_ps)
+                sampled = min_p_sampling_from_probs(probs, expanded_min_ps)
+            else:
+                sampled = top_k_top_p_sampling_from_probs(
+                    probs.contiguous(),
+                    expanded_top_ks,
+                    expanded_top_ps,
+                    filter_apply_order="joint",
+                    check_nan=False,
+                )
+
+            target_predict = sampled.view(bs, self.draft_token_num)
+
         accept_len, bonus = compute_dflash_accept_len_and_bonus(
             candidates=candidates,
             target_predict=target_predict,
