@@ -887,11 +887,20 @@ class FlashAttentionBackend(AttentionBackend):
                                 if q_rope is not None
                                 else None
                             )
-                        k_rope = (
-                            (k_rope / layer.k_scale).to(self.kv_cache_dtype)
-                            if k_rope is not None
-                            else None
-                        )
+                        if k_rope is not None:
+                            if (
+                                isinstance(k_scale, torch.Tensor)
+                                and k_scale.ndim == 1
+                                and k_rope.ndim == 3
+                                and k_scale.numel() == k_rope.shape[1]
+                            ):
+                                k_rope = (k_rope / k_scale.view(1, -1, 1)).to(
+                                    self.kv_cache_dtype
+                                )
+                            else:
+                                k_rope = (k_rope / k_scale).to(self.kv_cache_dtype)
+                        else:
+                            k_rope = None
                     else:
                         q_descale = layer.k_scale.expand(descale_shape)
                         # Quantize Q with the same per-layer scale used for KV cache so we
@@ -902,11 +911,20 @@ class FlashAttentionBackend(AttentionBackend):
                             if q_rope is not None
                             else None
                         )
-                        k_rope = (
-                            (k_rope / layer.k_scale).to(self.kv_cache_dtype)
-                            if k_rope is not None
-                            else None
-                        )
+                        if k_rope is not None:
+                            if (
+                                isinstance(k_scale, torch.Tensor)
+                                and k_scale.ndim == 1
+                                and k_rope.ndim == 3
+                                and k_scale.numel() == k_rope.shape[1]
+                            ):
+                                k_rope = (k_rope / k_scale.view(1, -1, 1)).to(
+                                    self.kv_cache_dtype
+                                )
+                            else:
+                                k_rope = (k_rope / k_scale).to(self.kv_cache_dtype)
+                        else:
+                            k_rope = None
             else:
                 q = q.to(self.kv_cache_dtype)
                 q_rope = (
@@ -1360,11 +1378,20 @@ class FlashAttentionBackend(AttentionBackend):
                                 if q_rope is not None
                                 else None
                             )
-                        k_rope = (
-                            (k_rope / layer.k_scale).to(self.kv_cache_dtype)
-                            if k_rope is not None
-                            else None
-                        )
+                        if k_rope is not None:
+                            if (
+                                isinstance(k_scale, torch.Tensor)
+                                and k_scale.ndim == 1
+                                and k_rope.ndim == 3
+                                and k_scale.numel() == k_rope.shape[1]
+                            ):
+                                k_rope = (k_rope / k_scale.view(1, -1, 1)).to(
+                                    self.kv_cache_dtype
+                                )
+                            else:
+                                k_rope = (k_rope / k_scale).to(self.kv_cache_dtype)
+                        else:
+                            k_rope = None
                     else:
                         q_descale = layer.k_scale.expand(descale_shape)
                         q = (q / layer.k_scale).to(self.kv_cache_dtype)
@@ -1373,11 +1400,20 @@ class FlashAttentionBackend(AttentionBackend):
                             if q_rope is not None
                             else None
                         )
-                        k_rope = (
-                            (k_rope / layer.k_scale).to(self.kv_cache_dtype)
-                            if k_rope is not None
-                            else None
-                        )
+                        if k_rope is not None:
+                            if (
+                                isinstance(k_scale, torch.Tensor)
+                                and k_scale.ndim == 1
+                                and k_rope.ndim == 3
+                                and k_scale.numel() == k_rope.shape[1]
+                            ):
+                                k_rope = (k_rope / k_scale.view(1, -1, 1)).to(
+                                    self.kv_cache_dtype
+                                )
+                            else:
+                                k_rope = (k_rope / k_scale).to(self.kv_cache_dtype)
+                        else:
+                            k_rope = None
             else:
                 q = q.to(self.kv_cache_dtype)
                 q_rope = (
