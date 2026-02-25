@@ -964,6 +964,12 @@ class MHATokenToKVPool(KVCache):
         else:
             layer_id = layer.layer_id
 
+        # When using hybrid KV pools (e.g. SWA/full split), callers may pass a
+        # pool-local `layer_id_override` for buffer indexing. For FP8 KV scale
+        # dumping/loading we must always key scales by the *global* layer_id so
+        # `--quantization-param-path` files can be applied consistently.
+        global_layer_id = int(layer.layer_id) if layer is not None else int(layer_id)
+
         # Optional: dump FP8-e4m3 KV cache scales by *probing* a BF16 run.
         # This avoids having to run an unstable FP8-e4m3 server with missing scales.
         dump_from_bf16 = (
@@ -1002,7 +1008,7 @@ class MHATokenToKVPool(KVCache):
                     scale_f = float(scale.item())
                 from sglang.srt.utils.kv_scale_dump import record_kv_scale
 
-                record_kv_scale(layer_id, scale_f)
+                record_kv_scale(global_layer_id, scale_f)
                 layer._fp8_kv_scale_dumped_from_bf16 = True
             except Exception:
                 # Never let debug dumping affect inference.
@@ -1128,7 +1134,7 @@ class MHATokenToKVPool(KVCache):
                 try:
                     from sglang.srt.utils.kv_scale_dump import record_kv_scale
 
-                    record_kv_scale(layer_id, layer.k_scale_float)
+                    record_kv_scale(global_layer_id, layer.k_scale_float)
                 except Exception:
                     pass
 
