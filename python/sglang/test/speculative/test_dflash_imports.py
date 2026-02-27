@@ -28,3 +28,15 @@ class TestDflashImportRobustness(unittest.TestCase):
             "DFLASH",
             parser._option_string_actions["--speculative-algorithm"].choices,
         )
+
+    def test_server_args_exposes_dflash_verify_mode(self):
+        import argparse
+
+        from sglang.srt.server_args import ServerArgs
+
+        parser = argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        action = parser._option_string_actions["--speculative-dflash-verify-mode"]
+        self.assertIn("target_only", action.choices)
+        self.assertIn("pq", action.choices)
+        self.assertEqual("target_only", action.default)

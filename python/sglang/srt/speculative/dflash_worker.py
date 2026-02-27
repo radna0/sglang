@@ -1,7 +1,8 @@
 import logging
 import math
+import os
 from copy import deepcopy
-from typing import Optional, Union
+from typing import List, Optional, Union
 
 import torch
 
@@ -506,19 +507,208 @@ class DFlashWorker:
             allocator.restore_state(token_to_kv_pool_state_backup)
 
         draft_hidden = draft_hidden.view(bs, self.block_size, -1)
-        draft_next = self._greedy_sample_from_vocab_parallel_head(
-            hidden_states=draft_hidden[:, 1:, :].reshape(-1, draft_hidden.shape[-1]),
-            lm_head=lm_head,
-        ).view(bs, self.block_size - 1)
         draft_tokens = self._draft_block_tokens_buf[:bs]
         draft_tokens[:, 0].copy_(block_ids[:, 0])
-        draft_tokens[:, 1:].copy_(draft_next)
+
+        sampling_info = batch.sampling_info
+        verify_mode = str(
+            getattr(self.server_args, "speculative_dflash_verify_mode", "target_only")
+            or "target_only"
+        )
+        # NOTE: On some backends/workers, `batch.sampling_info` can be None even when the
+        # request uses non-greedy sampling. For DFlash pq verification we must propose
+        # tokens by sampling from the draft distribution q, so we reconstruct the minimal
+        # sampling tensors from req-level SamplingParams if needed.
+        if sampling_info is not None:
+            temperatures = sampling_info.temperatures.to(draft_hidden.device)
+            top_ps = sampling_info.top_ps.to(draft_hidden.device)
+            top_ks = sampling_info.top_ks.to(draft_hidden.device)
+            min_ps = sampling_info.min_ps.to(draft_hidden.device)
+            need_min_p_sampling = bool(sampling_info.need_min_p_sampling)
+            # Do NOT trust sampling_info.is_all_greedy here: the draft worker may force
+            # greedy sampling (e.g. vLLM #16899-style) without changing the request's
+            # actual sampling params. For pq we care about whether the *request* is
+            # greedy, which is equivalent to top_k == 1 for all requests.
+            is_all_greedy = bool(torch.all(top_ks.to(torch.int64) == 1).item())
+        else:
+            temps_list = []
+            top_p_list = []
+            top_k_list = []
+            min_p_list = []
+            for req in batch.reqs:
+                sp = req.sampling_params
+                temps_list.append(float(getattr(sp, "temperature", 1.0)))
+                top_p_list.append(float(getattr(sp, "top_p", 1.0)))
+                top_k_list.append(int(getattr(sp, "top_k", 1)))
+                min_p_list.append(float(getattr(sp, "min_p", 0.0)))
+            temperatures = torch.tensor(
+                temps_list, dtype=torch.float32, device=draft_hidden.device
+            )
+            top_ps = torch.tensor(
+                top_p_list, dtype=torch.float32, device=draft_hidden.device
+            )
+            top_ks = torch.tensor(
+                top_k_list, dtype=torch.int32, device=draft_hidden.device
+            )
+            min_ps = torch.tensor(
+                min_p_list, dtype=torch.float32, device=draft_hidden.device
+            )
+            need_min_p_sampling = bool(any(mp > 0.0 for mp in min_p_list))
+            is_all_greedy = bool(all(int(k) == 1 for k in top_k_list))
+
+        if (
+            verify_mode == "pq"
+            and self.tp_rank == 0
+            and not getattr(self, "_logged_pq_draft_gate", False)
+        ):
+            try:
+                topk_dbg = top_ks.detach().to("cpu").to(torch.int64).tolist()
+            except Exception:
+                topk_dbg = None
+            sp0 = None
+            try:
+                if batch.reqs:
+                    sp = batch.reqs[0].sampling_params
+                    sp0 = {
+                        "temperature": float(getattr(sp, "temperature", 1.0)),
+                        "top_k": int(getattr(sp, "top_k", -999)),
+                        "top_p": float(getattr(sp, "top_p", 1.0)),
+                        "min_p": float(getattr(sp, "min_p", 0.0)),
+                    }
+            except Exception:
+                sp0 = None
+            logger.info(
+                "DFLASH pq draft gate: sampling_info=%s top_ks=%s is_all_greedy=%s sp0=%s",
+                bool(sampling_info is not None),
+                topk_dbg,
+                bool(is_all_greedy),
+                sp0,
+            )
+            setattr(self, "_logged_pq_draft_gate", True)
+
+        use_pq = verify_mode == "pq" and not is_all_greedy
+
+        draft_topk = 0
+        draft_topk_ids = None
+        draft_topk_probs = None
+
+        if use_pq:
+            # For pq verification we must know q(token), so the draft must propose
+            # tokens by sampling from its own distribution (not argmax).
+            #
+            # IMPORTANT: For acceptance under temperature sampling, we often want to
+            # shape the *proposal* distribution q to be closer to the target p
+            # (maximize overlap / reduce TV distance). These env vars allow fast
+            # experimentation without changing request-level sampling.
+            # Prefer ServerArgs knobs (if present), but allow env vars as an override for fast sweeps.
+            try:
+                draft_temp_mul = float(
+                    getattr(self.server_args, "speculative_dflash_pq_draft_temp_mul", 1.0) or 1.0
+                )
+            except Exception:
+                draft_temp_mul = 1.0
+            try:
+                draft_topk_cap = int(
+                    getattr(self.server_args, "speculative_dflash_pq_draft_topk_cap", 0) or 0
+                )
+            except Exception:
+                draft_topk_cap = 0
+
+            draft_temp_mul_env = (os.environ.get("DFLASH_PQ_DRAFT_TEMP_MUL") or "").strip()
+            draft_topk_cap_env = (os.environ.get("DFLASH_PQ_DRAFT_TOPK_CAP") or "").strip()
+            if draft_temp_mul_env:
+                try:
+                    draft_temp_mul = float(draft_temp_mul_env)
+                except Exception:
+                    pass
+            if draft_topk_cap_env:
+                try:
+                    draft_topk_cap = int(draft_topk_cap_env)
+                except Exception:
+                    pass
+            if not math.isfinite(draft_temp_mul) or draft_temp_mul <= 0:
+                draft_temp_mul = 1.0
+            if draft_topk_cap < 0:
+                draft_topk_cap = 0
+
+            topk = int(torch.max(top_ks).item())
+            if draft_topk_cap > 0:
+                topk = min(topk, int(draft_topk_cap))
+            # SGLang uses a huge TOP_K_ALL value for "whole vocab"; that's not feasible here.
+            if topk <= 0 or topk >= (1 << 20):
+                if self.tp_rank == 0 and not self._warned_forced_greedy:
+                    logger.warning(
+                        "DFLASH pq verification requires a finite/small top_k (>0), but got topk=%s. "
+                        "Falling back to target_only verification (draft uses argmax).",
+                        topk,
+                    )
+                    self._warned_forced_greedy = True
+                use_pq = False
+                verify_mode = "target_only"
+            else:
+                step_count = int(self.block_size - 1)
+                hs = draft_hidden[:, 1:, :].reshape(-1, draft_hidden.shape[-1])
+                topk_p_flat, topk_id_flat = self._topk_from_vocab_parallel_head(
+                    hidden_states=hs,
+                    lm_head=lm_head,
+                    topk=topk,
+                )
+
+                temps = torch.repeat_interleave(
+                    temperatures, step_count, dim=0
+                ).to(topk_p_flat.device)
+                if draft_temp_mul != 1.0:
+                    temps = temps * float(draft_temp_mul)
+                top_ps = torch.repeat_interleave(
+                    top_ps, step_count, dim=0
+                ).to(topk_p_flat.device)
+                top_ks = torch.repeat_interleave(
+                    top_ks, step_count, dim=0
+                ).to(topk_p_flat.device)
+                if draft_topk_cap > 0:
+                    cap = torch.tensor(int(draft_topk_cap), device=top_ks.device, dtype=top_ks.dtype)
+                    top_ks = torch.minimum(top_ks, cap)
+                min_ps = torch.repeat_interleave(
+                    min_ps, step_count, dim=0
+                ).to(topk_p_flat.device)
+
+                filtered_p = self._filter_topk_probs_for_sampling(
+                    topk_p_flat,
+                    temperatures=temps,
+                    top_ks=top_ks,
+                    top_ps=top_ps,
+                    min_ps=min_ps,
+                    need_min_p_sampling=bool(need_min_p_sampling),
+                )
+
+                sampled_col = torch.multinomial(filtered_p, num_samples=1)
+                sampled_ids = topk_id_flat.gather(1, sampled_col.to(torch.int64)).view(
+                    -1
+                )
+
+                draft_tokens[:, 1:].copy_(
+                    sampled_ids.view(bs, step_count).to(torch.long)
+                )
+                draft_topk = int(topk)
+                draft_topk_ids = topk_id_flat.view(bs, step_count, int(topk))
+                draft_topk_probs = filtered_p.view(bs, step_count, int(topk))
+
+        if not use_pq:
+            draft_next = self._greedy_sample_from_vocab_parallel_head(
+                hidden_states=draft_hidden[:, 1:, :].reshape(-1, draft_hidden.shape[-1]),
+                lm_head=lm_head,
+            ).view(bs, self.block_size - 1)
+            draft_tokens[:, 1:].copy_(draft_next)
         positions = positions_2d.reshape(-1)
 
         verify_input = DFlashVerifyInput(
             draft_token=draft_tokens.reshape(-1),
             positions=positions,
             draft_token_num=self.block_size,
+            verify_mode=verify_mode,
+            draft_topk=draft_topk,
+            draft_topk_ids=draft_topk_ids,
+            draft_topk_probs=draft_topk_probs,
         )
         backend_name = type(self.model_runner.attn_backend).__name__
         skip_custom_mask = backend_name in {
@@ -716,6 +906,188 @@ class DFlashWorker:
             out_token_ids[start:end].copy_(selected_ids.view(-1))
 
         return out_token_ids
+
+    def _topk_from_vocab_parallel_head(
+        self,
+        *,
+        hidden_states: torch.Tensor,
+        lm_head,
+        topk: int,
+        chunk_size: int = 128,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Top-k token selection over the target LM head in a TP-safe way.
+
+        Returns:
+            topk_p: (num_tokens, topk) float32, normalized over top-k logits.
+            topk_index: (num_tokens, topk) int64, global token ids.
+        """
+        if hidden_states.numel() == 0:
+            empty_p = torch.empty(
+                (0, int(topk)), dtype=torch.float32, device=hidden_states.device
+            )
+            empty_i = torch.empty(
+                (0, int(topk)), dtype=torch.int64, device=hidden_states.device
+            )
+            return empty_p, empty_i
+
+        if int(topk) <= 0:
+            raise ValueError(f"topk must be positive, got {topk}.")
+
+        tp_group = get_tp_group()
+        tp_size = int(tp_group.world_size)
+
+        if not hasattr(lm_head, "weight") or not hasattr(lm_head, "shard_indices"):
+            raise RuntimeError(
+                "DFLASH top-k sampling requires a vocab-parallel head with `weight` and `shard_indices`."
+            )
+
+        shard = lm_head.shard_indices
+        weight = lm_head.weight  # [local_vocab_padded, hidden]
+        weight_dtype = weight.dtype
+
+        # Valid ranges in the local shard (excluding padding):
+        #   base vocab:  [0, num_org)
+        #   added vocab: [num_org_padded, num_org_padded + num_added)
+        num_org = int(shard.num_org_elements)
+        num_org_padded = int(shard.num_org_elements_padded)
+        num_added = int(shard.num_added_elements)
+        org_vocab_start = int(shard.org_vocab_start_index)
+        added_vocab_start = int(shard.added_vocab_start_index)
+
+        num_tokens = int(hidden_states.shape[0])
+        out_p = torch.empty(
+            (num_tokens, int(topk)), dtype=torch.float32, device=hidden_states.device
+        )
+        out_ids = torch.empty(
+            (num_tokens, int(topk)), dtype=torch.int64, device=hidden_states.device
+        )
+
+        def _cast_hs(x: torch.Tensor) -> torch.Tensor:
+            return x if x.dtype == weight_dtype else x.to(weight_dtype)
+
+        min_val = torch.finfo(weight_dtype).min
+
+        for start in range(0, num_tokens, int(chunk_size)):
+            end = min(num_tokens, start + int(chunk_size))
+            hs = _cast_hs(hidden_states[start:end])
+            chunk_len = int(hs.shape[0])
+
+            local_vals_list: List[torch.Tensor] = []
+            local_ids_list: List[torch.Tensor] = []
+
+            if num_org > 0:
+                base_logits = torch.matmul(hs, weight[:num_org].T)
+                k_base = min(int(topk), int(num_org))
+                base_vals, base_idx = torch.topk(base_logits, k=k_base, dim=-1)
+                local_vals_list.append(base_vals)
+                local_ids_list.append(base_idx.to(torch.int64) + org_vocab_start)
+
+            if num_added > 0:
+                added_weight = weight[num_org_padded : num_org_padded + num_added]
+                added_logits = torch.matmul(hs, added_weight.T)
+                k_added = min(int(topk), int(num_added))
+                added_vals, added_idx = torch.topk(added_logits, k=k_added, dim=-1)
+                local_vals_list.append(added_vals)
+                local_ids_list.append(added_idx.to(torch.int64) + added_vocab_start)
+
+            if not local_vals_list:
+                local_vals = torch.full(
+                    (chunk_len, int(topk)),
+                    min_val,
+                    dtype=weight_dtype,
+                    device=hs.device,
+                )
+                local_ids = torch.zeros(
+                    (chunk_len, int(topk)), dtype=torch.int64, device=hs.device
+                )
+            else:
+                local_vals = torch.cat(local_vals_list, dim=1)
+                local_ids = torch.cat(local_ids_list, dim=1)
+
+                # Keep exactly topk candidates per rank.
+                if local_vals.shape[1] > int(topk):
+                    local_vals, sel = torch.topk(local_vals, k=int(topk), dim=-1)
+                    local_ids = local_ids.gather(1, sel.to(torch.int64))
+                elif local_vals.shape[1] < int(topk):
+                    pad = int(topk) - int(local_vals.shape[1])
+                    pad_vals = torch.full(
+                        (chunk_len, pad),
+                        min_val,
+                        dtype=local_vals.dtype,
+                        device=hs.device,
+                    )
+                    pad_ids = torch.zeros(
+                        (chunk_len, pad), dtype=torch.int64, device=hs.device
+                    )
+                    local_vals = torch.cat([local_vals, pad_vals], dim=1)
+                    local_ids = torch.cat([local_ids, pad_ids], dim=1)
+
+            # Gather local candidates across TP ranks and select global topk.
+            if tp_size > 1:
+                gathered_vals = tp_group.all_gather(local_vals.to(torch.float32), dim=1)
+                gathered_ids = tp_group.all_gather(local_ids, dim=1)
+                global_vals, global_sel = torch.topk(gathered_vals, k=int(topk), dim=1)
+                global_ids = gathered_ids.gather(1, global_sel.to(torch.int64))
+            else:
+                global_vals = local_vals.to(torch.float32)
+                global_ids = local_ids
+
+            probs = torch.softmax(global_vals, dim=1)
+            out_p[start:end].copy_(probs)
+            out_ids[start:end].copy_(global_ids)
+
+        return out_p, out_ids
+
+    def _filter_topk_probs_for_sampling(
+        self,
+        topk_probs: torch.Tensor,
+        *,
+        temperatures: torch.Tensor,
+        top_ks: torch.Tensor,
+        top_ps: torch.Tensor,
+        min_ps: torch.Tensor,
+        need_min_p_sampling: bool,
+    ) -> torch.Tensor:
+        """Apply request sampling params to a (num_tokens, topk) distribution.
+
+        `topk_probs` is assumed to be sorted (descending) along dim=1.
+        """
+        if topk_probs.numel() == 0:
+            return topk_probs
+
+        probs = topk_probs.to(torch.float32)
+        k = int(probs.shape[1])
+
+        # Temperature scaling on probabilities (equivalent to logits / T).
+        temps = temperatures.to(torch.float32).clamp_min(1e-6).view(-1, 1)
+        inv_t = 1.0 / temps
+        probs = probs.clamp_min(1e-20).pow(inv_t)
+
+        # Apply per-request top-k (some requests may use smaller top_k than `k`).
+        top_ks_i = top_ks.to(torch.int64).clamp(min=1, max=k).view(-1, 1)
+        ar = torch.arange(k, device=probs.device, dtype=torch.int64).view(1, -1)
+        probs = probs.masked_fill(ar >= top_ks_i, 0.0)
+
+        # Renormalize after temperature/top-k.
+        denom = probs.sum(dim=1, keepdim=True).clamp_min(1e-20)
+        probs = probs / denom
+
+        # Apply top-p (nucleus) filtering.
+        tp = top_ps.to(torch.float32).clamp(min=0.0, max=1.0).view(-1, 1)
+        cumsum = torch.cumsum(probs, dim=1)
+        probs = probs.masked_fill((cumsum - probs) > tp, 0.0)
+
+        # Apply min-p filtering (relative to the max prob).
+        if need_min_p_sampling:
+            mp = min_ps.to(torch.float32).clamp(min=0.0, max=1.0).view(-1, 1)
+            thresh = probs[:, :1] * mp
+            probs = probs.masked_fill(probs < thresh, 0.0)
+
+        # Final renormalization.
+        denom = probs.sum(dim=1, keepdim=True)
+        # If filtering removed everything (pathological), fall back to unfiltered probs.
+        probs = torch.where(denom > 0, probs / denom.clamp_min(1e-20), topk_probs)
+        return probs
 
     def _append_target_hidden_to_draft_kv(
         self,
@@ -998,7 +1370,9 @@ class DFlashWorker:
         num_accepted_tokens = sum(accept_length_per_req_cpu)
         if not self._logged_first_verify and self.tp_rank == 0:
             logger.info(
-                "DFLASH verify completed. accept_length_per_req=%s",
+                "DFLASH verify completed. verify_mode=%s draft_topk=%s accept_length_per_req=%s",
+                getattr(verify_input, "verify_mode", None),
+                getattr(verify_input, "draft_topk", None),
                 accept_length_per_req_cpu,
             )
             self._logged_first_verify = True

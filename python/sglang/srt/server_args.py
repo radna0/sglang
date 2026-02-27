@@ -472,6 +472,13 @@ class ServerArgs:
     speculative_eagle_topk: Optional[int] = None
     speculative_num_draft_tokens: Optional[int] = None
     speculative_dflash_block_size: Optional[int] = None
+    speculative_dflash_verify_mode: Literal["target_only", "pq"] = "target_only"
+    # In pq mode, we can shape the *proposal* distribution q (independent from request sampling)
+    # to maximize overlap with the target distribution p (higher acceptance under temperature sampling).
+    # 0 means "use request top_k".
+    speculative_dflash_pq_draft_topk_cap: int = 0
+    # Multiplier applied to request temperature for draft proposals in pq mode (e.g. 1.5 flattens q).
+    speculative_dflash_pq_draft_temp_mul: float = 1.0
     speculative_accept_threshold_single: float = 1.0
     speculative_accept_threshold_acc: float = 1.0
     speculative_token_map: Optional[str] = None
@@ -481,6 +488,7 @@ class ServerArgs:
     speculative_moe_runner_backend: Optional[str] = None
     speculative_moe_a2a_backend: Optional[str] = None
     speculative_draft_model_quantization: Optional[str] = None
+    speculative_draft_sampling: Literal["argmax", "request"] = "argmax"
 
     # Speculative decoding (ngram)
     speculative_ngram_min_match_window_size: int = 1
@@ -4366,6 +4374,38 @@ class ServerArgs:
             choices=SPECULATIVE_DRAFT_MODEL_QUANTIZATION_CHOICES,
             default=ServerArgs.speculative_draft_model_quantization,
             help="The quantization method for speculative model.",
+        )
+        parser.add_argument(
+            "--speculative-draft-sampling",
+            type=str,
+            choices=["argmax", "request"],
+            default=ServerArgs.speculative_draft_sampling,
+            help="When the request uses non-greedy sampling, choose how the *draft* model proposes tokens. "
+            "'argmax' forces greedy draft tokens (vLLM #16899-style, avoids draft-prob tensor management). "
+            "'request' uses the request's sampling parameters for the draft model.",
+        )
+        parser.add_argument(
+            "--speculative-dflash-verify-mode",
+            type=str,
+            choices=["target_only", "pq"],
+            default=ServerArgs.speculative_dflash_verify_mode,
+            help="For the DFlash speculative algorithm under non-greedy sampling, choose the verify rule. "
+            "'target_only' (default) samples from the target distribution p and accepts draft tokens only "
+            "while they match the sampled target tokens (exact, but acceptance collapses at high entropy). "
+            "'pq' performs true speculative sampling using draft probabilities q(token): accept with "
+            "min(1, p/q) and sample from the residual on rejection (exact, higher acceptance).",
+        )
+        parser.add_argument(
+            "--speculative-dflash-pq-draft-topk-cap",
+            type=int,
+            default=ServerArgs.speculative_dflash_pq_draft_topk_cap,
+            help="In --speculative-dflash-verify-mode=pq, cap the draft proposal top_k (0 uses the request top_k).",
+        )
+        parser.add_argument(
+            "--speculative-dflash-pq-draft-temp-mul",
+            type=float,
+            default=ServerArgs.speculative_dflash_pq_draft_temp_mul,
+            help="In --speculative-dflash-verify-mode=pq, multiply the request temperature for draft proposals (q).",
         )
 
         # Speculative decoding (ngram)

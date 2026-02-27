@@ -473,12 +473,26 @@ class CudaGraphRunner:
             else True
         )
 
+        # DFLASH policy may truncate TARGET_VERIFY token count dynamically (FailFast/EAFT).
+        # If the token count no longer matches the captured graph's num_tokens_per_bs,
+        # force eager execution for correctness (instead of replaying a mismatched graph).
+        is_dflash_supported = (
+            (
+                forward_batch.batch_size * self.num_tokens_per_bs
+                == forward_batch.input_ids.numel()
+            )
+            if getattr(self.model_runner, "spec_algorithm", None) is not None
+            and getattr(self.model_runner.spec_algorithm, "name", "") == "DFLASH"
+            else True
+        )
+
         return (
             is_bs_supported
             and is_encoder_lens_supported
             and is_tbo_supported
             and capture_hidden_mode_matches
             and is_ngram_supported
+            and is_dflash_supported
         )
 
     def _init_profile_context_and_memory_record(self):

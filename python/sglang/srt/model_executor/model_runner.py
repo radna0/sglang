@@ -14,6 +14,7 @@
 """ModelRunner runs the forward passes of the models."""
 
 import datetime
+import dataclasses
 import gc
 import inspect
 import json
@@ -2629,11 +2630,24 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 axis=-1,
             )
 
-        self._preprocess_logits(logits_output, forward_batch.sampling_info)
+        sampling_info = forward_batch.sampling_info
+        if (
+            self.is_draft_worker
+            and self.server_args.speculative_draft_sampling == "argmax"
+            and sampling_info is not None
+            and not sampling_info.is_all_greedy
+        ):
+            # vLLM #16899-style: always draft with argmax to avoid draft-prob tensor management.
+            # This does not change the final output distribution for speculative decoding
+            # (the target model still governs sampling), but may reduce acceptance at high
+            # entropy (high temperature) settings.
+            sampling_info = dataclasses.replace(sampling_info, is_all_greedy=True)
+
+        self._preprocess_logits(logits_output, sampling_info)
         # Sample the next tokens
         next_token_ids = self.sampler(
             logits_output,
-            forward_batch.sampling_info,
+            sampling_info,
             forward_batch.return_logprob,
             forward_batch.top_logprobs_nums,
             forward_batch.token_ids_logprobs,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import List, Tuple
 
@@ -19,6 +20,10 @@ from sglang.srt.speculative.dflash_utils import compute_dflash_accept_len_and_bo
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
 from sglang.srt.utils import is_cuda
+
+logger = logging.getLogger(__name__)
+
+_DFLASH_PQ_STATS_LOGGED = False
 
 if is_cuda():
     from sgl_kernel import (
@@ -141,6 +146,18 @@ class DFlashVerifyInput(SpecInput):
 
     # Shape info for padding (e.g., DP attention / CUDA graph).
     num_tokens_per_batch: int = -1
+
+    # Verification rule under non-greedy sampling:
+    #   - "target_only": sample from target p and accept only exact matches (current default).
+    #   - "pq": true speculative sampling with draft probabilities q (accept with min(1, p/q)).
+    verify_mode: str = "target_only"
+
+    # Draft-side distribution (q) for pq verification.
+    # Shape: [bs, draft_token_num - 1, draft_topk] where draft_topk matches the draft sampling top-k.
+    # Only populated when verify_mode == "pq" and the request uses non-greedy sampling.
+    draft_topk: int = 0
+    draft_topk_ids: torch.Tensor | None = None
+    draft_topk_probs: torch.Tensor | None = None
 
     def __post_init__(self):
         super().__init__(spec_input_type=SpecInputType.DFLASH_VERIFY)
@@ -334,53 +351,284 @@ class DFlashVerifyInput(SpecInput):
                     )
                 )
 
-        if sampling_info is None or sampling_info.is_all_greedy:
-            target_predict = torch.argmax(logits_output.next_token_logits, dim=-1).view(
-                bs, self.draft_token_num
+        use_pq = False
+        if sampling_info is not None and not sampling_info.is_all_greedy:
+            verify_mode = str(getattr(self, "verify_mode", "target_only"))
+            topk_max = int(torch.max(sampling_info.top_ks).item())
+            use_pq = (
+                verify_mode == "pq"
+                and self.draft_topk_ids is not None
+                and self.draft_topk_probs is not None
+                and int(self.draft_topk) > 0
+                and topk_max > 0
+                # SGLang uses a huge TOP_K_ALL value for "whole vocab"; pq needs a small finite top_k.
+                and topk_max < (1 << 20)
+            )
+            if verify_mode == "pq" and not use_pq and not getattr(self, "_warned_pq_disabled", False):
+                logger.warning(
+                    "DFLASH pq requested but disabled: draft_topk=%s topk_max=%s has_q=%s",
+                    getattr(self, "draft_topk", None),
+                    topk_max,
+                    bool(self.draft_topk_ids is not None and self.draft_topk_probs is not None),
+                )
+                setattr(self, "_warned_pq_disabled", True)
+
+        if sampling_info is None or sampling_info.is_all_greedy or not use_pq:
+            if sampling_info is None or sampling_info.is_all_greedy:
+                target_predict = torch.argmax(
+                    logits_output.next_token_logits, dim=-1
+                ).view(bs, self.draft_token_num)
+            else:
+                # Target-only speculative sampling: sample target tokens for each verify position
+                # and accept draft tokens only while they match the sampled target tokens.
+                #
+                # This produces the exact target distribution (same as baseline) without requiring
+                # draft probabilities q(token).
+                logits = logits_output.next_token_logits
+                expanded_temperature = torch.repeat_interleave(
+                    sampling_info.temperatures, self.draft_token_num, dim=0
+                )
+                logits.div_(expanded_temperature)
+                logits[:] = torch.softmax(logits, dim=-1)
+                probs = logits
+
+                expanded_top_ks = torch.repeat_interleave(
+                    sampling_info.top_ks, self.draft_token_num, dim=0
+                )
+                expanded_top_ps = torch.repeat_interleave(
+                    sampling_info.top_ps, self.draft_token_num, dim=0
+                )
+
+                if sampling_info.need_min_p_sampling:
+                    expanded_min_ps = torch.repeat_interleave(
+                        sampling_info.min_ps, self.draft_token_num, dim=0
+                    )
+                    probs = top_k_renorm_prob(probs, expanded_top_ks)
+                    probs = top_p_renorm_prob(probs, expanded_top_ps)
+                    sampled = min_p_sampling_from_probs(probs, expanded_min_ps)
+                else:
+                    sampled = top_k_top_p_sampling_from_probs(
+                        probs.contiguous(),
+                        expanded_top_ks,
+                        expanded_top_ps,
+                        filter_apply_order="joint",
+                        check_nan=False,
+                    )
+
+                target_predict = sampled.view(bs, self.draft_token_num)
+
+            accept_len, bonus = compute_dflash_accept_len_and_bonus(
+                candidates=candidates,
+                target_predict=target_predict,
             )
         else:
-            # Target-only speculative sampling: sample target tokens for each verify position
-            # and accept draft tokens only while they match the sampled target tokens.
-            #
-            # This produces the exact target distribution (same as baseline) without requiring
-            # draft probabilities q(token).
-            logits = logits_output.next_token_logits
+            # True speculative sampling (maximal coupling) using draft probabilities q:
+            # accept a draft token y with prob min(1, p(y)/q(y)); on rejection, sample
+            # from the residual (p - q)+. This preserves the exact target distribution
+            # while avoiding the entropy ceiling of target-only exact-match sampling.
+            if (
+                self.draft_topk_ids is None
+                or self.draft_topk_probs is None
+                or int(self.draft_topk) <= 0
+            ):
+                raise RuntimeError(
+                    "DFLASH pq verification requires draft_topk_ids/draft_topk_probs."
+                )
+
+            step_count = int(self.draft_token_num - 1)
+            num_rows = int(bs * self.draft_token_num)
+            device = logits_output.next_token_logits.device
+
+            # Build per-position target distributions p over top-k.
             expanded_temperature = torch.repeat_interleave(
                 sampling_info.temperatures, self.draft_token_num, dim=0
-            )
-            logits.div_(expanded_temperature)
-            logits[:] = torch.softmax(logits, dim=-1)
-            probs = logits
-
+            ).to(device)
             expanded_top_ks = torch.repeat_interleave(
                 sampling_info.top_ks, self.draft_token_num, dim=0
-            )
+            ).to(device)
             expanded_top_ps = torch.repeat_interleave(
                 sampling_info.top_ps, self.draft_token_num, dim=0
+            ).to(device)
+            expanded_min_ps = torch.repeat_interleave(
+                sampling_info.min_ps, self.draft_token_num, dim=0
+            ).to(device)
+
+            topk = int(torch.max(expanded_top_ks).item())
+            if topk <= 0 or topk == -1:
+                raise RuntimeError(
+                    f"DFLASH pq verification requires finite top_k (>0), got topk={topk}."
+                )
+
+            logits = logits_output.next_token_logits
+            if int(logits.shape[0]) != num_rows:
+                raise RuntimeError(
+                    f"DFLASH verify logits shape mismatch: logits.shape[0]={int(logits.shape[0])} vs expected {num_rows}."
+                )
+            p_vals, p_ids = torch.topk(logits, k=topk, dim=-1)
+            p_vals = p_vals.to(torch.float32) / expanded_temperature.to(torch.float32).view(
+                -1, 1
+            )
+            p_probs = torch.softmax(p_vals, dim=1)
+
+            # Per-row top-k (some requests may use smaller top_k than `topk`).
+            top_ks_i = expanded_top_ks.to(torch.int64).clamp(min=1, max=topk).view(
+                -1, 1
+            )
+            ar = torch.arange(topk, device=device, dtype=torch.int64).view(1, -1)
+            p_probs = p_probs.masked_fill(ar >= top_ks_i, 0.0)
+            p_probs = p_probs / p_probs.sum(dim=1, keepdim=True).clamp_min(1e-20)
+
+            # Top-p filtering.
+            tp = expanded_top_ps.to(torch.float32).clamp(min=0.0, max=1.0).view(-1, 1)
+            cumsum = torch.cumsum(p_probs, dim=1)
+            p_probs = p_probs.masked_fill((cumsum - p_probs) > tp, 0.0)
+
+            # Min-p filtering (relative to the max prob).
+            if sampling_info.need_min_p_sampling:
+                mp = (
+                    expanded_min_ps.to(torch.float32)
+                    .clamp(min=0.0, max=1.0)
+                    .view(-1, 1)
+                )
+                thresh = p_probs[:, :1] * mp
+                p_probs = p_probs.masked_fill(p_probs < thresh, 0.0)
+
+            p_denom = p_probs.sum(dim=1, keepdim=True)
+            p_probs = torch.where(
+                p_denom > 0, p_probs / p_denom.clamp_min(1e-20), p_probs
             )
 
-            if sampling_info.need_min_p_sampling:
-                expanded_min_ps = torch.repeat_interleave(
-                    sampling_info.min_ps, self.draft_token_num, dim=0
-                )
-                probs = top_k_renorm_prob(probs, expanded_top_ks)
-                probs = top_p_renorm_prob(probs, expanded_top_ps)
-                sampled = min_p_sampling_from_probs(probs, expanded_min_ps)
-            else:
-                sampled = top_k_top_p_sampling_from_probs(
-                    probs.contiguous(),
-                    expanded_top_ks,
-                    expanded_top_ps,
-                    filter_apply_order="joint",
-                    check_nan=False,
-                )
+            # Draft (q) distribution over top-k, provided by the draft worker.
+            q_ids = self.draft_topk_ids.to(device)
+            q_probs = self.draft_topk_probs.to(torch.float32).to(device)
 
-            target_predict = sampled.view(bs, self.draft_token_num)
+            # candidates[:, 1:] are the proposed draft tokens y_1..y_K.
+            proposed = candidates[:, 1:]
+            accept_len = torch.zeros((bs,), dtype=torch.int32, device=device)
+            bonus = torch.empty((bs,), dtype=torch.int64, device=device)
+            alive = torch.ones((bs,), dtype=torch.bool, device=device)
 
-        accept_len, bonus = compute_dflash_accept_len_and_bonus(
-            candidates=candidates,
-            target_predict=target_predict,
-        )
+            # Debug stats to understand acceptance under high-entropy sampling.
+            # These help distinguish "algorithm bug" (p/q wrong) vs "draft distribution mismatch" (q far from p).
+            p_y_sum = torch.zeros((), dtype=torch.float32, device=device)
+            q_y_sum = torch.zeros((), dtype=torch.float32, device=device)
+            a_sum = torch.zeros((), dtype=torch.float32, device=device)
+            tv_sum = torch.zeros((), dtype=torch.float32, device=device)
+            q_mass_in_p_sum = torch.zeros((), dtype=torch.float32, device=device)
+            topk_overlap_sum = torch.zeros((), dtype=torch.float32, device=device)
+            p_y_zero = torch.zeros((), dtype=torch.float32, device=device)
+            q_y_zero = torch.zeros((), dtype=torch.float32, device=device)
+            stat_count = torch.zeros((), dtype=torch.float32, device=device)
+
+            # Precompute row indices for each step: row = req_idx * block + step
+            req_rows = (
+                torch.arange(bs, device=device, dtype=torch.int64) * self.draft_token_num
+            )
+
+            for step in range(step_count):
+                if not bool(alive.any()):
+                    break
+                row = req_rows + int(step)
+                y = proposed[:, step]
+
+                p_ids_step = p_ids[row]
+                p_probs_step = p_probs[row]
+                p_y = (p_probs_step * (p_ids_step == y[:, None])).sum(dim=1)
+
+                q_ids_step = q_ids[:, step, :]
+                q_probs_step = q_probs[:, step, :]
+                q_y = (q_probs_step * (q_ids_step == y[:, None])).sum(dim=1)
+
+                ratio = torch.where(q_y > 0, p_y / q_y, torch.zeros_like(p_y))
+                a = torch.minimum(ratio, torch.ones_like(ratio))
+
+                # Estimate TV(p, q) for this step (both after filters).
+                # Achievable maximal-coupling match probability is 1 - TV.
+                q_on_p = (
+                    q_probs_step[:, None, :]
+                    * (q_ids_step[:, None, :] == p_ids_step[:, :, None])
+                ).sum(dim=2)  # [bs, topk]
+                q_on_p_sum = q_on_p.sum(dim=1)  # [bs]
+                # Intersection size between p top-k ids and q top-k ids.
+                # (Counts how many draft top-k tokens are also in target top-k.)
+                topk_inter = (q_ids_step[:, :, None] == p_ids_step[:, None, :]).any(dim=2).sum(dim=1).to(torch.float32)
+                l1 = (p_probs_step - q_on_p).abs().sum(dim=1) + (1.0 - q_on_p_sum).clamp_min(0.0)
+                tv = 0.5 * l1  # [bs]
+
+                # Accumulate stats only for still-alive requests.
+                mask_f = alive.to(torch.float32)
+                stat_count = stat_count + mask_f.sum().to(torch.float32)
+                p_y_sum = p_y_sum + (p_y.to(torch.float32) * mask_f).sum().to(torch.float32)
+                q_y_sum = q_y_sum + (q_y.to(torch.float32) * mask_f).sum().to(torch.float32)
+                a_sum = a_sum + (a.to(torch.float32) * mask_f).sum().to(torch.float32)
+                tv_sum = tv_sum + (tv.to(torch.float32) * mask_f).sum().to(torch.float32)
+                q_mass_in_p_sum = q_mass_in_p_sum + (q_on_p_sum.to(torch.float32) * mask_f).sum().to(torch.float32)
+                topk_overlap_sum = topk_overlap_sum + (topk_inter.to(torch.float32) * mask_f).sum().to(torch.float32)
+                p_y_zero = p_y_zero + ((p_y <= 0).to(torch.float32) * mask_f).sum().to(torch.float32)
+                q_y_zero = q_y_zero + ((q_y <= 0).to(torch.float32) * mask_f).sum().to(torch.float32)
+
+                u = torch.rand_like(a)
+                accept = (u < a) & alive
+                reject = (~accept) & alive
+                accept_len = accept_len + accept.to(torch.int32)
+
+                if bool(reject.any()):
+                    # Residual distribution on p's support: (p - q)+.
+                    q_on_p = (
+                        q_probs_step[:, None, :]
+                        * (q_ids_step[:, None, :] == p_ids_step[:, :, None])
+                    ).sum(dim=2)
+                    resid = (p_probs_step - q_on_p).clamp_min(0.0)
+                    resid_sum = resid.sum(dim=1, keepdim=True)
+                    resid = torch.where(
+                        resid_sum > 0,
+                        resid / resid_sum.clamp_min(1e-20),
+                        p_probs_step,
+                    )
+                    sampled_col = torch.multinomial(resid, num_samples=1).view(-1)
+                    sampled_tok = p_ids_step.gather(
+                        1, sampled_col.to(torch.int64).view(-1, 1)
+                    ).view(-1)
+                    bonus[reject] = sampled_tok[reject]
+                    alive[reject] = False
+
+            if bool(alive.any()):
+                # If all proposed draft tokens were accepted, sample the bonus token from
+                # the next target distribution p_K (row = K).
+                row = req_rows + int(step_count)
+                p_ids_step = p_ids[row]
+                p_probs_step = p_probs[row]
+                sampled_col = torch.multinomial(p_probs_step, num_samples=1).view(-1)
+                sampled_tok = p_ids_step.gather(
+                    1, sampled_col.to(torch.int64).view(-1, 1)
+                ).view(-1)
+                bonus[alive] = sampled_tok[alive]
+
+            # Log stats once per process (tp-rank 0 only), to keep logs readable.
+            global _DFLASH_PQ_STATS_LOGGED
+            if not _DFLASH_PQ_STATS_LOGGED:
+                try:
+                    from sglang.srt.distributed import get_tp_group
+
+                    tp_rank = int(get_tp_group().rank)
+                except Exception:
+                    tp_rank = 0
+                if tp_rank == 0:
+                    denom = float(stat_count.detach().cpu().item()) + 1e-6
+                    logger.info(
+                        "DFLASH pq stats: count=%.0f mean_p_y=%.6f mean_q_y=%.6f mean_a=%.6f mean_tv=%.6f mean_match=%.6f mean_q_mass_in_p=%.6f mean_topk_overlap=%.2f frac_p_y_zero=%.4f frac_q_y_zero=%.4f",
+                        denom,
+                        float(p_y_sum.detach().cpu().item()) / denom,
+                        float(q_y_sum.detach().cpu().item()) / denom,
+                        float(a_sum.detach().cpu().item()) / denom,
+                        float(tv_sum.detach().cpu().item()) / denom,
+                        1.0 - (float(tv_sum.detach().cpu().item()) / denom),
+                        float(q_mass_in_p_sum.detach().cpu().item()) / denom,
+                        float(topk_overlap_sum.detach().cpu().item()) / denom,
+                        float(p_y_zero.detach().cpu().item()) / denom,
+                        float(q_y_zero.detach().cpu().item()) / denom,
+                    )
+                    _DFLASH_PQ_STATS_LOGGED = True
 
         # Single D2H transfer: candidates[1:] + accept_len + bonus
         packed = torch.cat(
