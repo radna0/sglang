@@ -124,6 +124,11 @@ ATTENTION_BACKEND_CHOICES = [
     "triton",
     "torch_native",
     "flex_attention",
+    "flex_attention2",
+    "flex_flash",
+    "flex_flash2",
+    "flex_flash2_delegate_fa3",
+    "flex_flash4",
     "nsa",
     # NVIDIA specific
     "cutlass_mla",
@@ -322,6 +327,7 @@ class ServerArgs:
 
     # Memory and scheduling
     mem_fraction_static: Optional[float] = None
+    flex_temp_reserved_gb: Optional[float] = None
     max_running_requests: Optional[int] = None
     max_queued_requests: Optional[int] = None
     max_total_tokens: Optional[int] = None
@@ -586,6 +592,12 @@ class ServerArgs:
     multi_item_scoring_delimiter: Optional[Union[int]] = None
 
     # Optimization/debug options
+    # CUDA Graph capture mode:
+    # - none: disable all CUDA graphs
+    # - decode: enable decode/full CUDA graphs only
+    # - piecewise: enable piecewise CUDA graphs (extend/prefill) only
+    # - full+piecewise: enable both decode/full + piecewise graphs
+    cuda_graph_mode: Optional[str] = None
     disable_radix_cache: bool = False
     cuda_graph_max_bs: Optional[int] = None
     cuda_graph_bs: Optional[List[int]] = None
@@ -942,6 +954,29 @@ class ServerArgs:
 
           The coefficient 1.5 is a heuristic value, in the future, we can do better estimation by looking at the model types, hidden sizes or even do a dummy run.
         """
+        # Apply user-selected CUDA graph mode early so subsequent heuristics can
+        # size buffers appropriately (and so "piecewise-only" doesn't accidentally
+        # allocate decode/full CUDA graph buffers).
+        if self.cuda_graph_mode:
+            mode = str(self.cuda_graph_mode).strip().lower()
+            if mode in {"none", "off", "disable"}:
+                self.disable_cuda_graph = True
+                self.enable_piecewise_cuda_graph = False
+            elif mode in {"decode", "decode_only", "full"}:
+                self.disable_cuda_graph = False
+                self.enable_piecewise_cuda_graph = False
+            elif mode in {"piecewise", "prefill"}:
+                self.disable_cuda_graph = True
+                self.enable_piecewise_cuda_graph = True
+            elif mode in {"full+piecewise", "decode+piecewise", "both"}:
+                self.disable_cuda_graph = False
+                self.enable_piecewise_cuda_graph = True
+            else:
+                raise ValueError(
+                    "Invalid cuda_graph_mode. Supported: none, decode, piecewise, full+piecewise. "
+                    f"Got cuda_graph_mode={self.cuda_graph_mode!r}."
+                )
+
         if gpu_mem is not None:
             if gpu_mem < 20 * 1024:
                 # T4, 4080
@@ -1012,6 +1047,28 @@ class ServerArgs:
             self.cuda_graph_bs = self._generate_cuda_graph_batch_sizes()
         else:
             self.cuda_graph_max_bs = max(self.cuda_graph_bs)
+
+        # Safety: never capture CUDA graphs for batch sizes larger than the maximum number
+        # of concurrently running requests. Capturing bs >> concurrency can explode graph
+        # buffer sizes (e.g. DFLASH draft logits buffers where num_tokens_per_bs > 1) and
+        # OOM during startup, while providing no runtime benefit.
+        #
+        # This applies regardless of attention backend.
+        max_running = getattr(self, "max_running_requests", None)
+        if max_running is not None:
+            try:
+                max_running_i = int(max_running)
+            except Exception:
+                max_running_i = 0
+            if max_running_i > 0 and self.cuda_graph_bs:
+                if max(self.cuda_graph_bs) > max_running_i:
+                    self.cuda_graph_bs = [
+                        b for b in self.cuda_graph_bs if int(b) <= max_running_i
+                    ]
+                    if max_running_i not in self.cuda_graph_bs:
+                        self.cuda_graph_bs.append(max_running_i)
+                    self.cuda_graph_bs = sorted(set(int(b) for b in self.cuda_graph_bs))
+                    self.cuda_graph_max_bs = max(self.cuda_graph_bs)
 
         if self.piecewise_cuda_graph_max_tokens is None:
             # Refer to pr #15927, by default we set the piecewise cuda graph max tokens to the chunked prefill size by default.
@@ -1356,7 +1413,18 @@ class ServerArgs:
                 else:
                     self.attention_backend = "triton"
 
-            supported_backends = ["triton", "trtllm_mha", "fa3", "fa4", "ascend"]
+            # GPT-OSS uses attention sinks; allow FlexAttention backends that implement sinks correctly.
+            supported_backends = [
+                "triton",
+                "trtllm_mha",
+                "fa3",
+                "fa4",
+                "ascend",
+                "flex_attention",
+                "flex_attention2",
+                "flex_flash",
+                "flex_flash2",
+            ]
             prefill_attn_backend, decode_attn_backend = self.get_attention_backends()
             assert (
                 prefill_attn_backend in supported_backends
@@ -1855,14 +1923,28 @@ class ServerArgs:
             )
             self.disable_cuda_graph = True
 
-        if self.attention_backend == "flex_attention":
-            logger.warning(
-                "Cuda graph is disabled because of using torch Flex Attention backend"
-            )
-            self.disable_cuda_graph = True
-            assert (
-                self.speculative_algorithm is None
-            ), "Speculative decoding is currently not supported with Flex Attention backend"
+        if self.attention_backend in {
+            "flex_attention",
+            "flex_attention2",
+            "flex_flash",
+            "flex_flash2",
+        }:
+            if (os.environ.get("SGLANG_FLEX_ALLOW_CUDA_GRAPH") or "").strip() in {"1", "true", "True"}:
+                logger.warning(
+                    "Cuda graph was NOT disabled for torch Flex Attention backend because "
+                    "SGLANG_FLEX_ALLOW_CUDA_GRAPH=1 (experimental)."
+                )
+            else:
+                logger.warning(
+                    "Cuda graph is disabled because of using torch Flex Attention backend"
+                )
+                self.disable_cuda_graph = True
+            if self.speculative_algorithm not in (None, "DFLASH", "DFLASH_TREE"):
+                raise ValueError(
+                    "Speculative decoding is not supported with Flex Attention backends "
+                    "except for DFLASH/DFLASH_TREE (experimental). "
+                    f"Got speculative_algorithm={self.speculative_algorithm!r}."
+                )
 
         # Major NVIDIA platforms backends
         if (
@@ -1925,6 +2007,38 @@ class ServerArgs:
                 "Setting attention backend to triton."
             )
             self.attention_backend = "triton"
+
+        # FlexAttention backends (torch/flex2/hybrid flex_flash*) currently do not natively
+        # support quantized KV cache (FP8/FP4) in their paged path. For quality-first behavior
+        # we fail fast unless the user explicitly opts into a fallback.
+        flex_backends = {"flex_attention", "flex_attention2", "flex_flash", "flex_flash2"}
+        if self.attention_backend in flex_backends and self.kv_cache_dtype in {
+            "fp8_e4m3",
+            "fp8_e5m2",
+            "fp4_e2m1",
+        }:
+            allow = (os.environ.get("SGLANG_FLEX_ALLOW_QUANT_KV") or "").strip() in {
+                "1",
+                "true",
+                "True",
+                "yes",
+                "YES",
+            }
+            if allow:
+                logger.warning(
+                    "FlexAttention backend %s does not natively support kv_cache_dtype=%s; "
+                    "falling back to kv_cache_dtype=bfloat16 due to SGLANG_FLEX_ALLOW_QUANT_KV=1.",
+                    self.attention_backend,
+                    self.kv_cache_dtype,
+                )
+                self.kv_cache_dtype = "bfloat16"
+            else:
+                raise ValueError(
+                    "FlexAttention backends do not natively support quantized KV cache. "
+                    f"Got attention_backend={self.attention_backend!r}, kv_cache_dtype={self.kv_cache_dtype!r}. "
+                    "Best practice: keep the target on FA3 with FP8 KV, and set the draft to bf16 via "
+                    "--speculative-draft-kv-cache-dtype bfloat16."
+                )
 
         if self.prefill_attention_backend == "fa4" and not self.use_mla_backend():
             logger.warning(
@@ -2376,10 +2490,13 @@ class ServerArgs:
                 )
 
             if self.page_size != 1:
-                raise ValueError(
-                    "Currently DFLASH speculative decoding requires page_size == 1. "
-                    f"Got page_size={self.page_size}."
+                # The current DFLASH verify implementation requires page_size == 1
+                # (KV freeing / compaction and several shape assumptions).
+                logger.warning(
+                    "DFLASH requires --page-size 1 for correctness; overriding page_size=%s to 1.",
+                    self.page_size,
                 )
+                self.page_size = 1
 
             if self.speculative_draft_model_path is None:
                 raise ValueError(
@@ -2495,18 +2612,29 @@ class ServerArgs:
                     except Exception:
                         draft_model_type = None
 
-                # GPT-OSS requires attention sink behavior; enforce FA3 for both target and draft.
+                # GPT-OSS requires attention sink behavior. Historically we enforced FA3,
+                # but FlexAttention backends can also implement sinks correctly.
                 if draft_model_type == "gpt_oss":
-                    if self.attention_backend != "fa3":
+                    allowed = {
+                        "fa3",
+                        "flex_attention",
+                        "flex_attention2",
+                        "flex_flash",
+                        "flex_flash2",
+                    }
+                    if self.attention_backend not in allowed:
                         raise ValueError(
-                            "GPT-OSS DFLASH requires --attention-backend=fa3 (FlashAttention3). "
+                            "GPT-OSS DFLASH requires an attention backend that supports attention sinks. "
+                            f"Supported: {sorted(allowed)}. "
                             f"Got attention_backend={self.attention_backend!r}."
                         )
                     if self.speculative_draft_attention_backend is None:
-                        self.speculative_draft_attention_backend = "fa3"
-                    elif self.speculative_draft_attention_backend != "fa3":
+                        # Default draft backend to target backend (keeps semantics aligned).
+                        self.speculative_draft_attention_backend = self.attention_backend
+                    elif self.speculative_draft_attention_backend not in allowed:
                         raise ValueError(
-                            "GPT-OSS DFLASH requires --speculative-draft-attention-backend=fa3. "
+                            "GPT-OSS DFLASH requires a sinks-capable speculative draft attention backend. "
+                            f"Supported: {sorted(allowed)}. "
                             f"Got speculative_draft_attention_backend={self.speculative_draft_attention_backend!r}."
                         )
 
@@ -2534,6 +2662,29 @@ class ServerArgs:
                 logger.warning(
                     "Mixed chunked prefill is disabled because of using dflash speculative decoding."
                 )
+
+            # Draft KV dtype defaulting:
+            # If the target KV cache is quantized (FP8/FP4) but the draft attention backend is Flex*,
+            # the draft worker must not inherit the quantized dtype (Flex* does not natively support it).
+            flex_backends = {"flex_attention", "flex_attention2", "flex_flash", "flex_flash2"}
+            quant_kv = {"fp8_e4m3", "fp8_e5m2", "fp4_e2m1"}
+            draft_attn = (self.speculative_draft_attention_backend or self.attention_backend or "").strip()
+            if draft_attn in flex_backends:
+                if self.speculative_draft_kv_cache_dtype is None and self.kv_cache_dtype in quant_kv:
+                    logger.warning(
+                        "DFLASH draft backend=%s does not support kv_cache_dtype=%s; "
+                        "defaulting draft KV to bfloat16. You can override with "
+                        "--speculative-draft-kv-cache-dtype.",
+                        draft_attn,
+                        self.kv_cache_dtype,
+                    )
+                    self.speculative_draft_kv_cache_dtype = "bfloat16"
+                elif self.speculative_draft_kv_cache_dtype in quant_kv:
+                    raise ValueError(
+                        "DFLASH draft FlexAttention backend does not support quantized KV cache. "
+                        f"Got speculative_draft_attention_backend={draft_attn!r}, "
+                        f"speculative_draft_kv_cache_dtype={self.speculative_draft_kv_cache_dtype!r}."
+                    )
 
         elif self.speculative_algorithm == "DFLASH_TREE":
             if self.enable_dp_attention:
@@ -2627,18 +2778,28 @@ class ServerArgs:
                             e,
                         )
 
-                # GPT-OSS requires attention sink behavior; enforce FA3 for both target and draft.
+                # GPT-OSS requires attention sink behavior. Historically we enforced FA3,
+                # but FlexAttention backends can also implement sinks correctly.
                 if draft_model_type == "gpt_oss":
-                    if self.attention_backend != "fa3":
+                    allowed = {
+                        "fa3",
+                        "flex_attention",
+                        "flex_attention2",
+                        "flex_flash",
+                        "flex_flash2",
+                    }
+                    if self.attention_backend not in allowed:
                         raise ValueError(
-                            "GPT-OSS DFLASH_TREE requires --attention-backend=fa3 (FlashAttention3). "
+                            "GPT-OSS DFLASH_TREE requires an attention backend that supports attention sinks. "
+                            f"Supported: {sorted(allowed)}. "
                             f"Got attention_backend={self.attention_backend!r}."
                         )
                     if self.speculative_draft_attention_backend is None:
-                        self.speculative_draft_attention_backend = "fa3"
-                    elif self.speculative_draft_attention_backend != "fa3":
+                        self.speculative_draft_attention_backend = self.attention_backend
+                    elif self.speculative_draft_attention_backend not in allowed:
                         raise ValueError(
-                            "GPT-OSS DFLASH_TREE requires --speculative-draft-attention-backend=fa3. "
+                            "GPT-OSS DFLASH_TREE requires a sinks-capable speculative draft attention backend. "
+                            f"Supported: {sorted(allowed)}. "
                             f"Got speculative_draft_attention_backend={self.speculative_draft_attention_backend!r}."
                         )
 
@@ -2684,6 +2845,27 @@ class ServerArgs:
                 logger.warning(
                     "Mixed chunked prefill is disabled because of using DFLASH_TREE speculative decoding."
                 )
+
+            # Draft KV dtype defaulting for Flex* draft backends under a quantized target KV.
+            flex_backends = {"flex_attention", "flex_attention2", "flex_flash", "flex_flash2"}
+            quant_kv = {"fp8_e4m3", "fp8_e5m2", "fp4_e2m1"}
+            draft_attn = (self.speculative_draft_attention_backend or self.attention_backend or "").strip()
+            if draft_attn in flex_backends:
+                if self.speculative_draft_kv_cache_dtype is None and self.kv_cache_dtype in quant_kv:
+                    logger.warning(
+                        "DFLASH_TREE draft backend=%s does not support kv_cache_dtype=%s; "
+                        "defaulting draft KV to bfloat16. You can override with "
+                        "--speculative-draft-kv-cache-dtype.",
+                        draft_attn,
+                        self.kv_cache_dtype,
+                    )
+                    self.speculative_draft_kv_cache_dtype = "bfloat16"
+                elif self.speculative_draft_kv_cache_dtype in quant_kv:
+                    raise ValueError(
+                        "DFLASH_TREE draft FlexAttention backend does not support quantized KV cache. "
+                        f"Got speculative_draft_attention_backend={draft_attn!r}, "
+                        f"speculative_draft_kv_cache_dtype={self.speculative_draft_kv_cache_dtype!r}."
+                    )
 
         if self.speculative_algorithm in ("EAGLE", "EAGLE3", "STANDALONE"):
             if self.speculative_algorithm == "STANDALONE" and self.enable_dp_attention:
@@ -3473,6 +3655,13 @@ class ServerArgs:
             type=float,
             default=ServerArgs.mem_fraction_static,
             help="The fraction of the memory used for static allocation (model weights and KV cache memory pool). Use a smaller value if you see out-of-memory errors.",
+        )
+        parser.add_argument(
+            "--flex-temp-reserved-gb",
+            type=float,
+            default=ServerArgs.flex_temp_reserved_gb,
+            help="Extra GPU memory headroom (in GB) reserved for FlexAttention* temporary buffers/compilation when sizing the KV pool. "
+            "This reduces effective KV cache capacity but can prevent CUDA graph / inductor OOMs.",
         )
         parser.add_argument(
             "--max-running-requests",
@@ -4392,8 +4581,9 @@ class ServerArgs:
             help="For the DFlash speculative algorithm under non-greedy sampling, choose the verify rule. "
             "'target_only' (default) samples from the target distribution p and accepts draft tokens only "
             "while they match the sampled target tokens (exact, but acceptance collapses at high entropy). "
-            "'pq' performs true speculative sampling using draft probabilities q(token): accept with "
-            "min(1, p/q) and sample from the residual on rejection (exact, higher acceptance).",
+            "'pq' performs speculative sampling using draft probabilities q(token): accept with "
+            "min(1, p/q) and sample from the residual on rejection. This mode is gated by "
+            "SGLANG_DFLASH_PQ_ENABLE=1 and is approximate when using truncated top-k distributions.",
         )
         parser.add_argument(
             "--speculative-dflash-pq-draft-topk-cap",
@@ -4860,6 +5050,16 @@ class ServerArgs:
             "--disable-radix-cache",
             action="store_true",
             help="Disable RadixAttention for prefix caching.",
+        )
+        parser.add_argument(
+            "--cuda-graph-mode",
+            type=str,
+            default=ServerArgs.cuda_graph_mode,
+            choices=["none", "decode", "piecewise", "full+piecewise"],
+            help="CUDA graph capture mode. "
+            "'decode' enables decode/full graphs; 'piecewise' enables extend/prefill piecewise graphs; "
+            "'full+piecewise' enables both; 'none' disables all CUDA graphs. "
+            "When unset, SGLang uses default heuristics + individual flags.",
         )
         parser.add_argument(
             "--cuda-graph-max-bs",

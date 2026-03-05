@@ -49,20 +49,28 @@ class TorchFlexAttnBackendV2(TorchFlexAttnBackend):
     def __init__(self, model_runner: "ModelRunner", *, kernel_options: dict | None = None):
         super().__init__(model_runner, kernel_options=kernel_options)
         self._page_size = int(getattr(model_runner.server_args, "page_size", 1) or 1)
-        # "FlexFlash2" fastpath: when kernel_options contains {"force_flash": true},
-        # bypass PyTorch FlexAttention entirely and delegate to the native FA backend.
+        # FlexFlash2 (blog-style): when kernel_options contains {"force_flash": true},
+        # request the CuTe/FlashAttention backend inside PyTorch FlexAttention.
         #
-        # This is the highest-ROI path on Hopper (SM90): it preserves the ability to
-        # select a "flex_*" backend while avoiding Flex dispatcher/mask overhead, and
-        # it is CUDA-graph friendly because it uses the same graph hooks as FA3.
+        # Optional override: for benchmarking or parity, we can bypass FlexAttention
+        # entirely and delegate to native SGLang FA3. This is controlled by:
+        # - kernel_options["delegate_fa"] == True, or
+        # - env SGLANG_FLEX2_DELEGATE_TO_FA=1
         self._force_flash: bool = bool(getattr(self, "flex_kernel_options", {}).get("force_flash", False))
+        self._delegate_to_fa: bool = bool(getattr(self, "flex_kernel_options", {}).get("delegate_fa", False)) or (
+            (os.environ.get("SGLANG_FLEX2_DELEGATE_TO_FA") or "").strip() in _DISALLOW_FALLBACK_ENVS
+        )
         self._fa_delegate: object | None = None
-        if self._force_flash:
+        if self._delegate_to_fa:
             FlashAttentionBackend = _load_flashattention_backend()
             self._fa_delegate = FlashAttentionBackend(model_runner, fa_impl_ver=3)
             if (os.environ.get("SGLANG_FLEX2_LOG_FORCE_FLASH") or "1").strip() in {"1", "true", "True"}:
                 try:
-                    print("[flex2] force_flash=1 delegate=FlashAttentionBackend(fa_impl_ver=3)", flush=True)
+                    print(
+                        "[flex2] delegate_fa=1 delegate=FlashAttentionBackend(fa_impl_ver=3) force_flash="
+                        + ("1" if self._force_flash else "0"),
+                        flush=True,
+                    )
                 except Exception:
                     pass
         self._physical_to_logical: torch.Tensor | None = None

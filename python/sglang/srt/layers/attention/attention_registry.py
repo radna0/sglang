@@ -142,6 +142,24 @@ def create_flex_flash2_backend(runner):
     return TorchFlexAttnBackendV2(runner, kernel_options={"force_flash": True})
 
 
+@register_attention_backend("flex_flash2_delegate_fa3")
+def create_flex_flash2_delegate_fa3_backend(runner):
+    # For benchmarking/parity only: bypass FlexAttention entirely but keep the backend name
+    # in configs. This delegates to native SGLang FlashAttentionBackend(fa_impl_ver=3).
+    from sglang.srt.layers.attention.torch_flex2_backend import TorchFlexAttnBackendV2
+
+    return TorchFlexAttnBackendV2(runner, kernel_options={"force_flash": True, "delegate_fa": True})
+
+
+@register_attention_backend("flex_flash4")
+def create_flex_flash4_backend(runner):
+    # Blog-style "FlexAttention in FlashAttention CuTe DSL": this is an alias for FlexFlash2,
+    # but named explicitly to reflect the FA4/CuTe backend selection inside PyTorch when available.
+    from sglang.srt.layers.attention.torch_flex2_backend import TorchFlexAttnBackendV2
+
+    return TorchFlexAttnBackendV2(runner, kernel_options={"force_flash": True})
+
+
 @register_attention_backend("flashmla")
 def create_flashmla_backend(runner):
     from sglang.srt.layers.attention.flashmla_backend import FlashMLABackend
