@@ -19,6 +19,16 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_DISALLOW_FALLBACK_ENVS = {"1", "true", "True", "yes", "YES"}
+
+
+def _load_flashattention_backend():
+    # Import lazily so environments without triton (e.g. CPU-only dev) can still import
+    # this module. The actual FA backend is only needed when force_flash is enabled.
+    from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
+
+    return FlashAttentionBackend
+
 
 class TorchFlexAttnBackendV2(TorchFlexAttnBackend):
     """
@@ -39,6 +49,22 @@ class TorchFlexAttnBackendV2(TorchFlexAttnBackend):
     def __init__(self, model_runner: "ModelRunner", *, kernel_options: dict | None = None):
         super().__init__(model_runner, kernel_options=kernel_options)
         self._page_size = int(getattr(model_runner.server_args, "page_size", 1) or 1)
+        # "FlexFlash2" fastpath: when kernel_options contains {"force_flash": true},
+        # bypass PyTorch FlexAttention entirely and delegate to the native FA backend.
+        #
+        # This is the highest-ROI path on Hopper (SM90): it preserves the ability to
+        # select a "flex_*" backend while avoiding Flex dispatcher/mask overhead, and
+        # it is CUDA-graph friendly because it uses the same graph hooks as FA3.
+        self._force_flash: bool = bool(getattr(self, "flex_kernel_options", {}).get("force_flash", False))
+        self._fa_delegate: object | None = None
+        if self._force_flash:
+            FlashAttentionBackend = _load_flashattention_backend()
+            self._fa_delegate = FlashAttentionBackend(model_runner, fa_impl_ver=3)
+            if (os.environ.get("SGLANG_FLEX2_LOG_FORCE_FLASH") or "1").strip() in {"1", "true", "True"}:
+                try:
+                    print("[flex2] force_flash=1 delegate=FlashAttentionBackend(fa_impl_ver=3)", flush=True)
+                except Exception:
+                    pass
         self._physical_to_logical: torch.Tensor | None = None
         self._physical_to_logical_batched: torch.Tensor | None = None
         self._kv_start_rel: torch.Tensor | None = None
@@ -50,8 +76,10 @@ class TorchFlexAttnBackendV2(TorchFlexAttnBackend):
         self._logged_vectorized_extend: bool = False
         self._logged_run_decode: bool = False
         self._logged_run_extend: bool = False
+        self._logged_page_size1: bool = False
         self._page_col_cache: dict[tuple[torch.device, int], torch.Tensor] = {}
         self._logical_pages_row_cache: dict[tuple[torch.device, int], torch.Tensor] = {}
+        self._pos_row_cache: dict[tuple[torch.device, int], torch.Tensor] = {}
         # Persistent (across decode steps) batched decode caches keyed by static shape.
         # This is required to eliminate per-step allocations for CUDA-graph / compile viability.
         self._flex2_decode_cache_batched_by_sig: dict[tuple, dict] = {}
@@ -65,16 +93,135 @@ class TorchFlexAttnBackendV2(TorchFlexAttnBackend):
         # This avoids per-step BlockMask.from_kv_blocks allocations, which can trigger
         # torch.compile cache churn and destroy throughput.
         self._flex2_extend_cache_batched_by_sig: dict[tuple, dict] = {}
+        self._flex2_extend_cache_batched_key_order: list[tuple] = []
+        self._flex2_extend_cache_batched_max_keys: int = int(
+            os.environ.get("SGLANG_FLEX2_EXTEND_CACHE_MAX_KEYS", "32") or 32
+        )
         self._flex2_extend_cache_batched_alloc_ct: int = 0
+
+        # page_size==1 token-block (dense KV blocks) cache for DFlash verify + prefill.
+        # Keyed by static signature so we can reuse BlockMask/kv_indices buffers.
+        self._flex2_tokenblock_cache_by_sig: dict[tuple, dict] = {}
+        self._flex2_tokenblock_cache_key_order: list[tuple] = []
+        self._flex2_tokenblock_cache_max_keys: int = int(
+            os.environ.get("SGLANG_FLEX2_TOKENBLOCK_CACHE_MAX_KEYS", "16") or 16
+        )
+        self._flex2_tokenblock_cache_alloc_ct: int = 0
+        self._flex2_fallback_decode_ct: int = 0
+        self._flex2_fallback_extend_ct: int = 0
+
+    # ------------------------
+    # Delegate-to-FA3 fastpath
+    # ------------------------
+    def init_forward_metadata(self, forward_batch: "ForwardBatch"):
+        if self._fa_delegate is not None:
+            return self._fa_delegate.init_forward_metadata(forward_batch)
+        # NOTE: do not call TorchFlexAttnBackend.init_forward_metadata() because it
+        # unconditionally calls torch.cuda.empty_cache(), which is extremely costly
+        # for long-context inference and breaks CUDA-graph stability.
+        self._last_forward_mode_is_extend = forward_batch.forward_mode.is_extend()
+
+    def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
+        if self._fa_delegate is not None:
+            return self._fa_delegate.init_cuda_graph_state(max_bs, max_num_tokens)
+        return super().init_cuda_graph_state(max_bs, max_num_tokens)
+
+    def init_forward_metadata_capture_cuda_graph(
+        self,
+        bs: int,
+        num_tokens: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        encoder_lens,
+        forward_mode,
+        spec_info,
+    ):
+        if self._fa_delegate is not None:
+            return self._fa_delegate.init_forward_metadata_capture_cuda_graph(
+                bs,
+                num_tokens,
+                req_pool_indices,
+                seq_lens,
+                encoder_lens,
+                forward_mode,
+                spec_info,
+            )
+        return super().init_forward_metadata_capture_cuda_graph(
+            bs,
+            num_tokens,
+            req_pool_indices,
+            seq_lens,
+            encoder_lens,
+            forward_mode,
+            spec_info,
+        )
+
+    def init_forward_metadata_replay_cuda_graph(
+        self,
+        bs: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_sum: int,
+        encoder_lens,
+        forward_mode,
+        spec_info,
+        seq_lens_cpu,
+    ):
+        if self._fa_delegate is not None:
+            return self._fa_delegate.init_forward_metadata_replay_cuda_graph(
+                bs,
+                req_pool_indices,
+                seq_lens,
+                seq_lens_sum,
+                encoder_lens,
+                forward_mode,
+                spec_info,
+                seq_lens_cpu,
+            )
+        return super().init_forward_metadata_replay_cuda_graph(
+            bs,
+            req_pool_indices,
+            seq_lens,
+            seq_lens_sum,
+            encoder_lens,
+            forward_mode,
+            spec_info,
+            seq_lens_cpu,
+        )
+
+    def get_cuda_graph_seq_len_fill_value(self):
+        if self._fa_delegate is not None:
+            return self._fa_delegate.get_cuda_graph_seq_len_fill_value()
+        return super().get_cuda_graph_seq_len_fill_value()
+
+    def get_verify_buffers_to_fill_after_draft(self):
+        if self._fa_delegate is not None:
+            return self._fa_delegate.get_verify_buffers_to_fill_after_draft()
+        return super().get_verify_buffers_to_fill_after_draft()
+
+    def update_verify_buffers_to_fill_after_draft(self, spec_info, cuda_graph_bs):
+        if self._fa_delegate is not None:
+            return self._fa_delegate.update_verify_buffers_to_fill_after_draft(
+                spec_info, cuda_graph_bs
+            )
+        return super().update_verify_buffers_to_fill_after_draft(spec_info, cuda_graph_bs)
 
         # FlexAttention relies on torch inductor and (typically) Triton for kernel generation.
         # Ensure at least one GEMM backend is enabled for autotuning, otherwise inductor can
         # raise NoValidChoicesError during flex kernel compilation.
-        try:
-            if not (os.environ.get("TORCHINDUCTOR_MAX_AUTOTUNE_GEMM_BACKENDS") or "").strip():
-                torch._inductor.config.max_autotune_gemm_backends = "CUTLASS,TRITON,ATEN"
-        except Exception:
-            pass
+        #
+        # IMPORTANT: avoid importing torch._inductor at module init (it can be slow and can
+        # deadlock/hang under some containerized launchers). Prefer the env var.
+        if not (os.environ.get("TORCHINDUCTOR_MAX_AUTOTUNE_GEMM_BACKENDS") or "").strip():
+            os.environ["TORCHINDUCTOR_MAX_AUTOTUNE_GEMM_BACKENDS"] = "CUTLASS,TRITON,ATEN"
+
+    def _extend_cache_put(self, key: tuple, cache: dict) -> None:
+        self._flex2_extend_cache_batched_by_sig[key] = cache
+        self._flex2_extend_cache_batched_key_order.append(key)
+        max_keys = int(self._flex2_extend_cache_batched_max_keys)
+        if max_keys > 0 and len(self._flex2_extend_cache_batched_key_order) > max_keys:
+            evict = self._flex2_extend_cache_batched_key_order.pop(0)
+            self._flex2_extend_cache_batched_by_sig.pop(evict, None)
 
     def _get_page_col(self, *, device: torch.device, total_pages: int) -> torch.Tensor:
         key = (device, int(total_pages))
@@ -91,6 +238,105 @@ class TorchFlexAttnBackendV2(TorchFlexAttnBackend):
             t = torch.arange(int(total_pages), device=device, dtype=torch.int32)
             self._logical_pages_row_cache[key] = t
         return t
+
+    def _get_pos_row(self, *, device: torch.device, n: int) -> torch.Tensor:
+        key = (device, int(n))
+        t = self._pos_row_cache.get(key)
+        if t is None:
+            t = torch.arange(int(n), device=device, dtype=torch.int64)
+            self._pos_row_cache[key] = t
+        return t
+
+    def _tokenblock_cache_put(self, key: tuple, cache: dict) -> None:
+        self._flex2_tokenblock_cache_by_sig[key] = cache
+        self._flex2_tokenblock_cache_key_order.append(key)
+        max_keys = int(self._flex2_tokenblock_cache_max_keys)
+        if max_keys > 0 and len(self._flex2_tokenblock_cache_key_order) > max_keys:
+            evict = self._flex2_tokenblock_cache_key_order.pop(0)
+            self._flex2_tokenblock_cache_by_sig.pop(evict, None)
+
+    def _get_or_build_tokenblock_mask_batched(
+        self,
+        *,
+        device: torch.device,
+        batch_size: int,
+        q_len: int,
+        kv_total_len: int,
+        q_block_size: int,
+        kv_block_size: int,
+    ) -> dict:
+        """
+        Build a dense token-block BlockMask for page_size==1.
+
+        KV blocks are contiguous token blocks over the *global* KV pool:
+          kv_block_id in [0..num_kv_blocks-1], kv_idx = kv_block_id * kv_block_size + offset.
+
+        Correctness is enforced by `_paged_mask_mod`, which uses per-request
+        `physical_to_logical_batched` to invalidate tokens not belonging to the request
+        (logical=-1) and apply window constraints via kv_start_rel/q_kv_offset.
+        """
+        bsz = int(batch_size)
+        q_len_i = int(q_len)
+        kv_total_len_i = int(kv_total_len)
+        q_block = int(q_block_size) if int(q_block_size) > 0 else 128
+        kv_block = int(kv_block_size) if int(kv_block_size) > 0 else 128
+        if q_len_i <= 0:
+            raise ValueError(f"q_len must be positive, got {q_len_i}")
+        if kv_total_len_i <= 0:
+            raise ValueError(f"kv_total_len must be positive, got {kv_total_len_i}")
+        if kv_block <= 0:
+            raise ValueError(f"kv_block_size must be positive, got {kv_block}")
+
+        static_sig = (device, bsz, q_len_i, kv_total_len_i, q_block, kv_block)
+        cache = self._flex2_tokenblock_cache_by_sig.get(static_sig)
+        if cache is not None:
+            return cache
+
+        q_num_blocks = (q_len_i + q_block - 1) // q_block
+        num_kv_blocks = (kv_total_len_i + kv_block - 1) // kv_block
+        max_cols = int(num_kv_blocks) + 1
+        kv_indices = torch.full(
+            (bsz, 1, int(q_num_blocks), int(max_cols)),
+            fill_value=int(num_kv_blocks),
+            dtype=torch.int32,
+            device=device,
+        )
+        if num_kv_blocks > 0:
+            kv_indices[:, :, :, : int(num_kv_blocks)] = torch.arange(
+                int(num_kv_blocks), device=device, dtype=torch.int32
+            ).view(1, 1, 1, -1)
+        kv_num_blocks = torch.full(
+            (bsz, 1, int(q_num_blocks)),
+            fill_value=int(num_kv_blocks),
+            dtype=torch.int32,
+            device=device,
+        )
+        block_mask = BlockMask.from_kv_blocks(
+            kv_num_blocks=kv_num_blocks,
+            kv_indices=kv_indices,
+            full_kv_num_blocks=None,
+            full_kv_indices=None,
+            BLOCK_SIZE=(int(q_block), int(kv_block)),
+            mask_mod=self._paged_mask_mod,
+            seq_lengths=(int(q_len_i), int(kv_total_len_i)),
+        )
+        cache = {
+            "sig": static_sig,
+            "q_num_blocks": int(q_num_blocks),
+            "num_kv_blocks": int(num_kv_blocks),
+            "kv_indices": kv_indices,
+            "kv_num_blocks": kv_num_blocks,
+            "block_mask": block_mask,
+        }
+        self._tokenblock_cache_put(static_sig, cache)
+        self._flex2_tokenblock_cache_alloc_ct += 1
+        if (os.environ.get("SGLANG_FLEX2_LOG_CACHE") or "").strip() in {"1", "true", "True"}:
+            logger.info(
+                "Flex2 tokenblock cache alloc_ct=%s sig=%s",
+                int(self._flex2_tokenblock_cache_alloc_ct),
+                static_sig,
+            )
+        return cache
 
     def _ensure_paged_buffers(self, *, total_pages: int) -> None:
         device = self.device
@@ -189,7 +435,9 @@ class TorchFlexAttnBackendV2(TorchFlexAttnBackend):
         q_num_blocks = (int(q_len) + q_block - 1) // q_block
 
         num_pages = int(physical_pages.numel())
-        # kv_indices: [B=1, H=1, q_rows, MAX_COLS=total_pages+1]
+        # kv_indices stores KV *block ids* in the global KV sequence.
+        # Our KV tensor for flex_attention is the global KV cache pool, so these must be
+        # physical page ids (0..total_pages-1), not compacted ids.
         max_cols = int(total_pages) + 1
         kv_indices = torch.full(
             (1, 1, int(q_num_blocks), int(max_cols)),
@@ -198,8 +446,7 @@ class TorchFlexAttnBackendV2(TorchFlexAttnBackend):
             device=physical_pages.device,
         )
         if num_pages > 0:
-            pages_i32 = physical_pages.to(dtype=torch.int32, device=physical_pages.device)
-            kv_indices[:, :, :, :num_pages] = pages_i32.view(1, 1, 1, -1)
+            kv_indices[:, :, :, :num_pages] = physical_pages.to(torch.int32).view(1, 1, 1, -1)
 
         kv_num_blocks = torch.full(
             (1, 1, int(q_num_blocks)),
@@ -324,9 +571,62 @@ class TorchFlexAttnBackendV2(TorchFlexAttnBackend):
                 sinks=sinks,
                 window_left=window_left,
             )
-        # If page_size is not usable, fall back to V1 gather/slice behavior.
+
+        # FP8 KV-cache compatibility: fall back to V1 gather path for float8 KV.
+        try:
+            if k_cache.dtype == torch.float8_e5m2 or v_cache.dtype == torch.float8_e5m2:
+                raise RuntimeError(
+                    "FlexAttention2 does not support fp8_e5m2 KV-cache in this build (quality/perf). "
+                    "Use fp8_e4m3 or bf16 KV-cache."
+                )
+            is_fp8_kv = k_cache.dtype == torch.float8_e4m3fn or v_cache.dtype == torch.float8_e4m3fn
+        except Exception:
+            is_fp8_kv = False
+        if is_fp8_kv:
+            return TorchFlexAttnBackend._run_flex_forward_extend(
+                self,
+                query,
+                output,
+                k_cache,
+                v_cache,
+                req_to_token,
+                req_pool_indices,
+                seq_lens,
+                extend_prefix_lens,
+                extend_seq_lens,
+                scaling=scaling,
+                enable_gqa=enable_gqa,
+                causal=causal,
+                sinks=sinks,
+                window_left=window_left,
+            )
+        # page_size==1 is slower (degenerates to token-blocking), but we allow it when
+        # explicitly requested because DFLASH verify currently forces page_size=1.
         if int(self._page_size) <= 1:
-            return super()._run_flex_forward_extend(
+            if (os.environ.get("SGLANG_FLEX2_ALLOW_PAGE_SIZE1") or "").strip() not in _DISALLOW_FALLBACK_ENVS:
+                return super()._run_flex_forward_extend(
+                    query,
+                    output,
+                    k_cache,
+                    v_cache,
+                    req_to_token,
+                    req_pool_indices,
+                    seq_lens,
+                    extend_prefix_lens,
+                    extend_seq_lens,
+                    scaling=scaling,
+                    enable_gqa=enable_gqa,
+                    causal=causal,
+                    sinks=sinks,
+                    window_left=window_left,
+                )
+            if not self._logged_page_size1:
+                self._logged_page_size1 = True
+                logger.warning(
+                    "FlexAttention2 _run_flex_forward_extend running with page_size=1 (requested via SGLANG_FLEX2_ALLOW_PAGE_SIZE1=1). "
+                    "This can be significantly slower than page_size=64/128."
+                )
+            return self._run_flex_forward_extend_tokenblock(
                 query,
                 output,
                 k_cache,
@@ -345,6 +645,12 @@ class TorchFlexAttnBackendV2(TorchFlexAttnBackend):
 
         ps = int(self._page_size)
         if int(k_cache.shape[0]) % ps != 0:
+            if (os.environ.get("SGLANG_FLEX2_DISALLOW_FALLBACK") or "").strip() in _DISALLOW_FALLBACK_ENVS:
+                raise RuntimeError(
+                    "TorchFlexAttnBackendV2: KV cache is not page-aligned "
+                    f"(k_cache.shape[0]={int(k_cache.shape[0])}, page_size={ps}); "
+                    "fallback to gather is disallowed by SGLANG_FLEX2_DISALLOW_FALLBACK=1."
+                )
             logger.warning(
                 "TorchFlexAttnBackendV2: KV cache is not page-aligned (k_cache.shape[0]=%s, page_size=%s). "
                 "Falling back to flex_attention (gather).",
@@ -377,6 +683,12 @@ class TorchFlexAttnBackendV2(TorchFlexAttnBackend):
 
         kv_total_len = int(k_cache.shape[0])
         if kv_total_len % ps != 0:
+            if (os.environ.get("SGLANG_FLEX2_DISALLOW_FALLBACK") or "").strip() in _DISALLOW_FALLBACK_ENVS:
+                raise RuntimeError(
+                    "TorchFlexAttnBackendV2: KV cache is not page-aligned "
+                    f"(k_cache.shape[0]={int(k_cache.shape[0])}, page_size={ps}); "
+                    "fallback to gather is disallowed by SGLANG_FLEX2_DISALLOW_FALLBACK=1."
+                )
             logger.warning(
                 "TorchFlexAttnBackendV2: KV cache is not page-aligned (k_cache.shape[0]=%s, page_size=%s). "
                 "Falling back to flex_attention (gather).",
@@ -406,6 +718,11 @@ class TorchFlexAttnBackendV2(TorchFlexAttnBackend):
         # extend length and prefix length (common in benchmarking / fixed-chunk prefill).
         if (os.environ.get("SGLANG_FLEX2_DISABLE_VECTORIZED_EXTEND") or "").strip() not in {"1", "true", "True"}:
             try:
+                # Avoid synchronizing on GPU tensors just to decide whether the uniform-lens
+                # fastpath applies. If lens tensors live on CUDA, skip this fastpath and
+                # rely on the bucketed vectorized extend below.
+                if getattr(extend_seq_lens, "is_cuda", False) or getattr(extend_prefix_lens, "is_cuda", False):
+                    raise RuntimeError("skip uniform-lens fastpath for CUDA lens tensors")
                 if (
                     int(extend_seq_lens.numel()) > 0
                     and bool(torch.all(extend_seq_lens == extend_seq_lens[0]).item())
@@ -517,7 +834,7 @@ class TorchFlexAttnBackendV2(TorchFlexAttnBackend):
                                 "block_mask": block_mask,
                                 "q_num_blocks": int(q_num_blocks),
                             }
-                            self._flex2_extend_cache_batched_by_sig[static_sig] = extend_cache
+                            self._extend_cache_put(static_sig, extend_cache)
                             self._flex2_extend_cache_batched_alloc_ct += 1
                             if (os.environ.get("SGLANG_FLEX2_LOG_CACHE") or "").strip() in {"1", "true", "True"}:
                                 logger.info(
@@ -573,8 +890,11 @@ class TorchFlexAttnBackendV2(TorchFlexAttnBackend):
                 # Best-effort fastpath; fall back to per-request loop below.
                 pass
 
-        # Bucketed vectorized extend: group requests by (q_len, prefix_len) so we
-        # can run a small number of batched flex calls instead of per-request loops.
+        # Bucketed vectorized extend: group requests by q_len so we can run a small
+        # number of batched flex calls instead of per-request loops.
+        #
+        # prefix_len can vary across requests; we handle it via the batched paging
+        # offsets (kv_start_rel/q_kv_offset) consulted by `_paged_mask_mod`.
         if (os.environ.get("SGLANG_FLEX2_DISABLE_BUCKETED_EXTEND") or "").strip() not in {"1", "true", "True"}:
             try:
                 bsz = int(seq_lens.shape[0])
@@ -585,29 +905,57 @@ class TorchFlexAttnBackendV2(TorchFlexAttnBackend):
                     end_pos = torch.cumsum(extend_seq_lens_i64, dim=0)
                     start_pos = end_pos - extend_seq_lens_i64
 
-                    groups: dict[tuple[int, int], list[int]] = {}
-                    # This outer loop is over batch size (typically small); the win is
-                    # avoiding per-request *attention* calls.
-                    for i in range(bsz):
-                        ql = int(extend_seq_lens[i])
-                        if ql <= 0:
-                            continue
-                        pl = int(extend_prefix_lens[i])
-                        groups.setdefault((ql, pl), []).append(i)
-
-                    if len(groups) > 0:
+                    q_lens_i64 = extend_seq_lens_i64
+                    valid_mask = q_lens_i64 > 0
+                    if bool(valid_mask.any()):
                         device = req_to_token.device
                         total_pages_i32 = int(total_pages)
                         page_col = self._get_page_col(device=device, total_pages=total_pages_i32)
 
-                        for (q_len, prefix_len), idxs in groups.items():
-                            g_bsz = int(len(idxs))
+                        if torch.cuda.is_current_stream_capturing():
+                            # CUDA graphs require stable control flow and fixed-shape outputs.
+                            # Avoid torch.unique/nonzero in capture; treat the batch as a single uniform-q_len group.
+                            total_q = int(q.shape[0])
+                            if total_q % bsz != 0:
+                                raise RuntimeError(
+                                    "FlexAttention2 extend during CUDA graph capture requires q.shape[0] divisible "
+                                    f"by batch_size. Got total_q={total_q}, batch_size={bsz}."
+                                )
+                            q_lens_unique = [total_q // bsz]
+                        else:
+                            q_lens_unique = torch.unique(q_lens_i64.masked_select(valid_mask)).tolist()
+                        if (
+                            not self._logged_vectorized_extend
+                            and (os.environ.get("SGLANG_FLEX2_LOG_VECTORIZED") or "").strip() in {"1", "true", "True"}
+                        ):
+                            self._logged_vectorized_extend = True
+                            logger.info(
+                                "FlexAttention2 vectorized extend enabled (bucketed). page_size=%s q_block=%s window_left=%s groups=%s",
+                                int(self._page_size),
+                                int(q_block_size),
+                                int(window_left),
+                                int(q_lens_unique.numel()),
+                            )
+                            print(
+                                f"[flex2] vectorized_extend=1 mode=bucketed page_size={int(self._page_size)} "
+                                f"q_block={int(q_block_size)} window_left={int(window_left)} groups={int(q_lens_unique.numel())}",
+                                flush=True,
+                            )
+
+                        for q_len in q_lens_unique:
+                            q_len = int(q_len)
+                            if q_len <= 0:
+                                continue
+                            if torch.cuda.is_current_stream_capturing():
+                                idx_t = torch.arange(bsz, device=device, dtype=torch.int64)
+                            else:
+                                idx_t = torch.nonzero(q_lens_i64 == q_len, as_tuple=False).view(-1).to(torch.int64)
+                            g_bsz = int(idx_t.numel())
                             if g_bsz <= 0:
                                 continue
-                            idx_t = torch.tensor(idxs, device=device, dtype=torch.int64)
-                            seq_len_kv = seq_lens.index_select(0, idx_t).to(torch.int64)
 
-                            abs_q0 = torch.full_like(seq_len_kv, int(prefix_len), dtype=torch.int64)
+                            seq_len_kv = seq_lens.index_select(0, idx_t).to(torch.int64)
+                            abs_q0 = extend_prefix_lens.index_select(0, idx_t).to(torch.int64)
                             abs_q_last = seq_len_kv - 1
 
                             wl = int(window_left)
@@ -627,7 +975,8 @@ class TorchFlexAttnBackendV2(TorchFlexAttnBackend):
                             page_starts_safe = torch.where(valid, page_starts, torch.zeros_like(page_starts))
 
                             req_pool_idx = req_pool_indices.index_select(0, idx_t).to(torch.int64)
-                            page_tokens = req_to_token[req_pool_idx.view(-1, 1), page_starts_safe]
+                            req_tokens = req_to_token.index_select(0, req_pool_idx)
+                            page_tokens = req_tokens.gather(1, page_starts_safe)
                             physical_pages = torch.div(page_tokens, ps, rounding_mode="floor").to(torch.int64)
                             # Sentinel for padding (maps to total_pages which is out-of-range).
                             physical_pages = torch.where(
@@ -642,25 +991,75 @@ class TorchFlexAttnBackendV2(TorchFlexAttnBackend):
                             assert self._q_kv_offset_batched is not None
                             self._physical_to_logical_batched.fill_(-1)
                             # Scatter logical page indices for valid pages.
-                            logical_pages = self._get_logical_pages_row(
-                                device=device, total_pages=total_pages_i32
-                            ).view(1, -1)
+                            logical_pages = (
+                                self._get_logical_pages_row(device=device, total_pages=total_pages_i32)
+                                .view(1, -1)
+                                .expand(g_bsz, -1)
+                            )
+                            scatter_vals = torch.where(valid, logical_pages, torch.full_like(logical_pages, -1))
                             self._physical_to_logical_batched.scatter_(
-                                1,
-                                physical_pages.to(torch.int64).clamp_max(total_pages_i32),
-                                torch.where(valid, logical_pages.expand(g_bsz, -1), torch.full_like(logical_pages.expand(g_bsz, -1), -1)),
+                                1, physical_pages.to(torch.int64).clamp_max(total_pages_i32), scatter_vals
                             )
                             self._kv_start_rel_batched.copy_(kv_start_rel)
                             self._q_kv_offset_batched.copy_(q_kv_offset)
 
-                            block_mask = self._build_block_mask_from_pages_batched(
-                                q_len=int(q_len),
-                                kv_total_len=kv_total_len,
-                                total_pages=total_pages_i32,
-                                physical_pages_padded=physical_pages,
-                                kv_num_pages=num_window_pages.to(torch.int32),
-                                q_block_size=q_block_size,
+                            # Reuse a single BlockMask instance for this static shape, updating
+                            # its backing kv_indices/kv_num_blocks tensors in-place each step.
+                            static_sig = (
+                                device,
+                                int(total_pages_i32),
+                                int(g_bsz),
+                                int(q_len),
+                                int(q_block_size),
                             )
+                            extend_cache = self._flex2_extend_cache_batched_by_sig.get(static_sig)
+                            if extend_cache is None:
+                                q_block = int(q_block_size) if int(q_block_size) > 0 else 128
+                                q_num_blocks = (int(q_len) + q_block - 1) // q_block
+                                max_cols = int(total_pages_i32) + 1
+                                kv_indices = torch.full(
+                                    (g_bsz, 1, int(q_num_blocks), int(max_cols)),
+                                    fill_value=int(total_pages_i32),
+                                    dtype=torch.int32,
+                                    device=device,
+                                )
+                                kv_num_blocks = torch.empty((g_bsz, 1, int(q_num_blocks)), dtype=torch.int32, device=device)
+                                block_mask = BlockMask.from_kv_blocks(
+                                    kv_num_blocks=kv_num_blocks,
+                                    kv_indices=kv_indices,
+                                    full_kv_num_blocks=None,
+                                    full_kv_indices=None,
+                                    BLOCK_SIZE=(int(q_block), int(self._page_size)),
+                                    mask_mod=self._paged_mask_mod,
+                                    seq_lengths=(int(q_len), int(kv_total_len)),
+                                )
+                                extend_cache = {
+                                    "kv_indices": kv_indices,
+                                    "kv_num_blocks": kv_num_blocks,
+                                    "block_mask": block_mask,
+                                    "q_num_blocks": int(q_num_blocks),
+                                }
+                                self._extend_cache_put(static_sig, extend_cache)
+                                self._flex2_extend_cache_batched_alloc_ct += 1
+                                if (os.environ.get("SGLANG_FLEX2_LOG_CACHE") or "").strip() in {"1", "true", "True"}:
+                                    logger.info(
+                                        "Flex2 extend cache alloc_ct=%s sig=%s",
+                                        int(self._flex2_extend_cache_batched_alloc_ct),
+                                        static_sig,
+                                    )
+
+                            kv_indices = extend_cache["kv_indices"]
+                            kv_num_blocks = extend_cache["kv_num_blocks"]
+                            q_num_blocks = int(extend_cache["q_num_blocks"])
+                            kv_indices[:, :, :, : int(total_pages_i32)] = physical_pages.to(torch.int32).view(
+                                g_bsz, 1, 1, int(total_pages_i32)
+                            )
+                            kv_num_blocks.copy_(
+                                num_window_pages.to(torch.int32)
+                                .view(g_bsz, 1, 1)
+                                .expand(g_bsz, 1, int(q_num_blocks))
+                            )
+                            block_mask = extend_cache["block_mask"]
 
                             # Gather query tokens for this group.
                             starts = start_pos.index_select(0, idx_t).to(torch.int64)
@@ -698,6 +1097,21 @@ class TorchFlexAttnBackendV2(TorchFlexAttnBackend):
                         return output
             except Exception:
                 pass
+
+        # CUDA graph capture cannot tolerate falling back to the per-request extend path
+        # (it has Python loops and can allocate/cause compile cache churn).
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "FlexAttention2 extend fell back to per-request path during CUDA graph capture. "
+                "CUDA graphs require the vectorized/batched extend path."
+            )
+
+        disallow_extend_fallback = (os.environ.get("SGLANG_FLEX2_DISALLOW_EXTEND_FALLBACK") or "").strip() in _DISALLOW_FALLBACK_ENVS
+        if disallow_extend_fallback:
+            raise RuntimeError(
+                "FlexAttention2 extend fell back to per-request path, but "
+                "SGLANG_FLEX2_DISALLOW_EXTEND_FALLBACK=1 is set."
+            )
 
         if (
             not self._logged_vectorized_extend
@@ -1110,6 +1524,18 @@ class TorchFlexAttnBackendV2(TorchFlexAttnBackend):
         save_kv_cache: bool = True,
         **kwargs,
     ):
+        if self._fa_delegate is not None:
+            return self._fa_delegate.forward_decode(
+                q,
+                k,
+                v,
+                layer,
+                forward_batch,
+                save_kv_cache=save_kv_cache,
+                q_rope=kwargs.get("q_rope", None),
+                k_rope=kwargs.get("k_rope", None),
+                sinks=kwargs.get("sinks", None),
+            )
         if (os.environ.get("SGLANG_FLEX2_FORCE_FALLBACK") or "").strip() in {"1", "true", "True"}:
             return super().forward_decode(
                 q,
@@ -1134,17 +1560,24 @@ class TorchFlexAttnBackendV2(TorchFlexAttnBackend):
                 layer, forward_batch.out_cache_loc, k, v
             )
 
-        # If not using paged mode, fall back to base behavior.
+        # If not using paged mode, fall back to base behavior unless explicitly allowed.
         if int(self._page_size) <= 1:
-            return super().forward_decode(
-                q,
-                k,
-                v,
-                layer,
-                forward_batch,
-                save_kv_cache=save_kv_cache,
-                **kwargs,
-            )
+            if (os.environ.get("SGLANG_FLEX2_ALLOW_PAGE_SIZE1") or "").strip() not in _DISALLOW_FALLBACK_ENVS:
+                return super().forward_decode(
+                    q,
+                    k,
+                    v,
+                    layer,
+                    forward_batch,
+                    save_kv_cache=save_kv_cache,
+                    **kwargs,
+                )
+            if not self._logged_page_size1:
+                self._logged_page_size1 = True
+                logger.warning(
+                    "FlexAttention2 forward_decode running with page_size=1 (requested via SGLANG_FLEX2_ALLOW_PAGE_SIZE1=1). "
+                    "This can be significantly slower than page_size=64/128."
+                )
 
         use_gqa = layer.tp_q_head_num != layer.tp_k_head_num
         q_ = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
@@ -1164,6 +1597,68 @@ class TorchFlexAttnBackendV2(TorchFlexAttnBackend):
         value_global = v_cache.movedim(0, query.dim() - 2)
 
         kv_total_len = int(k_cache.shape[0])
+
+        # FP8 KV-cache compatibility:
+        # FlexAttention2's fast path operates directly over the *global* KV cache pool.
+        # If the KV cache is stored in float8 (fp8_e4m3/fp8_e5m2), some PyTorch builds
+        # cannot run FlexAttention kernels directly on float8 K/V. Additionally, even
+        # when supported, casting the entire global KV cache to bf16 would destroy the
+        # memory advantage and can be prohibitively expensive.
+        #
+        # For correctness, when KV is float8 we fall back to the V1 gather path
+        # (TorchFlexAttnBackend), which materializes only the per-request K/V window.
+        # This is slower than the V2 path but avoids global-KV casts.
+        try:
+            if k_cache.dtype == torch.float8_e5m2 or v_cache.dtype == torch.float8_e5m2:
+                raise RuntimeError(
+                    "FlexAttention2 does not support fp8_e5m2 KV-cache in this build (quality/perf). "
+                    "Use fp8_e4m3 or bf16 KV-cache."
+                )
+            is_fp8_kv = k_cache.dtype == torch.float8_e4m3fn or v_cache.dtype == torch.float8_e4m3fn
+        except Exception:
+            is_fp8_kv = False
+        if is_fp8_kv:
+            if not getattr(self, "_logged_fp8_kv_fallback", False):
+                self._logged_fp8_kv_fallback = True
+                logger.warning(
+                    "FlexAttention2 KV-cache is float8; falling back to gather-based FlexAttention (V1) for correctness. "
+                    "For best FP8-KV performance, prefer FA3/FA4 for the target model and keep draft KV in bf16."
+                )
+            # Explicitly call the V1 gather implementation to avoid re-entering V2.
+            TorchFlexAttnBackend._run_flex_forward_decode(
+                self,
+                query,
+                output,
+                k_cache,
+                v_cache,
+                req_to_token,
+                req_pool_indices,
+                seq_lens,
+                scaling=layer.scaling,
+                enable_gqa=use_gqa,
+                causal=True,
+                sinks=kwargs.get("sinks", None),
+                window_left=window_left,
+            )
+            return o
+        # page_size==1 path: avoid O(total_pages) page-table buffers by using
+        # dense token-block masking over the global KV pool.
+        if int(self._page_size) <= 1:
+            self._run_flex_forward_decode_tokenblock(
+                query.movedim(query.dim() - 2, 0),  # back to [T, H, D]
+                output,
+                k_cache,
+                v_cache,
+                req_to_token,
+                req_pool_indices,
+                seq_lens,
+                scaling=layer.scaling,
+                enable_gqa=use_gqa,
+                causal=True,
+                sinks=sinks,
+                window_left=window_left,
+            )
+            return o
         total_pages = kv_total_len // ps
         self._ensure_paged_buffers(total_pages=total_pages)
 
@@ -1362,6 +1857,38 @@ class TorchFlexAttnBackendV2(TorchFlexAttnBackend):
 
         return o
 
+    def forward_extend(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: "RadixAttention",
+        forward_batch: "ForwardBatch",
+        save_kv_cache: bool = True,
+        **kwargs,
+    ):
+        if self._fa_delegate is not None:
+            return self._fa_delegate.forward_extend(
+                q,
+                k,
+                v,
+                layer,
+                forward_batch,
+                save_kv_cache=save_kv_cache,
+                q_rope=kwargs.get("q_rope", None),
+                k_rope=kwargs.get("k_rope", None),
+                sinks=kwargs.get("sinks", None),
+            )
+        return super().forward_extend(
+            q,
+            k,
+            v,
+            layer,
+            forward_batch,
+            save_kv_cache=save_kv_cache,
+            **kwargs,
+        )
+
     def _run_flex_forward_decode(
         self,
         query: torch.Tensor,
@@ -1388,9 +1915,31 @@ class TorchFlexAttnBackendV2(TorchFlexAttnBackend):
                 int(window_left),
                 bool(causal),
             )
-        # If page_size is not usable, fall back to V1 gather/slice behavior.
+        # page_size==1 is slower (degenerates to token-blocking), but we allow it when
+        # explicitly requested because DFLASH verify currently forces page_size=1.
         if int(self._page_size) <= 1:
-            return super()._run_flex_forward_decode(
+            if (os.environ.get("SGLANG_FLEX2_ALLOW_PAGE_SIZE1") or "").strip() not in _DISALLOW_FALLBACK_ENVS:
+                return super()._run_flex_forward_decode(
+                    query,
+                    output,
+                    k_cache,
+                    v_cache,
+                    req_to_token,
+                    req_pool_indices,
+                    seq_lens,
+                    scaling=scaling,
+                    enable_gqa=enable_gqa,
+                    causal=causal,
+                    sinks=sinks,
+                    window_left=window_left,
+                )
+            if not self._logged_page_size1:
+                self._logged_page_size1 = True
+                logger.warning(
+                    "FlexAttention2 _run_flex_forward_decode running with page_size=1 (requested via SGLANG_FLEX2_ALLOW_PAGE_SIZE1=1). "
+                    "This can be significantly slower than page_size=64/128."
+                )
+            return self._run_flex_forward_decode_tokenblock(
                 query,
                 output,
                 k_cache,
@@ -1407,6 +1956,12 @@ class TorchFlexAttnBackendV2(TorchFlexAttnBackend):
 
         ps = int(self._page_size)
         if int(k_cache.shape[0]) % ps != 0:
+            if (os.environ.get("SGLANG_FLEX2_DISALLOW_FALLBACK") or "").strip() in _DISALLOW_FALLBACK_ENVS:
+                raise RuntimeError(
+                    "TorchFlexAttnBackendV2: KV cache is not page-aligned "
+                    f"(k_cache.shape[0]={int(k_cache.shape[0])}, page_size={ps}); "
+                    "fallback to gather is disallowed by SGLANG_FLEX2_DISALLOW_FALLBACK=1."
+                )
             logger.warning(
                 "TorchFlexAttnBackendV2: KV cache is not page-aligned (k_cache.shape[0]=%s, page_size=%s). "
                 "Falling back to flex_attention (gather).",
@@ -1605,3 +2160,291 @@ class TorchFlexAttnBackendV2(TorchFlexAttnBackend):
             start_q = end_q
 
         return output
+
+    def _run_flex_forward_decode_tokenblock(
+        self,
+        query: torch.Tensor,
+        output: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        req_to_token: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        scaling=None,
+        enable_gqa: bool = False,
+        causal: bool = False,
+        sinks: torch.Tensor | None = None,
+        window_left: int = -1,
+    ):
+        """
+        Token-block decode for page_size==1.
+
+        This avoids building page tables of width kv_total_len (120k+) for extend/prefill and
+        keeps CUDA-graph friendliness by reusing a cached BlockMask.
+        """
+        if not causal:
+            raise NotImplementedError("FlexAttention2 tokenblock decode only supports causal=True.")
+
+        # [num_tokens, num_heads, head_size] -> [num_heads, num_tokens, head_size]
+        query = query.movedim(0, query.dim() - 2)
+        key_global = k_cache.movedim(0, query.dim() - 2)
+        value_global = v_cache.movedim(0, query.dim() - 2)
+
+        device = req_to_token.device
+        bsz = int(seq_lens.shape[0])
+        kv_total_len = int(k_cache.shape[0])
+
+        # Token-block size for dense KV blocks.
+        kv_block_size_env = (os.environ.get("SGLANG_FLEX2_TOKEN_KV_BLOCK") or "").strip()
+        kv_block_size = int(kv_block_size_env) if kv_block_size_env else 128
+        q_block_size_env = (os.environ.get("SGLANG_FLEX2_Q_BLOCK") or "").strip()
+        q_block_size = int(q_block_size_env) if q_block_size_env else 128
+
+        # Per-request (window-relative) physical->logical token mapping.
+        self._ensure_paged_buffers_batched(total_pages=int(kv_total_len), batch_size=bsz)
+        assert self._physical_to_logical_batched is not None
+        assert self._kv_start_rel_batched is not None
+        assert self._q_kv_offset_batched is not None
+
+        # Choose a stable max_seq during CUDA-graph capture; otherwise use the runtime max.
+        max_seq = 0
+        if torch.cuda.is_current_stream_capturing():
+            max_seq = int(getattr(self.model_runner.server_args, "context_length", 0) or 0)
+        else:
+            try:
+                max_seq = int(seq_lens.max().item())
+            except Exception:
+                max_seq = int(getattr(self.model_runner.server_args, "context_length", 0) or 0)
+        max_seq = max(1, int(min(int(max_seq), int(req_to_token.shape[1]))))
+
+        req_pool_indices_i64 = req_pool_indices.to(torch.int64)
+        req_tokens = req_to_token.index_select(0, req_pool_indices_i64)[:, :max_seq]
+        pos = self._get_pos_row(device=device, n=max_seq).view(1, -1)
+
+        seq_lens_i64 = seq_lens.to(torch.int64).view(bsz, 1)
+        abs_qpos = (seq_lens.to(torch.int64) - 1).view(bsz, 1)
+        wl = int(window_left)
+        if wl >= 0:
+            kv_abs_start = (abs_qpos - int(wl)).clamp_min(0)
+        else:
+            kv_abs_start = torch.zeros_like(abs_qpos)
+        kv_base = kv_abs_start  # page_size==1
+        q_kv_offset = (abs_qpos - kv_base).to(torch.int32).view(bsz)
+
+        in_seq = pos < seq_lens_i64
+        in_window = pos >= kv_base
+        logical = (pos - kv_base).to(torch.int32)
+        logical = torch.where(in_seq & in_window, logical, torch.full_like(logical, -1, dtype=torch.int32))
+
+        self._physical_to_logical_batched.fill_(-1)
+        self._physical_to_logical_batched.scatter_(1, req_tokens.to(torch.int64).clamp_max(kv_total_len), logical)
+        self._kv_start_rel_batched.zero_()
+        self._q_kv_offset_batched.copy_(q_kv_offset)
+
+        cache = self._get_or_build_tokenblock_mask_batched(
+            device=device,
+            batch_size=bsz,
+            q_len=1,
+            kv_total_len=kv_total_len,
+            q_block_size=q_block_size,
+            kv_block_size=kv_block_size,
+        )
+        block_mask = cache["block_mask"]
+
+        # Run flex attention.
+        h = int(query.shape[0])
+        q_b = query.view(h, bsz, 1, query.shape[-1]).permute(1, 0, 2, 3)
+        k_b = key_global.unsqueeze(0).expand(bsz, -1, -1, -1)
+        v_b = value_global.unsqueeze(0).expand(bsz, -1, -1, -1)
+        need_sinks = sinks is not None and getattr(sinks, "numel", lambda: 0)() > 0
+        if need_sinks:
+            out, lse = self._flex(
+                q_b,
+                k_b,
+                v_b,
+                block_mask=block_mask,
+                scale=scaling,
+                enable_gqa=enable_gqa,
+                return_lse=True,
+            )
+            out = apply_attention_sinks(out, lse, sinks)
+        else:
+            out = self._flex(
+                q_b,
+                k_b,
+                v_b,
+                block_mask=block_mask,
+                scale=scaling,
+                enable_gqa=enable_gqa,
+                return_lse=False,
+            )
+        output[:, :, :] = out.squeeze(2)
+        return output
+
+    def _run_flex_forward_extend_tokenblock(
+        self,
+        query: torch.Tensor,
+        output: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        req_to_token: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        extend_prefix_lens: torch.Tensor,
+        extend_seq_lens: torch.Tensor,
+        scaling=None,
+        enable_gqa: bool = False,
+        causal: bool = False,
+        sinks: torch.Tensor | None = None,
+        window_left: int = -1,
+    ):
+        """
+        Token-block extend/prefill for page_size==1.
+
+        Fastpath supports the common uniform-lens extend case (benchmarking / chunked prefill).
+        """
+        if not causal:
+            raise NotImplementedError("FlexAttention2 tokenblock extend only supports causal=True.")
+
+        # [num_tokens, num_heads, head_size] -> [num_heads, num_tokens, head_size]
+        query = query.movedim(0, query.dim() - 2)
+        key_global = k_cache.movedim(0, query.dim() - 2)
+        value_global = v_cache.movedim(0, query.dim() - 2)
+
+        device = req_to_token.device
+        bsz = int(seq_lens.shape[0])
+        kv_total_len = int(k_cache.shape[0])
+
+        kv_block_size_env = (os.environ.get("SGLANG_FLEX2_TOKEN_KV_BLOCK") or "").strip()
+        kv_block_size = int(kv_block_size_env) if kv_block_size_env else 128
+
+        q_block_size_env = (os.environ.get("SGLANG_FLEX2_Q_BLOCK") or "").strip()
+        q_block_size = int(q_block_size_env) if q_block_size_env else 128
+
+        # Uniform-lens extend is the high-ROI case.
+        if (
+            not getattr(extend_seq_lens, "is_cuda", False)
+            and not getattr(extend_prefix_lens, "is_cuda", False)
+            and int(extend_seq_lens.numel()) > 0
+            and bool(torch.all(extend_seq_lens == extend_seq_lens[0]).item())
+            and bool(torch.all(extend_prefix_lens == extend_prefix_lens[0]).item())
+            and int(extend_seq_lens[0].item()) > 0
+        ):
+            q_len = int(extend_seq_lens[0].item())
+            prefix_len = int(extend_prefix_lens[0].item())
+            if int(query.shape[1]) != bsz * q_len:
+                raise RuntimeError(
+                    f"Tokenblock extend expected query tokens={bsz*q_len}, got {int(query.shape[1])}."
+                )
+
+            self._ensure_paged_buffers_batched(total_pages=int(kv_total_len), batch_size=bsz)
+            assert self._physical_to_logical_batched is not None
+            assert self._kv_start_rel_batched is not None
+            assert self._q_kv_offset_batched is not None
+
+            # Stable max_seq during capture; otherwise runtime max.
+            max_seq = 0
+            if torch.cuda.is_current_stream_capturing():
+                max_seq = int(getattr(self.model_runner.server_args, "context_length", 0) or 0)
+            else:
+                try:
+                    max_seq = int(seq_lens.max().item())
+                except Exception:
+                    max_seq = int(getattr(self.model_runner.server_args, "context_length", 0) or 0)
+            max_seq = max(1, int(min(int(max_seq), int(req_to_token.shape[1]))))
+
+            req_pool_indices_i64 = req_pool_indices.to(torch.int64)
+            req_tokens = req_to_token.index_select(0, req_pool_indices_i64)[:, :max_seq]
+            pos = self._get_pos_row(device=device, n=max_seq).view(1, -1)
+
+            seq_lens_i64 = seq_lens.to(torch.int64).view(bsz, 1)
+            abs_q0 = torch.full((bsz, 1), int(prefix_len), device=device, dtype=torch.int64)
+            abs_q_last = (seq_lens.to(torch.int64) - 1).view(bsz, 1)
+            wl = int(window_left)
+            if wl >= 0:
+                kv_abs_start = (abs_q_last - int(wl)).clamp_min(0)
+            else:
+                kv_abs_start = torch.zeros_like(abs_q_last)
+            kv_base = kv_abs_start
+            q_kv_offset = (abs_q0 - kv_base).to(torch.int32).view(bsz)
+
+            in_seq = pos < seq_lens_i64
+            in_window = pos >= kv_base
+            logical = (pos - kv_base).to(torch.int32)
+            logical = torch.where(in_seq & in_window, logical, torch.full_like(logical, -1, dtype=torch.int32))
+
+            self._physical_to_logical_batched.fill_(-1)
+            self._physical_to_logical_batched.scatter_(1, req_tokens.to(torch.int64).clamp_max(kv_total_len), logical)
+            self._kv_start_rel_batched.zero_()
+            self._q_kv_offset_batched.copy_(q_kv_offset)
+
+            cache = self._get_or_build_tokenblock_mask_batched(
+                device=device,
+                batch_size=bsz,
+                q_len=int(q_len),
+                kv_total_len=kv_total_len,
+                q_block_size=int(q_block_size),
+                kv_block_size=int(kv_block_size),
+            )
+            block_mask = cache["block_mask"]
+
+            h = int(query.shape[0])
+            q_b = query.view(h, bsz, int(q_len), query.shape[-1]).permute(1, 0, 2, 3)
+            k_b = key_global.unsqueeze(0).expand(bsz, -1, -1, -1)
+            v_b = value_global.unsqueeze(0).expand(bsz, -1, -1, -1)
+            need_sinks = sinks is not None and getattr(sinks, "numel", lambda: 0)() > 0
+            if need_sinks:
+                out, lse = self._flex(
+                    q_b,
+                    k_b,
+                    v_b,
+                    block_mask=block_mask,
+                    scale=scaling,
+                    enable_gqa=enable_gqa,
+                    return_lse=True,
+                )
+                out = apply_attention_sinks(out, lse, sinks)
+            else:
+                out = self._flex(
+                    q_b,
+                    k_b,
+                    v_b,
+                    block_mask=block_mask,
+                    scale=scaling,
+                    enable_gqa=enable_gqa,
+                    return_lse=False,
+                )
+            out_tokens = out.permute(0, 2, 1, 3).reshape(bsz * int(q_len), out.shape[1], out.shape[-1])
+            output[: out_tokens.shape[0], :, :] = out_tokens
+            return output
+
+        # Fallback: use the base (gather) path for non-uniform extend shapes.
+        disallow = (os.environ.get("SGLANG_FLEX2_DISALLOW_FALLBACK") or "").strip() in _DISALLOW_FALLBACK_ENVS
+        disallow = disallow or (os.environ.get("SGLANG_FLEX2_DISALLOW_EXTEND_FALLBACK") or "").strip() in _DISALLOW_FALLBACK_ENVS
+        if disallow:
+            raise RuntimeError(
+                "FlexAttention2 tokenblock extend hit non-uniform extend shapes and would fall back to gather, "
+                "but fallback is disallowed."
+            )
+        self._flex2_fallback_extend_ct += 1
+        if (os.environ.get("SGLANG_FLEX2_LOG_FALLBACK") or "").strip() in {"1", "true", "True"}:
+            logger.warning(
+                "FlexAttention2 tokenblock extend falling back to gather (ct=%s).",
+                int(self._flex2_fallback_extend_ct),
+            )
+        return super()._run_flex_forward_extend(
+            query.movedim(query.dim() - 2, 0),
+            output,
+            k_cache,
+            v_cache,
+            req_to_token,
+            req_pool_indices,
+            seq_lens,
+            extend_prefix_lens,
+            extend_seq_lens,
+            scaling=scaling,
+            enable_gqa=enable_gqa,
+            causal=causal,
+            sinks=sinks,
+            window_left=window_left,
+        )
