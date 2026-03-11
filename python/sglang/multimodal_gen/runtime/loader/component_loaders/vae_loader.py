@@ -60,7 +60,7 @@ class VAELoader(ComponentLoader):
         self, component_model_path: str, server_args: ServerArgs, component_name: str
     ):
         """Load the VAE based on the model path, and inference args."""
-        config = get_diffusers_component_config(model_path=component_model_path)
+        config = get_diffusers_component_config(component_path=component_model_path)
         class_name = config.pop("_class_name", None)
         assert (
             class_name is not None
@@ -68,7 +68,6 @@ class VAELoader(ComponentLoader):
 
         server_args.model_paths[component_name] = component_model_path
 
-        logger.debug("HF model config: %s", config)
         if component_name in ("vae", "video_vae"):
             pipeline_vae_config_attr = "vae_config"
             pipeline_vae_precision = "vae_precision"
@@ -129,9 +128,11 @@ class VAELoader(ComponentLoader):
 
         safetensors_list = _list_safetensors_files(component_model_path)
         assert (
-            len(safetensors_list) == 1
-        ), f"Found {len(safetensors_list)} safetensors files in {component_model_path}"
-        loaded = safetensors_load_file(safetensors_list[0])
+            len(safetensors_list) >= 1
+        ), f"Found no safetensors files in {component_model_path}"
+        loaded = {}
+        for sf_path in safetensors_list:
+            loaded.update(safetensors_load_file(sf_path))
         vae.load_state_dict(loaded, strict=False)
 
         state_keys = set(vae.state_dict().keys())

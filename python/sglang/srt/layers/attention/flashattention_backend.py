@@ -4,7 +4,6 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
 import numpy as np
-import os
 import torch
 import triton
 import triton.language as tl
@@ -347,9 +346,7 @@ class FlashAttentionBackend(AttentionBackend):
         self.target_verify_metadata = {}
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.kv_cache_dtype = model_runner.kv_cache_dtype
-        self.kv_cache_dtype_str = getattr(
-            model_runner, "kv_cache_dtype_str", model_runner.server_args.kv_cache_dtype
-        )
+        self.kv_cache_dtype_str = model_runner.server_args.kv_cache_dtype
         self.page_size = model_runner.page_size
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
         self.skip_prefill = skip_prefill
@@ -757,14 +754,8 @@ class FlashAttentionBackend(AttentionBackend):
                     else forward_batch.encoder_out_cache_loc
                 )
                 if not self.use_mla:
-                    k_scale = getattr(layer, 'k_scale_vec', None)
-                    v_scale = getattr(layer, 'v_scale_vec', None)
-                    if k_scale is None:
-                        k_scale = layer.k_scale
-                    if v_scale is None:
-                        v_scale = layer.v_scale
                     forward_batch.token_to_kv_pool.set_kv_buffer(
-                        layer, cache_loc, k, v, k_scale, v_scale
+                        layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                     )
                 else:
                     forward_batch.token_to_kv_pool.set_mla_kv_buffer(
@@ -784,7 +775,7 @@ class FlashAttentionBackend(AttentionBackend):
             layer.sliding_window_size is not None and layer.sliding_window_size > -1
         )
         window_size = (layer.sliding_window_size, 0) if is_swa_layer else (-1, -1)
-        q_descale, k_descale, v_descale = None, None, None
+        k_descale, v_descale = None, None
         # only use kv scaling if: 1) fp8 kv is explicitly enabled, 2) RadixAttention
         # has corresponding quantization method so that layer.k_scale is not None,
         # 3) layer.head_dim <= 256 since fa3 kernel require fp16 and bf16 data type in this case,
@@ -796,143 +787,11 @@ class FlashAttentionBackend(AttentionBackend):
         ):
             if layer.k_scale is not None:
                 descale_shape = (forward_batch.batch_size, layer.tp_k_head_num)
-                k_scale = getattr(layer, 'k_scale_vec', None)
-                v_scale = getattr(layer, 'v_scale_vec', None)
-                if k_scale is None:
-                    k_scale = layer.k_scale
-                if v_scale is None:
-                    v_scale = layer.v_scale
-                k_descale = k_scale.expand(descale_shape)
-                v_descale = v_scale.expand(descale_shape)
-
-                # Optional accuracy mode: keep Q in bf16 while KV cache is FP8.
-                # This can reduce numeric drift (and improve speculative accept_len),
-                # at the cost of not taking the full FP8-Q path.
-                keep_q_bf16 = (os.environ.get("SGLANG_FP8_KEEP_Q_BF16") or "").strip().lower() in (
-                    "1",
-                    "true",
-                    "yes",
-                )
-                if not keep_q_bf16:
-                    dynamic_q_scale = (os.environ.get("SGLANG_FP8_DYNAMIC_Q_SCALE") or "").strip().lower() in (
-                        "1",
-                        "true",
-                        "yes",
-                    )
-                    if dynamic_q_scale:
-                        # Use a per-call (per-layer) Q scale instead of reusing KV scale.
-                        # This improves Q utilization of the FP8 range when |Q| << |K,V|.
-                        per_head_q_scale = (os.environ.get("SGLANG_FP8_Q_SCALE_PER_HEAD") or "").strip().lower() in (
-                            "1",
-                            "true",
-                            "yes",
-                        )
-                        max_fp8 = float(torch.finfo(self.kv_cache_dtype).max)
-                        with torch.no_grad():
-                            if per_head_q_scale:
-                                q3 = q.detach().reshape(
-                                    -1, layer.tp_q_head_num, layer.head_dim
-                                )
-                                q_heads = int(layer.tp_q_head_num)
-                                kv_heads = int(layer.tp_k_head_num)
-                                if kv_heads > 0 and q_heads % kv_heads == 0:
-                                    group = q_heads // kv_heads
-                                    q4 = q3.reshape(-1, kv_heads, group, layer.head_dim)
-                                    # Per KV-head scale: max over tokens, grouped Q-heads, and head_dim.
-                                    amax_q_h = q4.abs().amax(dim=(0, 2, 3)).to(
-                                        torch.float32
-                                    )
-                                    q_scale = (amax_q_h / (max_fp8 * 0.95)).clamp(
-                                        min=1e-6
-                                    )
-                                else:
-                                    # Fallback: cannot form KV-head groups.
-                                    per_head_q_scale = False
-                                    amax_q = q3.abs().amax().to(torch.float32)
-                                    q_scale = (amax_q / (max_fp8 * 0.95)).clamp(min=1e-6)
-                            else:
-                                amax_q = q.detach().abs().amax().to(torch.float32)
-                                q_scale = (amax_q / (max_fp8 * 0.95)).clamp(min=1e-6)
-
-                        if per_head_q_scale:
-                            q_scale_vec = q_scale.to(device=q.device, dtype=torch.float32)
-                            q_descale = q_scale_vec.expand(descale_shape)
-
-                            q_shape = q.shape
-                            q = (
-                                q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
-                                .reshape(-1, layer.tp_k_head_num, q_heads // kv_heads, layer.head_dim)
-                                .div(q_scale_vec.view(1, -1, 1, 1))
-                                .to(self.kv_cache_dtype)
-                                .reshape(-1, layer.tp_q_head_num, layer.head_dim)
-                                .reshape(q_shape)
-                            )
-                            if q_rope is not None:
-                                q_rope_shape = q_rope.shape
-                                q_rope = (
-                                    q_rope.reshape(
-                                        -1, layer.tp_q_head_num, layer.head_dim
-                                    )
-                                    .reshape(-1, layer.tp_k_head_num, q_heads // kv_heads, layer.head_dim)
-                                    .div(q_scale_vec.view(1, -1, 1, 1))
-                                    .to(self.kv_cache_dtype)
-                                    .reshape(-1, layer.tp_q_head_num, layer.head_dim)
-                                    .reshape(q_rope_shape)
-                                )
-                        else:
-                            q_descale = q_scale.expand(descale_shape)
-                            q = (q / q_scale).to(self.kv_cache_dtype)
-                            q_rope = (
-                                (q_rope / q_scale).to(self.kv_cache_dtype)
-                                if q_rope is not None
-                                else None
-                            )
-                        if k_rope is not None:
-                            if (
-                                isinstance(k_scale, torch.Tensor)
-                                and k_scale.ndim == 1
-                                and k_rope.ndim == 3
-                                and k_scale.numel() == k_rope.shape[1]
-                            ):
-                                k_rope = (k_rope / k_scale.view(1, -1, 1)).to(
-                                    self.kv_cache_dtype
-                                )
-                            else:
-                                k_rope = (k_rope / k_scale).to(self.kv_cache_dtype)
-                        else:
-                            k_rope = None
-                    else:
-                        q_descale = layer.k_scale.expand(descale_shape)
-                        # Quantize Q with the same per-layer scale used for KV cache so we
-                        # can use FA3 FP8 path without losing too much precision.
-                        q = (q / layer.k_scale).to(self.kv_cache_dtype)
-                        q_rope = (
-                            (q_rope / layer.k_scale).to(self.kv_cache_dtype)
-                            if q_rope is not None
-                            else None
-                        )
-                        if k_rope is not None:
-                            if (
-                                isinstance(k_scale, torch.Tensor)
-                                and k_scale.ndim == 1
-                                and k_rope.ndim == 3
-                                and k_scale.numel() == k_rope.shape[1]
-                            ):
-                                k_rope = (k_rope / k_scale.view(1, -1, 1)).to(
-                                    self.kv_cache_dtype
-                                )
-                            else:
-                                k_rope = (k_rope / k_scale).to(self.kv_cache_dtype)
-                        else:
-                            k_rope = None
-            else:
-                q = q.to(self.kv_cache_dtype)
-                q_rope = (
-                    q_rope.to(self.kv_cache_dtype) if q_rope is not None else None
-                )
-                k_rope = (
-                    k_rope.to(self.kv_cache_dtype) if k_rope is not None else None
-                )
+                k_descale = layer.k_scale.expand(descale_shape)
+                v_descale = layer.v_scale.expand(descale_shape)
+            q = q.to(self.kv_cache_dtype)
+            q_rope = q_rope.to(self.kv_cache_dtype) if q_rope is not None else None
+            k_rope = k_rope.to(self.kv_cache_dtype) if k_rope is not None else None
         causal = True
         if layer.is_cross_attention or layer.attn_type == AttentionType.ENCODER_ONLY:
             causal = False
@@ -1032,7 +891,6 @@ class FlashAttentionBackend(AttentionBackend):
                 causal=False if use_cascade_attn else causal,
                 window_size=window_size,
                 softcap=layer.logit_cap,
-                q_descale=q_descale,
                 k_descale=k_descale,
                 v_descale=v_descale,
                 return_softmax_lse=use_cascade_attn,
@@ -1060,7 +918,6 @@ class FlashAttentionBackend(AttentionBackend):
                     causal=False,
                     window_size=window_size,
                     softcap=layer.logit_cap,
-                    q_descale=q_descale,
                     k_descale=k_descale,
                     v_descale=v_descale,
                     return_softmax_lse=True,
@@ -1176,7 +1033,6 @@ class FlashAttentionBackend(AttentionBackend):
                     softmax_scale=layer.scaling,
                     causal=False if use_cascade_attn else causal,
                     softcap=layer.logit_cap,
-                    q_descale=q_descale,
                     k_descale=k_descale,
                     v_descale=v_descale,
                     return_softmax_lse=use_cascade_attn,
@@ -1199,7 +1055,6 @@ class FlashAttentionBackend(AttentionBackend):
                             causal=False,
                             window_size=window_size,
                             softcap=layer.logit_cap,
-                            q_descale=q_descale,
                             k_descale=k_descale,
                             v_descale=v_descale,
                             return_softmax_lse=True,
@@ -1239,14 +1094,8 @@ class FlashAttentionBackend(AttentionBackend):
                     else forward_batch.encoder_out_cache_loc
                 )
                 if not self.use_mla:
-                    k_scale = getattr(layer, 'k_scale_vec', None)
-                    v_scale = getattr(layer, 'v_scale_vec', None)
-                    if k_scale is None:
-                        k_scale = layer.k_scale
-                    if v_scale is None:
-                        v_scale = layer.v_scale
                     forward_batch.token_to_kv_pool.set_kv_buffer(
-                        layer, cache_loc, k, v, k_scale, v_scale
+                        layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                     )
                 else:
                     forward_batch.token_to_kv_pool.set_mla_kv_buffer(
@@ -1268,7 +1117,7 @@ class FlashAttentionBackend(AttentionBackend):
 
         # When Spec Decode enabled, forward_decode would be called with two mode:
         # 1. DRAFT_DECODE: we enable cascade attention when top_k > 1
-        # 2. IDLE: we donâ€™t need cascade attention, spec_info will be none in this case
+        # 2. IDLE: we don’t need cascade attention, spec_info will be none in this case
         use_cascade_attn = forward_batch.spec_info is not None and self.topk > 1
 
         # Calculate window size (can be moved to metadata if layer properties don't change)
@@ -1287,141 +1136,26 @@ class FlashAttentionBackend(AttentionBackend):
         if sinks is not None:
             kwargs["sinks"] = sinks
 
-        q_descale, k_descale, v_descale = None, None, None
+        flash_attn_with_kvcache_base = flash_attn_with_kvcache_fa3
+
+        flash_attn_with_kvcache = (
+            flash_attn_with_kvcache_fa4
+            if self.fa_impl_ver == 4
+            else flash_attn_with_kvcache_base
+        )
+
+        k_descale, v_descale = None, None
         # only use kv scaling if: 1) fp8 kv is explicitly enabled, 2) RadixAttention
         # has corresponding quantization method so that layer.k_scale is not None,
-        # 3) layer.head_dim <= 256 since FA3 kernel requires fp16/bf16 inputs for larger head dims.
+        # 3) layer.head_dim <= 256 since fa3 kernel require fp16 and bf16 data type in this case.
         if self.kv_cache_dtype_str != "auto" and layer.head_dim <= 256:
             if layer.k_scale is not None:
                 descale_shape = (forward_batch.batch_size, layer.tp_k_head_num)
-                k_scale = getattr(layer, 'k_scale_vec', None)
-                v_scale = getattr(layer, 'v_scale_vec', None)
-                if k_scale is None:
-                    k_scale = layer.k_scale
-                if v_scale is None:
-                    v_scale = layer.v_scale
-                k_descale = k_scale.expand(descale_shape)
-                v_descale = v_scale.expand(descale_shape)
-
-                keep_q_bf16 = (os.environ.get("SGLANG_FP8_KEEP_Q_BF16") or "").strip().lower() in (
-                    "1",
-                    "true",
-                    "yes",
-                )
-                if not keep_q_bf16:
-                    dynamic_q_scale = (os.environ.get("SGLANG_FP8_DYNAMIC_Q_SCALE") or "").strip().lower() in (
-                        "1",
-                        "true",
-                        "yes",
-                    )
-                    if dynamic_q_scale:
-                        per_head_q_scale = (os.environ.get("SGLANG_FP8_Q_SCALE_PER_HEAD") or "").strip().lower() in (
-                            "1",
-                            "true",
-                            "yes",
-                        )
-                        max_fp8 = float(torch.finfo(self.kv_cache_dtype).max)
-                        with torch.no_grad():
-                            if per_head_q_scale:
-                                q3 = q.detach().reshape(
-                                    -1, layer.tp_q_head_num, layer.head_dim
-                                )
-                                q_heads = int(layer.tp_q_head_num)
-                                kv_heads = int(layer.tp_k_head_num)
-                                if kv_heads > 0 and q_heads % kv_heads == 0:
-                                    group = q_heads // kv_heads
-                                    q4 = q3.reshape(-1, kv_heads, group, layer.head_dim)
-                                    amax_q_h = q4.abs().amax(dim=(0, 2, 3)).to(
-                                        torch.float32
-                                    )
-                                    q_scale = (amax_q_h / (max_fp8 * 0.95)).clamp(
-                                        min=1e-6
-                                    )
-                                else:
-                                    per_head_q_scale = False
-                                    amax_q = q3.abs().amax().to(torch.float32)
-                                    q_scale = (amax_q / (max_fp8 * 0.95)).clamp(min=1e-6)
-                            else:
-                                amax_q = q.detach().abs().amax().to(torch.float32)
-                                q_scale = (amax_q / (max_fp8 * 0.95)).clamp(min=1e-6)
-
-                        if per_head_q_scale:
-                            q_scale_vec = q_scale.to(device=q.device, dtype=torch.float32)
-                            q_descale = q_scale_vec.expand(descale_shape)
-
-                            q_shape = q.shape
-                            q = (
-                                q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
-                                .reshape(-1, layer.tp_k_head_num, q_heads // kv_heads, layer.head_dim)
-                                .div(q_scale_vec.view(1, -1, 1, 1))
-                                .to(self.kv_cache_dtype)
-                                .reshape(-1, layer.tp_q_head_num, layer.head_dim)
-                                .reshape(q_shape)
-                            )
-                            if q_rope is not None:
-                                q_rope_shape = q_rope.shape
-                                q_rope = (
-                                    q_rope.reshape(
-                                        -1, layer.tp_q_head_num, layer.head_dim
-                                    )
-                                    .reshape(-1, layer.tp_k_head_num, q_heads // kv_heads, layer.head_dim)
-                                    .div(q_scale_vec.view(1, -1, 1, 1))
-                                    .to(self.kv_cache_dtype)
-                                    .reshape(-1, layer.tp_q_head_num, layer.head_dim)
-                                    .reshape(q_rope_shape)
-                                )
-                        else:
-                            q_descale = q_scale.expand(descale_shape)
-                            q = (q / q_scale).to(self.kv_cache_dtype)
-                            q_rope = (
-                                (q_rope / q_scale).to(self.kv_cache_dtype)
-                                if q_rope is not None
-                                else None
-                            )
-                        if k_rope is not None:
-                            if (
-                                isinstance(k_scale, torch.Tensor)
-                                and k_scale.ndim == 1
-                                and k_rope.ndim == 3
-                                and k_scale.numel() == k_rope.shape[1]
-                            ):
-                                k_rope = (k_rope / k_scale.view(1, -1, 1)).to(
-                                    self.kv_cache_dtype
-                                )
-                            else:
-                                k_rope = (k_rope / k_scale).to(self.kv_cache_dtype)
-                        else:
-                            k_rope = None
-                    else:
-                        q_descale = layer.k_scale.expand(descale_shape)
-                        q = (q / layer.k_scale).to(self.kv_cache_dtype)
-                        q_rope = (
-                            (q_rope / layer.k_scale).to(self.kv_cache_dtype)
-                            if q_rope is not None
-                            else None
-                        )
-                        if k_rope is not None:
-                            if (
-                                isinstance(k_scale, torch.Tensor)
-                                and k_scale.ndim == 1
-                                and k_rope.ndim == 3
-                                and k_scale.numel() == k_rope.shape[1]
-                            ):
-                                k_rope = (k_rope / k_scale.view(1, -1, 1)).to(
-                                    self.kv_cache_dtype
-                                )
-                            else:
-                                k_rope = (k_rope / k_scale).to(self.kv_cache_dtype)
-                        else:
-                            k_rope = None
-            else:
-                q = q.to(self.kv_cache_dtype)
-                q_rope = (
-                    q_rope.to(self.kv_cache_dtype) if q_rope is not None else None
-                )
-                k_rope = (
-                    k_rope.to(self.kv_cache_dtype) if k_rope is not None else None
-                )
+                k_descale = layer.k_scale.expand(descale_shape)
+                v_descale = layer.v_scale.expand(descale_shape)
+            q = q.to(self.kv_cache_dtype)
+            q_rope = q_rope.to(self.kv_cache_dtype) if q_rope is not None else None
+            k_rope = k_rope.to(self.kv_cache_dtype) if k_rope is not None else None
         if not self.use_mla:
             # Do multi-head attention
 
@@ -1450,7 +1184,6 @@ class FlashAttentionBackend(AttentionBackend):
                     causal=False,
                     window_size=(-1, -1),
                     softcap=layer.logit_cap,
-                    q_descale=q_descale,
                     k_descale=k_descale,
                     v_descale=v_descale,
                     num_splits=self.num_splits,
@@ -1471,7 +1204,6 @@ class FlashAttentionBackend(AttentionBackend):
                     causal=True,
                     window_size=(-1, -1),
                     softcap=layer.logit_cap,
-                    q_descale=q_descale,
                     k_descale=k_descale,
                     v_descale=v_descale,
                     num_splits=self.num_splits,
@@ -1508,7 +1240,6 @@ class FlashAttentionBackend(AttentionBackend):
                     causal=False if use_cascade_attn else causal,
                     window_size=window_size,
                     softcap=layer.logit_cap,
-                    q_descale=q_descale,
                     k_descale=k_descale,
                     v_descale=v_descale,
                     return_softmax_lse=use_cascade_attn,
@@ -1531,7 +1262,6 @@ class FlashAttentionBackend(AttentionBackend):
                             causal=False,
                             window_size=window_size,
                             softcap=layer.logit_cap,
-                            q_descale=q_descale,
                             k_descale=k_descale,
                             v_descale=v_descale,
                             return_softmax_lse=True,
@@ -1588,7 +1318,6 @@ class FlashAttentionBackend(AttentionBackend):
                 softmax_scale=layer.scaling,
                 causal=False if use_cascade_attn else causal,
                 softcap=layer.logit_cap,
-                q_descale=q_descale,
                 k_descale=k_descale,
                 v_descale=v_descale,
                 return_softmax_lse=use_cascade_attn,  # softmax_lse is needed for merge states
@@ -1610,7 +1339,6 @@ class FlashAttentionBackend(AttentionBackend):
                     causal=False,
                     window_size=window_size,
                     softcap=layer.logit_cap,
-                    q_descale=q_descale,
                     k_descale=k_descale,
                     v_descale=v_descale,
                     return_softmax_lse=True,
