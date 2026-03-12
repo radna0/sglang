@@ -39,7 +39,15 @@ if _is_cuda:
     try:
         from sglang.jit_kernel.rope import apply_rope_with_cos_sin_cache_inplace
 
-        _HAS_JIT_ROPE = True
+        # The JIT rope path depends on tvm_ffi at runtime (load_inline). If tvm_ffi is
+        # unavailable, treat the JIT rope as unavailable and fall back to native.
+        try:
+            import tvm_ffi  # type: ignore  # noqa: F401
+
+            _HAS_JIT_ROPE = True
+        except Exception:
+            _HAS_JIT_ROPE = False
+            apply_rope_with_cos_sin_cache_inplace = None  # type: ignore
     except Exception:
         # JIT rope kernels depend on optional tvm_ffi. If unavailable (e.g. Kaggle),
         # fall back to the native rotary implementation.
