@@ -19,10 +19,18 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils.common import crash_on_warnings, get_bool_env_var, is_cuda, is_npu
 
 if is_cuda():
-    from flashinfer.sampling import (
-        min_p_sampling_from_probs,
-        top_k_top_p_sampling_from_probs,
-    )
+    _HAS_FLASHINFER = False
+    try:
+        from flashinfer.sampling import (  # type: ignore
+            min_p_sampling_from_probs,
+            top_k_top_p_sampling_from_probs,
+        )
+
+        _HAS_FLASHINFER = True
+    except Exception:
+        # flashinfer is optional. If missing, we fall back to the pytorch sampler.
+        min_p_sampling_from_probs = None  # type: ignore
+        top_k_top_p_sampling_from_probs = None  # type: ignore
     from sgl_kernel import (
         top_k_renorm_prob,
         top_p_renorm_prob,
@@ -206,6 +214,8 @@ class Sampler(nn.Module):
             )
         else:
             backend = get_global_server_args().sampling_backend
+            if backend == "flashinfer" and not _HAS_FLASHINFER:
+                backend = "pytorch"
             if backend == "flashinfer":
                 assert (
                     sampling_info.sampling_seed is None
@@ -213,11 +223,11 @@ class Sampler(nn.Module):
                 if sampling_info.need_min_p_sampling:
                     probs = top_k_renorm_prob(probs, sampling_info.top_ks)
                     probs = top_p_renorm_prob(probs, sampling_info.top_ps)
-                    batch_next_token_ids = min_p_sampling_from_probs(
+                    batch_next_token_ids = min_p_sampling_from_probs(  # type: ignore[misc]
                         probs, sampling_info.min_ps
                     )
                 else:
-                    batch_next_token_ids = top_k_top_p_sampling_from_probs(
+                    batch_next_token_ids = top_k_top_p_sampling_from_probs(  # type: ignore[misc]
                         probs.contiguous(),
                         sampling_info.top_ks,
                         sampling_info.top_ps,
