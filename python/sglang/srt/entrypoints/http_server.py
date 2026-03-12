@@ -2043,15 +2043,21 @@ def _setup_and_run_http_server(
         # while model/subprocess initialization is still in progress.
         reserved_socket.listen(128)
 
-        if server_args.ssl_certfile:
+        ssl_certfile = getattr(server_args, "ssl_certfile", None)
+        ssl_keyfile = getattr(server_args, "ssl_keyfile", None)
+        ssl_ca_certs = getattr(server_args, "ssl_ca_certs", None)
+        ssl_keyfile_password = getattr(server_args, "ssl_keyfile_password", None)
+        enable_ssl_refresh = bool(getattr(server_args, "enable_ssl_refresh", False))
+
+        if ssl_certfile:
             logger.info(
-                f"SSL enabled: certfile={server_args.ssl_certfile}, "
-                f"keyfile={server_args.ssl_keyfile}"
+                f"SSL enabled: certfile={ssl_certfile}, "
+                f"keyfile={ssl_keyfile}"
             )
 
         # Listen for HTTP requests
         if server_args.tokenizer_worker_num == 1:
-            if server_args.enable_ssl_refresh:
+            if enable_ssl_refresh:
                 # Use Config/Server API for access to the SSLContext.
                 config = uvicorn.Config(
                     app,
@@ -2060,10 +2066,10 @@ def _setup_and_run_http_server(
                     log_level=server_args.log_level_http or server_args.log_level,
                     timeout_keep_alive=envs.SGLANG_TIMEOUT_KEEP_ALIVE.get(),
                     loop="uvloop",
-                    ssl_keyfile=server_args.ssl_keyfile,
-                    ssl_certfile=server_args.ssl_certfile,
-                    ssl_ca_certs=server_args.ssl_ca_certs,
-                    ssl_keyfile_password=server_args.ssl_keyfile_password,
+                    ssl_keyfile=ssl_keyfile,
+                    ssl_certfile=ssl_certfile,
+                    ssl_ca_certs=ssl_ca_certs,
+                    ssl_keyfile_password=ssl_keyfile_password,
                 )
                 config.load()  # Creates the SSLContext
 
@@ -2074,9 +2080,9 @@ def _setup_and_run_http_server(
                 async def _run_with_ssl_refresh():
                     refresher = SSLCertRefresher(
                         config.ssl,
-                        server_args.ssl_keyfile,
-                        server_args.ssl_certfile,
-                        server_args.ssl_ca_certs,
+                        ssl_keyfile,
+                        ssl_certfile,
+                        ssl_ca_certs,
                     )
                     logger.info("SSL certificate auto-refresh enabled.")
                     try:
@@ -2096,10 +2102,10 @@ def _setup_and_run_http_server(
                     log_level=server_args.log_level_http or server_args.log_level,
                     timeout_keep_alive=envs.SGLANG_TIMEOUT_KEEP_ALIVE.get(),
                     loop="uvloop",
-                    ssl_keyfile=server_args.ssl_keyfile,
-                    ssl_certfile=server_args.ssl_certfile,
-                    ssl_ca_certs=server_args.ssl_ca_certs,
-                    ssl_keyfile_password=server_args.ssl_keyfile_password,
+                    ssl_keyfile=ssl_keyfile,
+                    ssl_certfile=ssl_certfile,
+                    ssl_ca_certs=ssl_ca_certs,
+                    ssl_keyfile_password=ssl_keyfile_password,
                 )
         else:
             # Multiple tokenizer and http processes
@@ -2112,7 +2118,7 @@ def _setup_and_run_http_server(
             }
             monkey_patch_uvicorn_multiprocessing()
 
-            if server_args.enable_ssl_refresh:
+            if enable_ssl_refresh:
                 logger.warning(
                     "--enable-ssl-refresh is not supported with multiple "
                     "tokenizer workers (--tokenizer-worker-num > 1). "
@@ -2127,10 +2133,10 @@ def _setup_and_run_http_server(
                 timeout_keep_alive=envs.SGLANG_TIMEOUT_KEEP_ALIVE.get(),
                 loop="uvloop",
                 workers=server_args.tokenizer_worker_num,
-                ssl_keyfile=server_args.ssl_keyfile,
-                ssl_certfile=server_args.ssl_certfile,
-                ssl_ca_certs=server_args.ssl_ca_certs,
-                ssl_keyfile_password=server_args.ssl_keyfile_password,
+                ssl_keyfile=ssl_keyfile,
+                ssl_certfile=ssl_certfile,
+                ssl_ca_certs=ssl_ca_certs,
+                ssl_keyfile_password=ssl_keyfile_password,
             )
     finally:
         # Close the reserved socket after uvicorn exits or on any error
