@@ -628,7 +628,7 @@ class Engine(EngineBase):
         )
 
         if (
-            server_args.enable_elastic_expert_backup
+            getattr(server_args, "enable_elastic_expert_backup", False)
             and server_args.elastic_ep_backend is not None
         ):
             run_expert_backup_manager(server_args, port_args)
