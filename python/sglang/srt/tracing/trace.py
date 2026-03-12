@@ -37,6 +37,9 @@ def trace_slice_end(*_args: Any, **_kwargs: Any) -> None:
     return
 
 
-def trace_slice_batch(*_args: Any, **_kwargs: Any) -> None:
+def trace_slice(*_args: Any, **_kwargs: Any) -> None:
     return
 
+
+def trace_slice_batch(*_args: Any, **_kwargs: Any) -> None:
+    return
