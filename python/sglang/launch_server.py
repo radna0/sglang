@@ -28,7 +28,7 @@ def run_server(server_args):
         from sglang.srt.entrypoints.grpc_server import serve_grpc
 
         asyncio.run(serve_grpc(server_args))
-    elif server_args.use_ray:
+    elif getattr(server_args, "use_ray", False):
         try:
             from sglang.srt.ray.http_server import launch_server
         except ImportError:
