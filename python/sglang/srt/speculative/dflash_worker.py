@@ -150,6 +150,7 @@ class DFlashWorker:
             is_draft_worker=True,
             req_to_token_pool=shared_req_to_token_pool,
             token_to_kv_pool_allocator=shared_token_to_kv_pool_allocator,
+            memory_pool_config=getattr(target_worker.model_runner, "memory_pool_config", None),
         )
         self.draft_model_runner = self.draft_worker.model_runner
         self.draft_model = self.draft_model_runner.model
