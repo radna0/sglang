@@ -226,10 +226,19 @@ def create_grammar_backend(
             whitespace_pattern=server_args.constrained_json_whitespace_pattern,
         )
     elif name == "xgrammar":
-        from sglang.srt.constrained.xgrammar_backend import (
-            TokenizerNotSupportedError,
-            XGrammarGrammarBackend,
-        )
+        try:
+            from sglang.srt.constrained.xgrammar_backend import (
+                TokenizerNotSupportedError,
+                XGrammarGrammarBackend,
+            )
+        except ModuleNotFoundError as e:
+            logger.warning(
+                "Grammar backend 'xgrammar' requested but dependency is missing (%s). "
+                "Falling back to grammar_backend='none'. Structured outputs will be disabled.",
+                e,
+            )
+            server_args.grammar_backend = "none"
+            return None
 
         # Convert Set[int] to List[int] if needed
         eos_list = list(eos_token_ids) if eos_token_ids else None
