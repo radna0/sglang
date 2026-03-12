@@ -2299,7 +2299,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         """Initialize piecewise CUDA graph runner."""
         self.piecewise_cuda_graph_runner = None
 
-        if self.server_args.disable_piecewise_cuda_graph:
+        if getattr(self.server_args, "disable_piecewise_cuda_graph", False):
             logger.info(
                 "Disable piecewise CUDA graph because --disable-piecewise-cuda-graph is set"
             )
