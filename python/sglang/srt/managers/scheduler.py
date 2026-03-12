@@ -155,7 +155,7 @@ from sglang.srt.managers.schedule_policy import (
 )
 from sglang.srt.managers.scheduler_dp_attn_mixin import SchedulerDPAttnMixin
 from sglang.srt.managers.scheduler_input_blocker import SchedulerInputBlocker
-from sglang.srt.managers.scheduler_metrics_mixin import (
+from sglang.srt.observability.scheduler_metrics_mixin import (
     RECORD_STEP_TIME,
     PrefillStats,
     SchedulerMetricsMixin,
