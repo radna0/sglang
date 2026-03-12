@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from enum import Enum, IntEnum, auto
+import os
 from typing import TYPE_CHECKING, List, Optional, Tuple, Type, Union
 
 if TYPE_CHECKING:
@@ -64,9 +65,16 @@ class SpeculativeAlgorithm(Enum):
         enable_overlap = not server_args.disable_overlap_schedule
 
         if self.is_dflash():
-            if enable_overlap:
+            if enable_overlap and (os.environ.get("SGLANG_DFLASH_ALLOW_OVERLAP_SCHEDULE") or "").strip() not in {
+                "1",
+                "true",
+                "True",
+                "yes",
+                "YES",
+            }:
                 raise ValueError(
-                    f"{self.name} does not support overlap scheduling (spec v2)."
+                    f"{self.name} does not support overlap scheduling (spec v2). "
+                    "Set SGLANG_DFLASH_ALLOW_OVERLAP_SCHEDULE=1 to bypass this check (experimental)."
                 )
             if self == SpeculativeAlgorithm.DFLASH:
                 from sglang.srt.speculative.dflash_worker import DFlashWorker
