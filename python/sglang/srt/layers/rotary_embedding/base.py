@@ -35,7 +35,15 @@ _is_musa = is_musa()
 _is_mps = is_mps()
 
 if _is_cuda:
-    from sglang.jit_kernel.rope import apply_rope_with_cos_sin_cache_inplace
+    _HAS_JIT_ROPE = False
+    try:
+        from sglang.jit_kernel.rope import apply_rope_with_cos_sin_cache_inplace
+
+        _HAS_JIT_ROPE = True
+    except Exception:
+        # JIT rope kernels depend on optional tvm_ffi. If unavailable (e.g. Kaggle),
+        # fall back to the native rotary implementation.
+        apply_rope_with_cos_sin_cache_inplace = None  # type: ignore
 
 if _is_npu:
     import torch_npu
@@ -289,14 +297,14 @@ class RotaryEmbedding(MultiPlatformOp):
         offsets: Optional[torch.Tensor] = None,
         fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        if not self.use_fallback_kernel:
+        if not self.use_fallback_kernel and _HAS_JIT_ROPE:
             batch_size = positions.size(0)
             q_rope = query.view(batch_size, -1, self.head_size)
             k_rope = key.view(batch_size, -1, self.head_size)
             if self.head_size != self.rotary_dim:
                 q_rope = q_rope[..., : self.rotary_dim]
                 k_rope = k_rope[..., : self.rotary_dim]
-            apply_rope_with_cos_sin_cache_inplace(
+            apply_rope_with_cos_sin_cache_inplace(  # type: ignore[misc]
                 positions=positions,
                 q=q_rope,
                 k=k_rope,
@@ -304,7 +312,7 @@ class RotaryEmbedding(MultiPlatformOp):
                 is_neox=self.is_neox_style,
                 fused_args=fused_set_kv_buffer_arg,
             )
-        else:
+        elif self.use_fallback_kernel:
             assert (
                 fused_set_kv_buffer_arg is None
             ), "save kv cache is not supported for fallback_rotary_embedding."
@@ -316,6 +324,10 @@ class RotaryEmbedding(MultiPlatformOp):
                 self.head_size,
                 self.cos_sin_cache,
                 self.is_neox_style,
+            )
+        else:
+            return self.forward_native(
+                positions, query, key, offsets, fused_set_kv_buffer_arg
             )
         return query, key
 
