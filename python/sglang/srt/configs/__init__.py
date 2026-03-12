@@ -8,7 +8,24 @@ from sglang.srt.configs.dots_vlm import DotsVLMConfig
 from sglang.srt.configs.exaone import ExaoneConfig
 from sglang.srt.configs.falcon_h1 import FalconH1Config
 from sglang.srt.configs.granitemoehybrid import GraniteMoeHybridConfig
-from sglang.srt.configs.janus_pro import MultiModalityConfig
+# Some environments ship Transformers versions that are temporarily incompatible
+# with certain multimodal config registrations (e.g., AutoImageProcessor.register
+# signature changes). These multimodal configs are not needed for text-only
+# models like GPT-OSS, so make the import optional and fail only if used.
+try:
+    from sglang.srt.configs.janus_pro import MultiModalityConfig as _MultiModalityConfig
+except Exception as _e:  # pragma: no cover
+    _MULTIMODALITY_IMPORT_ERROR = _e
+
+    class MultiModalityConfig:  # type: ignore
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError(
+                "MultiModalityConfig is unavailable due to an import-time dependency/API "
+                "mismatch (likely Transformers). This does not affect text-only models."
+            ) from _MULTIMODALITY_IMPORT_ERROR
+
+else:
+    MultiModalityConfig = _MultiModalityConfig
 from sglang.srt.configs.jet_nemotron import JetNemotronConfig
 from sglang.srt.configs.jet_vlm import JetVLMConfig
 from sglang.srt.configs.kimi_k25 import KimiK25Config
