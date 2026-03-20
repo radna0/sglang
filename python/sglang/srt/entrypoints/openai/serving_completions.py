@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import logging
 import time
-from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Union
 
 from fastapi import Request
@@ -23,6 +22,7 @@ from sglang.srt.entrypoints.openai.utils import (
     process_cached_tokens_details_from_ret,
     process_hidden_states_from_ret,
     process_routed_experts_from_ret,
+    process_speculative_metrics_from_ret,
     to_openai_style_logprobs,
 )
 from sglang.srt.managers.io_struct import GenerateReqInput
@@ -97,11 +97,6 @@ class OpenAIServingCompletion(OpenAIServingBase):
         # Extract custom labels from raw request headers
         custom_labels = self.extract_custom_labels(raw_request)
 
-        # Extract routed_dp_rank from header (has higher priority than body)
-        effective_routed_dp_rank = self.extract_routed_dp_rank_from_header(
-            raw_request, request.routed_dp_rank
-        )
-
         # Resolve LoRA adapter from model parameter or explicit lora_path
         lora_path = self._resolve_lora_path(request.model, request.lora_path)
 
@@ -117,7 +112,7 @@ class OpenAIServingCompletion(OpenAIServingBase):
             bootstrap_host=request.bootstrap_host,
             bootstrap_port=request.bootstrap_port,
             bootstrap_room=request.bootstrap_room,
-            routed_dp_rank=effective_routed_dp_rank,
+            routed_dp_rank=request.routed_dp_rank,
             disagg_prefill_dp_rank=request.disagg_prefill_dp_rank,
             return_hidden_states=request.return_hidden_states,
             return_routed_experts=request.return_routed_experts,
@@ -276,27 +271,13 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 # Generate delta
                 delta = text[len(stream_buffer) :]
                 stream_buffers[index] = stream_buffer + delta
-                finish_reason = content["meta_info"].get("finish_reason", None)
-                finish_reason_type = finish_reason["type"] if finish_reason else None
-
-                # If the abort is from scheduler.
-                if finish_reason_type == "abort":
-                    code = finish_reason.get(
-                        "status_code", HTTPStatus.INTERNAL_SERVER_ERROR
-                    )
-                    error = self.create_streaming_error_response(
-                        finish_reason.get("message", "Generation aborted."),
-                        code.name,
-                        code.value,
-                    )
-                    yield f"data: {error}\n\n"
-                    break
+                finish_reason = content["meta_info"]["finish_reason"]
 
                 choice_data = CompletionResponseStreamChoice(
                     index=index,
                     text=delta,
                     logprobs=logprobs,
-                    finish_reason=finish_reason_type,
+                    finish_reason=finish_reason["type"] if finish_reason else None,
                     matched_stop=(
                         finish_reason["matched"]
                         if finish_reason and "matched" in finish_reason
@@ -436,11 +417,13 @@ class OpenAIServingCompletion(OpenAIServingBase):
         cached_tokens_details = process_cached_tokens_details_from_ret(
             first_ret, request
         )
+        speculative_metrics = process_speculative_metrics_from_ret(first_ret, request)
         response_sglext = None
-        if routed_experts or cached_tokens_details:
+        if routed_experts or cached_tokens_details or speculative_metrics:
             response_sglext = SglExt(
                 routed_experts=routed_experts,
                 cached_tokens_details=cached_tokens_details,
+                speculative_metrics=speculative_metrics,
             )
 
         for idx, ret_item in enumerate(ret):

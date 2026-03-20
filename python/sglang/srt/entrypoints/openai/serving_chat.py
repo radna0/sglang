@@ -5,7 +5,6 @@ import json
 import logging
 import time
 import uuid
-from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Union
 
 import jinja2
@@ -41,6 +40,7 @@ from sglang.srt.entrypoints.openai.utils import (
     process_cached_tokens_details_from_ret,
     process_hidden_states_from_ret,
     process_routed_experts_from_ret,
+    process_speculative_metrics_from_ret,
     to_openai_style_logprobs,
 )
 from sglang.srt.function_call.core_types import ToolCallItem
@@ -276,11 +276,6 @@ class OpenAIServingChat(OpenAIServingBase):
         # Extract custom labels from raw request headers
         custom_labels = self.extract_custom_labels(raw_request)
 
-        # Extract routed_dp_rank from header (has higher priority than body)
-        effective_routed_dp_rank = self.extract_routed_dp_rank_from_header(
-            raw_request, request.routed_dp_rank
-        )
-
         # Resolve LoRA adapter from model parameter or explicit lora_path
         lora_path = self._resolve_lora_path(request.model, request.lora_path)
         img_max_dynamic_patch, vid_max_dynamic_patch = _extract_max_dynamic_patch(
@@ -302,7 +297,7 @@ class OpenAIServingChat(OpenAIServingBase):
             bootstrap_host=request.bootstrap_host,
             bootstrap_port=request.bootstrap_port,
             bootstrap_room=request.bootstrap_room,
-            routed_dp_rank=effective_routed_dp_rank,
+            routed_dp_rank=request.routed_dp_rank,
             disagg_prefill_dp_rank=request.disagg_prefill_dp_rank,
             return_hidden_states=request.return_hidden_states,
             return_routed_experts=request.return_routed_experts,
@@ -647,7 +642,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 routed_experts[index] = content["meta_info"].get("routed_experts", None)
 
                 # Handle logprobs
-                finish_reason = content["meta_info"].get("finish_reason", None)
+                finish_reason = content["meta_info"]["finish_reason"]
                 choice_logprobs = None
                 if request.logprobs:
                     n_prev_token = n_prev_tokens.get(index, 0)
@@ -667,20 +662,7 @@ class OpenAIServingChat(OpenAIServingBase):
 
                 # Track finish_reason for each index
                 if finish_reason_type:
-                    # If the abort is from scheduler.
-                    if finish_reason_type == "abort":
-                        code = finish_reason.get(
-                            "status_code", HTTPStatus.INTERNAL_SERVER_ERROR
-                        )
-                        error = self.create_streaming_error_response(
-                            finish_reason.get("message", "Generation aborted."),
-                            code.name,
-                            code.value,
-                        )
-                        yield f"data: {error}\n\n"
-                        break
-                    else:
-                        finish_reasons[index] = finish_reason
+                    finish_reasons[index] = finish_reason
 
                 # First chunk with role
                 if is_firsts.get(index, True):
@@ -924,11 +906,13 @@ class OpenAIServingChat(OpenAIServingBase):
         cached_tokens_details = process_cached_tokens_details_from_ret(
             first_ret, request
         )
+        speculative_metrics = process_speculative_metrics_from_ret(first_ret, request)
         response_sglext = None
-        if routed_experts or cached_tokens_details:
+        if routed_experts or cached_tokens_details or speculative_metrics:
             response_sglext = SglExt(
                 routed_experts=routed_experts,
                 cached_tokens_details=cached_tokens_details,
+                speculative_metrics=speculative_metrics,
             )
 
         for idx, ret_item in enumerate(ret):
@@ -1245,7 +1229,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 not request.chat_template_kwargs
                 or request.chat_template_kwargs.get("thinking") is not False
             )
-        if self.reasoning_parser in ["qwen3", "glm45", "nemotron_3", "interns1"]:
+        if self.reasoning_parser in ["qwen3", "glm45", "nano_v3", "interns1"]:
             # Models that thinking by default, and can be disabled by setting enable_thinking=False
             return (
                 not request.chat_template_kwargs
