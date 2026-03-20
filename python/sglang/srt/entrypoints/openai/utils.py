@@ -114,3 +114,30 @@ def process_cached_tokens_details_from_ret(
             device=details.get("device", 0),
             host=details.get("host", 0),
         )
+
+
+def process_speculative_metrics_from_ret(
+    ret_item: Dict[str, Any],
+    request: Union[
+        ChatCompletionRequest,
+        CompletionRequest,
+    ],
+) -> Optional[Dict[str, Any]]:
+    """Extract speculative decoding metrics (DFLASH/EAGLE/NGRAM) into an OpenAI-safe extension dict."""
+    if not getattr(request, "return_speculative_metrics", False):
+        return None
+
+    meta = ret_item.get("meta_info", {}) or {}
+    keys = (
+        "spec_accept_rate",
+        "spec_accept_length",
+        "spec_accept_token_num",
+        "spec_draft_token_num",
+        "spec_verify_ct",
+        "spec_accept_histogram",
+    )
+    out: Dict[str, Any] = {}
+    for k in keys:
+        if k in meta:
+            out[k] = meta[k]
+    return out or None

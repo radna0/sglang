@@ -1,46 +1,50 @@
 """
-Benchmark/sweep DFlash speculative decoding configurations (DFLASH vs DFLASH_TREE).
+Quick DFLASH vs baseline benchmark harness (fail-fast friendly).
 
-This is modeled after `scripts/playground/bench_speculative.py`, but adds:
-  - DFlash-specific server knobs: block_size / spec_steps / tree_topk / verify-node budget
-  - Production-like sampling knobs: temperature / top_p / min_p / top_k
-  - Long-decode regimes (e.g. decode_len=65536) + concurrency sweeps
+Design goals (for our repo workflow):
+  - Single script to benchmark *exactly one* config quickly (no long multi-matrix sweeps).
+  - Works with long decode + concurrency presets (ctx131072 / decode65536) when you *choose* to run them,
+    but also supports short decode smoke runs to avoid wasting 30+ minutes.
 
-Typical usage (single node, local server launch):
+Example (short smoke):
+  python3 scripts/playground/bench_speculative_dflash.py \\
+    --model-path /path/to/gpt-oss-120b \\
+    --draft-model-path /path/to/dflash_draft_ckpt \\
+    --attention-backend fa3 \\
+    --draft-attention-backend fa3 \\
+    --context-length 8192 \\
+    --decode-len 2048 \\
+    --concurrency 1
 
-  python3 bench_speculative_dflash.py \
-    --model-path /path/to/gpt-oss-120b \
-    --speculative-draft-model-path /path/to/dflash-draft-ckpt \
-    --attention-backend fa3 \
-    --speculative-draft-attention-backend fa3 \
-    --context-length 131072 \
-    --tp-size 1 \
-    --algorithms DFLASH DFLASH_TREE \
-    --batch-size 1 8 \
-    --decode-len 8192 65536 \
-    --block-size 16 \
-    --spec-steps 15 \
-    --tree-topk 4 \
-    --num-verify-tokens 16 \
-    --sampling-temperature 1.0 \
-    --sampling-top-p 1.0 \
-    --sampling-min-p 0.02 \
-    --output dflash_sweep.jsonl
+Example (gold regime, long decode):
+  python3 scripts/playground/bench_speculative_dflash.py \\
+    --model-path /path/to/gpt-oss-120b \\
+    --draft-model-path /path/to/dflash_draft_ckpt \\
+    --attention-backend fa3 \\
+    --draft-attention-backend fa3 \\
+    --context-length 131072 \\
+    --decode-len 65536 \\
+    --concurrency 8 \\
+    --temperature 1.0 --top-p 1.0 --top-k 50 --min-p 0.02 \\
+    --cuda-graph
 """
+
+from __future__ import annotations
 
 import argparse
 import asyncio
 import json
-import os
 import time
+from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Any, Dict, List, Optional, Tuple
+from typing import List, Optional
 
 import numpy as np
 import requests
 from transformers import AutoTokenizer
 
-from sglang.bench_serving import DatasetRow, benchmark, set_global_args
+from sglang.bench_serving import benchmark, set_global_args
+from sglang.benchmark.datasets import DatasetRow
 from sglang.srt.server_args import ServerArgs
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -50,67 +54,41 @@ from sglang.test.test_utils import (
 
 
 PROMPTS = [
-    "Human: Give me a fully functional FastAPI server. Show the full, long python code without stop.\n\nAssistant:",
-    "Human: Write a travel blog post to Hawaii.\n\nAssistant:",
-    "Human: Solve x^2 = -1. Think step-by-step.\n\nAssistant:",
-    "Human: Tell me about the president of the USA in wikipedia style.\n\nAssistant:",
+    "Write a short Python function that computes fibonacci(n).",
+    "Explain what speculative decoding is in 2 sentences.",
 ]
 
 
-def _node0_print(server_args: ServerArgs, msg: str) -> None:
-    if getattr(server_args, "node_rank", 0) == 0:
-        print(msg, flush=True)
+@dataclass(frozen=True)
+class BenchResult:
+    accept_length: float
+    step_time_s: float
+    output_tok_s: float
+    avg_output_tokens: float
 
 
-def _get_server_info(base_url: str) -> Dict[str, Any]:
-    info = requests.get(base_url + "/get_server_info").json()
-    # Some server modes nest decode states.
-    if isinstance(info, dict) and "decode" in info and info["decode"]:
-        return info["decode"][0]
-    return info
-
-
-def _build_sampling_params(args: argparse.Namespace, *, decode_len: int) -> Dict[str, Any]:
-    # This object overrides `payload["sampling_params"]` in bench_serving's sglang backend.
-    sampling_params: Dict[str, Any] = {
-        "temperature": float(args.sampling_temperature),
-        "top_p": float(args.sampling_top_p),
-        "min_p": float(args.sampling_min_p),
-        "top_k": int(args.sampling_top_k),
-        "max_new_tokens": int(decode_len),
-        "ignore_eos": bool(args.ignore_eos),
-    }
-    return sampling_params
-
-
-def _make_input_requests(num_prompts: int, *, decode_len: int) -> List[DatasetRow]:
-    padded = (PROMPTS * ((num_prompts + len(PROMPTS) - 1) // len(PROMPTS)))[:num_prompts]
-    # format: (prompt, input_len, output_len). input_len is a dummy value for `benchmark()`.
-    return [DatasetRow(p, 0, int(decode_len)) for p in padded]
-
-
-def _send_one_batch(
+def _bench_one(
     *,
     base_url: str,
-    batch_size: int,
-    num_prompts: int,
     tokenizer,
+    num_prompts: int,
+    concurrency: int,
     decode_len: int,
-    sampling_params: Dict[str, Any],
-    step_time_percentile: float,
-) -> Dict[str, Any]:
-    backend = "sglang"
-    api_url = f"{base_url}/generate"
-    input_requests = _make_input_requests(num_prompts, decode_len=decode_len)
+    temperature: float,
+    top_p: float,
+    top_k: int,
+    min_p: float,
+) -> BenchResult:
+    padded = (PROMPTS * ((num_prompts + len(PROMPTS) - 1) // len(PROMPTS)))[:num_prompts]
+    reqs: List[DatasetRow] = [DatasetRow(p, 0, int(decode_len)) for p in padded]
 
-    # We need to set some dummy values in order to call `benchmark` below.
-    bench_args = SimpleNamespace(
+    args = SimpleNamespace(
         disable_ignore_eos=False,
         disable_stream=False,
         return_logprob=False,
         return_routed_experts=False,
         plot_throughput=False,
-        backend=backend,
+        backend="sglang",
         dataset_name="custom",
         num_prompts=None,
         sharegpt_output_len=None,
@@ -121,20 +99,30 @@ def _send_one_batch(
         warmup_requests=1,
         output_details=False,
     )
-    set_global_args(bench_args)
+    set_global_args(args)
 
-    extra_request_body = {"sampling_params": sampling_params}
+    extra_request_body = {
+        "sampling_params": {
+            "temperature": float(temperature),
+            "top_p": float(top_p),
+            "top_k": int(top_k),
+            "min_p": float(min_p),
+            "max_new_tokens": int(decode_len),
+            # Always let the server run to max_new_tokens for throughput comparisons.
+            "ignore_eos": True,
+        }
+    }
 
     results = asyncio.run(
         benchmark(
-            backend=backend,
-            api_url=api_url,
+            backend="sglang",
+            api_url=f"{base_url}/generate",
             base_url=base_url,
             model_id="default",
             tokenizer=tokenizer,
-            input_requests=input_requests,
+            input_requests=reqs,
             request_rate=float("inf"),
-            max_concurrency=int(batch_size),
+            max_concurrency=int(concurrency),
             disable_tqdm=False,
             lora_names=None,
             lora_request_distribution=None,
@@ -144,332 +132,247 @@ def _send_one_batch(
         )
     )
 
-    server_info = _get_server_info(base_url)
-    internal = (server_info.get("internal_states") or [{}])[0] or {}
-    step_time_dict = internal.get("step_time_dict") or {}
-    step_times = step_time_dict.get(str(batch_size))
-    step_time = (
-        float(np.percentile(step_times, step_time_percentile))
-        if step_times
-        else None
+    if results["completed"] != len(reqs):
+        raise RuntimeError(
+            f"Benchmark incomplete: completed={results['completed']} expected={len(reqs)}"
+        )
+
+    accept_length = float(results["accept_length"] or 1.0)
+    avg_output_tokens = float(results["total_output_tokens"]) / float(results["completed"])
+
+    server_info = requests.get(base_url + "/get_server_info", timeout=60).json()
+    # Use 20th percentile like the upstream script (more robust than median for graphs warmup).
+    step_time_s = float(
+        np.percentile(
+            server_info["internal_states"][0]["step_time_dict"][str(int(concurrency))],
+            20,
+        )
+    )
+    output_tok_s = (1.0 / step_time_s) * accept_length
+    return BenchResult(
+        accept_length=round(accept_length, 3),
+        step_time_s=round(step_time_s, 6),
+        output_tok_s=round(output_tok_s, 3),
+        avg_output_tokens=round(avg_output_tokens, 3),
     )
 
-    accept_length = results.get("accept_length", None)
-    output_tok_s = results.get("output_throughput", None)
 
-    return {
-        "accept_length": accept_length,
-        "output_tok_s": output_tok_s,
-        "step_time_s_pctl": step_time,
-        "server_internal": {
-            "avg_spec_accept_length": internal.get("avg_spec_accept_length"),
-            "avg_spec_verify_ct": internal.get("avg_spec_verify_ct"),
-        },
-        "raw_results": {
-            "completed": results.get("completed"),
-            "total_output_tokens": results.get("total_output_tokens"),
-            "output_throughput": results.get("output_throughput"),
-            "request_throughput": results.get("request_throughput"),
-        },
+def _launch(
+    *,
+    model_path: str,
+    tp_size: int,
+    attention_backend: str,
+    context_length: int,
+    cuda_graph: bool,
+    speculative: bool,
+    draft_model_path: Optional[str],
+    draft_attention_backend: Optional[str],
+    dflash_block_size: Optional[int],
+    port: int,
+) -> tuple[object, str]:
+    cmd = [
+        "python3",
+        "-m",
+        "sglang.launch_server",
+        "--model",
+        model_path,
+        "--tensor-parallel-size",
+        str(int(tp_size)),
+        "--host",
+        "127.0.0.1",
+        "--port",
+        str(int(port)),
+        "--context-length",
+        str(int(context_length)),
+        "--attention-backend",
+        str(attention_backend),
+    ]
+    if cuda_graph:
+        cmd.append("--cuda-graph")
+    else:
+        cmd.append("--disable-cuda-graph")
+
+    if speculative:
+        if not draft_model_path:
+            raise ValueError("draft_model_path is required for DFLASH benchmark.")
+        cmd += [
+            "--speculative-algorithm",
+            "DFLASH",
+            "--speculative-draft-model-path",
+            draft_model_path,
+        ]
+        if draft_attention_backend:
+            cmd += ["--speculative-draft-attention-backend", str(draft_attention_backend)]
+        if dflash_block_size is not None:
+            cmd += ["--speculative-dflash-block-size", str(int(dflash_block_size))]
+
+    proc = popen_launch_server(cmd)
+    base_url = f"http://127.0.0.1:{int(port)}"
+    # Wait until server is up.
+    start = time.time()
+    while True:
+        try:
+            r = requests.get(base_url + "/get_model_info", timeout=5)
+            if r.status_code == 200:
+                break
+        except Exception:
+            pass
+        if time.time() - start > DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH:
+            kill_process_tree(proc.pid)
+            raise RuntimeError("Server launch timeout.")
+        time.sleep(1)
+    return proc, base_url
+
+
+def main() -> int:
+    p = argparse.ArgumentParser()
+    p.add_argument(
+        "--preset",
+        default=None,
+        choices=["smoke_det", "smoke_sampling", "gold_det", "gold_sampling"],
+        help="Convenience preset for (ctx/decode/concurrency/sampling). Explicit flags still override after preset.",
+    )
+    p.add_argument("--model-path", required=True)
+    p.add_argument("--draft-model-path", required=True, help="DFLASH draft checkpoint dir")
+    p.add_argument("--tp-size", type=int, default=1)
+    p.add_argument("--attention-backend", default="fa3")
+    p.add_argument("--draft-attention-backend", default="fa3")
+    p.add_argument("--context-length", type=int, default=8192)
+    p.add_argument("--dflash-block-size", type=int, default=None)
+    p.add_argument("--decode-len", type=int, default=2048)
+    p.add_argument("--concurrency", type=int, default=1)
+    p.add_argument("--num-prompts", type=int, default=2)
+    p.add_argument("--port", type=int, default=20000)
+
+    p.add_argument("--temperature", type=float, default=0.0)
+    p.add_argument("--top-p", type=float, default=1.0)
+    p.add_argument("--top-k", type=int, default=1)
+    p.add_argument("--min-p", type=float, default=0.0)
+
+    p.add_argument("--cuda-graph", action="store_true")
+    p.add_argument("--skip-baseline", action="store_true")
+    p.add_argument("--skip-dflash", action="store_true")
+    p.add_argument("--out-json", default=None)
+    args = p.parse_args()
+
+    # Presets (applied first; explicit flags can still override afterwards by user choice).
+    if args.preset == "smoke_det":
+        args.context_length = 8192
+        args.decode_len = 2048
+        args.concurrency = 1
+        args.temperature, args.top_k, args.min_p, args.top_p = 0.0, 1, 0.0, 1.0
+    elif args.preset == "smoke_sampling":
+        args.context_length = 8192
+        args.decode_len = 2048
+        args.concurrency = 1
+        args.temperature, args.top_k, args.min_p, args.top_p = 1.0, 50, 0.02, 1.0
+    elif args.preset == "gold_det":
+        args.context_length = 131072
+        args.decode_len = 65536
+        args.concurrency = 8
+        args.temperature, args.top_k, args.min_p, args.top_p = 0.0, 1, 0.0, 1.0
+        args.cuda_graph = True
+    elif args.preset == "gold_sampling":
+        args.context_length = 131072
+        args.decode_len = 65536
+        args.concurrency = 8
+        args.temperature, args.top_k, args.min_p, args.top_p = 1.0, 50, 0.02, 1.0
+        args.cuda_graph = True
+
+    tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
+
+    out: dict = {
+        "regime": {
+            "model_path": args.model_path,
+            "draft_model_path": args.draft_model_path,
+            "tp_size": args.tp_size,
+            "attention_backend": args.attention_backend,
+            "draft_attention_backend": args.draft_attention_backend,
+            "context_length": args.context_length,
+            "decode_len": args.decode_len,
+            "concurrency": args.concurrency,
+            "sampling": {
+                "temperature": args.temperature,
+                "top_p": args.top_p,
+                "top_k": args.top_k,
+                "min_p": args.min_p,
+            },
+            "cuda_graph": bool(args.cuda_graph),
+        }
     }
 
-
-def _launch_and_bench(
-    *,
-    args: argparse.Namespace,
-    server_args: ServerArgs,
-    base_url: str,
-    other_args: List[str],
-    batch_size: int,
-    decode_len: int,
-) -> Dict[str, Any]:
-    env = {"SGLANG_RECORD_STEP_TIME": "1", **os.environ}
-    process = popen_launch_server(
-        args.model_path,
-        base_url,
-        timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-        other_args=other_args,
-        env=env,
-    )
-
-    tokenizer = AutoTokenizer.from_pretrained(
-        args.model_path, trust_remote_code=server_args.trust_remote_code
-    )
-
-    sampling_params = _build_sampling_params(args, decode_len=decode_len)
-
+    baseline_proc = None
+    dflash_proc = None
     try:
-        # Warmup (single request) to build graphs/kernels.
-        _send_one_batch(
-            base_url=base_url,
-            batch_size=batch_size,
-            num_prompts=max(1, min(args.num_prompts, batch_size)),
-            tokenizer=tokenizer,
-            decode_len=min(64, int(decode_len)),
-            sampling_params={**sampling_params, "max_new_tokens": min(64, int(decode_len))},
-            step_time_percentile=float(args.step_time_percentile),
-        )
+        if not args.skip_baseline:
+            baseline_proc, baseline_url = _launch(
+                model_path=args.model_path,
+                tp_size=args.tp_size,
+                attention_backend=args.attention_backend,
+                context_length=args.context_length,
+                cuda_graph=args.cuda_graph,
+                speculative=False,
+                draft_model_path=None,
+                draft_attention_backend=None,
+                dflash_block_size=None,
+                port=args.port,
+            )
+            base = _bench_one(
+                base_url=baseline_url,
+                tokenizer=tokenizer,
+                num_prompts=args.num_prompts,
+                concurrency=args.concurrency,
+                decode_len=args.decode_len,
+                temperature=args.temperature,
+                top_p=args.top_p,
+                top_k=args.top_k,
+                min_p=args.min_p,
+            )
+            out["baseline"] = base.__dict__
 
-        bench = _send_one_batch(
-            base_url=base_url,
-            batch_size=batch_size,
-            num_prompts=max(args.num_prompts, batch_size),
-            tokenizer=tokenizer,
-            decode_len=decode_len,
-            sampling_params=sampling_params,
-            step_time_percentile=float(args.step_time_percentile),
-        )
+        if not args.skip_dflash:
+            dflash_proc, dflash_url = _launch(
+                model_path=args.model_path,
+                tp_size=args.tp_size,
+                attention_backend=args.attention_backend,
+                context_length=args.context_length,
+                cuda_graph=args.cuda_graph,
+                speculative=True,
+                draft_model_path=args.draft_model_path,
+                draft_attention_backend=args.draft_attention_backend,
+                dflash_block_size=args.dflash_block_size,
+                port=args.port + 1,
+            )
+            df = _bench_one(
+                base_url=dflash_url,
+                tokenizer=tokenizer,
+                num_prompts=args.num_prompts,
+                concurrency=args.concurrency,
+                decode_len=args.decode_len,
+                temperature=args.temperature,
+                top_p=args.top_p,
+                top_k=args.top_k,
+                min_p=args.min_p,
+            )
+            out["dflash"] = df.__dict__
+
+        if "baseline" in out and "dflash" in out:
+            out["speedup"] = round(
+                float(out["dflash"]["output_tok_s"]) / float(out["baseline"]["output_tok_s"]),
+                4,
+            )
+
+        print(json.dumps(out, indent=2))
+        if args.out_json:
+            with open(args.out_json, "w", encoding="utf-8") as f:
+                json.dump(out, f, indent=2)
+        return 0
     finally:
-        kill_process_tree(process.pid)
-
-    # Wait for the server to shutdown and port to be released.
-    time.sleep(float(args.shutdown_sleep_s))
-    return bench
-
-
-def _base_other_args(server_args: ServerArgs, *, batch_size: int) -> List[str]:
-    other_args: List[str] = [
-        "--cuda-graph-max-bs",
-        str(batch_size),
-        "--max-running-requests",
-        str(batch_size),
-        "--tp-size",
-        str(server_args.tp_size),
-        "--mem-fraction-static",
-        str(server_args.mem_fraction_static),
-    ]
-
-    if server_args.trust_remote_code:
-        other_args.append("--trust-remote-code")
-
-    if server_args.quantization:
-        other_args.extend(["--quantization", str(server_args.quantization)])
-
-    if server_args.attention_backend:
-        other_args.extend(["--attention-backend", str(server_args.attention_backend)])
-
-    if server_args.speculative_draft_attention_backend:
-        other_args.extend(
-            [
-                "--speculative-draft-attention-backend",
-                str(server_args.speculative_draft_attention_backend),
-            ]
-        )
-
-    if server_args.context_length:
-        other_args.extend(["--context-length", str(server_args.context_length)])
-
-    if server_args.max_total_tokens is not None:
-        other_args.extend(["--max-total-tokens", str(server_args.max_total_tokens)])
-
-    if server_args.allow_auto_truncate:
-        other_args.append("--allow-auto-truncate")
-
-    if server_args.dtype:
-        other_args.extend(["--dtype", str(server_args.dtype)])
-
-    return other_args
-
-
-def main(args: argparse.Namespace, server_args: ServerArgs) -> None:
-    base_url = f"http://127.0.0.1:{args.port}"
-
-    if (
-        any(a in ("DFLASH", "DFLASH_TREE") for a in args.algorithms)
-        and server_args.speculative_draft_model_path is None
-    ):
-        raise ValueError(
-            "DFlash benchmarks require --speculative-draft-model-path (a trained DFlash draft checkpoint)."
-        )
-
-    configs: List[Dict[str, Any]] = []
-    for algo in args.algorithms:
-        algo = str(algo).upper()
-        if algo == "BASELINE":
-            for batch_size in args.batch_size:
-                for decode_len in args.decode_len:
-                    configs.append(
-                        {
-                            "algorithm": "BASELINE",
-                            "batch_size": int(batch_size),
-                            "decode_len": int(decode_len),
-                        }
-                    )
-            continue
-
-        if algo == "DFLASH":
-            for batch_size in args.batch_size:
-                for decode_len in args.decode_len:
-                    for block_size in args.block_size:
-                        configs.append(
-                            {
-                                "algorithm": "DFLASH",
-                                "batch_size": int(batch_size),
-                                "decode_len": int(decode_len),
-                                "block_size": int(block_size),
-                            }
-                        )
-            continue
-
-        if algo == "DFLASH_TREE":
-            for batch_size in args.batch_size:
-                for decode_len in args.decode_len:
-                    for block_size in args.block_size:
-                        for spec_steps in args.spec_steps:
-                            if int(spec_steps) <= 0 or int(spec_steps) >= int(block_size):
-                                continue
-                            for tree_topk in args.tree_topk:
-                                for num_verify_tokens in args.num_verify_tokens:
-                                    candidate_count = int(tree_topk) + max(
-                                        0, int(spec_steps) - 1
-                                    ) * (int(tree_topk) ** 2)
-                                    max_verify_tokens = 1 + candidate_count
-                                    if int(num_verify_tokens) > max_verify_tokens:
-                                        continue
-                                    configs.append(
-                                        {
-                                            "algorithm": "DFLASH_TREE",
-                                            "batch_size": int(batch_size),
-                                            "decode_len": int(decode_len),
-                                            "block_size": int(block_size),
-                                            "spec_steps": int(spec_steps),
-                                            "tree_topk": int(tree_topk),
-                                            "num_verify_tokens": int(num_verify_tokens),
-                                        }
-                                    )
-            continue
-
-        raise ValueError(f"Unknown algorithm: {algo!r}")
-
-    if args.end is None:
-        args.end = len(configs)
-
-    _node0_print(server_args, f"Total configs: {len(configs)} (running [{args.start}, {args.end}))")
-    scored: List[Tuple[float, Dict[str, Any]]] = []
-
-    for idx in range(int(args.start), int(args.end)):
-        cfg = configs[idx]
-        batch_size = int(cfg["batch_size"])
-        decode_len = int(cfg["decode_len"])
-
-        other_args = _base_other_args(server_args, batch_size=batch_size)
-
-        if cfg["algorithm"] != "BASELINE":
-            other_args.extend(
-                [
-                    "--speculative-draft-model-path",
-                    str(server_args.speculative_draft_model_path),
-                    "--speculative-algorithm",
-                    str(cfg["algorithm"]),
-                ]
-            )
-
-        if cfg["algorithm"] == "DFLASH":
-            other_args.extend(
-                [
-                    "--speculative-dflash-block-size",
-                    str(cfg["block_size"]),
-                ]
-            )
-
-        if cfg["algorithm"] == "DFLASH_TREE":
-            other_args.extend(
-                [
-                    "--speculative-dflash-block-size",
-                    str(cfg["block_size"]),
-                    "--speculative-num-steps",
-                    str(cfg["spec_steps"]),
-                    "--speculative-eagle-topk",
-                    str(cfg["tree_topk"]),
-                    "--speculative-num-draft-tokens",
-                    str(cfg["num_verify_tokens"]),
-                ]
-            )
-
-        _node0_print(server_args, f"[{idx}] Launch+bench: {json.dumps(cfg)}")
-
-        bench = _launch_and_bench(
-            args=args,
-            server_args=server_args,
-            base_url=base_url,
-            other_args=other_args,
-            batch_size=batch_size,
-            decode_len=decode_len,
-        )
-
-        record = {
-            **cfg,
-            "tp_size": int(server_args.tp_size),
-            "context_length": int(server_args.context_length or 0),
-            "mem_fraction_static": float(server_args.mem_fraction_static),
-            "attention_backend": str(server_args.attention_backend or ""),
-            "sampling": _build_sampling_params(args, decode_len=decode_len),
-            "bench": bench,
-        }
-
-        with open(args.output, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record) + "\n")
-
-        accept_len = bench.get("accept_length") or 1.0
-        step_time = bench.get("step_time_s_pctl")
-        output_tok_s = bench.get("output_tok_s")
-        if step_time:
-            score = accept_len / step_time
-        else:
-            score = output_tok_s
-
-        if score is not None:
-            scored.append((float(score), cfg))
-
-        _node0_print(
-            server_args,
-            f"[{idx}] Done: alg={cfg['algorithm']} bs={batch_size} decode={decode_len} "
-            f"accept={accept_len} step_p{args.step_time_percentile}={step_time} output_tok_s={output_tok_s} score={score}",
-        )
-
-    if scored:
-        scored.sort(key=lambda x: x[0], reverse=True)
-        _node0_print(server_args, "Top configs by score (accept_len / step_time):")
-        for rank, (score, cfg) in enumerate(scored[: min(10, len(scored))]):
-            _node0_print(server_args, f"  #{rank+1}: score={score:.4f} cfg={json.dumps(cfg)}")
+        if baseline_proc is not None:
+            kill_process_tree(baseline_proc.pid)
+        if dflash_proc is not None:
+            kill_process_tree(dflash_proc.pid)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    ServerArgs.add_cli_args(parser)
-
-    parser.add_argument("--port", type=int, default=20000)
-
-    parser.add_argument(
-        "--algorithms",
-        type=str,
-        nargs="+",
-        default=("DFLASH", "DFLASH_TREE"),
-        help="Which server modes to sweep: BASELINE, DFLASH, DFLASH_TREE",
-    )
-    parser.add_argument("--batch-size", type=int, nargs="+", default=(1, 8))
-    parser.add_argument("--decode-len", type=int, nargs="+", default=(8192,))
-    parser.add_argument("--num-prompts", type=int, default=16)
-
-    parser.add_argument("--block-size", type=int, nargs="+", default=(16,))
-    parser.add_argument("--spec-steps", type=int, nargs="+", default=(15,))
-    parser.add_argument("--tree-topk", type=int, nargs="+", default=(4,))
-    parser.add_argument("--num-verify-tokens", type=int, nargs="+", default=(16,))
-
-    parser.add_argument("--sampling-temperature", type=float, default=0.0)
-    parser.add_argument("--sampling-top-p", type=float, default=1.0)
-    parser.add_argument("--sampling-min-p", type=float, default=0.0)
-    parser.add_argument("--sampling-top-k", type=int, default=-1)
-    parser.add_argument("--ignore-eos", dest="ignore_eos", action="store_true", default=True)
-    parser.add_argument("--no-ignore-eos", dest="ignore_eos", action="store_false")
-
-    parser.add_argument("--step-time-percentile", type=float, default=20.0)
-    parser.add_argument("--shutdown-sleep-s", type=float, default=5.0)
-
-    parser.add_argument("--start", type=int, default=0)
-    parser.add_argument("--end", type=int)
-    parser.add_argument("--output", type=str, default="dflash_sweep.jsonl")
-
-    args = parser.parse_args()
-    server_args: ServerArgs = ServerArgs.from_cli_args(args)
-    main(args, server_args)
+    raise SystemExit(main())

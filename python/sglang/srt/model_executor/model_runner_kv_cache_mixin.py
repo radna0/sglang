@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional, Tuple
+import os
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -25,6 +25,7 @@ from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool, SWATokenToKVPoolAllocator
+from sglang.srt.speculative.dflash_utils import scale_kv_cell_size_per_token_for_dflash
 from sglang.srt.utils.common import (
     get_available_gpu_memory,
     is_float4_e2m1fn_x2,
@@ -33,26 +34,6 @@ from sglang.srt.utils.common import (
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
-
-
-@dataclass
-class MemoryPoolConfig:
-    """Resolved memory pool config, shared between target and draft workers."""
-
-    max_total_num_tokens: int
-    max_running_requests: int
-    full_max_total_num_tokens: Optional[int] = None
-    swa_max_total_num_tokens: Optional[int] = None
-
-    mem_fraction_static: Optional[float] = None
-
-    def __post_init__(self):
-        if self.max_total_num_tokens <= 0:
-            msg = "Not enough memory. Please try to increase --mem-fraction-static."
-            if self.mem_fraction_static is not None:
-                msg += f" Current value: mem_fraction_static={self.mem_fraction_static}"
-            raise RuntimeError(msg)
-
 
 # the ratio of mamba cache pool size to max_running_requests
 MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO = 3
@@ -150,8 +131,8 @@ class ModelRunnerKVCacheMixin:
                 )
         return cell_size
 
-    def profile_max_num_token(self: ModelRunner, pre_model_load_memory: int):
-        post_model_load_memory = get_available_gpu_memory(
+    def profile_max_num_token(self: ModelRunner, total_gpu_memory: int):
+        available_gpu_memory = get_available_gpu_memory(
             self.device,
             self.gpu_id,
             distributed=get_world_group().world_size > 1,
@@ -176,10 +157,40 @@ class ModelRunnerKVCacheMixin:
             num_layers = self.num_effective_layers
 
         cell_size = self.get_cell_size_per_token(num_layers)
+        if self.spec_algorithm.is_dflash() and not self.is_draft_worker:
+            draft_num_layers = getattr(self, "dflash_draft_num_layers", None)
+            if (
+                draft_num_layers is not None
+                and int(draft_num_layers) > 0
+                and int(num_layers) > 0
+            ):
+                cell_size = scale_kv_cell_size_per_token_for_dflash(
+                    target_cell_size_per_token=cell_size,
+                    target_num_layers=int(num_layers),
+                    draft_num_layers=int(draft_num_layers),
+                )
 
-        rest_memory = post_model_load_memory - pre_model_load_memory * (
+        rest_memory = available_gpu_memory - total_gpu_memory * (
             1 - self.mem_fraction_static
         )
+        # FlexAttention backends (especially with CUDA graphs enabled) can require extra temporary
+        # VRAM headroom for compiled/fused kernels during decode. Reserve headroom by *reducing*
+        # KV sizing (do NOT allocate a persistent tensor, which would negate the headroom).
+        try:
+            backend = str(getattr(self.server_args, "attention_backend", "") or "").lower()
+            reserve_gb = float((os.environ.get("SGLANG_FLEX_TEMP_RESERVED_GB") or "0").strip() or "0")
+            if reserve_gb > 0 and "flex" in backend and not is_npu():
+                before = float(rest_memory)
+                rest_memory = max(0.0, float(rest_memory) - float(reserve_gb))
+                logger.info(
+                    "Flex KV sizing headroom: reserve_gb=%.2f backend=%s rest_memory_gb=%.2f->%.2f",
+                    float(reserve_gb),
+                    backend,
+                    before,
+                    float(rest_memory),
+                )
+        except Exception:
+            pass
         if self.mambaish_config is not None:
             rest_memory = self.handle_max_mamba_cache(rest_memory)
 
@@ -285,13 +296,7 @@ class ModelRunnerKVCacheMixin:
 
         return kv_cache_dim
 
-    def _resolve_hybrid_swa_tokens(
-        self: ModelRunner, token_capacity: int
-    ) -> Tuple[int, int, int]:
-        """Split token_capacity into full/swa pools.
-
-        Returns (effective_capacity, full_max_total_num_tokens, swa_max_total_num_tokens).
-        """
+    def set_num_tokens_hybrid_swa(self: ModelRunner):
         page_size = self.server_args.page_size
 
         assert self.sliding_window_size is not None and self.sliding_window_size > 0
@@ -305,11 +310,13 @@ class ModelRunnerKVCacheMixin:
 
         if full_layers_num == 0:
             # all layers are SWA
-            swa_tokens = align_page_size(token_capacity)
+            self.swa_max_total_num_tokens = align_page_size(self.max_total_num_tokens)
+            self.full_max_total_num_tokens = 0
+            self.max_total_num_tokens = self.swa_max_total_num_tokens
             logger.info(
-                f"Use sliding window memory pool (all SWA). swa_layer_tokens={swa_tokens}"
+                f"Use sliding window memory pool (all SWA). swa_layer_tokens={self.swa_max_total_num_tokens}"
             )
-            return swa_tokens, 0, swa_tokens
+            return
 
         swa_full_tokens_ratio = self.server_args.swa_full_tokens_ratio
 
@@ -322,8 +329,8 @@ class ModelRunnerKVCacheMixin:
         #
         # The profile phase computed:
         #   cell_size = F * n_full + S * n_swa
-        #   token_capacity = rest_memory / cell_size
-        #   => total_memory = token_capacity * (F * n_full + S * n_swa)
+        #   max_total_num_tokens = rest_memory / cell_size
+        #   => total_memory = max_total_num_tokens * (F * n_full + S * n_swa)
         #
         # We need to solve:
         #   full_tokens * F * n_full + swa_tokens * S * n_swa = total_memory
@@ -331,7 +338,7 @@ class ModelRunnerKVCacheMixin:
         #
         # Solution:
         #   full_tokens = total_memory / (F * n_full + r * S * n_swa)
-        #               = token_capacity * (F * n_full + S * n_swa) / (F * n_full + r * S * n_swa)
+        #               = max_total_num_tokens * (F * n_full + S * n_swa) / (F * n_full + r * S * n_swa)
 
         kv_size = torch._utils._element_size(self.kv_cache_dtype)
 
@@ -350,7 +357,7 @@ class ModelRunnerKVCacheMixin:
         )
 
         # Total memory available from profile
-        total_memory = token_capacity * (
+        total_memory = self.max_total_num_tokens * (
             full_per_token * full_layers_num + swa_per_token * swa_layers_num
         )
 
@@ -363,31 +370,101 @@ class ModelRunnerKVCacheMixin:
             denominator > 0
         ), f"Invalid denominator={denominator} for memory-based allocation. full_per_token={full_per_token}, full_layers_num={full_layers_num}, swa_per_token={swa_per_token}, swa_layers_num={swa_layers_num}, swa_full_tokens_ratio={swa_full_tokens_ratio}"
 
-        full_tokens = align_page_size(int(total_memory / denominator))
-        swa_tokens = align_page_size(int(full_tokens * swa_full_tokens_ratio))
+        self.full_max_total_num_tokens = int(total_memory / denominator)
+        self.swa_max_total_num_tokens = int(
+            self.full_max_total_num_tokens * swa_full_tokens_ratio
+        )
+
+        self.full_max_total_num_tokens = align_page_size(self.full_max_total_num_tokens)
+        self.swa_max_total_num_tokens = align_page_size(self.swa_max_total_num_tokens)
+
+        self.max_total_num_tokens = self.full_max_total_num_tokens
 
         logger.info(
-            f"Use sliding window memory pool. full_layer_tokens={full_tokens}, swa_layer_tokens={swa_tokens}"
+            f"Use sliding window memory pool. full_layer_tokens={self.full_max_total_num_tokens}, swa_layer_tokens={self.swa_max_total_num_tokens}"
         )
-        return full_tokens, full_tokens, swa_tokens
 
-    def _calculate_mamba_ratio(self: ModelRunner) -> int:
-        if self.server_args.disable_radix_cache:
-            return 1
+    def init_memory_pool(self: ModelRunner, total_gpu_memory: int):
+        max_num_reqs = self.server_args.max_running_requests
+        max_total_tokens = self.server_args.max_total_tokens
+        self.max_total_num_tokens = self.profile_max_num_token(total_gpu_memory)
 
-        additional_ratio = 0
-        if self.server_args.enable_mamba_extra_buffer():
-            # ping-pong buffer size is 2 when overlap schedule is on, 1 otherwise.
-            if not self.server_args.disable_overlap_schedule:
-                additional_ratio = MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP
+        if max_num_reqs is None:
+            max_num_reqs = min(
+                max(
+                    int(
+                        self.max_total_num_tokens / self.model_config.context_len * 512
+                    ),
+                    2048,
+                ),
+                4096,
+            )
+
+        if self.mambaish_config is not None:
+            additional_ratio = 0
+            if self.server_args.enable_mamba_extra_buffer():
+                if not self.spec_algorithm.is_none():
+                    additional_ratio = MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_OVERLAP
+                else:
+                    additional_ratio = MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP
+            if self.server_args.disable_radix_cache:
+                ratio = 1
             else:
-                additional_ratio = MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_OVERLAP
+                ratio = MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO + additional_ratio
+            max_num_reqs = min(
+                max_num_reqs, self.server_args.max_mamba_cache_size // ratio
+            )
+            # for dp attention, we need control the max_num_reqs for speculative decoding mamba space
+            if (
+                not self.spec_algorithm.is_none()
+                and self.server_args.enable_dp_attention
+            ):
+                max_num_reqs = min(
+                    max_num_reqs, self.server_args.max_running_requests // self.dp_size
+                )
 
-        return MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO + additional_ratio
+        if max_total_tokens is not None:
+            if max_total_tokens > self.max_total_num_tokens:
+                logging.warning(
+                    f"max_total_tokens={max_total_tokens} is larger than the profiled value "
+                    f"{self.max_total_num_tokens}. "
+                    f"Use the profiled value instead."
+                )
+            self.max_total_num_tokens = min(self.max_total_num_tokens, max_total_tokens)
 
-    def _init_pools(self: ModelRunner):
-        """Initialize the memory pools."""
-        max_num_reqs = self.max_running_requests
+        self.max_total_num_tokens = (
+            self.max_total_num_tokens
+            // self.server_args.page_size
+            * self.server_args.page_size
+        )
+        # different pp rank may have different num of layers, so we need to reduce the max_total_num_tokens
+        if self.pp_size > 1:
+            tensor = torch.tensor(self.max_total_num_tokens, dtype=torch.int64)
+            torch.distributed.all_reduce(
+                tensor,
+                op=torch.distributed.ReduceOp.MIN,
+                group=get_world_group().cpu_group,
+            )
+            self.max_total_num_tokens = tensor.item()
+
+        if not self.spec_algorithm.is_none() and self.is_draft_worker:
+            self.max_total_num_tokens = self.server_args.draft_runner_cache_size
+            max_num_reqs = self.server_args.max_num_reqs
+
+        # create token size for hybrid cache
+        if self.is_hybrid_swa:
+            self.set_num_tokens_hybrid_swa()
+
+        if not self.spec_algorithm.is_none() and not self.is_draft_worker:
+            # Draft worker should use SWA adjusted max_total_num_tokens for cache size, otherwise it may cause oob in kv cache store
+            self.server_args.draft_runner_cache_size = self.max_total_num_tokens
+            self.server_args.max_num_reqs = max_num_reqs
+
+        if self.max_total_num_tokens <= 0:
+            raise RuntimeError(
+                f"Not enough memory. Please try to increase --mem-fraction-static. "
+                f"Current value: {self.server_args.mem_fraction_static=}"
+            )
 
         # Initialize req_to_token_pool
         if self.req_to_token_pool is None:
@@ -456,7 +533,7 @@ class ModelRunnerKVCacheMixin:
 
         # Initialize token_to_kv_pool
         is_nsa_model = is_deepseek_nsa(self.model_config.hf_config)
-        if self.server_args.attention_backend == "ascend" and not self.mambaish_config:
+        if self.server_args.attention_backend == "ascend":
             if self.use_mla_backend:
                 from sglang.srt.hardware_backend.npu.memory_pool_npu import (
                     NPUMLATokenToKVPool,
@@ -759,103 +836,6 @@ class ModelRunnerKVCacheMixin:
                 self.token_to_kv_pool.full_to_swa_index_mapping = (
                     self.token_to_kv_pool_allocator.full_to_swa_index_mapping
                 )
-
-    def _resolve_token_capacity(self: ModelRunner, profiled_tokens: int) -> int:
-        """Compute final token pool capacity from profiled value,
-        applying user cap, page alignment, and PP sync"""
-        user_limit = self.server_args.max_total_tokens
-
-        # Apply user-specified upper bound
-        if user_limit is not None:
-            if user_limit > profiled_tokens:
-                logging.warning(
-                    f"max_total_tokens={user_limit} is larger than the profiled value "
-                    f"{profiled_tokens}. Use the profiled value instead."
-                )
-            capacity = min(profiled_tokens, user_limit)
-        else:
-            capacity = profiled_tokens
-
-        # Align to page boundary
-        page_size = self.server_args.page_size
-        capacity = capacity // page_size * page_size
-
-        # Sync across PP ranks (each may have different layer counts)
-        if self.pp_size > 1:
-            tensor = torch.tensor(capacity, dtype=torch.int64)
-            torch.distributed.all_reduce(
-                tensor,
-                op=torch.distributed.ReduceOp.MIN,
-                group=get_world_group().cpu_group,
-            )
-            capacity = tensor.item()
-
-        return capacity
-
-    def _resolve_max_num_reqs(self: ModelRunner, token_capacity: int) -> int:
-        """Compute max concurrent requests (per dp worker) from the finalized
-        token capacity."""
-        # Estimate pool size (used as upper bound when user specifies max_running_requests)
-        estimated = int(token_capacity / self.model_config.context_len * 512)
-        estimated = max(min(estimated, 4096), 2048)
-
-        max_num_reqs = self.server_args.max_running_requests
-        if max_num_reqs is not None:
-            max_num_reqs = min(max_num_reqs // self.dp_size, estimated)
-        else:
-            max_num_reqs = min(estimated, token_capacity // 2)
-
-        if self.mambaish_config is not None:
-            ratio = self._calculate_mamba_ratio()
-            max_num_reqs = min(
-                max_num_reqs, self.server_args.max_mamba_cache_size // ratio
-            )
-
-        return max_num_reqs
-
-    def _apply_memory_pool_config(self: ModelRunner, config: MemoryPoolConfig):
-        """Apply a resolved MemoryPoolConfig and initialize pools."""
-        self.max_total_num_tokens = config.max_total_num_tokens
-        self.max_running_requests = config.max_running_requests
-        if self.is_hybrid_swa:
-            self.full_max_total_num_tokens = config.full_max_total_num_tokens
-            self.swa_max_total_num_tokens = config.swa_max_total_num_tokens
-
-        self._init_pools()
-
-    def _resolve_memory_pool_config(
-        self: ModelRunner, pre_model_load_memory: int
-    ) -> MemoryPoolConfig:
-        """Profile GPU memory and resolve all pool parameters into a config."""
-        profiled_tokens = self.profile_max_num_token(pre_model_load_memory)
-        token_capacity = self._resolve_token_capacity(profiled_tokens)
-
-        full_tokens = None
-        swa_tokens = None
-        if self.is_hybrid_swa:
-            token_capacity, full_tokens, swa_tokens = self._resolve_hybrid_swa_tokens(
-                token_capacity
-            )
-
-        return MemoryPoolConfig(
-            max_total_num_tokens=token_capacity,
-            max_running_requests=self._resolve_max_num_reqs(token_capacity),
-            full_max_total_num_tokens=full_tokens,
-            swa_max_total_num_tokens=swa_tokens,
-            mem_fraction_static=self.server_args.mem_fraction_static,
-        )
-
-    def init_memory_pool(self: ModelRunner, pre_model_load_memory: int):
-        if not self.spec_algorithm.is_none() and self.is_draft_worker:
-            assert (
-                self.memory_pool_config is not None
-            ), "Draft worker requires memory_pool_config"
-        else:
-            self.memory_pool_config = self._resolve_memory_pool_config(
-                pre_model_load_memory
-            )
-
-        self._apply_memory_pool_config(self.memory_pool_config)
 
         logger.info(
             f"Memory pool end. "

@@ -1,9 +1,8 @@
 import logging
 import math
 import os
-import time
 from copy import deepcopy
-from typing import List, Optional, Union
+from typing import Optional, Union
 
 import torch
 
@@ -11,6 +10,7 @@ from sglang.srt.distributed import get_tp_group
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
+from sglang.srt.mem_cache.common import get_last_loc
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -18,17 +18,11 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.dflash_info import DFlashDraftInput, DFlashVerifyInput
-from sglang.srt.speculative.dflash_controller import (
-    DFlashAdaptivePqConfig,
-    DFlashAdaptivePqController,
-    DFlashDifficultySignals,
-    DFlashReqDifficultyState,
-    survival_should_force_target_only,
-)
 from sglang.srt.speculative.dflash_utils import (
     can_dflash_use_fused_qkv_proj,
-    resolve_dflash_mask_token,
-    resolve_dflash_mask_token_id,
+    is_dflash_sampling_verify_available,
+    parse_dflash_draft_config,
+    resolve_dflash_verify_mask_policy,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
@@ -64,32 +58,23 @@ class DFlashWorker:
         moe_dp_rank: int,
         nccl_port: int,
         target_worker: TpModelWorker,
-        **_unused_kwargs,
     ):
         self.server_args = server_args
         self.gpu_id = gpu_id
         self.tp_rank = tp_rank
         self.dp_rank = dp_rank
         self.moe_ep_rank = moe_ep_rank
+        self.attn_cp_rank = attn_cp_rank
+        self.moe_dp_rank = moe_dp_rank
         self.nccl_port = nccl_port
         self.target_worker = target_worker
         self.model_runner = target_worker.model_runner
-        self.tp_rank = tp_rank
         self.page_size = server_args.page_size
         self.device = target_worker.device
-        self.attn_cp_rank = attn_cp_rank
-        self.moe_dp_rank = moe_dp_rank
 
-        self._warned_forced_greedy = False
+        self._warned_sampling_fallback = False
         self._logged_first_verify = False
-        self._adaptive_pq = DFlashAdaptivePqController(
-            DFlashAdaptivePqConfig.from_env(
-                default_temp_mul=float(
-                    getattr(server_args, "speculative_dflash_pq_draft_temp_mul", 1.0)
-                    or 1.0
-                )
-            )
-        )
+        self._verify_step = 0
 
         # Draft runner (separate KV cache + attention backend).
         # Share req_to_token_pool + token_to_kv_pool_allocator with the target worker (EAGLE3-style),
@@ -100,6 +85,7 @@ class DFlashWorker:
         draft_server_args = deepcopy(server_args)
         draft_server_args.skip_tokenizer_init = True
         draft_backend = draft_server_args.speculative_draft_attention_backend
+        supported_draft_backends = ("flashinfer", "fa3", "fa4")
         if draft_backend is None:
             draft_backend, _ = draft_server_args.get_attention_backends()
         if draft_backend is None:
@@ -110,19 +96,11 @@ class DFlashWorker:
                 "falling back to 'flashinfer'."
             )
             draft_backend = "flashinfer"
-        elif draft_backend not in (
-            "flashinfer",
-            "fa3",
-            "flex_attention",
-            "flex_attention2",
-            "flex_flash",
-            "flex_flash2",
-            "flex_flash2_delegate_fa3",
-            "flex_flash4",
-        ):
+        elif draft_backend not in supported_draft_backends:
             logger.warning(
-                "DFLASH draft worker only supports attention_backend in {'flashinfer', 'fa3', 'flex_attention', 'flex_attention2', 'flex_flash', 'flex_flash2', 'flex_flash2_delegate_fa3', 'flex_flash4'} for now, "
+                "DFLASH draft worker only supports attention_backend in %s for now, "
                 "but got %r. Falling back to 'flashinfer'.",
+                supported_draft_backends,
                 draft_backend,
             )
             draft_backend = "flashinfer"
@@ -132,7 +110,6 @@ class DFlashWorker:
         draft_server_args.prefill_attention_backend = None
         draft_server_args.decode_attention_backend = None
         draft_server_args.attention_backend = draft_backend
-        self._draft_attention_backend = draft_backend
         # Keep draft context length aligned with the target.
         draft_server_args.context_length = (
             target_worker.model_runner.model_config.context_len
@@ -150,16 +127,20 @@ class DFlashWorker:
             is_draft_worker=True,
             req_to_token_pool=shared_req_to_token_pool,
             token_to_kv_pool_allocator=shared_token_to_kv_pool_allocator,
-            memory_pool_config=getattr(target_worker.model_runner, "memory_pool_config", None),
         )
         self.draft_model_runner = self.draft_worker.model_runner
         self.draft_model = self.draft_model_runner.model
+        draft_config = parse_dflash_draft_config(
+            draft_hf_config=self.draft_model_runner.model_config.hf_config
+        )
         if server_args.speculative_num_draft_tokens is None:
             # Should not happen (ServerArgs should have inferred it), but keep a fallback.
-            self.block_size = int(getattr(self.draft_model, "block_size", 16))
+            self.block_size = int(draft_config.resolve_block_size(default=16))
         else:
             self.block_size = int(server_args.speculative_num_draft_tokens)
-            model_block_size = getattr(self.draft_model, "block_size", None)
+            model_block_size = draft_config.block_size
+            if model_block_size is None:
+                model_block_size = getattr(self.draft_model, "block_size", None)
             if model_block_size is not None and int(model_block_size) != int(
                 self.block_size
             ):
@@ -169,12 +150,8 @@ class DFlashWorker:
                     model_block_size,
                 )
 
-        self._mask_token = resolve_dflash_mask_token(
-            draft_hf_config=self.draft_model_runner.model_config.hf_config
-        )
-        self._mask_token_id_override = resolve_dflash_mask_token_id(
-            draft_hf_config=self.draft_model_runner.model_config.hf_config
-        )
+        self._mask_token = draft_config.mask_token
+        self._mask_token_id_override = draft_config.mask_token_id
         self._mask_token_id = self._resolve_mask_token_id(
             mask_token=self._mask_token,
             mask_token_id=self._mask_token_id_override,
@@ -220,30 +197,10 @@ class DFlashWorker:
         self._draft_greedy_selected_ids_buf: Optional[torch.Tensor] = None
         self._draft_greedy_index_cap: int = 0
 
-        # The fused KV materialization helper currently uses Triton kernels.
-        # If we are experimenting with FlexAttention backends, keep the stack Triton-free by default.
-        self._use_fused_kv_materialize = is_cuda() and self._draft_attention_backend not in (
-            "flex_attention",
-            "flex_attention2",
-            "flex_flash",
-            "flex_flash2",
-        )
-        if (os.environ.get("SGLANG_DFLASH_DISABLE_FUSED_KV_MATERIALIZE") or "").strip().lower() not in (
-            "",
-            "0",
-            "false",
-            "off",
-            "no",
-        ):
-            self._use_fused_kv_materialize = False
+        self._use_fused_kv_materialize = is_cuda()
         self._fused_kv_helper: Optional[object] = None
         if self._use_fused_kv_materialize:
             self._init_fused_kv_helper()
-        elif is_cuda() and self.tp_rank == 0:
-            logger.info(
-                "DFLASH: fused_kv_materialize disabled (draft attention_backend=%s).",
-                self._draft_attention_backend,
-            )
 
     def _init_fused_kv_helper(self) -> None:
         """Initialize the fused KV materialization helper with pre-stacked weights."""
@@ -274,6 +231,16 @@ class DFlashWorker:
                     fused_disable_reason = (
                         "non-unit v_scale is not supported for fused KV path: "
                         f"layer={layer_idx}, v_scale={v_scale}"
+                    )
+                    break
+
+                rope_is_neox_style = bool(
+                    getattr(attn.rotary_emb, "is_neox_style", True)
+                )
+                if not rope_is_neox_style:
+                    fused_disable_reason = (
+                        "non-neox RoPE is not supported for fused KV path: "
+                        f"layer={layer_idx}, rope_is_neox_style={rope_is_neox_style}"
                     )
                     break
 
@@ -349,12 +316,6 @@ class DFlashWorker:
     def clear_cache_pool(self):
         # allocator and req_to_token_pool are shared with target worker
         pass
-
-    def on_req_finished(self, req):
-        # allocator and req_to_token_pool are shared with the target worker;
-        # there is no separate draft allocation to release here.
-        if hasattr(req, "dflash_draft_seq_len"):
-            req.dflash_draft_seq_len = 0
 
     def _resolve_mask_token_id(
         self, *, mask_token: str, mask_token_id: Optional[int] = None
@@ -445,14 +406,22 @@ class DFlashWorker:
             return
 
         if batch.has_grammar:
-            raise ValueError(
-                "DFLASH does not support grammar-constrained decoding yet."
+            raise RuntimeError(
+                "Invariant broken: DFLASH batch has grammar constraints, but scheduler should have rejected this request."
             )
-
-        batch.maybe_evict_swa()
+        if batch.sampling_info is not None and not batch.sampling_info.is_all_greedy:
+            if (
+                not is_dflash_sampling_verify_available()
+                and not self._warned_sampling_fallback
+                and self.tp_rank == 0
+            ):
+                logger.warning(
+                    "DFLASH non-greedy verification is unavailable on this build/device; "
+                    "falling back to greedy argmax verification."
+                )
+                self._warned_sampling_fallback = True
 
         bs = batch.batch_size()
-        device = self.model_runner.device
 
         # --- 1) Append any newly committed tokens into the draft KV cache.
         self._append_target_hidden_to_draft_kv(batch, draft_input)
@@ -505,7 +474,23 @@ class DFlashWorker:
         allocator = self.draft_model_runner.token_to_kv_pool_allocator
         token_to_kv_pool_state_backup = allocator.backup_state()
         try:
-            block_cache_loc = allocator.alloc(bs * self.block_size)
+            if self.page_size == 1:
+                block_cache_loc = allocator.alloc(bs * self.block_size)
+            else:
+                block_end_cpu = seq_lens_cpu + int(self.block_size)
+                last_loc = get_last_loc(
+                    self.draft_model_runner.req_to_token_pool.req_to_token,
+                    batch.req_pool_indices,
+                    block_start,
+                )
+                block_cache_loc = allocator.alloc_extend(
+                    block_start,
+                    seq_lens_cpu,
+                    block_end,
+                    block_end_cpu,
+                    last_loc,
+                    bs * self.block_size,
+                )
             if block_cache_loc is None:
                 raise RuntimeError(
                     f"DFLASH draft OOM when allocating {bs * self.block_size} block tokens."
@@ -554,335 +539,23 @@ class DFlashWorker:
             allocator.restore_state(token_to_kv_pool_state_backup)
 
         draft_hidden = draft_hidden.view(bs, self.block_size, -1)
+        draft_next = self._greedy_sample_from_vocab_parallel_head(
+            hidden_states=draft_hidden[:, 1:, :].reshape(-1, draft_hidden.shape[-1]),
+            lm_head=lm_head,
+        ).view(bs, self.block_size - 1)
         draft_tokens = self._draft_block_tokens_buf[:bs]
         draft_tokens[:, 0].copy_(block_ids[:, 0])
-
-        sampling_info = batch.sampling_info
-        verify_mode = str(
-            getattr(self.server_args, "speculative_dflash_verify_mode", "target_only")
-            or "target_only"
-        )
-        # Survival-weighted scheduling (FailFast/SSD-style): if recent accept lengths are low,
-        # avoid spending extra pq bookkeeping and fall back to target_only until we recover.
-        surv_flag = (os.environ.get("SGLANG_DFLASH_SURVIVAL_FAILFAST") or "").strip().lower() not in (
-            "",
-            "0",
-            "false",
-            "off",
-            "no",
-        )
-        if surv_flag and verify_mode == "pq":
-            try:
-                thr = float(os.environ.get("SGLANG_DFLASH_SURVIVAL_ACCEPT_EMA_LE") or "1.0")
-            except Exception:
-                thr = 1.0
-            states = []
-            for r in batch.reqs:
-                st = getattr(r, "dflash_difficulty_state", None)
-                if st is not None:
-                    states.append(st)
-            if survival_should_force_target_only(states, accept_ema_le=float(thr)):
-                    if self.tp_rank == 0 and not getattr(self, "_logged_survival_failfast", False):
-                        logger.info(
-                            "DFLASH survival failfast: forcing target_only (accept_len_ema <= %.4f)",
-                            float(thr),
-                        )
-                        setattr(self, "_logged_survival_failfast", True)
-                    verify_mode = "target_only"
-        if verify_mode == "pq" and self._adaptive_pq.should_force_target_only():
-            # FailFast: pq was recently deemed pathological; temporarily fall back to
-            # target_only verification (still exact target distribution).
-            verify_mode = "target_only"
-        draft_conf_debug = None
-        # NOTE: On some backends/workers, `batch.sampling_info` can be None even when the
-        # request uses non-greedy sampling. For DFlash pq verification we must propose
-        # tokens by sampling from the draft distribution q, so we reconstruct the minimal
-        # sampling tensors from req-level SamplingParams if needed.
-        if sampling_info is not None:
-            temperatures = sampling_info.temperatures.to(draft_hidden.device)
-            top_ps = sampling_info.top_ps.to(draft_hidden.device)
-            top_ks = sampling_info.top_ks.to(draft_hidden.device)
-            min_ps = sampling_info.min_ps.to(draft_hidden.device)
-            need_min_p_sampling = bool(sampling_info.need_min_p_sampling)
-            # Do NOT trust sampling_info.is_all_greedy here: the draft worker may force
-            # greedy sampling (e.g. vLLM #16899-style) without changing the request's
-            # actual sampling params. For pq we care about whether the *request* is
-            # greedy, which is equivalent to top_k == 1 for all requests.
-            is_all_greedy = bool(torch.all(top_ks.to(torch.int64) == 1).item())
-        else:
-            temps_list = []
-            top_p_list = []
-            top_k_list = []
-            min_p_list = []
-            for req in batch.reqs:
-                sp = req.sampling_params
-                temps_list.append(float(getattr(sp, "temperature", 1.0)))
-                top_p_list.append(float(getattr(sp, "top_p", 1.0)))
-                top_k_list.append(int(getattr(sp, "top_k", 1)))
-                min_p_list.append(float(getattr(sp, "min_p", 0.0)))
-            temperatures = torch.tensor(
-                temps_list, dtype=torch.float32, device=draft_hidden.device
-            )
-            top_ps = torch.tensor(
-                top_p_list, dtype=torch.float32, device=draft_hidden.device
-            )
-            top_ks = torch.tensor(
-                top_k_list, dtype=torch.int32, device=draft_hidden.device
-            )
-            min_ps = torch.tensor(
-                min_p_list, dtype=torch.float32, device=draft_hidden.device
-            )
-            need_min_p_sampling = bool(any(mp > 0.0 for mp in min_p_list))
-            is_all_greedy = bool(all(int(k) == 1 for k in top_k_list))
-
-        if (
-            verify_mode == "pq"
-            and self.tp_rank == 0
-            and not getattr(self, "_logged_pq_draft_gate", False)
-        ):
-            try:
-                topk_dbg = top_ks.detach().to("cpu").to(torch.int64).tolist()
-            except Exception:
-                topk_dbg = None
-            sp0 = None
-            try:
-                if batch.reqs:
-                    sp = batch.reqs[0].sampling_params
-                    sp0 = {
-                        "temperature": float(getattr(sp, "temperature", 1.0)),
-                        "top_k": int(getattr(sp, "top_k", -999)),
-                        "top_p": float(getattr(sp, "top_p", 1.0)),
-                        "min_p": float(getattr(sp, "min_p", 0.0)),
-                    }
-            except Exception:
-                sp0 = None
-            logger.info(
-                "DFLASH pq draft gate: sampling_info=%s top_ks=%s is_all_greedy=%s sp0=%s",
-                bool(sampling_info is not None),
-                topk_dbg,
-                bool(is_all_greedy),
-                sp0,
-            )
-            setattr(self, "_logged_pq_draft_gate", True)
-
-        use_pq = verify_mode == "pq" and not is_all_greedy
-
-        draft_topk = 0
-        draft_topk_ids = None
-        draft_topk_probs = None
-        max_steps_per_req = None
-
-        if use_pq:
-            # For pq verification we must know q(token), so the draft must propose
-            # tokens by sampling from its own distribution (not argmax).
-            #
-            # IMPORTANT: For acceptance under temperature sampling, we often want to
-            # shape the *proposal* distribution q to be closer to the target p
-            # (maximize overlap / reduce TV distance). These env vars allow fast
-            # experimentation without changing request-level sampling.
-            # Prefer ServerArgs knobs (if present), but allow env vars as an override for fast sweeps.
-            draft_temp_mul = float(self._adaptive_pq.cfg.temp_mul or 1.0)
-            try:
-                draft_topk_cap = int(
-                    getattr(self.server_args, "speculative_dflash_pq_draft_topk_cap", 0) or 0
-                )
-            except Exception:
-                draft_topk_cap = 0
-
-            draft_temp_mul_env = (os.environ.get("DFLASH_PQ_DRAFT_TEMP_MUL") or "").strip()
-            draft_topk_cap_env = (os.environ.get("DFLASH_PQ_DRAFT_TOPK_CAP") or "").strip()
-            if draft_temp_mul_env:
-                try:
-                    draft_temp_mul = float(draft_temp_mul_env)
-                except Exception:
-                    pass
-            if draft_topk_cap_env:
-                try:
-                    draft_topk_cap = int(draft_topk_cap_env)
-                except Exception:
-                    pass
-            if not math.isfinite(draft_temp_mul) or draft_temp_mul <= 0:
-                draft_temp_mul = 1.0
-            if draft_topk_cap < 0:
-                draft_topk_cap = 0
-
-            topk = int(torch.max(top_ks).item())
-            if draft_topk_cap > 0:
-                topk = min(topk, int(draft_topk_cap))
-            # SGLang uses a huge TOP_K_ALL value for "whole vocab"; that's not feasible here.
-            if topk <= 0 or topk >= (1 << 20):
-                if self.tp_rank == 0 and not self._warned_forced_greedy:
-                    logger.warning(
-                        "DFLASH pq verification requires a finite/small top_k (>0), but got topk=%s. "
-                        "Falling back to target_only verification (draft uses argmax).",
-                        topk,
-                    )
-                    self._warned_forced_greedy = True
-                use_pq = False
-                verify_mode = "target_only"
-            else:
-                step_count = int(self.block_size - 1)
-                hs = draft_hidden[:, 1:, :].reshape(-1, draft_hidden.shape[-1])
-                topk_p_flat, topk_id_flat = self._topk_from_vocab_parallel_head(
-                    hidden_states=hs,
-                    lm_head=lm_head,
-                    topk=topk,
-                )
-
-                temps = torch.repeat_interleave(
-                    temperatures, step_count, dim=0
-                ).to(topk_p_flat.device)
-                if draft_temp_mul != 1.0:
-                    temps = temps * float(draft_temp_mul)
-                top_ps = torch.repeat_interleave(
-                    top_ps, step_count, dim=0
-                ).to(topk_p_flat.device)
-                top_ks = torch.repeat_interleave(
-                    top_ks, step_count, dim=0
-                ).to(topk_p_flat.device)
-                if draft_topk_cap > 0:
-                    cap = torch.tensor(int(draft_topk_cap), device=top_ks.device, dtype=top_ks.dtype)
-                    top_ks = torch.minimum(top_ks, cap)
-                min_ps = torch.repeat_interleave(
-                    min_ps, step_count, dim=0
-                ).to(topk_p_flat.device)
-
-                filtered_p = self._filter_topk_probs_for_sampling(
-                    topk_p_flat,
-                    temperatures=temps,
-                    top_ks=top_ks,
-                    top_ps=top_ps,
-                    min_ps=min_ps,
-                    need_min_p_sampling=bool(need_min_p_sampling),
-                )
-                # Optional invariants to catch silent normalization bugs during development.
-                if (os.environ.get("SGLANG_DFLASH_PQ_ASSERTS") or "").strip().lower() not in (
-                    "",
-                    "0",
-                    "false",
-                    "off",
-                    "no",
-                ):
-                    with torch.no_grad():
-                        if torch.isnan(filtered_p).any() or torch.isinf(filtered_p).any():
-                            raise RuntimeError("DFLASH pq: draft filtered_p contains NaN/Inf.")
-                        s = filtered_p.sum(dim=1)
-                        if not torch.allclose(s, torch.ones_like(s), atol=5e-3, rtol=1e-3):
-                            raise RuntimeError(
-                                f"DFLASH pq: draft filtered_p rows not normalized: min={float(s.min().item()):.6f} max={float(s.max().item()):.6f}"
-                            )
-
-                sampled_col = torch.multinomial(filtered_p, num_samples=1)
-                sampled_ids = topk_id_flat.gather(1, sampled_col.to(torch.int64)).view(
-                    -1
-                )
-
-                draft_tokens[:, 1:].copy_(
-                    sampled_ids.view(bs, step_count).to(torch.long)
-                )
-                draft_topk = int(topk)
-                draft_topk_ids = topk_id_flat.view(bs, step_count, int(topk))
-                draft_topk_probs = filtered_p.view(bs, step_count, int(topk))
-
-                # DAWN/FailFast-style per-request speculation cap based on draft confidence.
-                # If early steps look uncertain (low q_max), cap the number of steps we attempt
-                # so we don't waste work speculating deep into a hard/conflict region.
-                dawn_enable = (os.environ.get("SGLANG_DFLASH_DAWN_ENABLE") or "").strip().lower() not in (
-                    "",
-                    "0",
-                    "false",
-                    "off",
-                    "no",
-                )
-                if dawn_enable:
-                    try:
-                        qmax_lt = float(os.environ.get("SGLANG_DFLASH_DAWN_QMAX_LT") or "0.25")
-                    except Exception:
-                        qmax_lt = 0.25
-                    try:
-                        cap_steps = int(os.environ.get("SGLANG_DFLASH_DAWN_CAP_STEPS") or "4")
-                    except Exception:
-                        cap_steps = 4
-                    try:
-                        look = int(os.environ.get("SGLANG_DFLASH_DAWN_LOOKAHEAD") or "4")
-                    except Exception:
-                        look = 4
-                    cap_steps = max(1, min(int(step_count), int(cap_steps)))
-                    look = max(1, min(int(step_count), int(look)))
-                    with torch.no_grad():
-                        q = draft_topk_probs.to(torch.float32)
-                        qmax = q.max(dim=-1).values  # [bs, step_count]
-                        min_first = qmax[:, :look].min(dim=1).values
-                        hard = min_first < float(qmax_lt)
-                        max_steps_per_req = torch.where(
-                            hard,
-                            torch.full((bs,), int(cap_steps), device=q.device, dtype=torch.int32),
-                            torch.full((bs,), int(step_count), device=q.device, dtype=torch.int32),
-                        )
-                    if self.tp_rank == 0 and not getattr(self, "_logged_dawn_cap", False):
-                        try:
-                            frac_hard = float((hard.to(torch.float32).mean()).item())
-                        except Exception:
-                            frac_hard = -1.0
-                        logger.info(
-                            "DFLASH DAWN cap enabled: qmax_lt=%.4f cap_steps=%d lookahead=%d frac_hard=%.3f",
-                            float(qmax_lt),
-                            int(cap_steps),
-                            int(look),
-                            float(frac_hard),
-                        )
-                        setattr(self, "_logged_dawn_cap", True)
-                if (os.environ.get("SGLANG_DFLASH_DRAFT_CONF_DEBUG") or "").strip().lower() not in (
-                    "",
-                    "0",
-                    "false",
-                    "off",
-                    "no",
-                ):
-                    with torch.no_grad():
-                        q = draft_topk_probs.to(torch.float32)
-                        q_safe = q.clamp_min(1e-20)
-                        q_max = q.max(dim=-1).values  # [bs, step_count]
-                        q_ent = -(q_safe * torch.log(q_safe)).sum(dim=-1)  # [bs, step_count]
-                        first = min(int(step_count), 4)
-                        draft_conf_debug = {
-                            "q_max_mean_first": float(q_max[:, :first].mean().item()),
-                            "q_max_min_first": float(q_max[:, :first].min().item()),
-                            "q_ent_mean_first": float(q_ent[:, :first].mean().item()),
-                        }
-
-        if not use_pq:
-            draft_next = self._greedy_sample_from_vocab_parallel_head(
-                hidden_states=draft_hidden[:, 1:, :].reshape(-1, draft_hidden.shape[-1]),
-                lm_head=lm_head,
-            ).view(bs, self.block_size - 1)
-            draft_tokens[:, 1:].copy_(draft_next)
+        draft_tokens[:, 1:].copy_(draft_next)
         positions = positions_2d.reshape(-1)
 
         verify_input = DFlashVerifyInput(
             draft_token=draft_tokens.reshape(-1),
             positions=positions,
             draft_token_num=self.block_size,
-            verify_mode=verify_mode,
-            draft_topk=draft_topk,
-            draft_topk_ids=draft_topk_ids,
-            draft_topk_probs=draft_topk_probs,
-            max_steps_per_req=max_steps_per_req,
         )
-        if draft_conf_debug is not None:
-            setattr(verify_input, "draft_conf_debug", draft_conf_debug)
-            if self.tp_rank == 0 and not getattr(self, "_logged_draft_conf_debug", False):
-                logger.info("DFLASH draft confidence (debug): %s", draft_conf_debug)
-                setattr(self, "_logged_draft_conf_debug", True)
-        backend_name = type(self.model_runner.attn_backend).__name__
-        skip_custom_mask = backend_name in {
-            "FlashInferAttnBackend",
-            "FlashInferMLAAttnBackend",
-            "FlashAttentionBackend",
-            "TRTLLMHAAttnBackend",
-            "TRTLLMMLABackend",
-        }
-        build_custom_mask = not skip_custom_mask
+        _, build_custom_mask = resolve_dflash_verify_mask_policy(
+            self.model_runner.attn_backend
+        )
         verify_input.prepare_for_verify(
             batch,
             self.page_size,
@@ -1071,164 +744,6 @@ class DFlashWorker:
 
         return out_token_ids
 
-    def _topk_from_vocab_parallel_head(
-        self,
-        *,
-        hidden_states: torch.Tensor,
-        lm_head,
-        topk: int,
-        chunk_size: int = 128,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Top-k token selection over the target LM head in a TP-safe way.
-
-        Returns:
-            topk_p: (num_tokens, topk) float32, normalized over top-k logits.
-            topk_index: (num_tokens, topk) int64, global token ids.
-        """
-        if hidden_states.numel() == 0:
-            empty_p = torch.empty(
-                (0, int(topk)), dtype=torch.float32, device=hidden_states.device
-            )
-            empty_i = torch.empty(
-                (0, int(topk)), dtype=torch.int64, device=hidden_states.device
-            )
-            return empty_p, empty_i
-
-        if int(topk) <= 0:
-            raise ValueError(f"topk must be positive, got {topk}.")
-
-        tp_group = get_tp_group()
-        tp_size = int(tp_group.world_size)
-
-        if not hasattr(lm_head, "weight") or not hasattr(lm_head, "shard_indices"):
-            raise RuntimeError(
-                "DFLASH top-k sampling requires a vocab-parallel head with `weight` and `shard_indices`."
-            )
-
-        shard = lm_head.shard_indices
-        weight = lm_head.weight  # [local_vocab_padded, hidden]
-        weight_dtype = weight.dtype
-
-        # Valid ranges in the local shard (excluding padding):
-        #   base vocab:  [0, num_org)
-        #   added vocab: [num_org_padded, num_org_padded + num_added)
-        num_org = int(shard.num_org_elements)
-        num_org_padded = int(shard.num_org_elements_padded)
-        num_added = int(shard.num_added_elements)
-        org_vocab_start = int(shard.org_vocab_start_index)
-        added_vocab_start = int(shard.added_vocab_start_index)
-
-        num_tokens = int(hidden_states.shape[0])
-        out_p = torch.empty(
-            (num_tokens, int(topk)), dtype=torch.float32, device=hidden_states.device
-        )
-        out_ids = torch.empty(
-            (num_tokens, int(topk)), dtype=torch.int64, device=hidden_states.device
-        )
-
-        def _cast_hs(x: torch.Tensor) -> torch.Tensor:
-            return x if x.dtype == weight_dtype else x.to(weight_dtype)
-
-        min_val = torch.finfo(weight_dtype).min
-
-        for start in range(0, num_tokens, int(chunk_size)):
-            end = min(num_tokens, start + int(chunk_size))
-            hs = _cast_hs(hidden_states[start:end])
-            chunk_len = int(hs.shape[0])
-
-            local_vals_list: List[torch.Tensor] = []
-            local_ids_list: List[torch.Tensor] = []
-
-            if num_org > 0:
-                base_logits = torch.matmul(hs, weight[:num_org].T)
-                k_base = min(int(topk), int(num_org))
-                base_vals, base_idx = torch.topk(base_logits, k=k_base, dim=-1)
-                local_vals_list.append(base_vals)
-                local_ids_list.append(base_idx.to(torch.int64) + org_vocab_start)
-
-            if num_added > 0:
-                added_weight = weight[num_org_padded : num_org_padded + num_added]
-                added_logits = torch.matmul(hs, added_weight.T)
-                k_added = min(int(topk), int(num_added))
-                added_vals, added_idx = torch.topk(added_logits, k=k_added, dim=-1)
-                local_vals_list.append(added_vals)
-                local_ids_list.append(added_idx.to(torch.int64) + added_vocab_start)
-
-            if not local_vals_list:
-                local_vals = torch.full(
-                    (chunk_len, int(topk)),
-                    min_val,
-                    dtype=weight_dtype,
-                    device=hs.device,
-                )
-                local_ids = torch.zeros(
-                    (chunk_len, int(topk)), dtype=torch.int64, device=hs.device
-                )
-            else:
-                local_vals = torch.cat(local_vals_list, dim=1)
-                local_ids = torch.cat(local_ids_list, dim=1)
-
-                # Keep exactly topk candidates per rank.
-                if local_vals.shape[1] > int(topk):
-                    local_vals, sel = torch.topk(local_vals, k=int(topk), dim=-1)
-                    local_ids = local_ids.gather(1, sel.to(torch.int64))
-                elif local_vals.shape[1] < int(topk):
-                    pad = int(topk) - int(local_vals.shape[1])
-                    pad_vals = torch.full(
-                        (chunk_len, pad),
-                        min_val,
-                        dtype=local_vals.dtype,
-                        device=hs.device,
-                    )
-                    pad_ids = torch.zeros(
-                        (chunk_len, pad), dtype=torch.int64, device=hs.device
-                    )
-                    local_vals = torch.cat([local_vals, pad_vals], dim=1)
-                    local_ids = torch.cat([local_ids, pad_ids], dim=1)
-
-            # Gather local candidates across TP ranks and select global topk.
-            if tp_size > 1:
-                gathered_vals = tp_group.all_gather(local_vals.to(torch.float32), dim=1)
-                gathered_ids = tp_group.all_gather(local_ids, dim=1)
-                global_vals, global_sel = torch.topk(gathered_vals, k=int(topk), dim=1)
-                global_ids = gathered_ids.gather(1, global_sel.to(torch.int64))
-            else:
-                global_vals = local_vals.to(torch.float32)
-                global_ids = local_ids
-
-            probs = torch.softmax(global_vals, dim=1)
-            out_p[start:end].copy_(probs)
-            out_ids[start:end].copy_(global_ids)
-
-        return out_p, out_ids
-
-    def _filter_topk_probs_for_sampling(
-        self,
-        topk_probs: torch.Tensor,
-        *,
-        temperatures: torch.Tensor,
-        top_ks: torch.Tensor,
-        top_ps: torch.Tensor,
-        min_ps: torch.Tensor,
-        need_min_p_sampling: bool,
-    ) -> torch.Tensor:
-        """Apply SGLang-equivalent sampling filters to a (num_tokens, topk) distribution.
-
-        `topk_probs` is assumed to be sorted (descending) along dim=1.
-        """
-        from sglang.srt.speculative.pq_filter import filter_topk_probs_like_sglang_sampler
-
-        return filter_topk_probs_like_sglang_sampler(
-            topk_probs,
-            temperatures=temperatures,
-            top_ks=top_ks,
-            top_ps=top_ps,
-            min_ps=min_ps,
-            need_min_p_sampling=bool(need_min_p_sampling),
-            # Match the CUDA sampler default: joint top-k/top-p when min_p is off.
-            no_min_p_filter_apply_order="joint",
-        )
-
     def _append_target_hidden_to_draft_kv(
         self,
         batch: ScheduleBatch,
@@ -1394,14 +909,60 @@ class DFlashWorker:
             write_layer_kv=_write_layer_kv,
         )
 
+    def _update_target_mamba_state_after_verify(
+        self,
+        *,
+        batch: ScheduleBatch,
+        seq_lens_pre_verify: torch.Tensor,
+        commit_lens: torch.Tensor,
+    ) -> None:
+        """Commit Mamba intermediate states for accepted verify steps.
+
+        During TARGET_VERIFY, Mamba kernels run with `disable_state_update=True` and
+        cache per-step intermediate states. After acceptance, we need to commit the
+        state corresponding to each request's last accepted step.
+        """
+        attn_backend = self.target_worker.model_runner.attn_backend
+        if not hasattr(attn_backend, "update_mamba_state_after_mtp_verify"):
+            return
+
+        accepted_steps = commit_lens.to(torch.int64) - 1
+        mamba_steps_to_track = None
+
+        if batch.mamba_track_indices is not None:
+            mamba_track_interval = self.server_args.mamba_track_interval
+            to_track_mask = (
+                seq_lens_pre_verify // mamba_track_interval
+                != batch.seq_lens // mamba_track_interval
+            )
+            tracking_point = (
+                batch.seq_lens // mamba_track_interval * mamba_track_interval
+            )
+            to_track_ith = torch.clamp(tracking_point - seq_lens_pre_verify - 1, min=0)
+            can_track_mask = to_track_mask & (
+                to_track_ith < commit_lens.to(to_track_ith.dtype)
+            )
+            mamba_steps_to_track = torch.where(
+                can_track_mask,
+                to_track_ith.to(torch.int64),
+                torch.full_like(to_track_ith, -1, dtype=torch.int64),
+            )
+
+        attn_backend.update_mamba_state_after_mtp_verify(
+            accepted_steps=accepted_steps,
+            mamba_track_indices=batch.mamba_track_indices,
+            mamba_steps_to_track=mamba_steps_to_track,
+            model=self.target_worker.model_runner.model,
+        )
+
     def forward_batch_generation(
         self,
         batch: Union[ScheduleBatch, ModelWorkerBatch],
         **kwargs,
     ) -> GenerationBatchResult:
         if getattr(batch, "return_logprob", False):
-            raise ValueError(
-                "DFLASH speculative decoding does not support return_logprob yet."
+            raise RuntimeError(
+                "Invariant broken: DFLASH batch requested return_logprob, but scheduler should have rejected this request."
             )
 
         if isinstance(batch, ModelWorkerBatch):
@@ -1454,8 +1015,6 @@ class DFlashWorker:
             )
             self._append_target_hidden_to_draft_kv(batch, draft_input)
             batch.spec_info = draft_input
-            for req, draft_len in zip(batch.reqs, batch.seq_lens_cpu, strict=True):
-                req.dflash_draft_seq_len = int(draft_len)
 
             return GenerationBatchResult(
                 logits_output=logits_output,
@@ -1478,6 +1037,13 @@ class DFlashWorker:
         assert model_worker_batch.forward_mode.is_target_verify()
         verify_input = model_worker_batch.spec_info
         assert isinstance(verify_input, DFlashVerifyInput)
+        need_mamba_verify_commit = hasattr(
+            self.target_worker.model_runner.attn_backend,
+            "update_mamba_state_after_mtp_verify",
+        )
+        seq_lens_pre_verify = (
+            batch.seq_lens.clone() if need_mamba_verify_commit else None
+        )
 
         batch_result = self.target_worker.forward_batch_generation(
             model_worker_batch, is_verify=True, **kwargs
@@ -1487,55 +1053,23 @@ class DFlashWorker:
             batch_result.can_run_cuda_graph,
         )
 
-        timing_flag = (os.environ.get("SGLANG_DFLASH_VERIFY_WALL_TIMING") or "").strip().lower() not in (
-            "",
-            "0",
-            "false",
-            "off",
-            "no",
-        )
-        t0 = time.perf_counter() if timing_flag else 0.0
         (
             new_verified_id,
             commit_lens,
             next_target_hidden,
             accept_length_per_req_cpu,
-            dflash_debug,
-        ) = verify_input.verify(batch=batch, logits_output=logits_output, page_size=self.page_size)
-        if timing_flag and self.tp_rank == 0 and not getattr(self, "_logged_verify_wall", False):
-            dt = time.perf_counter() - t0
-            logger.info(
-                "DFLASH verify wall timing (one-shot): %.6fs bs=%d accept_len_sum=%d verify_mode=%s",
-                float(dt),
-                int(bs),
-                int(sum(accept_length_per_req_cpu)),
-                str(getattr(verify_input, "verify_mode", None)),
+        ) = verify_input.verify(
+            batch=batch,
+            logits_output=logits_output,
+            page_size=self.page_size,
+        )
+        if need_mamba_verify_commit:
+            assert seq_lens_pre_verify is not None
+            self._update_target_mamba_state_after_verify(
+                batch=batch,
+                seq_lens_pre_verify=seq_lens_pre_verify,
+                commit_lens=commit_lens,
             )
-            setattr(self, "_logged_verify_wall", True)
-
-        # Adaptive pq controller (FailFast/EAFT-inspired): update proposal shaping based
-        # on verify-side scalar stats. This never changes verifier correctness; it only
-        # changes the draft proposal temperature multiplier for future rounds and may
-        # temporarily disable pq if it is clearly counterproductive.
-        try:
-            sig = DFlashDifficultySignals.from_debug(
-                verify_mode=str(getattr(verify_input, "verify_mode", "unknown")),
-                dflash_debug=dflash_debug,
-                draft_conf_debug=getattr(verify_input, "draft_conf_debug", None),
-            )
-            new_temp_mul, ctrl_dbg = self._adaptive_pq.on_verify_end(sig)
-            self._adaptive_pq.cfg.temp_mul = float(new_temp_mul)
-            if self._adaptive_pq.cfg.enabled and self.tp_rank == 0:
-                if ctrl_dbg.get("pq_disabled_triggered"):
-                    logger.info("DFLASH failfast: pq temporarily disabled: %s", ctrl_dbg)
-                if ctrl_dbg.get("eaft_conflict") is True:
-                    logger.info("DFLASH EAFT gate: confident conflict detected: %s", ctrl_dbg)
-                if not getattr(self, "_logged_adaptive_pq", False):
-                    logger.info("DFLASH adaptive_pq (first): %s", ctrl_dbg)
-                    setattr(self, "_logged_adaptive_pq", True)
-        except Exception:
-            # Keep inference robust: never crash the scheduler on controller issues.
-            pass
 
         # Update draft state for the next iteration. Also materialize the committed verify tokens
         # into the draft KV cache immediately so radix cache entries are safe to reuse.
@@ -1547,32 +1081,30 @@ class DFlashWorker:
         batch.forward_mode = ForwardMode.DECODE
 
         num_accepted_tokens = sum(accept_length_per_req_cpu)
+        self._verify_step += 1
         if not self._logged_first_verify and self.tp_rank == 0:
             logger.info(
-                "DFLASH verify completed. verify_mode=%s draft_topk=%s accept_length_per_req=%s",
-                getattr(verify_input, "verify_mode", None),
-                getattr(verify_input, "draft_topk", None),
+                "DFLASH verify completed. accept_length_per_req=%s",
                 accept_length_per_req_cpu,
             )
             self._logged_first_verify = True
-        if dflash_debug is not None and self.tp_rank == 0 and not getattr(self, "_logged_pq_step_stats", False):
-            logger.info("DFLASH pq step stats (debug): %s", dflash_debug)
-            setattr(self, "_logged_pq_step_stats", True)
 
-        # Update per-request rolling difficulty state (used by higher-level schedulers/policies).
-        try:
-            beta = float(os.environ.get("SGLANG_DFLASH_REQ_EMA_BETA") or "0.9")
-        except Exception:
-            beta = 0.9
-        for req, a_len in zip(batch.reqs, accept_length_per_req_cpu, strict=True):
-            st = getattr(req, "dflash_difficulty_state", None)
-            if st is None:
-                st = DFlashReqDifficultyState()
-                setattr(req, "dflash_difficulty_state", st)
+        log_every = int((os.environ.get("SGLANG_DFLASH_LOG_EVERY") or "0").strip() or 0)
+        if log_every > 0 and self.tp_rank == 0 and (self._verify_step % log_every) == 0:
             try:
-                st.update(accept_len=int(a_len), verify_ct=int(getattr(req, "spec_verify_ct", 0)), ema_beta=float(beta))
+                mean_acc = float(num_accepted_tokens) / float(max(1, len(accept_length_per_req_cpu)))
             except Exception:
-                pass
+                mean_acc = -1.0
+            logger.info(
+                "DFLASH verify stats: step=%s bs=%s accept_mean=%.3f accept_sum=%s commit_lens=%s",
+                self._verify_step,
+                batch.batch_size(),
+                mean_acc,
+                num_accepted_tokens,
+                commit_lens.detach().to("cpu", non_blocking=True).tolist()
+                if hasattr(commit_lens, "detach")
+                else commit_lens,
+            )
 
         return GenerationBatchResult(
             logits_output=logits_output,
