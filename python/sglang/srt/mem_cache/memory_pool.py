@@ -27,9 +27,8 @@ KVCache actually holds the physical kv cache.
 import abc
 import dataclasses
 import logging
-import os
 from contextlib import contextmanager, nullcontext
-from dataclasses import dataclass, fields
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
 
 import numpy as np
@@ -100,7 +99,7 @@ def _set_kv_buffer_impl(
     same_kv_dim: bool = True,
 ) -> None:
     row_bytes = row_dim * store_dtype.itemsize
-    if (_is_cuda or _is_hip) and same_kv_dim and can_use_store_cache(row_bytes):
+    if _is_cuda and same_kv_dim and can_use_store_cache(row_bytes):
         return store_cache(
             k.view(-1, row_dim),
             v.view(-1, row_dim),
@@ -154,18 +153,16 @@ class ReqToTokenPool:
         return len(self.free_slots)
 
     def alloc(self, reqs: list[Req]) -> Optional[List[int]]:
-        # Indices of reqs that already have a req_pool_idx and will reuse
-        # their existing slot (e.g. chunked prefill continuing across chunks).
-        reusing = [i for i, r in enumerate(reqs) if r.req_pool_idx is not None]
+        chunked = [i for i, r in enumerate(reqs) if r.req_pool_idx is not None]
         if not any(r.is_dllm() for r in reqs):
             assert (
-                sum(1 for i in reusing if reqs[i].is_chunked > 0) <= 1
+                len(chunked) <= 1
             ), "only one chunked request may reuse req_pool_idx in a batch"
         assert all(
-            reqs[i].is_chunked > 0 or reqs[i].kv_committed_len > 0 for i in reusing
-        ), "reusing request must be chunked or have committed KV"
+            reqs[i].is_chunked > 0 or reqs[i].kv_committed_len > 0 for i in chunked
+        ), "request has req_pool_idx but is not chunked"
 
-        need_size = len(reqs) - len(reusing)
+        need_size = len(reqs) - len(chunked)
         if need_size > len(self.free_slots):
             return None
         select_index = self.free_slots[:need_size]
@@ -194,15 +191,11 @@ class MambaPool:
 
         def at_layer_idx(self, layer: int):
             kwargs = {}
-            # Use fields instead of vars to avoid torch.compile graph break
-            for f in fields(self):
-                name = f.name
-                v = getattr(self, name)
-                if name in ("conv", "intermediate_conv_window"):
-                    kwargs[name] = [conv[layer] for conv in v]
+            for k, v in vars(self).items():
+                if k == "conv" or k == "intermediate_conv_window":
+                    kwargs[k] = [conv[layer] for conv in v]
                 else:
-                    kwargs[name] = v[layer]
-
+                    kwargs[k] = v[layer]
             return type(self)(**kwargs)
 
         def mem_usage_bytes(self):
@@ -344,18 +337,10 @@ class MambaPool:
 
         select_index = self.free_slots[:need_size]
         self.free_slots = self.free_slots[need_size:]
-        # clear at alloc time — expand a scalar GPU zero to the right shape, no CPU-GPU sync
+        # clear at alloc time, fill allocated slots with zeros
         for i in range(len(self.mamba_cache.conv)):
-            t = self.mamba_cache.conv[i]
-            z = torch.zeros(1, dtype=t.dtype, device=t.device).expand(
-                t.shape[0], need_size, *t.shape[2:]
-            )
-            t[:, select_index] = z
-        t = self.mamba_cache.temporal
-        z = torch.zeros(1, dtype=t.dtype, device=t.device).expand(
-            t.shape[0], need_size, *t.shape[2:]
-        )
-        t[:, select_index] = z
+            self.mamba_cache.conv[i][:, select_index] = 0
+        self.mamba_cache.temporal[:, select_index] = 0
 
         return select_index
 
@@ -381,7 +366,7 @@ class MambaPool:
 
     def fork_from(self, src_index: torch.Tensor) -> Optional[torch.Tensor]:
         dst_index = self.alloc(1)
-        if dst_index is None:
+        if dst_index == None:
             return None
         self.copy_from(src_index, dst_index)
         return dst_index
@@ -458,7 +443,6 @@ class HybridReqToTokenPool(ReqToTokenPool):
         cache_params: BaseLinearStateParams,
         enable_mamba_extra_buffer: bool,
         speculative_num_draft_tokens: int = None,
-        enable_overlap_schedule: bool = True,
     ):
         super().__init__(
             size=size,
@@ -466,8 +450,9 @@ class HybridReqToTokenPool(ReqToTokenPool):
             device=device,
             enable_memory_saver=enable_memory_saver,
         )
-
-        self.mamba_ping_pong_track_buffer_size = 2 if enable_overlap_schedule else 1
+        self.mamba_ping_pong_track_buffer_size = (
+            2 if speculative_num_draft_tokens is None else 1
+        )
         self.enable_mamba_extra_buffer = enable_mamba_extra_buffer
         self.enable_memory_saver = enable_memory_saver
         self._init_mamba_pool(
@@ -518,8 +503,8 @@ class HybridReqToTokenPool(ReqToTokenPool):
         if select_index is None:
             return None
 
-        mamba_indices: list[torch.Tensor] = []
-        mamba_ping_pong_track_buffers: list[torch.Tensor] = []
+        mamba_index = []
+        mamba_ping_pong_track_buffer_list = []
         for req in reqs:
             mid = None
             if req.mamba_pool_idx is not None:  # for radix cache
@@ -531,7 +516,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
                 ), f"Not enough space for mamba cache, try to increase --mamba-full-memory-ratio or --max-mamba-cache-size. {mid=}, {self.mamba_pool.size=}, {self.mamba_pool.available_size()=}, {len(reqs)=}"
                 mid = mid[0]
                 req.mamba_pool_idx = mid
-            mamba_indices.append(mid)
+            mamba_index.append(mid)
             if self.enable_mamba_extra_buffer:
                 if req.mamba_ping_pong_track_buffer is None:
                     req.mamba_ping_pong_track_buffer = self.mamba_pool.alloc(
@@ -541,22 +526,26 @@ class HybridReqToTokenPool(ReqToTokenPool):
                         req.mamba_ping_pong_track_buffer is not None
                     ), "Not enough space for mamba ping pong idx, try to increase --mamba-full-memory-ratio."
                     req.mamba_next_track_idx = 0
-                mamba_ping_pong_track_buffers.append(req.mamba_ping_pong_track_buffer)
+                mamba_ping_pong_track_buffer_list.append(
+                    req.mamba_ping_pong_track_buffer.tolist()
+                )
         assert len(select_index) == len(
-            mamba_indices
+            mamba_index
         ), f"Not enough space for mamba cache, try to increase --mamba-full-memory-ratio or --max-mamba-cache-size."
         if self.enable_mamba_extra_buffer:
             assert len(select_index) == len(
-                mamba_ping_pong_track_buffers
+                mamba_ping_pong_track_buffer_list
             ), f"Not enough space for mamba ping pong idx, try to increase --mamba-full-memory-ratio."
-        mamba_index_tensor = torch.stack(mamba_indices).to(dtype=torch.int32)
-        self.req_index_to_mamba_index_mapping[select_index] = mamba_index_tensor
+        self.req_index_to_mamba_index_mapping[select_index] = torch.tensor(
+            mamba_index, dtype=torch.int32, device=self.device
+        )
         if self.enable_mamba_extra_buffer:
-            ping_pong_tensor = torch.stack(mamba_ping_pong_track_buffers).to(
-                dtype=torch.int32
-            )
             self.req_index_to_mamba_ping_pong_track_buffer_mapping[select_index] = (
-                ping_pong_tensor
+                torch.tensor(
+                    mamba_ping_pong_track_buffer_list,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
             )
         return select_index
 
@@ -593,28 +582,11 @@ class HybridReqToTokenPool(ReqToTokenPool):
                     0,
                     1,
                 ], f"mamba_ping_pong_track_buffer_to_keep must be 0 or 1, {mamba_ping_pong_track_buffer_to_keep=}"
-                # Avoid Python-list advanced indexing on a device tensor.
-                # The ping-pong buffer size is either 2 (normal) or 1 (spec decode).
-                if self.mamba_ping_pong_track_buffer_size == 2:
-                    idx_to_free = 1 - mamba_ping_pong_track_buffer_to_keep
-                    mamba_ping_pong_track_buffer_to_free = (
-                        mamba_ping_pong_track_buffer_to_free[
-                            idx_to_free : idx_to_free + 1
-                        ]
-                    )
-                else:
-                    assert self.mamba_ping_pong_track_buffer_size == 1, (
-                        f"Unexpected mamba_ping_pong_track_buffer_size="
-                        f"{self.mamba_ping_pong_track_buffer_size}"
-                    )
-                    assert mamba_ping_pong_track_buffer_to_keep == 0, (
-                        "mamba_ping_pong_track_buffer_to_keep must be 0 when "
-                        "mamba_ping_pong_track_buffer_size is 1"
-                    )
-                    # Keep the only slot, so free nothing.
-                    mamba_ping_pong_track_buffer_to_free = (
-                        mamba_ping_pong_track_buffer_to_free[0:0]
-                    )
+                idx_to_free = list(range(self.mamba_ping_pong_track_buffer_size))
+                idx_to_free.remove(mamba_ping_pong_track_buffer_to_keep)
+                mamba_ping_pong_track_buffer_to_free = (
+                    mamba_ping_pong_track_buffer_to_free[idx_to_free]
+                )
             self.mamba_pool.free(mamba_ping_pong_track_buffer_to_free)
 
     def clear(self):
@@ -990,201 +962,11 @@ class MHATokenToKVPool(KVCache):
             layer_id = layer_id_override
         else:
             layer_id = layer.layer_id
-
-        # When using hybrid KV pools (e.g. SWA/full split), callers may pass a
-        # pool-local `layer_id_override` for buffer indexing. For FP8 KV scale
-        # dumping/loading we must always key scales by the *global* layer_id so
-        # `--quantization-param-path` files can be applied consistently.
-        global_layer_id = int(layer.layer_id) if layer is not None else int(layer_id)
-
-        # Optional: dump FP8-e4m3 KV cache scales by *probing* a BF16 run.
-        # This avoids having to run an unstable FP8-e4m3 server with missing scales.
-        dump_from_bf16 = (
-            (os.environ.get("SGLANG_FP8_KV_SCALE_DUMP_FROM_BF16") or "")
-            .strip()
-            .lower()
-            in ("1", "true", "yes")
-        )
-        dump_min_tokens_env = (os.environ.get("SGLANG_FP8_KV_SCALE_DUMP_MIN_TOKENS") or "").strip()
-        try:
-            dump_min_tokens = int(dump_min_tokens_env) if dump_min_tokens_env else 128
-        except Exception:
-            dump_min_tokens = 128
-        if dump_min_tokens < 1:
-            dump_min_tokens = 1
-        if (
-            dump_from_bf16
-            and layer is not None
-            and not bool(getattr(layer, "_fp8_kv_scale_dumped_from_bf16", False))
-            and (cache_k.size(0) if cache_k.ndim >= 1 else 0) >= dump_min_tokens
-            and cache_k.dtype == self.dtype
-            and self.dtype in (torch.bfloat16, torch.float16)
-        ):
-            try:
-                max_fp8 = float(torch.finfo(torch.float8_e4m3fn).max)
-                with torch.no_grad():
-                    if cache_k.ndim == 3 and cache_v.ndim == 3 and cache_k.shape[1] == cache_v.shape[1]:
-                        amax_k_h = cache_k.detach().abs().nan_to_num(0.0).amax(dim=(0, 2)).to(torch.float32)
-                        amax_v_h = cache_v.detach().abs().nan_to_num(0.0).amax(dim=(0, 2)).to(torch.float32)
-                        amax = torch.maximum(amax_k_h.max(), amax_v_h.max())
-                    else:
-                        amax_k = cache_k.detach().abs().nan_to_num(0.0).amax()
-                        amax_v = cache_v.detach().abs().nan_to_num(0.0).amax()
-                        amax = torch.maximum(amax_k, amax_v).to(torch.float32)
-                    scale = (amax / (max_fp8 * 0.95)).clamp(min=1e-6)
-                    scale_f = float(scale.item())
-                from sglang.srt.utils.kv_scale_dump import record_kv_scale
-
-                record_kv_scale(global_layer_id, scale_f)
-                layer._fp8_kv_scale_dumped_from_bf16 = True
-            except Exception:
-                # Never let debug dumping affect inference.
-                pass
         if cache_k.dtype != self.dtype:
-            # If FP8 KV cache is enabled but the model didn't provide scaling factors
-            # (common for non-quantized checkpoints), defaulting to scale=1.0 can
-            # cause severe numeric drift (and kills speculative accept_len).
-            #
-            # Best-effort auto-calibration: compute a per-layer per-tensor scale
-            # once, on first write, and reuse it for the rest of the process.
-            # This keeps the KV cache internally consistent (a fixed scale is
-            # required because we do not store per-token scales).
-            force_auto_scale = (
-                (os.environ.get("SGLANG_FP8_FORCE_AUTO_KV_SCALE") or "")
-                .strip()
-                .lower()
-                in ("1", "true", "yes")
-            )
-            # IMPORTANT: KV cache scales must be fixed for the entire process (we do not store
-            # per-token scales). Recomputing scales on every write will corrupt previously
-            # stored tokens (old tokens were quantized with old scales, but reads would use
-            # new scales). Therefore, any auto-calibration must run at most once per layer.
-            already_calibrated = bool(getattr(layer, "_fp8_kv_scale_calibrated", False))
-            need_auto_scale = (
-                (k_scale is None or v_scale is None)
-                or (force_auto_scale and not already_calibrated)
-                or (
-                    force_auto_scale
-                    and (getattr(layer, "k_scale_float", None) in (None, 1.0))
-                    and (getattr(layer, "v_scale_float", None) in (None, 1.0))
-                )
-            )
-            if (
-                need_auto_scale
-                and self.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
-                and layer is not None
-                and not already_calibrated
-            ):
-                # Best-effort scales for FP8 KV cache. For FA3, per-head scales can
-                # significantly reduce quantization error vs a single global scale.
-                # Add headroom to reduce the chance of later clipping.
-                max_fp8 = float(torch.finfo(self.dtype).max)
-                scale_mult_env = (os.environ.get("SGLANG_FP8_KV_SCALE_MULT") or "").strip()
-                try:
-                    scale_mult = float(scale_mult_env) if scale_mult_env else 1.0
-                except Exception:
-                    scale_mult = 1.0
-                if not (scale_mult > 0.0):
-                    scale_mult = 1.0
-                with torch.no_grad():
-                    if cache_k.ndim == 3 and cache_v.ndim == 3 and cache_k.shape[1] == cache_v.shape[1]:
-                        # cache_{k,v}: [num_tokens, num_kv_heads, head_dim]
-                        # scale_{k,v}_h: [num_kv_heads]
-                        amax_k_h = cache_k.detach().abs().amax(dim=(0, 2)).to(torch.float32)
-                        amax_v_h = cache_v.detach().abs().amax(dim=(0, 2)).to(torch.float32)
-                        scale_k_h = (amax_k_h / (max_fp8 * 0.95)).clamp(min=1e-6) * scale_mult
-                        scale_v_h = (amax_v_h / (max_fp8 * 0.95)).clamp(min=1e-6) * scale_mult
-
-                        k_scale_vec = scale_k_h.to(device=cache_k.device, dtype=torch.float32)
-                        v_scale_vec = scale_v_h.to(device=cache_k.device, dtype=torch.float32)
-
-                        # Keep scalar fallbacks for backends that only support a single scale.
-                        k_scale_scalar = k_scale_vec.max()
-                        v_scale_scalar = v_scale_vec.max()
-
-                        layer.k_scale_vec = k_scale_vec
-                        layer.v_scale_vec = v_scale_vec
-
-                        # 0-dim tensors for `.expand(...)` and scalar-only kernels.
-                        try:
-                            if getattr(layer, "k_scale", None) is not None:
-                                layer.k_scale.copy_(k_scale_scalar)  # type: ignore[attr-defined]
-                            else:
-                                layer.k_scale = k_scale_scalar
-                        except Exception:
-                            layer.k_scale = k_scale_scalar
-                        try:
-                            if getattr(layer, "v_scale", None) is not None:
-                                layer.v_scale.copy_(v_scale_scalar)  # type: ignore[attr-defined]
-                            else:
-                                layer.v_scale = v_scale_scalar
-                        except Exception:
-                            layer.v_scale = v_scale_scalar
-                        layer.k_scale_float = float(k_scale_scalar.item())
-                        layer.v_scale_float = float(v_scale_scalar.item())
-
-                        # Use per-head scales for this write.
-                        k_scale = k_scale_vec
-                        v_scale = v_scale_vec
-                    else:
-                        # Fallback: one global scale shared across K/V.
-                        amax_k = cache_k.detach().abs().amax()
-                        amax_v = cache_v.detach().abs().amax()
-                        amax = torch.maximum(amax_k, amax_v).to(torch.float32)
-                        # scale = amax / (max_fp8 * 0.95). Clamp to avoid div-by-0.
-                        scale = (amax / (max_fp8 * 0.95)).clamp(min=1e-6) * scale_mult
-                        # Store as 0-dim tensors so `.expand(...)` works in FA3 backend.
-                        scale_t = scale.to(device=cache_k.device, dtype=torch.float32)
-                        try:
-                            if getattr(layer, "k_scale", None) is not None:
-                                layer.k_scale.copy_(scale_t)  # type: ignore[attr-defined]
-                            else:
-                                layer.k_scale = scale_t
-                        except Exception:
-                            layer.k_scale = scale_t
-                        try:
-                            if getattr(layer, "v_scale", None) is not None:
-                                layer.v_scale.copy_(scale_t)  # type: ignore[attr-defined]
-                            else:
-                                layer.v_scale = scale_t
-                        except Exception:
-                            layer.v_scale = scale_t
-                        layer.k_scale_float = float(scale.item())
-                        layer.v_scale_float = float(scale.item())
-                        k_scale = scale_t
-                        v_scale = scale_t
-
-                layer._fp8_kv_scale_calibrated = True
-
-                # Optional: dump the computed per-layer scale to a QuantParamSchema
-                # JSON file for later reuse via --quantization-param-path.
-                try:
-                    from sglang.srt.utils.kv_scale_dump import record_kv_scale
-
-                    record_kv_scale(global_layer_id, layer.k_scale_float)
-                except Exception:
-                    pass
-
             if k_scale is not None:
-                if (
-                    isinstance(k_scale, torch.Tensor)
-                    and k_scale.ndim == 1
-                    and cache_k.ndim == 3
-                    and k_scale.numel() == cache_k.shape[1]
-                ):
-                    cache_k.div_(k_scale.view(1, -1, 1))
-                else:
-                    cache_k.div_(k_scale)
+                cache_k.div_(k_scale)
             if v_scale is not None:
-                if (
-                    isinstance(v_scale, torch.Tensor)
-                    and v_scale.ndim == 1
-                    and cache_v.ndim == 3
-                    and v_scale.numel() == cache_v.shape[1]
-                ):
-                    cache_v.div_(v_scale.view(1, -1, 1))
-                else:
-                    cache_v.div_(v_scale)
+                cache_v.div_(v_scale)
             cache_k = cache_k.to(self.dtype)
             cache_v = cache_v.to(self.dtype)
 
@@ -2092,10 +1874,8 @@ class NSATokenToKVPool(MLATokenToKVPool):
     def get_index_k_scale_buffer(
         self,
         layer_id: int,
-        seq_len_tensor: torch.Tensor,
+        seq_len: int,
         page_indices: torch.Tensor,
-        seq_len_sum: int,
-        max_seq_len: int,
     ):
         """
         Fused method to get both index K and scale data in a single call using Triton.
@@ -2110,12 +1890,7 @@ class NSATokenToKVPool(MLATokenToKVPool):
         """
         buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
         return index_buf_accessor.GetKAndS.execute(
-            self,
-            buf,
-            page_indices=page_indices,
-            seq_len_tensor=seq_len_tensor,
-            seq_len_sum=seq_len_sum,
-            max_seq_len=max_seq_len,
+            self, buf, seq_len=seq_len, page_indices=page_indices
         )
 
     def set_index_k_scale_buffer(

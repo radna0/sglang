@@ -1890,6 +1890,15 @@ class GptOssForCausalLM(nn.Module):
     def end_layer(self):
         return self.model.end_layer
 
+    def load_kv_cache_scales(self, quantization_param_path: str) -> None:
+        logger.warning(
+            "Ignoring KV scale file for GPT-OSS FP8 path: %s. "
+            "The current GPT-OSS KV-scale loader is disabled because it is "
+            "numerically unstable in the validated DFlash FP8 serving path.",
+            quantization_param_path,
+        )
+        return
+
     def _get_default_weight_mapping(self):
         """Generate default weight name mapping for GptOss safetensors."""
         weight_mapping = {}
