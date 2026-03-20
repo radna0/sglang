@@ -326,6 +326,15 @@ class DFlashDraftModel(nn.Module):
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
+    def load_kv_cache_scales(self, quantization_param_path: str) -> None:
+        logger.warning(
+            "Ignoring KV scale file for DFlash draft FP8 path: %s. "
+            "The validated production path keeps draft KV in BF16 and does not "
+            "use GPT-OSS KV-scale files for the draft model.",
+            quantization_param_path,
+        )
+        return
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, weight_name, shard_id)
