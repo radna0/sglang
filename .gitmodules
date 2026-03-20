@@ -1,0 +1,9 @@
+[submodule "3rdparty/flashmla"]
+	path = 3rdparty/flashmla
+	url = https://github.com/meituan-longcat/FlashMLA.git
+[submodule "3rdparty/flashmla-fp8"]
+	path = 3rdparty/flashmla-fp8
+	url = https://github.com/meituan-longcat/FlashMLA.git
+[submodule "3rdparty/flashmla-swap"]
+	path = 3rdparty/flashmla-swap
+	url = https://github.com/meituan-longcat/FlashMLA.git
