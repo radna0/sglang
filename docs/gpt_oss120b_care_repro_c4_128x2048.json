@@ -1,0 +1,14 @@
+{
+  "sources": [
+    {
+      "name": "c4_repro",
+      "kind": "hf",
+      "path": "allenai/c4",
+      "config_name": "en",
+      "split": "train",
+      "streaming": true,
+      "text_field": "text",
+      "max_sequences": 128
+    }
+  ]
+}

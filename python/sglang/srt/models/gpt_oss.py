@@ -49,6 +49,7 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
+    ColumnParallelLinear,
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
@@ -362,6 +363,322 @@ class GptOssAttention(nn.Module):
         return self.forward_core(s)
 
 
+class GptOssMLAAttention(nn.Module):
+    def __init__(
+        self,
+        config: GptOssConfig,
+        hidden_size: int,
+        num_heads: int,
+        kv_lora_rank: Optional[int] = None,
+        layer_id: int = 0,
+        rope_theta: float = 10000,
+        rope_scaling: Optional[Dict[str, Any]] = None,
+        max_position_embeddings: int = 8192,
+        head_dim: Optional[int] = None,
+        attention_bias: bool = False,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+        sliding_window_size: int = -1,
+        layer_type: str = "",
+        params_dtype: torch.dtype = torch.bfloat16,
+    ) -> None:
+        super().__init__()
+        self.layer_id = layer_id
+        self.hidden_size = hidden_size
+        self.sliding_window_size = sliding_window_size
+        self.qk_nope_head_dim = int(getattr(config, "qk_nope_head_dim"))
+        self.qk_rope_head_dim = int(getattr(config, "qk_rope_head_dim"))
+        self.qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
+        self.v_head_dim = int(getattr(config, "v_head_dim"))
+        self.total_mla_rope_num_kv_heads = int(
+            getattr(config, "mla_rope_num_kv_heads", 1)
+        )
+
+        attn_tp_rank = get_attention_tp_rank()
+        attn_tp_size = get_attention_tp_size()
+
+        self.total_num_heads = num_heads
+        assert self.total_num_heads % attn_tp_size == 0
+        self.num_heads = self.total_num_heads // attn_tp_size
+        if self.total_mla_rope_num_kv_heads < 1:
+            raise ValueError(
+                f"mla_rope_num_kv_heads must be >= 1, got {self.total_mla_rope_num_kv_heads}"
+            )
+        self.use_native_mha_anchor = bool(
+            getattr(config, "mla_attention_mode", None) == "mha_explicit"
+            or self.total_mla_rope_num_kv_heads > 1
+        )
+        if self.total_num_heads % self.total_mla_rope_num_kv_heads != 0:
+            raise ValueError(
+                f"num_attention_heads={self.total_num_heads} is not divisible by "
+                f"mla_rope_num_kv_heads={self.total_mla_rope_num_kv_heads}"
+            )
+        self.query_heads_per_rope_kv = (
+            self.total_num_heads // self.total_mla_rope_num_kv_heads
+        )
+        self.global_q_head_start = attn_tp_rank * self.num_heads
+        self.global_q_head_end = self.global_q_head_start + self.num_heads
+        if self.use_native_mha_anchor and (
+            self.global_q_head_start % self.query_heads_per_rope_kv != 0
+            or self.global_q_head_end % self.query_heads_per_rope_kv != 0
+        ):
+            raise ValueError(
+                "GPT-OSS native MLA MHA-mode requires attention TP shards to align "
+                "with rope-KV head groups."
+            )
+        if self.use_native_mha_anchor:
+            self.local_rope_head_start = (
+                self.global_q_head_start // self.query_heads_per_rope_kv
+            )
+            self.local_rope_head_end = (
+                self.global_q_head_end // self.query_heads_per_rope_kv
+            )
+            self.mla_rope_num_kv_heads = (
+                self.local_rope_head_end - self.local_rope_head_start
+            )
+        else:
+            self.local_rope_head_start = 0
+            self.local_rope_head_end = 1
+            self.mla_rope_num_kv_heads = 1
+        self.head_dim = head_dim or hidden_size // self.total_num_heads
+        if kv_lora_rank is None:
+            kv_lora_rank = int(getattr(config, "kv_lora_rank"))
+        self.kv_lora_rank = int(kv_lora_rank)
+        self.scaling = self.qk_head_dim**-0.5
+        self.rope_theta = rope_theta
+        self.max_position_embeddings = max_position_embeddings
+
+        self.q_proj = ColumnParallelLinear(
+            hidden_size,
+            self.total_num_heads * self.qk_head_dim,
+            bias=attention_bias,
+            quant_config=quant_config,
+            prefix=add_prefix("q_proj", prefix),
+            tp_rank=attn_tp_rank,
+            tp_size=attn_tp_size,
+            params_dtype=params_dtype,
+        )
+        self.kv_a_proj_with_mqa = ReplicatedLinear(
+            hidden_size,
+            self.kv_lora_rank
+            + self.total_mla_rope_num_kv_heads * self.qk_rope_head_dim,
+            bias=attention_bias,
+            quant_config=quant_config,
+            prefix=add_prefix("kv_a_proj_with_mqa", prefix),
+            params_dtype=params_dtype,
+        )
+        self.kv_b_proj = ColumnParallelLinear(
+            self.kv_lora_rank,
+            self.total_num_heads * (self.qk_nope_head_dim + self.v_head_dim),
+            bias=False,
+            quant_config=quant_config,
+            prefix=add_prefix("kv_b_proj", prefix),
+            tp_rank=attn_tp_rank,
+            tp_size=attn_tp_size,
+            params_dtype=params_dtype,
+        )
+
+        attn_backend = get_global_server_args().attention_backend
+        sinks_dtype = torch.float32 if attn_backend == "trtllm_mha" else torch.bfloat16
+        self.sinks = nn.Parameter(
+            torch.zeros(self.num_heads, dtype=sinks_dtype), requires_grad=False
+        )
+
+        self.o_proj = RowParallelLinear(
+            self.total_num_heads * self.v_head_dim,
+            hidden_size,
+            bias=attention_bias,
+            quant_config=quant_config,
+            tp_rank=attn_tp_rank,
+            tp_size=attn_tp_size,
+            reduce_results=False,
+            params_dtype=params_dtype,
+            prefix=add_prefix("o_proj", prefix),
+        )
+
+        self.rotary_emb = (
+            get_rope(
+                self.qk_rope_head_dim,
+                rotary_dim=self.qk_rope_head_dim,
+                max_position=max_position_embeddings,
+                base=rope_theta,
+                rope_scaling=rope_scaling,
+            )
+            if self.qk_rope_head_dim > 0
+            else None
+        )
+
+        assert layer_type in {"sliding_attention", "full_attention"}
+        use_sliding_window = layer_type == "sliding_attention"
+        if self.use_native_mha_anchor:
+            self.attn = RadixAttention(
+                self.num_heads,
+                self.qk_head_dim,
+                self.scaling,
+                num_kv_heads=self.num_heads,
+                layer_id=layer_id,
+                prefix=add_prefix("attn", prefix),
+                v_head_dim=self.v_head_dim,
+                sliding_window_size=(
+                    sliding_window_size if use_sliding_window else -1
+                ),
+            )
+        else:
+            self.attn = RadixAttention(
+                self.num_heads,
+                self.kv_lora_rank + self.qk_rope_head_dim,
+                self.scaling,
+                num_kv_heads=1,
+                layer_id=layer_id,
+                prefix=add_prefix("attn", prefix),
+                v_head_dim=self.kv_lora_rank,
+                sliding_window_size=(
+                    sliding_window_size if use_sliding_window else -1
+                ),
+            )
+
+        self.w_kc = None
+        self.w_vc = None
+
+    def _ensure_postprocessed_weights(self) -> None:
+        if self.w_kc is not None and self.w_vc is not None:
+            return
+        if not hasattr(self, "kv_b_proj"):
+            raise RuntimeError(
+                "GptOssMLAAttention weights not post-processed and kv_b_proj is unavailable."
+            )
+        w_kc, w_vc = self.kv_b_proj.weight.unflatten(
+            0, (-1, self.qk_nope_head_dim + self.v_head_dim)
+        ).split([self.qk_nope_head_dim, self.v_head_dim], dim=1)
+        self.w_kc = w_kc.contiguous()
+        self.w_vc = w_vc.contiguous().transpose(1, 2)
+        del self.kv_b_proj
+
+    def _prepare_q_pe(
+        self, positions: torch.Tensor, q_pe: torch.Tensor, k_pe: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self.rotary_emb is None:
+            return q_pe, k_pe
+        if q_pe.shape[0] == 0:
+            return q_pe, k_pe
+        q_shape = q_pe.shape
+        k_shape = k_pe.shape
+        q_pe, k_pe = self.rotary_emb(
+            positions,
+            q_pe.reshape(-1, q_shape[1] * q_shape[2]),
+            k_pe.reshape(-1, k_shape[1] * k_shape[2]),
+        )
+        return q_pe.view(q_shape), k_pe.view(k_shape)
+
+    def _expand_local_k_rope(self, k_rope: torch.Tensor) -> torch.Tensor:
+        if self.mla_rope_num_kv_heads == self.num_heads:
+            return k_rope
+        repeat_factor = self.num_heads // self.mla_rope_num_kv_heads
+        return k_rope.repeat_interleave(repeat_factor, dim=1)
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        if hidden_states.shape[0] == 0:
+            return hidden_states
+
+        self._ensure_postprocessed_weights()
+
+        q = self.q_proj(hidden_states)[0].view(-1, self.num_heads, self.qk_head_dim)
+        latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
+
+        if self.use_native_mha_anchor:
+            kv_latent = latent_cache[..., : self.kv_lora_rank]
+            q_nope = q[..., : self.qk_nope_head_dim]
+            q_pe = q[..., self.qk_nope_head_dim :]
+            k_pe_all = latent_cache[..., self.kv_lora_rank :]
+            k_pe_all = k_pe_all.view(
+                -1,
+                self.total_mla_rope_num_kv_heads,
+                self.qk_rope_head_dim,
+            )
+            k_pe = k_pe_all[
+                :, self.local_rope_head_start : self.local_rope_head_end, :
+            ].contiguous()
+
+            if self.qk_rope_head_dim > 0:
+                q_pe, k_pe = self._prepare_q_pe(positions, q_pe, k_pe)
+                k_pe = self._expand_local_k_rope(k_pe)
+
+            k_nope = torch.einsum("tr,hdr->thd", kv_latent, self.w_kc)
+            value_states = torch.einsum("tr,hrv->thv", kv_latent, self.w_vc)
+            key_states = (
+                torch.cat((k_nope, k_pe), dim=-1)
+                if self.qk_rope_head_dim > 0
+                else k_nope
+            )
+            query_states = (
+                torch.cat((q_nope, q_pe), dim=-1)
+                if self.qk_rope_head_dim > 0
+                else q_nope
+            )
+
+            attn_dtype = getattr(
+                getattr(forward_batch, "token_to_kv_pool", None), "dtype", None
+            )
+            if attn_dtype is not None and query_states.dtype != attn_dtype:
+                query_states = query_states.to(attn_dtype)
+                key_states = key_states.to(attn_dtype)
+                value_states = value_states.to(attn_dtype)
+
+            attn_output = self.attn(
+                query_states.flatten(1, 2),
+                key_states,
+                value_states,
+                forward_batch,
+                sinks=self.sinks,
+            )
+            output, _ = self.o_proj(attn_output)
+            return output
+
+        q_input = hidden_states.new_zeros(
+            hidden_states.shape[0],
+            self.num_heads,
+            self.kv_lora_rank + self.qk_rope_head_dim,
+        )
+        v_input = latent_cache[..., : self.kv_lora_rank].unsqueeze(1)
+        k_input = latent_cache.unsqueeze(1)
+
+        if self.qk_nope_head_dim > 0:
+            q_nope = q[..., : self.qk_nope_head_dim]
+            q_nope_out = torch.bmm(q_nope.transpose(0, 1), self.w_kc)
+            q_input[..., : self.kv_lora_rank] = q_nope_out.transpose(0, 1)
+
+        if self.qk_rope_head_dim > 0:
+            q_pe = q[..., self.qk_nope_head_dim :]
+            k_pe = k_input[..., self.kv_lora_rank :].clone()
+            q_pe, k_pe = self._prepare_q_pe(positions, q_pe, k_pe)
+            q_input[..., self.kv_lora_rank :] = q_pe
+            k_input[..., self.kv_lora_rank :] = k_pe
+
+        attn_dtype = getattr(getattr(forward_batch, "token_to_kv_pool", None), "dtype", None)
+        if attn_dtype is not None and q_input.dtype != attn_dtype:
+            q_input = q_input.to(attn_dtype)
+
+        attn_output = self.attn(
+            q_input,
+            k_input,
+            v_input,
+            forward_batch,
+            sinks=self.sinks,
+        )
+        attn_output = attn_output.view(-1, self.num_heads, self.kv_lora_rank)
+        if attn_output.dtype != self.w_vc.dtype:
+            attn_output = attn_output.to(self.w_vc.dtype)
+        attn_bmm_output = torch.bmm(attn_output.transpose(0, 1), self.w_vc)
+        attn_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
+        output, _ = self.o_proj(attn_output)
+        return output
+
+
 class GptOssDecoderLayer(nn.Module):
     def __init__(
         self,
@@ -489,6 +806,60 @@ class GptOssDecoderLayer(nn.Module):
             )
 
         return hidden_states, residual
+
+
+class GptOssMLADecoderLayer(GptOssDecoderLayer):
+    def __init__(
+        self,
+        config: GptOssConfig,
+        layer_id: int,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+        sliding_window_size: int | None = None,
+    ) -> None:
+        super().__init__(
+            config=config,
+            layer_id=layer_id,
+            quant_config=quant_config,
+            prefix=prefix,
+            sliding_window_size=sliding_window_size,
+        )
+
+        rope_theta = getattr(config, "rope_theta", 10000)
+        rope_scaling = getattr(config, "rope_scaling", None)
+        max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
+        head_dim = getattr(
+            config, "head_dim", config.hidden_size // config.num_attention_heads
+        )
+        kv_rank_schedule = getattr(config, "kv_lora_rank_per_layer", None)
+        if isinstance(kv_rank_schedule, (list, tuple)) and len(kv_rank_schedule) == int(
+            getattr(config, "num_hidden_layers", 0) or 0
+        ):
+            kv_lora_rank = int(kv_rank_schedule[int(layer_id)])
+        else:
+            kv_lora_rank = int(config.kv_lora_rank)
+
+        self.self_attn = GptOssMLAAttention(
+            config=config,
+            hidden_size=self.hidden_size,
+            num_heads=config.num_attention_heads,
+            kv_lora_rank=kv_lora_rank,
+            layer_id=layer_id,
+            rope_theta=rope_theta,
+            rope_scaling=rope_scaling,
+            max_position_embeddings=max_position_embeddings,
+            head_dim=head_dim,
+            attention_bias=config.attention_bias,
+            # Mirror the stock GPT-OSS attention path: dense attention projections are
+            # instantiated as regular linears even when expert weights use MXFP4.
+            # Passing the MXFP4 quant config into these MLA-specific projections hits an
+            # unsupported LinearBase quant path during model construction.
+            quant_config=None,
+            prefix=add_prefix("self_attn", prefix),
+            sliding_window_size=self.sliding_window_size,
+            layer_type=config.layer_types[layer_id],
+            params_dtype=config.torch_dtype,
+        )
 
 
 class GptOssModel(nn.Module):
@@ -1242,6 +1613,237 @@ class GptOssForCausalLM(nn.Module):
         return get_attention_sliding_window_size(self.config)
 
 
+class GptOssMlaForCausalLM(GptOssForCausalLM):
+    fall_back_to_pt_during_load = False
+
+    def __init__(
+        self,
+        config: GptOssConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ) -> None:
+        nn.Module.__init__(self)
+        self.pp_group = get_pp_group()
+        self.config = config
+        self.quant_config = quant_config
+        self.model = GptOssModel(
+            config,
+            quant_config,
+            prefix=add_prefix("model", prefix),
+            decoder_layer_type=GptOssMLADecoderLayer,
+        )
+        self.lm_head = ParallelLMHead(
+            config.vocab_size,
+            config.hidden_size,
+            prefix=add_prefix("lm_head", prefix),
+            use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+        )
+        self.logits_processor = LogitsProcessor(config)
+        self.capture_aux_hidden_states = False
+
+        self._routed_experts_weights_of_layer = LazyValue(
+            lambda: {
+                layer_id: self.model.layers[layer_id].mlp.get_moe_weights()
+                for layer_id in range(self.start_layer, self.end_layer)
+                if isinstance(self.model.layers[layer_id].mlp, GptOssSparseMoeBlock)
+            }
+        )
+
+    def _get_legacy_weight_mapping(self):
+        weight_mapping = {
+            "embedding.weight": "model.embed_tokens.weight",
+            "unembedding.weight": "lm_head.weight",
+            "norm.scale": "model.norm.weight",
+        }
+        for layer_id in range(self.config.num_hidden_layers):
+            weight_mapping[f"block.{layer_id}.attn.q_proj.weight"] = (
+                f"model.layers.{layer_id}.self_attn.q_proj.weight"
+            )
+            weight_mapping[f"block.{layer_id}.attn.q_proj.bias"] = (
+                f"model.layers.{layer_id}.self_attn.q_proj.bias"
+            )
+            weight_mapping[f"block.{layer_id}.attn.out.weight"] = (
+                f"model.layers.{layer_id}.self_attn.o_proj.weight"
+            )
+            weight_mapping[f"block.{layer_id}.attn.out.bias"] = (
+                f"model.layers.{layer_id}.self_attn.o_proj.bias"
+            )
+            weight_mapping[f"block.{layer_id}.attn.sinks"] = (
+                f"model.layers.{layer_id}.self_attn.sinks"
+            )
+            weight_mapping[f"block.{layer_id}.attn.norm.scale"] = (
+                f"model.layers.{layer_id}.input_layernorm.weight"
+            )
+            weight_mapping[f"block.{layer_id}.mlp.gate.weight"] = (
+                f"model.layers.{layer_id}.mlp.router.weight"
+            )
+            weight_mapping[f"block.{layer_id}.mlp.gate.bias"] = (
+                f"model.layers.{layer_id}.mlp.router.bias"
+            )
+            weight_mapping[f"block.{layer_id}.mlp.norm.scale"] = (
+                f"model.layers.{layer_id}.post_attention_layernorm.weight"
+            )
+            weight_mapping[f"block.{layer_id}.mlp.experts.gate_up_proj"] = (
+                f"model.layers.{layer_id}.mlp.experts.gate_up_proj"
+            )
+            weight_mapping[f"block.{layer_id}.mlp.gate_up_proj_bias"] = (
+                f"model.layers.{layer_id}.mlp.experts.gate_up_proj_bias"
+            )
+            weight_mapping[f"block.{layer_id}.mlp.down_proj"] = (
+                f"model.layers.{layer_id}.mlp.experts.mlp2_weight"
+            )
+            weight_mapping[f"block.{layer_id}.mlp.down_proj_bias"] = (
+                f"model.layers.{layer_id}.mlp.experts.mlp2_bias"
+            )
+        return weight_mapping
+
+    def _maybe_load_absorbed_weight(
+        self, name: str, loaded_weight: torch.Tensor
+    ) -> bool:
+        if not name.startswith("model.layers.") or ".self_attn." not in name:
+            return False
+        if not (name.endswith(".self_attn.w_kc") or name.endswith(".self_attn.w_vc")):
+            return False
+
+        parts = name.split(".")
+        if len(parts) < 5:
+            return False
+        layer_id = int(parts[2])
+        if (
+            hasattr(self.model, "start_layer")
+            and (
+                layer_id < self.model.start_layer
+                or layer_id >= self.model.end_layer
+            )
+        ):
+            return True
+
+        layer = self.model.layers[layer_id]
+        if isinstance(layer, nn.Identity) or isinstance(layer, PPMissingLayer):
+            return True
+
+        self_attn = layer.self_attn
+        attn_tp_rank = get_attention_tp_rank()
+        attn_tp_size = get_attention_tp_size()
+        if loaded_weight.shape[0] % attn_tp_size != 0:
+            raise ValueError(
+                f"Absorbed weight {name} has incompatible head dimension {loaded_weight.shape[0]} "
+                f"for attention tp_size={attn_tp_size}."
+            )
+        heads_per_rank = loaded_weight.shape[0] // attn_tp_size
+        start = attn_tp_rank * heads_per_rank
+        end = start + heads_per_rank
+        target = loaded_weight[start:end].to(
+            device=self_attn.q_proj.weight.device,
+            dtype=self_attn.q_proj.weight.dtype,
+        )
+
+        if name.endswith(".self_attn.w_kc"):
+            self_attn.w_kc = target.contiguous()
+        else:
+            self_attn.w_vc = target.contiguous()
+        return True
+
+    def load_weights(
+        self,
+        weights: Iterable[Tuple[str, torch.Tensor]],
+        is_nextn: bool = False,
+        weight_name_mapping: dict = None,
+    ):
+        if is_nextn:
+            logging.warning(
+                "Loading weights for nextn is currently not supported in GptOssMlaForCausalLM."
+            )
+            return
+
+        weights = _canonicalize_weights(self.config, weights)
+        weights = sorted(weights, key=lambda x: x[0])
+        params_dict = dict(self.named_parameters())
+        legacy_mapping = self._get_legacy_weight_mapping()
+        if weight_name_mapping:
+            legacy_mapping.update(weight_name_mapping)
+
+        for name, loaded_weight in weights:
+            loaded_weight = _WeightCreator.maybe_materialize(loaded_weight)
+
+            if self._maybe_load_absorbed_weight(name, loaded_weight):
+                continue
+
+            if "qkv.weight" in name:
+                q_proj, _, _ = loaded_weight.split(
+                    [
+                        self.config.num_attention_heads * self.config.head_dim,
+                        self.config.num_key_value_heads * self.config.head_dim,
+                        self.config.num_key_value_heads * self.config.head_dim,
+                    ],
+                    dim=0,
+                )
+                loaded_weight = q_proj
+                name = name.replace("qkv.weight", "q_proj.weight")
+            elif "qkv.bias" in name:
+                q_bias, _, _ = loaded_weight.split(
+                    [
+                        self.config.num_attention_heads * self.config.head_dim,
+                        self.config.num_key_value_heads * self.config.head_dim,
+                        self.config.num_key_value_heads * self.config.head_dim,
+                    ],
+                    dim=0,
+                )
+                loaded_weight = q_bias
+                name = name.replace("qkv.bias", "q_proj.bias")
+
+            layer_id = get_layer_id(name)
+            if (
+                layer_id is not None
+                and hasattr(self.model, "start_layer")
+                and (
+                    layer_id < self.model.start_layer
+                    or layer_id >= self.model.end_layer
+                )
+            ):
+                continue
+
+            if "rotary_emb.inv_freq" in name:
+                continue
+
+            target_name = None
+            if name in params_dict:
+                target_name = name
+            elif name in legacy_mapping:
+                target_name = legacy_mapping[name]
+
+            if target_name is None or target_name not in params_dict:
+                continue
+
+            param = params_dict[target_name]
+            if target_name.endswith("sinks"):
+                start = get_attention_tp_rank() * param.numel()
+                param.data.copy_(loaded_weight[start : start + param.numel()])
+                continue
+
+            weight_loader = getattr(param, "weight_loader", default_weight_loader)
+            weight_loader(param, loaded_weight)
+
+    def post_load_weights(self):
+        for layer_id in range(self.config.num_hidden_layers):
+            layer = self.model.layers[layer_id]
+            if isinstance(layer, nn.Identity) or isinstance(layer, PPMissingLayer):
+                continue
+            self_attn = layer.self_attn
+            if self_attn.w_kc is not None and self_attn.w_vc is not None:
+                if hasattr(self_attn, "kv_b_proj"):
+                    del self_attn.kv_b_proj
+                continue
+            if not hasattr(self_attn, "kv_b_proj"):
+                continue
+            w_kc, w_vc = self_attn.kv_b_proj.weight.unflatten(
+                0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
+            ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
+            self_attn.w_kc = w_kc.contiguous()
+            self_attn.w_vc = w_vc.contiguous().transpose(1, 2)
+            del self_attn.kv_b_proj
+
+
 def _canonicalize_weights(config, weights_in: Iterable[Tuple[str, torch.Tensor]]):
     weights_out_dict = dict(weights_in)
 
@@ -1297,4 +1899,4 @@ class _WeightCreator:
         return obj
 
 
-EntryClass = GptOssForCausalLM
+EntryClass = [GptOssForCausalLM, GptOssMlaForCausalLM]

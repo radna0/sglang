@@ -1755,7 +1755,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         ]
                 kv_cache_dtype_req = TORCH_DTYPE_TO_KV_CACHE_STR[self.kv_cache_dtype]
             else:
-                self.kv_cache_dtype = self.dtype
+                # Do not default KV cache to fp16. For GPT-OSS CARE and similar
+                # long-context serving paths, bf16 is the intended default even if
+                # model weights/activations are running in float16.
+                self.kv_cache_dtype = (
+                    torch.bfloat16 if self.dtype == torch.float16 else self.dtype
+                )
                 kv_cache_dtype_req = TORCH_DTYPE_TO_KV_CACHE_STR[self.kv_cache_dtype]
         elif kv_cache_dtype_req == "fp8_e5m2":
             if _is_hip:  # Using natively supported format
@@ -2267,6 +2272,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if self.device == "cpu" and not self.server_args.enable_torch_compile:
             return
 
+        attn_backend_name = type(getattr(self, "attn_backend", None)).__name__
+        if (
+            self.device != "cpu"
+            and getattr(self.model_config, "has_dynamic_mla_kv_lora_rank", lambda: False)()
+            and attn_backend_name == "FlashInferMLAAttnBackend"
+        ):
+            logger.info(
+                "Disable cuda graph for FlashInfer MLA because dynamic per-layer "
+                "kv_lora_rank is not supported by its CUDA-graph path yet."
+            )
+            return
+
         tic = time.perf_counter()
         before_mem = get_available_gpu_memory(self.device, self.gpu_id)
         graph_backend = defaultdict(
@@ -2299,9 +2316,33 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         """Initialize piecewise CUDA graph runner."""
         self.piecewise_cuda_graph_runner = None
 
+        if getattr(self.server_args, "disable_cuda_graph", False):
+            logger.info(
+                "Disable piecewise CUDA graph because --disable-cuda-graph is set"
+            )
+            return
+
+        if getattr(self.server_args, "cuda_graph_mode", None) == "none":
+            logger.info(
+                "Disable piecewise CUDA graph because --cuda-graph-mode none is set"
+            )
+            return
+
         if getattr(self.server_args, "disable_piecewise_cuda_graph", False):
             logger.info(
                 "Disable piecewise CUDA graph because --disable-piecewise-cuda-graph is set"
+            )
+            return
+
+        attn_backend_name = type(getattr(self, "attn_backend", None)).__name__
+        if (
+            self.device != "cpu"
+            and getattr(self.model_config, "has_dynamic_mla_kv_lora_rank", lambda: False)()
+            and attn_backend_name == "FlashInferMLAAttnBackend"
+        ):
+            logger.info(
+                "Disable piecewise CUDA graph for FlashInfer MLA because dynamic per-layer "
+                "kv_lora_rank is not supported by its piecewise capture path yet."
             )
             return
 

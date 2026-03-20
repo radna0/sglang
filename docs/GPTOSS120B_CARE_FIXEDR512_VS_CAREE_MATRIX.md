@@ -1,0 +1,10 @@
+| Task | Metric | Original | CARE-E | CARE-fixed-r512 |
+| --- | --- | --- | --- | --- |
+| arc_easy | acc_norm,none | 0.765993 | 0.258838 | 0.259680 |
+| arc_challenge | acc_norm,none | 0.529010 | pending | pending |
+| hellaswag | acc_norm,none | pending | 0.260108 | 0.262796 |
+| piqa | acc_norm,none | 0.782372 | pending | pending |
+| mmlu | acc,none | pending | 0.256231 | 0.248398 |
+| openbookqa | acc_norm,none | 0.402000 | pending | pending |
+| race | acc,none | 0.282297 | pending | pending |
+| winogrande | acc,none | 0.683504 | pending | pending |

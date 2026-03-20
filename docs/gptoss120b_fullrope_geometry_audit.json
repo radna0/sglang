@@ -1,0 +1,320 @@
+{
+  "converted_config": null,
+  "interpretation": {
+    "current_split_mismatch": "Original GPT-OSS applies RoPE to the full head_dim. Any nonzero qk_nope_head_dim forces some originally-RoPE channels into a non-RoPE path.",
+    "r1024_note": "If r=1024 is already enough to represent the unique noPE+V rows exactly, then remaining error is dominated by attention-geometry mismatch rather than latent-rank shortage.",
+    "shared_rope_mismatch": "The rope slice is forced into a shared path. rope_shared_rel_frob quantifies head-to-head variation in that slice that cannot be preserved by a single shared rope key."
+  },
+  "layers": [
+    {
+      "exact_factorization_at_r1024": true,
+      "layer_id": 0,
+      "nope_head_variation_rel_frob": 0.0,
+      "repeated_factorized_rows": 4096,
+      "rope_shared_rel_frob": 0.9379310344827586,
+      "unique_factorized_rows": 512
+    },
+    {
+      "exact_factorization_at_r1024": true,
+      "layer_id": 1,
+      "nope_head_variation_rel_frob": 0.0,
+      "repeated_factorized_rows": 4096,
+      "rope_shared_rel_frob": 0.9324324324324325,
+      "unique_factorized_rows": 512
+    },
+    {
+      "exact_factorization_at_r1024": true,
+      "layer_id": 2,
+      "nope_head_variation_rel_frob": 0.0,
+      "repeated_factorized_rows": 4096,
+      "rope_shared_rel_frob": 0.9359605911330049,
+      "unique_factorized_rows": 512
+    },
+    {
+      "exact_factorization_at_r1024": true,
+      "layer_id": 3,
+      "nope_head_variation_rel_frob": 0.0,
+      "repeated_factorized_rows": 4096,
+      "rope_shared_rel_frob": 0.9383259911894273,
+      "unique_factorized_rows": 512
+    },
+    {
+      "exact_factorization_at_r1024": true,
+      "layer_id": 4,
+      "nope_head_variation_rel_frob": 0.0,
+      "repeated_factorized_rows": 4096,
+      "rope_shared_rel_frob": 0.935064935064935,
+      "unique_factorized_rows": 512
+    },
+    {
+      "exact_factorization_at_r1024": true,
+      "layer_id": 5,
+      "nope_head_variation_rel_frob": 0.0,
+      "repeated_factorized_rows": 4096,
+      "rope_shared_rel_frob": 0.9378531073446328,
+      "unique_factorized_rows": 512
+    },
+    {
+      "exact_factorization_at_r1024": true,
+      "layer_id": 6,
+      "nope_head_variation_rel_frob": 0.0,
+      "repeated_factorized_rows": 4096,
+      "rope_shared_rel_frob": 0.937037037037037,
+      "unique_factorized_rows": 512
+    },
+    {
+      "exact_factorization_at_r1024": true,
+      "layer_id": 7,
+      "nope_head_variation_rel_frob": 0.0,
+      "repeated_factorized_rows": 4096,
+      "rope_shared_rel_frob": 0.9329268292682927,
+      "unique_factorized_rows": 512
+    },
+    {
+      "exact_factorization_at_r1024": true,
+      "layer_id": 8,
+      "nope_head_variation_rel_frob": 0.0,
+      "repeated_factorized_rows": 4096,
+      "rope_shared_rel_frob": 0.9351145038167938,
+      "unique_factorized_rows": 512
+    },
+    {
+      "exact_factorization_at_r1024": true,
+      "layer_id": 9,
+      "nope_head_variation_rel_frob": 0.0,
+      "repeated_factorized_rows": 4096,
+      "rope_shared_rel_frob": 0.9383886255924171,
+      "unique_factorized_rows": 512
+    },
+    {
+      "exact_factorization_at_r1024": true,
+      "layer_id": 10,
+      "nope_head_variation_rel_frob": 0.0,
+      "repeated_factorized_rows": 4096,
+      "rope_shared_rel_frob": 0.9358974358974359,
+      "unique_factorized_rows": 512
+    },
+    {
+      "exact_factorization_at_r1024": true,
+      "layer_id": 11,
+      "nope_head_variation_rel_frob": 0.0,
+      "repeated_factorized_rows": 4096,
+      "rope_shared_rel_frob": 0.9329608938547486,
+      "unique_factorized_rows": 512
+    },
+    {
+      "exact_factorization_at_r1024": true,
+      "layer_id": 12,
+      "nope_head_variation_rel_frob": 0.0,
+      "repeated_factorized_rows": 4096,
+      "rope_shared_rel_frob": 0.9310344827586207,
+      "unique_factorized_rows": 512
+    },
+    {
+      "exact_factorization_at_r1024": true,
+      "layer_id": 13,
+      "nope_head_variation_rel_frob": 0.0,
+      "repeated_factorized_rows": 4096,
+      "rope_shared_rel_frob": 0.9306930693069307,
+      "unique_factorized_rows": 512
+    },
+    {
+      "exact_factorization_at_r1024": true,
+      "layer_id": 14,
+      "nope_head_variation_rel_frob": 0.0,
+      "repeated_factorized_rows": 4096,
+      "rope_shared_rel_frob": 0.9361702127659575,
+      "unique_factorized_rows": 512
+    },
+    {
+      "exact_factorization_at_r1024": true,
+      "layer_id": 15,
+      "nope_head_variation_rel_frob": 0.0,
+      "repeated_factorized_rows": 4096,
+      "rope_shared_rel_frob": 0.937888198757764,
+      "unique_factorized_rows": 512
+    },
+    {
+      "exact_factorization_at_r1024": true,
+      "layer_id": 16,
+      "nope_head_variation_rel_frob": 0.0,
+      "repeated_factorized_rows": 4096,
+      "rope_shared_rel_frob": 0.9353448275862069,
+      "unique_factorized_rows": 512
+    },
+    {
+      "exact_factorization_at_r1024": true,
+      "layer_id": 17,
+      "nope_head_variation_rel_frob": 0.0,
+      "repeated_factorized_rows": 4096,
+      "rope_shared_rel_frob": 0.9383561643835616,
+      "unique_factorized_rows": 512
+    },
+    {
+      "exact_factorization_at_r1024": true,
+      "layer_id": 18,
+      "nope_head_variation_rel_frob": 0.0,
+      "repeated_factorized_rows": 4096,
+      "rope_shared_rel_frob": 0.9416058394160584,
+      "unique_factorized_rows": 512
+    },
+    {
+      "exact_factorization_at_r1024": true,
+      "layer_id": 19,
+      "nope_head_variation_rel_frob": 0.0,
+      "repeated_factorized_rows": 4096,
+      "rope_shared_rel_frob": 0.9393939393939394,
+      "unique_factorized_rows": 512
+    },
+    {
+      "exact_factorization_at_r1024": true,
+      "layer_id": 20,
+      "nope_head_variation_rel_frob": 0.0,
+      "repeated_factorized_rows": 4096,
+      "rope_shared_rel_frob": 0.9305555555555556,
+      "unique_factorized_rows": 512
+    },
+    {
+      "exact_factorization_at_r1024": true,
+      "layer_id": 21,
+      "nope_head_variation_rel_frob": 0.0,
+      "repeated_factorized_rows": 4096,
+      "rope_shared_rel_frob": 0.9351145038167938,
+      "unique_factorized_rows": 512
+    },
+    {
+      "exact_factorization_at_r1024": true,
+      "layer_id": 22,
+      "nope_head_variation_rel_frob": 0.0,
+      "repeated_factorized_rows": 4096,
+      "rope_shared_rel_frob": 0.932806324110672,
+      "unique_factorized_rows": 512
+    },
+    {
+      "exact_factorization_at_r1024": true,
+      "layer_id": 23,
+      "nope_head_variation_rel_frob": 0.0,
+      "repeated_factorized_rows": 4096,
+      "rope_shared_rel_frob": 0.937007874015748,
+      "unique_factorized_rows": 512
+    },
+    {
+      "exact_factorization_at_r1024": true,
+      "layer_id": 24,
+      "nope_head_variation_rel_frob": 0.0,
+      "repeated_factorized_rows": 4096,
+      "rope_shared_rel_frob": 0.9367816091954023,
+      "unique_factorized_rows": 512
+    },
+    {
+      "exact_factorization_at_r1024": true,
+      "layer_id": 25,
+      "nope_head_variation_rel_frob": 0.0,
+      "repeated_factorized_rows": 4096,
+      "rope_shared_rel_frob": 0.9440559440559441,
+      "unique_factorized_rows": 512
+    },
+    {
+      "exact_factorization_at_r1024": true,
+      "layer_id": 26,
+      "nope_head_variation_rel_frob": 0.0,
+      "repeated_factorized_rows": 4096,
+      "rope_shared_rel_frob": 0.9387755102040817,
+      "unique_factorized_rows": 512
+    },
+    {
+      "exact_factorization_at_r1024": true,
+      "layer_id": 27,
+      "nope_head_variation_rel_frob": 0.0,
+      "repeated_factorized_rows": 4096,
+      "rope_shared_rel_frob": 0.9325153374233128,
+      "unique_factorized_rows": 512
+    },
+    {
+      "exact_factorization_at_r1024": true,
+      "layer_id": 28,
+      "nope_head_variation_rel_frob": 0.0,
+      "repeated_factorized_rows": 4096,
+      "rope_shared_rel_frob": 0.9296296296296296,
+      "unique_factorized_rows": 512
+    },
+    {
+      "exact_factorization_at_r1024": true,
+      "layer_id": 29,
+      "nope_head_variation_rel_frob": 0.0,
+      "repeated_factorized_rows": 4096,
+      "rope_shared_rel_frob": 0.9325842696629213,
+      "unique_factorized_rows": 512
+    },
+    {
+      "exact_factorization_at_r1024": true,
+      "layer_id": 30,
+      "nope_head_variation_rel_frob": 0.0,
+      "repeated_factorized_rows": 4096,
+      "rope_shared_rel_frob": 0.9363057324840764,
+      "unique_factorized_rows": 512
+    },
+    {
+      "exact_factorization_at_r1024": true,
+      "layer_id": 31,
+      "nope_head_variation_rel_frob": 0.0,
+      "repeated_factorized_rows": 4096,
+      "rope_shared_rel_frob": 0.9389671361502347,
+      "unique_factorized_rows": 512
+    },
+    {
+      "exact_factorization_at_r1024": true,
+      "layer_id": 32,
+      "nope_head_variation_rel_frob": 0.0,
+      "repeated_factorized_rows": 4096,
+      "rope_shared_rel_frob": 0.935,
+      "unique_factorized_rows": 512
+    },
+    {
+      "exact_factorization_at_r1024": true,
+      "layer_id": 33,
+      "nope_head_variation_rel_frob": 0.0,
+      "repeated_factorized_rows": 4096,
+      "rope_shared_rel_frob": 0.9341085271317829,
+      "unique_factorized_rows": 512
+    },
+    {
+      "exact_factorization_at_r1024": true,
+      "layer_id": 34,
+      "nope_head_variation_rel_frob": 0.0,
+      "repeated_factorized_rows": 4096,
+      "rope_shared_rel_frob": 0.9298245614035088,
+      "unique_factorized_rows": 512
+    },
+    {
+      "exact_factorization_at_r1024": true,
+      "layer_id": 35,
+      "nope_head_variation_rel_frob": 0.0,
+      "repeated_factorized_rows": 4096,
+      "rope_shared_rel_frob": 0.9345794392523364,
+      "unique_factorized_rows": 512
+    }
+  ],
+  "mla_geometry_under_audit": {
+    "latent_mode": "shared_rope_path_with_per_head_nope_value_projection",
+    "qk_nope_head_dim": 0,
+    "qk_rope_head_dim": 64
+  },
+  "model_path": "/workspace/offload_root/gpt-oss-120b",
+  "original_geometry": {
+    "gpt_oss_original_rope_mode": "full_head_rope",
+    "head_dim": 64,
+    "hidden_size": 2880,
+    "num_attention_heads": 64,
+    "num_key_value_heads": 8,
+    "repeat_factor": 8
+  },
+  "summary": {
+    "max_nope_head_variation_rel_frob": 0.0,
+    "max_rope_shared_rel_frob": 0.9440559440559441,
+    "mean_nope_head_variation_rel_frob": 0.0,
+    "mean_rope_shared_rel_frob": 0.9355275584881932,
+    "r1024_exact_for_nope_plus_value_factorization": true,
+    "unique_factorized_rows_at_r1024": 512
+  }
+}

@@ -674,10 +674,26 @@ class CompressedTensorsConfig(QuantizationConfig):
                     self._is_mxint4a16(weight_quant, input_quant)
                     and get_moe_runner_backend().is_flashinfer_trtllm()
                 ):
-                    logger.info_once(
-                        "Using CompressedTensorsMxInt4MoE with flashinfer_trtllm backend"
+                    if CompressedTensorsMxInt4MoE.__name__ == "CompressedTensorsMxInt4MoE" and hasattr(
+                        CompressedTensorsMxInt4MoE, "__mro__"
+                    ):
+                        logger.info_once(
+                            "Using CompressedTensorsMxInt4MoE with flashinfer_trtllm backend"
+                        )
+                        try:
+                            return CompressedTensorsMxInt4MoE(self)
+                        except RuntimeError as exc:
+                            logger.warning_once(
+                                "MXINT4 MoE path unavailable; fallback to unquantized MoE (%s)",
+                                exc,
+                            )
+                    use_triton_kernels = get_moe_runner_backend().is_triton_kernels()
+                    use_flashinfer_trtllm_moe = (
+                        get_moe_runner_backend().is_flashinfer_trtllm()
                     )
-                    return CompressedTensorsMxInt4MoE(self)
+                    return UnquantizedFusedMoEMethod(
+                        use_triton_kernels, use_flashinfer_trtllm_moe
+                    )
                 elif _is_hip:
                     logger.info_once("Using CompressedTensorsWNA16TritonMoE (ROCm)")
                     return CompressedTensorsWNA16TritonMoE(self)

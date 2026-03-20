@@ -311,6 +311,11 @@ class ServerArgs:
     warmups: Optional[str] = None
     nccl_port: Optional[int] = None
     checkpoint_engine_wait_weights_before_ready: bool = False
+    ssl_keyfile: Optional[str] = None
+    ssl_certfile: Optional[str] = None
+    ssl_ca_certs: Optional[str] = None
+    ssl_keyfile_password: Optional[str] = None
+    enable_ssl_refresh: bool = False
 
     # Quantization and data type
     dtype: str = "auto"
@@ -619,6 +624,7 @@ class ServerArgs:
     enable_mixed_chunk: bool = False
     enable_dp_attention: bool = False
     enable_dp_lm_head: bool = False
+    enable_fused_moe_sum_all_reduce: bool = False
     enable_two_batch_overlap: bool = False
     enable_single_batch_overlap: bool = False
     tbo_token_distribution_threshold: float = 0.48
@@ -729,6 +735,7 @@ class ServerArgs:
 
         # Normalize load balancing defaults early (before dummy-model short-circuit).
         self._handle_load_balance_method()
+        self._handle_ssl_args()
 
         if self.model_path.lower() in ["none", "dummy"]:
             # Skip for dummy models
@@ -1419,6 +1426,7 @@ class ServerArgs:
                 "trtllm_mha",
                 "fa3",
                 "fa4",
+                "flashmla",
                 "ascend",
                 "flex_attention",
                 "flex_attention2",
@@ -2617,6 +2625,7 @@ class ServerArgs:
                 if draft_model_type == "gpt_oss":
                     allowed = {
                         "fa3",
+                        "flashmla",
                         "flex_attention",
                         "flex_attention2",
                         "flex_flash",
@@ -2795,6 +2804,7 @@ class ServerArgs:
                 if draft_model_type == "gpt_oss":
                     allowed = {
                         "fa3",
+                        "flashmla",
                         "flex_attention",
                         "flex_attention2",
                         "flex_flash",
@@ -3570,6 +3580,36 @@ class ServerArgs:
             action="store_true",
             help="If set, the server will wait for initial weights to be loaded via checkpoint-engine or other update methods "
             "before serving inference requests.",
+        )
+        parser.add_argument(
+            "--ssl-keyfile",
+            type=str,
+            default=ServerArgs.ssl_keyfile,
+            help="Path to the SSL private key file for HTTPS serving.",
+        )
+        parser.add_argument(
+            "--ssl-certfile",
+            type=str,
+            default=ServerArgs.ssl_certfile,
+            help="Path to the SSL certificate file for HTTPS serving.",
+        )
+        parser.add_argument(
+            "--ssl-ca-certs",
+            type=str,
+            default=ServerArgs.ssl_ca_certs,
+            help="Optional CA bundle used to verify server warmup/self-check requests when HTTPS is enabled.",
+        )
+        parser.add_argument(
+            "--ssl-keyfile-password",
+            type=str,
+            default=ServerArgs.ssl_keyfile_password,
+            help="Optional password for the SSL private key.",
+        )
+        parser.add_argument(
+            "--enable-ssl-refresh",
+            action="store_true",
+            default=ServerArgs.enable_ssl_refresh,
+            help="Enable SSL certificate/key refresh support. Requires HTTPS to be configured.",
         )
 
         # Quantization and data type
@@ -5176,6 +5216,12 @@ class ServerArgs:
             help="Enable vocabulary parallel across the attention TP group to avoid all-gather across DP groups, optimizing performance under DP attention.",
         )
         parser.add_argument(
+            "--enable-fused-moe-sum-all-reduce",
+            action="store_true",
+            default=ServerArgs.enable_fused_moe_sum_all_reduce,
+            help="Enable fused MoE sum-all-reduce combine path when supported by the MoE kernels.",
+        )
+        parser.add_argument(
             "--enable-two-batch-overlap",
             action="store_true",
             help="Enabling two micro batches to overlap.",
@@ -5677,10 +5723,63 @@ class ServerArgs:
         return cls(**{attr: getattr(args, attr) for attr in attrs})
 
     def url(self):
-        if is_valid_ipv6_address(self.host):
-            return f"http://[{self.host}]:{self.port}"
+        host = self.host or "127.0.0.1"
+        if host == "0.0.0.0":
+            host = "127.0.0.1"
+        scheme = (
+            "https"
+            if getattr(self, "ssl_keyfile", None) and getattr(self, "ssl_certfile", None)
+            else "http"
+        )
+        if is_valid_ipv6_address(host):
+            return f"{scheme}://[{host}]:{self.port}"
         else:
-            return f"http://{self.host}:{self.port}"
+            return f"{scheme}://{host}:{self.port}"
+
+    def ssl_verify(self):
+        if not (
+            getattr(self, "ssl_keyfile", None) and getattr(self, "ssl_certfile", None)
+        ):
+            return True
+        return getattr(self, "ssl_ca_certs", None) or False
+
+    @property
+    def disable_piecewise_cuda_graph(self) -> bool:
+        return bool(
+            getattr(self, "disable_cuda_graph", False)
+            or getattr(self, "cuda_graph_mode", None) == "none"
+            or not getattr(self, "enable_piecewise_cuda_graph", False)
+        )
+
+    def _handle_ssl_args(self):
+        ssl_keyfile = getattr(self, "ssl_keyfile", None)
+        ssl_certfile = getattr(self, "ssl_certfile", None)
+        ssl_ca_certs = getattr(self, "ssl_ca_certs", None)
+        ssl_keyfile_password = getattr(self, "ssl_keyfile_password", None)
+        enable_ssl_refresh = getattr(self, "enable_ssl_refresh", False)
+
+        if ssl_keyfile and not ssl_certfile:
+            raise ValueError("--ssl-keyfile requires --ssl-certfile.")
+        if ssl_certfile and not ssl_keyfile:
+            raise ValueError("--ssl-certfile requires --ssl-keyfile.")
+        if ssl_ca_certs and not ssl_certfile:
+            raise ValueError("--ssl-ca-certs requires --ssl-certfile and --ssl-keyfile.")
+        if ssl_keyfile_password and not ssl_certfile:
+            raise ValueError(
+                "--ssl-keyfile-password requires --ssl-certfile and --ssl-keyfile."
+            )
+        if enable_ssl_refresh and not (ssl_keyfile and ssl_certfile):
+            raise ValueError(
+                "--enable-ssl-refresh requires --ssl-certfile and --ssl-keyfile."
+            )
+
+        for label, path in [
+            ("SSL key file", ssl_keyfile),
+            ("SSL certificate file", ssl_certfile),
+            ("SSL CA certificates file", ssl_ca_certs),
+        ]:
+            if path and not os.path.isfile(path):
+                raise ValueError(f"{label} not found: {path}")
 
     def get_model_config(self):
         # Lazy init to avoid circular import

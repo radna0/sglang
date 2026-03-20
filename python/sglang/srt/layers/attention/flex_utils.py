@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import torch
+import math
 from torch.nn.attention.flex_attention import BlockMask
 
 
@@ -8,6 +9,7 @@ def apply_attention_sinks(
     out: torch.Tensor,
     lse: torch.Tensor,
     sinks: torch.Tensor | None,
+    base: float = math.e,
 ) -> torch.Tensor:
     """
     Apply GPT-OSS attention sinks to a FlexAttention output.
@@ -23,6 +25,9 @@ def apply_attention_sinks(
         out_sink = out * 1 / (1 + sinks[h] * exp(-lse))
 
     where `lse = log(sum_j exp(score_j))`.
+
+    For backends like FlashMLA that use 2-based log-sum-exp, passing `base=2.0`
+    will use `2**(-lse)` instead of `exp(-lse)`.
     """
     if sinks is None:
         return out
@@ -32,17 +37,25 @@ def apply_attention_sinks(
     # sinks: [num_q_heads] (or broadcastable). Keep math in float32 for stability,
     # but return in `out.dtype` to avoid inflating activations.
     sinks_f = sinks.to(dtype=torch.float32).clamp_min(0.0)
-    if sinks_f.ndim == 1:
-        sinks_f = sinks_f.view(1, -1, 1)
-    elif sinks_f.ndim == 2:
-        sinks_f = sinks_f.view(1, sinks_f.shape[-1], 1)
-    else:
-        # Best-effort: rely on broadcasting.
-        sinks_f = sinks_f
 
     lse_f = lse.to(dtype=torch.float32)
-    scale = torch.reciprocal(1.0 + sinks_f * torch.exp(-lse_f)).to(dtype=out.dtype)
-    return out * scale.unsqueeze(-1)
+    if sinks_f.ndim == 1:
+        sinks_f = sinks_f.view(*([1] * max(lse_f.ndim - 1, 0)), sinks_f.shape[0])
+    elif sinks_f.ndim == 2 and lse_f.ndim >= 2:
+        sinks_f = sinks_f.view(*([1] * max(lse_f.ndim - 2, 0)), *sinks_f.shape)
+
+    if base == math.e:
+        scale = torch.reciprocal(1.0 + sinks_f * torch.exp(-lse_f)).to(dtype=out.dtype)
+    elif base == 2.0:
+        scale = torch.reciprocal(1.0 + sinks_f * torch.exp2(-lse_f)).to(dtype=out.dtype)
+    else:
+        scale = torch.reciprocal(
+            1.0 + sinks_f * torch.pow(base, -lse_f)
+        ).to(dtype=out.dtype)
+
+    if scale.ndim == out.ndim - 1:
+        scale = scale.unsqueeze(-1)
+    return out * scale
 
 
 def make_extend_causal_mask_mod(*, q_kv_offset: int):

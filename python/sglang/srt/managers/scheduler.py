@@ -1517,7 +1517,11 @@ class Scheduler(
                 bootstrap_port=recv_req.bootstrap_port,
                 bootstrap_room=recv_req.bootstrap_room,
                 disagg_mode=self.disaggregation_mode,
-                data_parallel_rank=recv_req.data_parallel_rank,
+                routed_dp_rank=getattr(
+                    recv_req,
+                    "routed_dp_rank",
+                    getattr(recv_req, "data_parallel_rank", None),
+                ),
                 vocab_size=self.model_config.vocab_size,
                 priority=recv_req.priority,
                 metrics_collector=(
@@ -2191,12 +2195,10 @@ class Scheduler(
         new_batch.prepare_for_extend()
 
         # Record prefill stats for logging after forward
-        new_batch.prefill_stats = PrefillStats(
-            log_input_tokens=adder.log_input_tokens,
-            log_hit_tokens=adder.log_hit_tokens,
-            new_token_ratio=adder.new_token_ratio,
-            running_bs=len(self.running_batch.reqs),
-            num_new_seqs=len(can_run_list),
+        new_batch.prefill_stats = PrefillStats.from_adder(
+            adder,
+            self.running_batch.reqs,
+            enable_priority_scheduling=self.enable_priority_scheduling,
         )
 
         # Mixed-style chunked prefill

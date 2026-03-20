@@ -55,6 +55,13 @@ class CutlassMLABackend(FlashInferMLAAttnBackend):
         kv_indptr_buf: Optional[torch.Tensor] = None,
         kv_last_page_len_buf: Optional[torch.Tensor] = None,
     ):
+        if getattr(
+            model_runner.model_config, "has_dynamic_mla_kv_lora_rank", lambda: False
+        )():
+            raise NotImplementedError(
+                "Dynamic per-layer kv_lora_rank schedules (CARE-E) are not supported by cutlass_mla yet. "
+                "Use `--attention-backend flashinfer` for dynamic-rank MLA."
+            )
         super().__init__(
             model_runner, skip_prefill, kv_indptr_buf, kv_last_page_len_buf
         )

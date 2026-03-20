@@ -569,6 +569,17 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
         }
         return state
 
+    @property
+    def prefill_finished_ts(self) -> float:
+        return self.prefill_finished_time
+
+    @prefill_finished_ts.setter
+    def prefill_finished_ts(self, ts: float) -> None:
+        self.prefill_finished_time = ts
+
+    def get_prefill_finished_ts(self) -> float:
+        return self.prefill_finished_time
+
     def set_scheduler_recv_time(self, ts=None):
         calibrate_time_diff()
         if ts is None:
@@ -907,6 +918,9 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
         if self.prefill_run_batch_start_time > 0.0:
             return self.prefill_run_batch_start_time - self.forward_entry_time
         return None
+
+    def get_prefill_launch_delay(self) -> Optional[float]:
+        return self.get_prefill_waiting_latency()
 
     def get_prefill_launch_latency(self) -> Optional[float]:
         if (

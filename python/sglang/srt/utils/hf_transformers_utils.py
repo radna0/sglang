@@ -565,8 +565,29 @@ def get_tokenizer(
                 "or using the `--trust-remote-code` flag in the CLI."
             )
             raise RuntimeError(err_msg) from e
-        else:
-            raise e
+        if (
+            tokenizer_mode == "auto"
+            and kwargs.get("use_fast", True)
+            and (
+                "Converting from SentencePiece and Tiktoken failed" in str(e)
+                or "Unable to instantiate tokenizer" in str(e)
+                or "failed to load vocab" in str(e).lower()
+            )
+        ):
+            warnings.warn(
+                "Tokenizer fast conversion failed; retrying with slow tokenizer."
+            )
+            kwargs["use_fast"] = False
+            return get_tokenizer(
+                tokenizer_name,
+                *args,
+                tokenizer_mode="slow",
+                trust_remote_code=trust_remote_code,
+                tokenizer_revision=tokenizer_revision,
+                clean_up_tokenization_spaces=False,
+                **kwargs,
+            )
+        raise e
 
     if not isinstance(tokenizer, PreTrainedTokenizerFast):
         warnings.warn(

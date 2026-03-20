@@ -1,0 +1,11 @@
+{
+  "sources": [
+    {
+      "name": "aimo3",
+      "kind": "jsonl_filelist",
+      "filelist": "/workspace/data/jsonl_shards_kaggle/wenliangtlh__aimo3-high-difficulty-tool-calling-dataset/train/rows1024/filelists/mod1_i0/shard_jsonl_filelist_ws.txt",
+      "text_fields": ["text", "messages", "conversation", "prompt", "chosen"],
+      "max_rows": 7293
+    }
+  ]
+}

@@ -1,0 +1,12 @@
+{
+  "sources": [
+    {
+      "name": "alpaca_repro",
+      "kind": "hf",
+      "path": "tatsu-lab/alpaca",
+      "split": "train",
+      "text_field": "text",
+      "max_sequences": 128
+    }
+  ]
+}

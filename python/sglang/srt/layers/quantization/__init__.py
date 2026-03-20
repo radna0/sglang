@@ -3,9 +3,12 @@ from __future__ import annotations
 
 import builtins
 import inspect
+import logging
 from typing import TYPE_CHECKING, Dict, Optional, Type
 
 import torch
+
+_logger = logging.getLogger(__name__)
 
 
 # Define empty classes as placeholders when vllm is not available
@@ -21,18 +24,40 @@ from sglang.srt.layers.quantization.awq import AWQConfig, AWQMarlinConfig
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.bitsandbytes import BitsAndBytesConfig
 from sglang.srt.layers.quantization.blockwise_int8 import BlockInt8Config
-from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
-    CompressedTensorsConfig,
-)
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.fpgemm_fp8 import FBGEMMFp8Config
 from sglang.srt.layers.quantization.gguf import GGUFConfig
 from sglang.srt.layers.quantization.gptq import GPTQConfig, GPTQMarlinConfig
-from sglang.srt.layers.quantization.modelopt_quant import (
-    ModelOptFp4Config,
-    ModelOptFp8Config,
-)
 from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
+
+try:
+    from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+        CompressedTensorsConfig,
+    )
+except Exception as exc:  # pragma: no cover - environment-dependent
+    _logger.warning(
+        "Fallback to Dummy quantization config for compressed_tensors: %s", exc
+    )
+
+    class CompressedTensorsConfig(DummyConfig):
+        pass
+
+try:
+    from sglang.srt.layers.quantization.modelopt_quant import (
+        ModelOptFp4Config,
+        ModelOptFp8Config,
+    )
+except Exception as exc:  # pragma: no cover - environment-dependent
+    _logger.warning(
+        "Fallback to Dummy quantization config for modelopt_quant: %s", exc
+    )
+
+    class _ModelOptConfigBase(DummyConfig):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+
+    ModelOptFp4Config = _ModelOptConfigBase
+    ModelOptFp8Config = _ModelOptConfigBase
 from sglang.srt.layers.quantization.moe_wna16 import MoeWNA16Config
 from sglang.srt.layers.quantization.mxfp4 import Mxfp4Config
 from sglang.srt.layers.quantization.petit import PetitNvFp4Config

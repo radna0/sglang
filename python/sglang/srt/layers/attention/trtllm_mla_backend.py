@@ -262,6 +262,13 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         kv_indptr_buf: Optional[torch.Tensor] = None,
         q_indptr_decode_buf: Optional[torch.Tensor] = None,
     ):
+        if getattr(
+            model_runner.model_config, "has_dynamic_mla_kv_lora_rank", lambda: False
+        )():
+            raise NotImplementedError(
+                "Dynamic per-layer kv_lora_rank schedules (CARE-E) are not supported by trtllm_mla yet. "
+                "Use `--attention-backend flashinfer` for dynamic-rank MLA."
+            )
         super().__init__(
             model_runner,
             skip_prefill,

@@ -766,6 +766,10 @@ class MLATokenToKVPoolHost(HostKVCache):
         )
 
     def get_size_per_token(self):
+        if getattr(self.device_pool, "kv_lora_rank_per_layer", None) is not None:
+            raise NotImplementedError(
+                "MLATokenToKVPoolHost does not support dynamic per-layer kv_lora_rank schedules."
+            )
         self.kv_lora_rank = self.device_pool.kv_lora_rank
         self.qk_rope_head_dim = self.device_pool.qk_rope_head_dim
         self.layer_num = self.device_pool.layer_num

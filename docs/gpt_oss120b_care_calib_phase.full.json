@@ -1,0 +1,11 @@
+{
+  "sources": [
+    {
+      "name": "calib_packs",
+      "kind": "jsonl_filelist",
+      "filelist": "/root/data/jsonl_shards_modelscope/Isekai-Creation__harmony-qwen3-calib-packs-20260113/train/rows1024/filelists/mod1_i0/shard_jsonl_filelist.txt",
+      "text_fields": ["text", "messages", "conversation", "prompt", "chosen"],
+      "max_rows": 190000
+    }
+  ]
+}

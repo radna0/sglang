@@ -68,11 +68,27 @@ class ModelRunnerKVCacheMixin:
     def get_cell_size_per_token(self: ModelRunner, num_layers: int) -> int:
         kv_size = torch._utils._element_size(self.kv_cache_dtype)
         if self.use_mla_backend:
-            cell_size = (
-                (self.model_config.kv_lora_rank + self.model_config.qk_rope_head_dim)
-                * num_layers
-                * kv_size
+            qk_rope_head_dim = int(self.model_config.qk_rope_head_dim)
+            kv_rank_schedule = getattr(
+                self.model_config, "kv_lora_rank_per_layer", None
             )
+            if self.model_config.is_hybrid_swa and kv_rank_schedule is not None:
+                cell_size = (
+                    sum(
+                        int(kv_rank_schedule[layer_id]) + qk_rope_head_dim
+                        for layer_id in self.model_config.full_attention_layer_ids
+                    )
+                    + sum(
+                        int(kv_rank_schedule[layer_id]) + qk_rope_head_dim
+                        for layer_id in self.model_config.swa_attention_layer_ids
+                    )
+                ) * kv_size
+            else:
+                cell_size = (
+                    (self.model_config.kv_lora_rank + qk_rope_head_dim)
+                    * num_layers
+                    * kv_size
+                )
             if is_float4_e2m1fn_x2(self.kv_cache_dtype):
                 # kv_scale_buffer
                 scale_block_size = 16
@@ -495,14 +511,25 @@ class ModelRunnerKVCacheMixin:
                 end_layer=self.end_layer,
                 index_head_dim=get_nsa_index_head_dim(self.model_config.hf_config),
             )
-        elif self.use_mla_backend and not self.mambaish_config:
+        elif (
+            self.use_mla_backend
+            and not self.mambaish_config
+            and not self.is_hybrid_swa
+        ):
             assert not is_nsa_model
+            kv_lora_rank_arg = self.model_config.get_mla_kv_lora_rank_slice(
+                self.start_layer, self.end_layer
+            )
             if is_float4_e2m1fn_x2(self.kv_cache_dtype):
+                if isinstance(kv_lora_rank_arg, list) and len(set(kv_lora_rank_arg)) > 1:
+                    raise NotImplementedError(
+                        "Dynamic per-layer kv_lora_rank schedules are not supported with FP4 KV cache yet."
+                    )
                 self.token_to_kv_pool = MLATokenToKVPoolFP4(
                     self.max_total_num_tokens,
                     page_size=self.page_size,
                     dtype=self.kv_cache_dtype,
-                    kv_lora_rank=self.model_config.kv_lora_rank,
+                    kv_lora_rank=kv_lora_rank_arg,
                     qk_rope_head_dim=self.model_config.qk_rope_head_dim,
                     layer_num=self.num_effective_layers,
                     device=self.device,
@@ -515,7 +542,7 @@ class ModelRunnerKVCacheMixin:
                     self.max_total_num_tokens,
                     page_size=self.page_size,
                     dtype=self.kv_cache_dtype,
-                    kv_lora_rank=self.model_config.kv_lora_rank,
+                    kv_lora_rank=kv_lora_rank_arg,
                     qk_rope_head_dim=self.model_config.qk_rope_head_dim,
                     layer_num=self.num_effective_layers,
                     device=self.device,
@@ -540,6 +567,9 @@ class ModelRunnerKVCacheMixin:
         else:
             if self.is_hybrid_swa:
                 kwargs = {}
+                token_to_kv_pool_class = MHATokenToKVPool
+                full_pool_kwargs = None
+                swa_pool_kwargs = None
                 if self.is_hybrid_swa_compress:
                     kwargs = {
                         "swa_head_num": max(
@@ -550,6 +580,35 @@ class ModelRunnerKVCacheMixin:
                         "swa_head_dim": self.model_config.hf_text_config.swa_head_dim,
                         "swa_v_head_dim": self.model_config.hf_text_config.swa_v_head_dim,
                         "v_head_dim": self.model_config.hf_text_config.v_head_dim,
+                    }
+                if self.use_mla_backend:
+                    token_to_kv_pool_class = (
+                        MLATokenToKVPoolFP4
+                        if is_float4_e2m1fn_x2(self.kv_cache_dtype)
+                        else MLATokenToKVPool
+                    )
+                    kv_rank_schedule = getattr(
+                        self.model_config, "kv_lora_rank_per_layer", None
+                    )
+                    if kv_rank_schedule is None:
+                        full_kv_lora_rank = int(self.model_config.kv_lora_rank)
+                        swa_kv_lora_rank = int(self.model_config.kv_lora_rank)
+                    else:
+                        full_kv_lora_rank = [
+                            int(kv_rank_schedule[layer_id])
+                            for layer_id in self.model_config.full_attention_layer_ids
+                        ]
+                        swa_kv_lora_rank = [
+                            int(kv_rank_schedule[layer_id])
+                            for layer_id in self.model_config.swa_attention_layer_ids
+                        ]
+                    full_pool_kwargs = {
+                        "kv_lora_rank": full_kv_lora_rank,
+                        "qk_rope_head_dim": int(self.model_config.qk_rope_head_dim),
+                    }
+                    swa_pool_kwargs = {
+                        "kv_lora_rank": swa_kv_lora_rank,
+                        "qk_rope_head_dim": int(self.model_config.qk_rope_head_dim),
                     }
                 self.token_to_kv_pool = SWAKVPool(
                     size=self.full_max_total_num_tokens,
@@ -564,6 +623,9 @@ class ModelRunnerKVCacheMixin:
                     full_attention_layer_ids=self.model_config.full_attention_layer_ids,
                     enable_kvcache_transpose=False,
                     device=self.device,
+                    token_to_kv_pool_class=token_to_kv_pool_class,
+                    full_token_to_kv_pool_kwargs=full_pool_kwargs,
+                    swa_token_to_kv_pool_kwargs=swa_pool_kwargs,
                     **kwargs,
                 )
             elif config := self.mambaish_config:

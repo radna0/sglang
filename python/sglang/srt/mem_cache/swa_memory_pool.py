@@ -1,3 +1,4 @@
+import inspect
 import logging
 import weakref
 from typing import Dict, List, Optional, Tuple
@@ -17,6 +18,19 @@ logger = logging.getLogger(__name__)
 GB = 1024 * 1024 * 1024
 
 
+def _filter_pool_init_kwargs(pool_cls, kwargs: dict) -> dict:
+    valid_params = set(inspect.signature(pool_cls.__init__).parameters)
+    valid_params.discard("self")
+    return {key: value for key, value in kwargs.items() if key in valid_params}
+
+
+def _normalize_kv_size_bytes(kv_size):
+    if isinstance(kv_size, tuple):
+        return kv_size
+    size = int(kv_size)
+    return size, 0
+
+
 class SWAKVPool(KVCache):
     """KV cache with separate pools for full and SWA attention layers."""
 
@@ -33,6 +47,8 @@ class SWAKVPool(KVCache):
         enable_kvcache_transpose: bool,
         device: str,
         token_to_kv_pool_class: KVCache = MHATokenToKVPool,
+        full_token_to_kv_pool_kwargs: Optional[dict] = None,
+        swa_token_to_kv_pool_kwargs: Optional[dict] = None,
         **kwargs,
     ):
         self.size = size
@@ -47,11 +63,12 @@ class SWAKVPool(KVCache):
         self.page_size = page_size
         self.swa_loc = None
 
-        kwargs["page_size"] = page_size
-        kwargs["enable_memory_saver"] = False
-        kwargs["head_num"] = head_num
-        kwargs["head_dim"] = head_dim
-        kwargs["device"] = device
+        base_kwargs = dict(kwargs)
+        base_kwargs["page_size"] = page_size
+        base_kwargs["enable_memory_saver"] = False
+        base_kwargs["head_num"] = head_num
+        base_kwargs["head_dim"] = head_dim
+        base_kwargs["device"] = device
         # TODO MHATransposedTokenToKVPool if enable_kvcache_transpose is True
         assert not enable_kvcache_transpose
 
@@ -60,20 +77,31 @@ class SWAKVPool(KVCache):
             maybe_init_custom_mem_pool(device=self.device)
         )
 
+        full_pool_kwargs = dict(base_kwargs)
+        if full_token_to_kv_pool_kwargs:
+            full_pool_kwargs.update(full_token_to_kv_pool_kwargs)
+        full_pool_kwargs = _filter_pool_init_kwargs(
+            token_to_kv_pool_class, full_pool_kwargs
+        )
+
+        swa_pool_kwargs = dict(base_kwargs)
+        if swa_token_to_kv_pool_kwargs:
+            swa_pool_kwargs.update(swa_token_to_kv_pool_kwargs)
+        swa_pool_kwargs = _filter_pool_init_kwargs(
+            token_to_kv_pool_class, swa_pool_kwargs
+        )
+
         self.swa_kv_pool = token_to_kv_pool_class(
             size=size_swa,
             dtype=dtype,
             layer_num=self.swa_layer_nums,
-            **kwargs,
+            **swa_pool_kwargs,
         )
-        kwargs.pop("swa_head_num", None)
-        kwargs.pop("swa_head_dim", None)
-        kwargs.pop("swa_v_head_dim", None)
         self.full_kv_pool = token_to_kv_pool_class(
             size=size,
             dtype=dtype,
             layer_num=self.full_layer_nums,
-            **kwargs,
+            **full_pool_kwargs,
         )
         # {layer_id: (index, is_swa_layer)}
         self.layers_mapping: Dict[int, Tuple[int, bool]] = {}
@@ -83,8 +111,11 @@ class SWAKVPool(KVCache):
             self.layers_mapping[global_layer_id] = (swa_layer_id, True)
         self.full_to_swa_index_mapping: Optional[torch.Tensor] = None
 
-        k_size, v_size = self.get_kv_size_bytes()
-        self.mem_usage = (k_size + v_size) / GB
+        kv_size_bytes = self.get_kv_size_bytes()
+        if isinstance(kv_size_bytes, tuple):
+            self.mem_usage = sum(kv_size_bytes) / GB
+        else:
+            self.mem_usage = int(kv_size_bytes) / GB
         logger.info(
             f"SWAKVPool mem usage: {self.mem_usage:.2f} GB, swa size: {self.size_swa}, full size: {self.size}"
         )
@@ -93,9 +124,15 @@ class SWAKVPool(KVCache):
         self.full_to_swa_index_mapping = full_to_swa_index_mapping
 
     def get_kv_size_bytes(self):
-        k_size, v_size = self.full_kv_pool.get_kv_size_bytes()
-        k_size_swa, v_size_swa = self.swa_kv_pool.get_kv_size_bytes()
-        return k_size + k_size_swa, v_size + v_size_swa
+        k_size, v_size = _normalize_kv_size_bytes(self.full_kv_pool.get_kv_size_bytes())
+        k_size_swa, v_size_swa = _normalize_kv_size_bytes(
+            self.swa_kv_pool.get_kv_size_bytes()
+        )
+        total_k = k_size + k_size_swa
+        total_v = v_size + v_size_swa
+        if v_size == 0 and v_size_swa == 0:
+            return total_k
+        return total_k, total_v
 
     def get_contiguous_buf_infos(self):
         full_kv_data_ptrs, full_kv_data_lens, full_kv_item_lens = (
@@ -145,6 +182,35 @@ class SWAKVPool(KVCache):
         # since the last item of full_to_swa_index_mapping is -1.
         return self.full_to_swa_index_mapping[kv_indices].to(torch.int32)
 
+    def _set_pool_kv_buffer(
+        self,
+        pool: KVCache,
+        layer_id_pool: int,
+        layer: RadixAttention,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+        k_scale: float,
+        v_scale: float,
+    ) -> None:
+        valid_params = set(inspect.signature(pool.set_kv_buffer).parameters)
+        kwargs = {}
+        if "k_scale" in valid_params:
+            kwargs["k_scale"] = k_scale
+        if "v_scale" in valid_params:
+            kwargs["v_scale"] = v_scale
+        if "layer_id_override" in valid_params:
+            kwargs["layer_id_override"] = layer_id_pool
+            pool.set_kv_buffer(layer, loc, cache_k, cache_v, **kwargs)
+            return
+
+        original_layer_id = layer.layer_id
+        layer.layer_id = layer_id_pool
+        try:
+            pool.set_kv_buffer(layer, loc, cache_k, cache_v, **kwargs)
+        finally:
+            layer.layer_id = original_layer_id
+
     def set_kv_buffer(
         self,
         layer: RadixAttention,
@@ -164,24 +230,26 @@ class SWAKVPool(KVCache):
                 if self.full_to_swa_index_mapping is not None:
                     loc = self.translate_loc_from_full_to_swa(loc)
 
-            self.swa_kv_pool.set_kv_buffer(
+            self._set_pool_kv_buffer(
+                self.swa_kv_pool,
+                layer_id_pool,
                 layer,
                 loc,
                 cache_k,
                 cache_v,
                 k_scale,
                 v_scale,
-                layer_id_override=layer_id_pool,
             )
         else:
-            self.full_kv_pool.set_kv_buffer(
+            self._set_pool_kv_buffer(
+                self.full_kv_pool,
+                layer_id_pool,
                 layer,
                 loc,
                 cache_k,
                 cache_v,
                 k_scale,
                 v_scale,
-                layer_id_override=layer_id_pool,
             )
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):

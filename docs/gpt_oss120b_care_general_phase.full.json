@@ -1,0 +1,30 @@
+{
+  "sources": [
+    {
+      "name": "general_c4",
+      "kind": "hf",
+      "path": "allenai/c4",
+      "config_name": "en",
+      "split": "train",
+      "streaming": true,
+      "text_field": "text",
+      "weight": 0.7
+    },
+    {
+      "name": "livecodebench",
+      "kind": "hf",
+      "path": "livecodebench/code_generation",
+      "split": "test",
+      "concat_fields": ["question_content", "starter_code"],
+      "weight": 0.15
+    },
+    {
+      "name": "math500",
+      "kind": "hf",
+      "path": "HuggingFaceH4/MATH-500",
+      "split": "test",
+      "concat_fields": ["problem", "solution"],
+      "weight": 0.15
+    }
+  ]
+}

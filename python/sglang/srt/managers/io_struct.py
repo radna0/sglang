@@ -943,6 +943,13 @@ class BatchTokenizedEmbeddingReqInput(BaseBatchReq):
 
 @dataclass
 class BatchTokenIDOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
+    # For observability
+    queue_time: Optional[List[float]] = field(default=None, kw_only=True)
+    forward_entry_time: Optional[List[float]] = field(default=None, kw_only=True)
+    prefill_launch_delay: Optional[List[float]] = field(default=None, kw_only=True)
+    prefill_launch_latency: Optional[List[float]] = field(default=None, kw_only=True)
+    prefill_finished_ts: Optional[List[float]] = field(default=None, kw_only=True)
+
     # The finish reason
     finished_reasons: List[BaseFinishReason]
     # For incremental decoding

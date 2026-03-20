@@ -1,0 +1,12 @@
+{
+  "sources": [
+    {
+      "name": "aimo3_tool_integrated_reasoning",
+      "kind": "jsonl_filelist",
+      "filelist": "/workspace/data/jsonl_shards_kaggle/jeannkouagou__aimo3-tool-integrated-reasoning/train/rows1024/filelists/mod1_i0/shard_jsonl_filelist_ws.txt",
+      "text_fields": ["text", "messages", "conversation", "prompt", "chosen", "completion"],
+      "max_rows": 141277
+    }
+  ]
+}
+

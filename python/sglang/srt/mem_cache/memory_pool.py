@@ -1598,7 +1598,7 @@ class MLATokenToKVPool(KVCache):
         size: int,
         page_size: int,
         dtype: torch.dtype,
-        kv_lora_rank: int,
+        kv_lora_rank,
         qk_rope_head_dim: int,
         layer_num: int,
         device: str,
@@ -1619,7 +1619,16 @@ class MLATokenToKVPool(KVCache):
             end_layer,
         )
 
-        self.kv_lora_rank = kv_lora_rank
+        self.kv_lora_rank_per_layer = None
+        if isinstance(kv_lora_rank, (list, tuple)):
+            self.kv_lora_rank_per_layer = [int(x) for x in kv_lora_rank]
+            if len(self.kv_lora_rank_per_layer) != int(self.layer_num):
+                raise ValueError(
+                    f"kv_lora_rank schedule length mismatch: expected {int(self.layer_num)} got {len(self.kv_lora_rank_per_layer)}"
+                )
+            self.kv_lora_rank = int(max(self.kv_lora_rank_per_layer))
+        else:
+            self.kv_lora_rank = int(kv_lora_rank)
         self.qk_rope_head_dim = qk_rope_head_dim
         self.use_nsa = use_nsa
         self.nsa_kv_cache_store_fp8 = (
@@ -1629,11 +1638,21 @@ class MLATokenToKVPool(KVCache):
         )
         # When override_kv_cache_dim is provided with nsa model, we assume the
         # override kv cache dim is correct and use it directly.
-        self.kv_cache_dim = (
-            override_kv_cache_dim
-            if self.nsa_kv_cache_store_fp8
-            else (kv_lora_rank + qk_rope_head_dim)
-        )
+        if self.nsa_kv_cache_store_fp8:
+            self.kv_cache_dim = override_kv_cache_dim
+            self.kv_cache_dim_per_layer = [int(self.kv_cache_dim)] * int(self.layer_num)
+        else:
+            if self.kv_lora_rank_per_layer is None:
+                self.kv_cache_dim = int(self.kv_lora_rank + qk_rope_head_dim)
+                # Align to 64 for FlashMLA kernels (which often require 576)
+                if self.kv_cache_dim % 64 != 0:
+                   self.kv_cache_dim = (self.kv_cache_dim + 63) // 64 * 64
+                self.kv_cache_dim_per_layer = [int(self.kv_cache_dim)] * int(self.layer_num)
+            else:
+                self.kv_cache_dim_per_layer = [
+                    (int(r) + int(qk_rope_head_dim) + 63) // 64 * 64 for r in self.kv_lora_rank_per_layer
+                ]
+                self.kv_cache_dim = int(max(self.kv_cache_dim_per_layer))
 
         self._create_buffers()
 
@@ -1656,11 +1675,15 @@ class MLATokenToKVPool(KVCache):
                 # The padded slot 0 is used for writing dummy outputs from padded tokens.
                 self.kv_buffer = [
                     torch.zeros(
-                        (self.size + self.page_size, 1, self.kv_cache_dim),
+                        (
+                            self.size + self.page_size,
+                            1,
+                            int(self.kv_cache_dim_per_layer[i]),
+                        ),
                         dtype=self.store_dtype,
                         device=self.device,
                     )
-                    for _ in range(self.layer_num)
+                    for i in range(self.layer_num)
                 ]
 
     def _clear_buffers(self):
@@ -1696,11 +1719,15 @@ class MLATokenToKVPool(KVCache):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
 
+        idx = layer_id - self.start_layer
+        kv_rank = (
+            int(self.kv_lora_rank_per_layer[idx])
+            if self.kv_lora_rank_per_layer is not None
+            else int(self.kv_lora_rank)
+        )
         if self.store_dtype != self.dtype:
-            return self.kv_buffer[layer_id - self.start_layer][
-                ..., : self.kv_lora_rank
-            ].view(self.dtype)
-        return self.kv_buffer[layer_id - self.start_layer][..., : self.kv_lora_rank]
+            return self.kv_buffer[idx][..., :kv_rank].view(self.dtype)
+        return self.kv_buffer[idx][..., :kv_rank]
 
     def get_kv_buffer(self, layer_id: int):
         return self.get_key_buffer(layer_id), self.get_value_buffer(layer_id)
@@ -1718,11 +1745,19 @@ class MLATokenToKVPool(KVCache):
             cache_k = cache_k.to(self.dtype)
 
         if self.store_dtype != self.dtype:
-            self.kv_buffer[layer_id - self.start_layer][loc] = cache_k.view(
-                self.store_dtype
-            )
+            target = self.kv_buffer[layer_id - self.start_layer][loc]
+            if cache_k.shape[-1] < target.shape[-1]:
+                target[..., :cache_k.shape[-1]] = cache_k.view(self.store_dtype)
+            else:
+                self.kv_buffer[layer_id - self.start_layer][loc] = cache_k.view(
+                    self.store_dtype
+                )
         else:
-            self.kv_buffer[layer_id - self.start_layer][loc] = cache_k
+            target = self.kv_buffer[layer_id - self.start_layer][loc]
+            if cache_k.shape[-1] < target.shape[-1]:
+                target[..., :cache_k.shape[-1]] = cache_k
+            else:
+                self.kv_buffer[layer_id - self.start_layer][loc] = cache_k
 
     def set_mla_kv_buffer(
         self,
@@ -1775,8 +1810,14 @@ class MLATokenToKVPool(KVCache):
         layer_id = layer.layer_id
         kv_buffer = self.get_key_buffer(layer_id)
         dst_dtype = dst_dtype or self.dtype
+        idx = layer_id - self.start_layer
+        kv_rank = (
+            int(self.kv_lora_rank_per_layer[idx])
+            if self.kv_lora_rank_per_layer is not None
+            else int(self.kv_lora_rank)
+        )
         cache_k_nope = torch.empty(
-            (loc.shape[0], 1, self.kv_lora_rank),
+            (loc.shape[0], 1, kv_rank),
             dtype=dst_dtype,
             device=kv_buffer.device,
         )

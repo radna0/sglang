@@ -303,7 +303,12 @@ if is_blackwell_supported() and is_flashinfer_available():
 
 if is_sm90_supported() and is_flashinfer_available():
     # FlashInfer SM90 DeepGEMM with automatic swapAB optimization for small M
-    from flashinfer.gemm import fp8_blockscale_gemm_sm90
+    try:
+        from flashinfer.gemm import fp8_blockscale_gemm_sm90
+    except Exception as exc:  # pragma: no cover - environment-dependent
+        fp8_blockscale_gemm_sm90 = None
+        logger.warning("FlashInfer SM90 DeepGEMM unavailable (fp8_blockscale_gemm_sm90 missing): %s", exc
+        )
 
 
 def dispatch_w8a8_block_fp8_linear() -> Callable:
@@ -551,6 +556,11 @@ def flashinfer_deepgemm_w8a8_block_fp8_linear_with_fallback(
     assert input_scale is None
 
     output_dtype = input.dtype
+    if fp8_blockscale_gemm_sm90 is None:
+        return triton_w8a8_block_fp8_linear(
+            input, weight, block_size, weight_scale, input_scale, bias
+        )
+
     dtype_supported = output_dtype == torch.bfloat16
 
     # fp8_blockscale_gemm_sm90 requires: N % 64 == 0, K % 128 == 0

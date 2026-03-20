@@ -18,7 +18,7 @@ import math
 import os
 from enum import Enum, IntEnum, auto
 from pathlib import Path
-from typing import Any, List, Optional, Set, Union
+from typing import Any, List, Optional, Sequence, Set, Union
 
 import torch
 from transformers import PretrainedConfig
@@ -117,6 +117,11 @@ class ModelConfig:
 
         # Validate quantize_and_serve configuration
         self._validate_quantize_and_serve_config()
+
+        # Optional CARE/converted-model feature: per-layer MLA KV latent ranks.
+        # Keep `self.kv_lora_rank` scalar for broad compatibility; dynamic schedules
+        # live in `self.kv_lora_rank_per_layer`.
+        self.kv_lora_rank_per_layer: Optional[List[int]] = None
 
         # Get hf config
         self._maybe_pull_model_tokenizer_from_remote()
@@ -424,6 +429,7 @@ class ModelConfig:
             or "DeepseekV32ForCausalLM" in self.hf_config.architectures
             or "DeepseekV3ForCausalLM" in self.hf_config.architectures
             or "DeepseekV3ForCausalLMNextN" in self.hf_config.architectures
+            or "GptOssMlaForCausalLM" in self.hf_config.architectures
             or "Glm4MoeLiteForCausalLM" in self.hf_config.architectures
             or "GlmMoeDsaForCausalLM" in self.hf_config.architectures
             or "LongcatFlashForCausalLM" in self.hf_config.architectures
@@ -434,8 +440,25 @@ class ModelConfig:
             or "MistralLarge3ForCausalLMEagle" in self.hf_config.architectures
             or "KimiK25ForConditionalGeneration" in self.hf_config.architectures
         ):
-            self.head_dim = 256
-            self.attention_arch = AttentionArch.MLA
+            gpt_oss_native_mha_anchor = (
+                "GptOssMlaForCausalLM" in self.hf_config.architectures
+                and (
+                    getattr(self.hf_text_config, "mla_attention_mode", None)
+                    == "mha_explicit"
+                    or int(getattr(self.hf_text_config, "mla_rope_num_kv_heads", 1))
+                    > 1
+                )
+            )
+            if "GptOssMlaForCausalLM" in self.hf_config.architectures:
+                self.head_dim = (
+                    self.hf_text_config.qk_nope_head_dim
+                    + self.hf_text_config.qk_rope_head_dim
+                )
+            else:
+                self.head_dim = 256
+            self.attention_arch = (
+                AttentionArch.MHA if gpt_oss_native_mha_anchor else AttentionArch.MLA
+            )
             self.kv_lora_rank = self.hf_text_config.kv_lora_rank
             self.qk_nope_head_dim = self.hf_text_config.qk_nope_head_dim
             self.qk_rope_head_dim = self.hf_text_config.qk_rope_head_dim
@@ -582,6 +605,103 @@ class ModelConfig:
             self.hf_text_config, "num_nextn_predict_layers", None
         )
         self.vocab_size = self.hf_text_config.vocab_size
+
+        # Parse dynamic MLA rank schedule if present in the HF config.
+        self._maybe_init_dynamic_mla_kv_ranks()
+
+    def _maybe_init_dynamic_mla_kv_ranks(self) -> None:
+        """
+        Initialize per-layer MLA KV latent rank schedule.
+
+        Convention supported:
+          - `kv_lora_rank_per_layer`: list[int] length == num_hidden_layers
+          - `kv_lora_rank`: list[int] length == num_hidden_layers (fallback)
+
+        If a schedule is present, `self.kv_lora_rank` is set to max(schedule) for
+        compatibility with codepaths that still assume a scalar rank.
+        """
+
+        if getattr(self, "attention_arch", None) != AttentionArch.MLA:
+            return
+        if not hasattr(self, "kv_lora_rank"):
+            return
+
+        def _as_int_list(x: Sequence[Any]) -> Optional[List[int]]:
+            try:
+                out = [int(v) for v in list(x)]
+            except Exception:
+                return None
+            if not out:
+                return None
+            if any(v <= 0 for v in out):
+                return None
+            return out
+
+        raw = getattr(self.hf_text_config, "kv_lora_rank_per_layer", None)
+        schedule = None
+        if isinstance(raw, (list, tuple)):
+            schedule = _as_int_list(raw)
+
+        if schedule is None:
+            raw = getattr(self.hf_text_config, "kv_lora_rank", None)
+            if isinstance(raw, (list, tuple)):
+                schedule = _as_int_list(raw)
+
+        if schedule is None:
+            raw = getattr(self.hf_config, "kv_lora_rank_per_layer", None)
+            if isinstance(raw, (list, tuple)):
+                schedule = _as_int_list(raw)
+            if schedule is None:
+                raw = getattr(self.hf_config, "kv_lora_rank", None)
+                if isinstance(raw, (list, tuple)):
+                    schedule = _as_int_list(raw)
+
+        if schedule is None:
+            return
+
+        if len(schedule) != int(self.num_hidden_layers):
+            logger.warning(
+                "Ignoring kv_lora_rank_per_layer schedule: expected len=%d got len=%d",
+                int(self.num_hidden_layers),
+                len(schedule),
+            )
+            return
+
+        self.kv_lora_rank_per_layer = schedule
+        try:
+            self.kv_lora_rank = int(max(schedule))
+        except Exception:
+            self.kv_lora_rank_per_layer = None
+
+    def has_dynamic_mla_kv_lora_rank(self) -> bool:
+        return bool(self.kv_lora_rank_per_layer) and len(
+            set(self.kv_lora_rank_per_layer)
+        ) > 1
+
+    def get_mla_kv_lora_rank(self, layer_id: int) -> int:
+        if self.kv_lora_rank_per_layer is None:
+            return int(self.kv_lora_rank)
+        return int(self.kv_lora_rank_per_layer[int(layer_id)])
+
+    def get_unique_mla_kv_lora_ranks(self) -> List[int]:
+        if self.kv_lora_rank_per_layer is None:
+            return [int(self.kv_lora_rank)]
+        return sorted({int(x) for x in self.kv_lora_rank_per_layer})
+
+    def get_mla_kv_lora_rank_slice(
+        self, start_layer: int, end_layer: int
+    ) -> Union[int, List[int]]:
+        if self.kv_lora_rank_per_layer is None:
+            return int(self.kv_lora_rank)
+        sliced = [
+            int(x)
+            for x in self.kv_lora_rank_per_layer[int(start_layer) : int(end_layer)]
+        ]
+        if not sliced:
+            return int(self.kv_lora_rank)
+        if len(set(sliced)) == 1:
+            return int(sliced[0])
+        return sliced
 
     def get_total_num_attention_heads(self) -> int:
         return self.num_attention_heads
@@ -1403,6 +1523,7 @@ def is_hybrid_swa_model(model_architectures: List[str]):
     hybrid_swa_archs = {
         "Llama4ForConditionalGeneration",
         "GptOssForCausalLM",
+        "GptOssMlaForCausalLM",
         "MiMoV2FlashForCausalLM",
         "MiMoV2MTP",
         "Step3p5ForCausalLM",
@@ -1423,7 +1544,10 @@ def get_hybrid_layer_ids(
         full_attention_layer_ids = [
             i for i in range(num_hidden_layers) if (i + 1) % 4 == 0
         ]
-    elif "GptOssForCausalLM" in model_architectures:
+    elif (
+        "GptOssForCausalLM" in model_architectures
+        or "GptOssMlaForCausalLM" in model_architectures
+    ):
         layer_types = getattr(hf_text_config, "layer_types", None)
         swa_attention_layer_ids = [
             i for i, x in enumerate(layer_types) if x == "sliding_attention"

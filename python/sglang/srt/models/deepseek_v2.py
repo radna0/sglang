@@ -1509,6 +1509,13 @@ class DeepseekV2DecoderLayer(nn.Module):
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
         self.layer_id = layer_id
         self.is_nextn = is_nextn
+        kv_rank_schedule = getattr(config, "kv_lora_rank_per_layer", None)
+        if isinstance(kv_rank_schedule, (list, tuple)) and len(kv_rank_schedule) == int(
+            getattr(config, "num_hidden_layers", 0) or 0
+        ):
+            kv_lora_rank = int(kv_rank_schedule[int(layer_id)])
+        else:
+            kv_lora_rank = int(config.kv_lora_rank)
         self.self_attn = DeepseekV2AttentionMLA(
             config=config,
             hidden_size=self.hidden_size,
@@ -1519,7 +1526,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             q_lora_rank=(
                 config.q_lora_rank if hasattr(config, "q_lora_rank") else None
             ),
-            kv_lora_rank=config.kv_lora_rank,
+            kv_lora_rank=kv_lora_rank,
             rope_theta=rope_theta,
             rope_scaling=rope_scaling,
             max_position_embeddings=max_position_embeddings,
