@@ -672,6 +672,8 @@ class Qwen3_5ForCausalLM(nn.Module):
                 org_num_embeddings=config.vocab_size,
                 enable_tp=not is_dp_attention_enabled(),
             )
+        else:
+            self.embed_tokens = PPMissingLayer()
 
         # Decoder layers
         def get_layer(idx: int, prefix: str):
@@ -699,7 +701,7 @@ class Qwen3_5ForCausalLM(nn.Module):
         if self.pp_group.is_last_rank:
             self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-    def get_input_embeddings(self) -> nn.Embedding:
+    def get_input_embeddings(self):
         return self.embed_tokens
 
     @torch.no_grad()
