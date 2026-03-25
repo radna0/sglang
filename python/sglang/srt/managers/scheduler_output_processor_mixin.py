@@ -44,6 +44,15 @@ class SchedulerOutputProcessorMixin:
     We put them into a separate file to make the `scheduler.py` shorter.
     """
 
+    def _release_kv_cache_and_draft(
+        self: Scheduler, req: Req, *, is_insert: bool = True
+    ):
+        release_kv_cache(req, self.tree_cache, is_insert=is_insert)
+        draft_worker = getattr(self, "draft_worker", None)
+        hook = getattr(draft_worker, "on_req_finished", None) if draft_worker else None
+        if hook is not None:
+            hook(req)
+
     def _get_storage_backend_type(self) -> str:
         """Get storage backend type from tree_cache."""
         storage_backend_type = "none"
@@ -96,7 +105,7 @@ class SchedulerOutputProcessorMixin:
                     req.rid,
                     thread_finish_flag=True,
                 )
-                release_kv_cache(req, self.tree_cache)
+                self._release_kv_cache_and_draft(req)
 
         # Note: Logprobs should be handled on the prefill engine.
         trace_slice_batch(RequestStage.DECODE_FAKE_OUTPUT, batch.reqs)
@@ -176,7 +185,7 @@ class SchedulerOutputProcessorMixin:
 
                     if req.finished():
                         self.maybe_collect_routed_experts(req)
-                        release_kv_cache(req, self.tree_cache)
+                        self._release_kv_cache_and_draft(req)
                         req.time_stats.completion_time = time.perf_counter()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         # This updates radix so others can match
@@ -310,7 +319,7 @@ class SchedulerOutputProcessorMixin:
                     req.check_finished()
 
                     if req.finished():
-                        release_kv_cache(req, self.tree_cache)
+                        self._release_kv_cache_and_draft(req)
                     else:
                         self.tree_cache.cache_unfinished_req(req)
                 else:
@@ -362,6 +371,65 @@ class SchedulerOutputProcessorMixin:
 
         return predict_tokens
 
+    def _accumulate_dflash_ssd_metrics(
+        self: Scheduler, result: GenerationBatchResult, batch: ScheduleBatch
+    ) -> None:
+        hit_cts = getattr(result, "spec_ssd_hit_ct", None)
+        prepare_cts = getattr(result, "spec_ssd_prepare_ct", None)
+        prepare_failure_cts = getattr(result, "spec_ssd_prepare_failure_ct", None)
+        cache_pending = getattr(result, "spec_ssd_cache_pending", None)
+        overlap_launch_cts = getattr(result, "spec_ssd_overlap_launch_ct", None)
+        overlap_wait_cts = getattr(result, "spec_ssd_overlap_wait_ct", None)
+        difficulty_gate_skip_cts = getattr(
+            result, "spec_ssd_difficulty_gate_skip_ct", None
+        )
+        fanout_gate_skip_cts = getattr(result, "spec_ssd_fanout_gate_skip_ct", None)
+        fanout_escalation_cts = getattr(
+            result, "spec_ssd_fanout_escalation_ct", None
+        )
+        fanout_alt_budget = getattr(result, "spec_ssd_fanout_alt_budget", None)
+
+        if (
+            hit_cts is None
+            and prepare_cts is None
+            and prepare_failure_cts is None
+            and cache_pending is None
+            and overlap_launch_cts is None
+            and overlap_wait_cts is None
+            and difficulty_gate_skip_cts is None
+            and fanout_gate_skip_cts is None
+            and fanout_escalation_cts is None
+            and fanout_alt_budget is None
+        ):
+            return
+
+        for i, req in enumerate(batch.reqs):
+            if hit_cts is not None and i < len(hit_cts):
+                req.spec_ssd_hit_ct = int(hit_cts[i])
+            if prepare_cts is not None and i < len(prepare_cts):
+                req.spec_ssd_prepare_ct = int(prepare_cts[i])
+            if prepare_failure_cts is not None and i < len(prepare_failure_cts):
+                req.spec_ssd_prepare_failure_ct = int(prepare_failure_cts[i])
+            if cache_pending is not None and i < len(cache_pending):
+                req.spec_ssd_cache_pending = int(cache_pending[i])
+            if overlap_launch_cts is not None and i < len(overlap_launch_cts):
+                req.spec_ssd_overlap_launch_ct = int(overlap_launch_cts[i])
+            if overlap_wait_cts is not None and i < len(overlap_wait_cts):
+                req.spec_ssd_overlap_wait_ct = int(overlap_wait_cts[i])
+            if (
+                difficulty_gate_skip_cts is not None
+                and i < len(difficulty_gate_skip_cts)
+            ):
+                req.spec_ssd_difficulty_gate_skip_ct = int(
+                    difficulty_gate_skip_cts[i]
+                )
+            if fanout_gate_skip_cts is not None and i < len(fanout_gate_skip_cts):
+                req.spec_ssd_fanout_gate_skip_ct = int(fanout_gate_skip_cts[i])
+            if fanout_escalation_cts is not None and i < len(fanout_escalation_cts):
+                req.spec_ssd_fanout_escalation_ct = int(fanout_escalation_cts[i])
+            if fanout_alt_budget is not None and i < len(fanout_alt_budget):
+                req.spec_ssd_fanout_alt_budget = int(fanout_alt_budget[i])
+
     def process_batch_result_idle(
         self: Scheduler,
         batch: ScheduleBatch,
@@ -397,7 +465,7 @@ class SchedulerOutputProcessorMixin:
                 req.output_ids.append(next_token_id)
                 req.check_finished()
                 if req.finished():
-                    release_kv_cache(req, self.tree_cache)
+                    self._release_kv_cache_and_draft(req)
                     req.time_stats.completion_time = time.perf_counter()
                     break
 
@@ -438,6 +506,7 @@ class SchedulerOutputProcessorMixin:
         self.num_generated_tokens += len(batch.reqs)
         if not batch.spec_algorithm.is_none():
             self.update_spec_metrics(batch.batch_size(), result.num_accepted_tokens)
+            self._accumulate_dflash_ssd_metrics(result, batch)
         if self.enable_metrics:
             self.metrics_collector.increment_cuda_graph_pass(value=can_run_cuda_graph)
 
@@ -475,9 +544,9 @@ class SchedulerOutputProcessorMixin:
                 if self.server_args.disaggregation_decode_enable_offload_kvcache:
                     # Asynchronously offload KV cache; release_kv_cache will be called after Device->Host transfer completes
                     if not self.decode_offload_manager.offload_kv_cache(req):
-                        release_kv_cache(req, self.tree_cache)
+                        self._release_kv_cache_and_draft(req)
                 else:
-                    release_kv_cache(req, self.tree_cache)
+                    self._release_kv_cache_and_draft(req)
 
                 req.time_stats.completion_time = time.perf_counter()
 
@@ -1042,6 +1111,45 @@ class SchedulerOutputProcessorMixin:
                     spec_verify_ct.append(req.spec_verify_ct)
                     spec_accepted_tokens.append(req.spec_accepted_tokens)
                     spec_acceptance_histogram.append(req.spec_acceptance_histogram)
+                    customized_info.setdefault("spec_ssd_hit_ct", []).append(
+                        int(getattr(req, "spec_ssd_hit_ct", 0))
+                    )
+                    customized_info.setdefault("spec_ssd_prepare_ct", []).append(
+                        int(getattr(req, "spec_ssd_prepare_ct", 0))
+                    )
+                    customized_info.setdefault("spec_ssd_prepare_failure_ct", []).append(
+                        int(getattr(req, "spec_ssd_prepare_failure_ct", 0))
+                    )
+                    customized_info.setdefault("spec_ssd_cache_pending", []).append(
+                        int(
+                            getattr(req, "spec_ssd_cache_pending", 0)
+                            or len(getattr(req, "dflash_ssd_cache", {}) or {})
+                            or (
+                                1
+                                if getattr(req, "dflash_ssd_cached_proposal", None)
+                                is not None
+                                else 0
+                            )
+                        )
+                    )
+                    customized_info.setdefault("spec_ssd_overlap_launch_ct", []).append(
+                        int(getattr(req, "spec_ssd_overlap_launch_ct", 0))
+                    )
+                    customized_info.setdefault("spec_ssd_overlap_wait_ct", []).append(
+                        int(getattr(req, "spec_ssd_overlap_wait_ct", 0))
+                    )
+                    customized_info.setdefault(
+                        "spec_ssd_difficulty_gate_skip_ct", []
+                    ).append(int(getattr(req, "spec_ssd_difficulty_gate_skip_ct", 0)))
+                    customized_info.setdefault(
+                        "spec_ssd_fanout_gate_skip_ct", []
+                    ).append(int(getattr(req, "spec_ssd_fanout_gate_skip_ct", 0)))
+                    customized_info.setdefault(
+                        "spec_ssd_fanout_escalation_ct", []
+                    ).append(int(getattr(req, "spec_ssd_fanout_escalation_ct", 0)))
+                    customized_info.setdefault(
+                        "spec_ssd_fanout_alt_budget", []
+                    ).append(int(getattr(req, "spec_ssd_fanout_alt_budget", 0)))
 
                 if return_logprob:
                     if (

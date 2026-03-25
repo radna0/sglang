@@ -37,12 +37,12 @@ from sglang.srt.layers.quantization.base_config import (
 from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
-    is_cuda,
     is_flashinfer_available,
     is_gfx95_supported,
     is_hip,
     is_sm90_supported,
     is_sm100_supported,
+    is_sm120_supported,
     is_triton_kernels_available,
     mxfp_supported,
     next_power_of_2,
@@ -52,18 +52,27 @@ from sglang.srt.utils import (
 from sglang.srt.utils.common import get_bool_env_var
 from sglang.srt.utils.custom_op import register_custom_op
 
-_is_sm100_supported = is_cuda() and is_sm100_supported()
-_is_sm90_supported = is_cuda() and is_sm90_supported()
 has_triton_kernels = is_triton_kernels_available()
 
 
 if is_flashinfer_available():
-    from flashinfer import (
-        mxfp8_quantize,
-        nvfp4_block_scale_interleave,
-        trtllm_fp4_block_scale_moe,
-    )
-    from flashinfer.fused_moe.core import get_w2_permute_indices_with_cache
+    try:
+        from flashinfer import (
+            mxfp8_quantize,
+            nvfp4_block_scale_interleave,
+            trtllm_fp4_block_scale_moe,
+        )
+        from flashinfer.fused_moe.core import get_w2_permute_indices_with_cache
+    except ModuleNotFoundError:
+        mxfp8_quantize = None
+        nvfp4_block_scale_interleave = None
+        trtllm_fp4_block_scale_moe = None
+        get_w2_permute_indices_with_cache = None
+else:
+    mxfp8_quantize = None
+    nvfp4_block_scale_interleave = None
+    trtllm_fp4_block_scale_moe = None
+    get_w2_permute_indices_with_cache = None
 
 _flashinfer_mxfp4_permute_indices_cache: dict[torch.Size, torch.Tensor] = {}
 _flashinfer_mxfp4_permute_indices_device_cache: dict[
@@ -140,23 +149,42 @@ def _swizzle_mxfp4(quant_tensor, scale, num_warps):
     from triton_kernels.tensor import FP4, convert_layout, wrap_torch_tensor
     from triton_kernels.tensor_details import layout
 
-    value_layout, value_layout_opts = layout.make_default_matmul_mxfp4_w_layout(
-        mx_axis=1
-    )
-    scale_layout, scale_layout_opts = layout.make_default_matmul_mxfp4_w_scale_layout(
-        mx_axis=1, num_warps=num_warps
-    )
-    if _is_sm100_supported:
+    if is_sm120_supported():
+        # SM120 desktop Blackwell does not support the persistent/TMA MXFP4 path.
+        # This MXFP4 path uses StridedLayout and the non-persistent kernel with
+        # block_k=128 so the selected tile stays within the per-block shared-memory budget.
+        from triton_kernels.tensor_details.layout import StridedLayout
+
+        value_layout = StridedLayout
+        value_layout_opts = {}
+        scale_layout = StridedLayout
+        scale_layout_opts = {}
         constraints = {
-            "is_persistent": True,
-            "epilogue_subtile": 1,
+            "is_persistent": False,
+            "block_k": 128,
+            "num_stages": 1,
         }
         opt_flags.update_opt_flags_constraints(constraints)
-    elif _is_sm90_supported:
-        constraints = {
-            "split_k": 1,
-        }
-        opt_flags.update_opt_flags_constraints(constraints)
+    else:
+        value_layout, value_layout_opts = layout.make_default_matmul_mxfp4_w_layout(
+            mx_axis=1
+        )
+        scale_layout, scale_layout_opts = (
+            layout.make_default_matmul_mxfp4_w_scale_layout(
+                mx_axis=1, num_warps=num_warps
+            )
+        )
+        if is_sm100_supported():
+            constraints = {
+                "is_persistent": True,
+                "epilogue_subtile": 1,
+            }
+            opt_flags.update_opt_flags_constraints(constraints)
+        elif is_sm90_supported():
+            constraints = {
+                "split_k": 1,
+            }
+            opt_flags.update_opt_flags_constraints(constraints)
     # transpose the tensor so that the quantization axis is on dim1
     quant_tensor = quant_tensor.transpose(-2, -1)
     scale = scale.transpose(-2, -1)
@@ -320,11 +348,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         scale_dtype = torch.uint8
         self.with_bias = with_bias
         mxfp4_block = 32
+        triton_kernels_padding_alignment = 64
 
         # pad the intermediate size to be a multiple of 2 * mxfp4_block
         # for to hold non-uniform sharded tensor as well as swizzling
         intermediate_size_per_partition_after_pad = intermediate_size_per_partition
-        if _is_sm100_supported:
+        if is_sm100_supported():
             if self.use_flashinfer:
                 intermediate_size_per_partition_after_pad = round_up(
                     intermediate_size_per_partition, 256
@@ -332,7 +361,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 hidden_size = round_up(hidden_size, 256)
             else:
                 intermediate_size_per_partition_after_pad = round_up(
-                    intermediate_size_per_partition, 64
+                    intermediate_size_per_partition, triton_kernels_padding_alignment
                 )
         elif _use_aiter:
 
@@ -347,11 +376,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 - layer.intermediate_size_per_partition
             )
         elif has_triton_kernels:
-            # TODO: this is a hack to make
-            # intermediate_size_per_partition_after_pad the same as the
-            # per_rank_intermediate_size during weight loading
             intermediate_size_per_partition_after_pad = round_up(
-                intermediate_size_per_partition, mxfp4_block
+                intermediate_size_per_partition, triton_kernels_padding_alignment
             )
 
         self.intermediate_size_per_partition = intermediate_size_per_partition_after_pad
@@ -525,7 +551,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             w13_scale_permute_indices = _get_flashinfer_mxfp4_device_permute_indices(
                 w13_weight_scale[0].view(torch.uint8),
                 epilogue_tile_m,
-                num_elts_per_sf=16,
+                # MXFP4 uses 32-element blocks per scaling factor.
+                num_elts_per_sf=sf_block_size,
             )
             w13_bias_permute_indices = _get_flashinfer_mxfp4_device_permute_indices(
                 w13_bias[0].reshape(-1, 1),
@@ -539,7 +566,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             w2_scale_permute_indices = _get_flashinfer_mxfp4_device_permute_indices(
                 w2_weight_scale[0].view(torch.uint8),
                 epilogue_tile_m,
-                num_elts_per_sf=16,
+                # MXFP4 uses 32-element blocks per scaling factor.
+                num_elts_per_sf=sf_block_size,
             )
             w2_bias_permute_indices = _get_flashinfer_mxfp4_device_permute_indices(
                 w2_bias[0].reshape(-1, 1),
@@ -751,13 +779,13 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             # When bf16 mode is enabled, we don't need to quantize the input,
             # TRT-LLM automatically handles quantization in the kernel implementation and pipelines it with GEMM operations,
             # which can theoretically improve performance
+            origin_hidden_states_dim = x.shape[-1]
             if self.flashinfer_mxfp4_moe_precision == "bf16":
                 assert x.dtype == torch.bfloat16
                 x_quant = x
                 x_scale = None
 
                 # May be fused later if this code branch is frequently needed
-                origin_hidden_states_dim = x_quant.shape[-1]
                 if self.hidden_size != origin_hidden_states_dim:
                     x_quant = torch.nn.functional.pad(
                         x_quant,
@@ -781,11 +809,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 get_tp_group(), disabled=not is_allocation_symmetric()
             ):
                 num_tokens = x_quant.shape[0]
-                hidden_size = (
-                    x_quant.shape[-1] * 2
-                    if x_quant.dtype == torch.uint8
-                    else x_quant.shape[-1]
-                )
+                hidden_size = origin_hidden_states_dim
                 symm_output = torch.empty(
                     num_tokens, hidden_size, dtype=torch.bfloat16, device=x_quant.device
                 )
@@ -813,7 +837,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 self.intermediate_size_per_partition,  # padded to multiple of 256
                 layer.moe_ep_rank * layer.num_local_experts,  # local_expert_offset
                 layer.num_local_experts,  # local num experts
-                None,
+                None,  # routed_scaling_factor
                 1,  # routing_method_type, renormalize
                 True,  # do finalize
                 tune_max_num_tokens=next_power_of_2(x_quant.shape[0]),

@@ -3,7 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
+import logging
 import numpy as np
+import os
 import torch
 import triton
 import triton.language as tl
@@ -17,6 +19,8 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import get_compiler_backend
 
+logger = logging.getLogger(__name__)
+
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -29,10 +33,19 @@ flash_attn_varlen_func = flash_attn_varlen_func_fa3
 flash_attn_with_kvcache = flash_attn_with_kvcache_fa3
 
 from sglang.jit_kernel.flash_attention_v4 import (
+    fa4_hopper_stable_enabled,
+)
+from sglang.jit_kernel.flash_attention_v4 import (
+    fa4_hopper_scheduler_metadata_enabled,
+)
+from sglang.jit_kernel.flash_attention_v4 import (
     flash_attn_varlen_func as flash_attn_varlen_func_fa4,
 )
 from sglang.jit_kernel.flash_attention_v4 import (
     flash_attn_with_kvcache as flash_attn_with_kvcache_fa4,
+)
+from sglang.jit_kernel.flash_attention_v4 import (
+    hopper_get_scheduler_metadata,
 )
 
 
@@ -70,6 +83,10 @@ class FlashAttentionMetadata:
     encoder_lens_int32: torch.Tensor = None
     # Page table for the encoder
     encoder_page_table: torch.Tensor = None
+    # Official Hopper FA4 scheduler metadata. This must stay pointer-stable for
+    # CUDA graph replay, so it is allocated during capture and updated in place.
+    scheduler_metadata: torch.Tensor = None
+    swa_scheduler_metadata: torch.Tensor = None
 
     @dataclass
     class LocalAttentionMetadata:
@@ -342,11 +359,14 @@ class FlashAttentionBackend(AttentionBackend):
         self.forward_metadata_spec_decode_expand: FlashAttentionMetadata = None
         self.max_context_len = model_runner.model_config.context_len
         self.device = model_runner.device
+        self._model_runner = model_runner
         self.decode_cuda_graph_metadata = {}
         self.target_verify_metadata = {}
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
         self.kv_cache_dtype = model_runner.kv_cache_dtype
-        self.kv_cache_dtype_str = model_runner.server_args.kv_cache_dtype
+        self.kv_cache_dtype_str = getattr(
+            model_runner, "kv_cache_dtype_str", model_runner.server_args.kv_cache_dtype
+        )
         self.page_size = model_runner.page_size
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
         self.skip_prefill = skip_prefill
@@ -396,6 +416,265 @@ class FlashAttentionBackend(AttentionBackend):
             )
             else 0
         )
+        self._fa4_graph_scheduler_spec: tuple[int, int, int, int, torch.dtype, bool] | None = None
+        # Optional verify-only override: route TARGET_VERIFY attention through Triton kernels.
+        # Useful when paged-KV multi-token verify has known kernel/semantic mismatches.
+        self._dflash_verify_triton_backend = None
+        self._logged_dflash_verify_triton_once = False
+
+    def _should_use_triton_for_target_verify(self, forward_batch: ForwardBatch) -> bool:
+        if not forward_batch.forward_mode.is_target_verify():
+            return False
+        if int(getattr(self, "page_size", 1) or 1) <= 1:
+            return False
+        flag = (os.environ.get("SGLANG_DFLASH_VERIFY_FORCE_TRITON_ATTENTION") or "").strip().lower()
+        if flag in ("", "0", "false", "off", "no"):
+            return False
+        # Only supported for standard MHA path for now.
+        if bool(getattr(self, "use_mla", False)):
+            return False
+        return True
+
+    def _use_fa4_hopper_scheduler_metadata(self) -> bool:
+        if (os.environ.get("SGLANG_FA4_DISABLE_HOPPER_SCHEDULER_METADATA") or "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        ):
+            return False
+        return (
+            self.fa_impl_ver == 4
+            and fa4_hopper_stable_enabled()
+            and fa4_hopper_scheduler_metadata_enabled()
+            and not self.use_mla
+        )
+
+    def _fa4_scheduler_max_seqlen_k(
+        self,
+        metadata: FlashAttentionMetadata,
+        page_table: Optional[torch.Tensor],
+    ) -> int:
+        if page_table is not None:
+            return int(page_table.shape[1]) * int(self.page_size)
+        return int(metadata.max_seq_len_k)
+
+    def _build_fa4_scheduler_metadata_from_spec(
+        self,
+        metadata: FlashAttentionMetadata,
+        *,
+        q_head_num: int,
+        k_head_num: int,
+        head_dim: int,
+        v_head_dim: int,
+        q_dtype: torch.dtype,
+        page_table: Optional[torch.Tensor],
+        causal: bool,
+        window_size: tuple[int, int],
+        has_softcap: bool,
+        cu_seqlens_k_new: Optional[torch.Tensor] = None,
+        max_seqlen_k_new: int = 0,
+    ) -> torch.Tensor:
+        return hopper_get_scheduler_metadata(
+            batch_size=int(metadata.cache_seqlens_int32.shape[0]),
+            max_seqlen_q=int(metadata.max_seq_len_q),
+            max_seqlen_k=self._fa4_scheduler_max_seqlen_k(metadata, page_table),
+            num_heads_q=int(q_head_num),
+            num_heads_kv=int(k_head_num),
+            headdim=int(head_dim),
+            cache_seqlens=metadata.cache_seqlens_int32,
+            qkv_dtype=q_dtype,
+            headdim_v=int(v_head_dim),
+            cu_seqlens_q=metadata.cu_seqlens_q,
+            cu_seqlens_k_new=cu_seqlens_k_new,
+            page_size=(int(self.page_size) if page_table is not None else None),
+            max_seqlen_k_new=int(max_seqlen_k_new),
+            causal=bool(causal),
+            window_size=window_size,
+            attention_chunk=0,
+            has_softcap=bool(has_softcap),
+            num_splits=int(self.num_splits),
+            pack_gqa=None,
+            sm_margin=0,
+        )
+
+    def _build_fa4_scheduler_metadata(
+        self,
+        metadata: FlashAttentionMetadata,
+        layer: RadixAttention,
+        q_dtype: torch.dtype,
+        page_table: Optional[torch.Tensor],
+        causal: bool,
+        window_size: tuple[int, int],
+        *,
+        cu_seqlens_k_new: Optional[torch.Tensor] = None,
+        max_seqlen_k_new: int = 0,
+    ) -> torch.Tensor:
+        return self._build_fa4_scheduler_metadata_from_spec(
+            metadata,
+            q_head_num=int(layer.tp_q_head_num),
+            k_head_num=int(layer.tp_k_head_num),
+            head_dim=int(layer.head_dim),
+            v_head_dim=int(layer.v_head_dim),
+            q_dtype=q_dtype,
+            page_table=page_table,
+            causal=causal,
+            window_size=window_size,
+            has_softcap=bool(layer.logit_cap),
+            cu_seqlens_k_new=cu_seqlens_k_new,
+            max_seqlen_k_new=max_seqlen_k_new,
+        )
+
+    def _maybe_init_fa4_scheduler_metadata_capture(
+        self,
+        metadata: FlashAttentionMetadata,
+        layer: RadixAttention,
+        q_dtype: torch.dtype,
+        page_table: Optional[torch.Tensor],
+        causal: bool,
+        window_size: tuple[int, int],
+        *,
+        is_swa_layer: bool,
+    ) -> None:
+        if not self._use_fa4_hopper_scheduler_metadata():
+            return
+        scheduler_metadata = self._build_fa4_scheduler_metadata(
+            metadata,
+            layer,
+            q_dtype,
+            page_table,
+            causal,
+            window_size,
+        )
+        if is_swa_layer:
+            metadata.swa_scheduler_metadata = scheduler_metadata
+        else:
+            metadata.scheduler_metadata = scheduler_metadata
+        self._fa4_graph_scheduler_spec = (
+            int(layer.tp_q_head_num),
+            int(layer.tp_k_head_num),
+            int(layer.head_dim),
+            int(layer.v_head_dim),
+            q_dtype,
+            bool(layer.logit_cap),
+        )
+
+    def _maybe_refresh_fa4_scheduler_metadata_replay(
+        self,
+        metadata: FlashAttentionMetadata,
+        layer: RadixAttention,
+        q_dtype: torch.dtype,
+        page_table: Optional[torch.Tensor],
+        causal: bool,
+        window_size: tuple[int, int],
+        *,
+        is_swa_layer: bool,
+    ) -> None:
+        if not self._use_fa4_hopper_scheduler_metadata():
+            return
+        target_attr = "swa_scheduler_metadata" if is_swa_layer else "scheduler_metadata"
+        target_tensor = getattr(metadata, target_attr)
+        if target_tensor is None:
+            self._maybe_init_fa4_scheduler_metadata_capture(
+                metadata,
+                layer,
+                q_dtype,
+                page_table,
+                causal,
+                window_size,
+                is_swa_layer=is_swa_layer,
+            )
+            return
+        refreshed = self._build_fa4_scheduler_metadata(
+            metadata,
+            layer,
+            q_dtype,
+            page_table,
+            causal,
+            window_size,
+        )
+        if (
+            target_tensor.shape != refreshed.shape
+            or target_tensor.dtype != refreshed.dtype
+        ):
+            raise RuntimeError(
+                "FA4 Hopper scheduler metadata shape/dtype changed across CUDA-graph replay: "
+                f"old_shape={tuple(target_tensor.shape)} "
+                f"new_shape={tuple(refreshed.shape)} "
+                f"old_dtype={target_tensor.dtype} "
+                f"new_dtype={refreshed.dtype}"
+            )
+        target_tensor.copy_(refreshed)
+
+    def _maybe_refresh_fa4_scheduler_metadata_replay_graph_metadata(
+        self,
+        metadata: FlashAttentionMetadata,
+    ) -> None:
+        if (
+            not self._use_fa4_hopper_scheduler_metadata()
+            or self._fa4_graph_scheduler_spec is None
+        ):
+            return
+        (
+            q_head_num,
+            k_head_num,
+            head_dim,
+            v_head_dim,
+            q_dtype,
+            has_softcap,
+        ) = self._fa4_graph_scheduler_spec
+
+        def _refresh_one(
+            target_tensor: Optional[torch.Tensor],
+            page_table: Optional[torch.Tensor],
+            causal: bool,
+            window_size: tuple[int, int],
+        ) -> None:
+            if target_tensor is None:
+                return
+            refreshed = self._build_fa4_scheduler_metadata_from_spec(
+                metadata,
+                q_head_num=q_head_num,
+                k_head_num=k_head_num,
+                head_dim=head_dim,
+                v_head_dim=v_head_dim,
+                q_dtype=q_dtype,
+                page_table=page_table,
+                causal=causal,
+                window_size=window_size,
+                has_softcap=has_softcap,
+            )
+            if (
+                target_tensor.shape != refreshed.shape
+                or target_tensor.dtype != refreshed.dtype
+            ):
+                raise RuntimeError(
+                    "FA4 Hopper graph scheduler metadata shape/dtype changed across replay: "
+                    f"old_shape={tuple(target_tensor.shape)} "
+                    f"new_shape={tuple(refreshed.shape)} "
+                    f"old_dtype={target_tensor.dtype} "
+                    f"new_dtype={refreshed.dtype}"
+                )
+            target_tensor.copy_(refreshed)
+
+        _refresh_one(
+            metadata.scheduler_metadata,
+            metadata.page_table,
+            True,
+            (-1, -1),
+        )
+        if metadata.swa_page_table is not None or metadata.swa_scheduler_metadata is not None:
+            swa_page_table = metadata.swa_page_table
+            if swa_page_table is None:
+                swa_page_table = metadata.page_table
+            _refresh_one(
+                metadata.swa_scheduler_metadata,
+                swa_page_table,
+                True,
+                (self.sliding_window_size, 0)
+                if self.sliding_window_size is not None
+                else (-1, -1),
+            )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize forward metadata hence all layers in the forward pass can reuse it."""
@@ -732,6 +1011,29 @@ class FlashAttentionBackend(AttentionBackend):
 
         self.forward_metadata = metadata
 
+        if self._should_use_triton_for_target_verify(forward_batch):
+            try:
+                if self._dflash_verify_triton_backend is None:
+                    from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
+
+                    self._dflash_verify_triton_backend = TritonAttnBackend(self._model_runner)
+                self._dflash_verify_triton_backend.init_forward_metadata(forward_batch)
+                if not self._logged_dflash_verify_triton_once and self.speculative_step_id == 0:
+                    logger.info(
+                        "FlashAttentionBackend: routing TARGET_VERIFY attention through Triton kernels "
+                        "(SGLANG_DFLASH_VERIFY_FORCE_TRITON_ATTENTION=1 page_size=%s).",
+                        int(self.page_size),
+                    )
+                    self._logged_dflash_verify_triton_once = True
+            except Exception as e:
+                # Fail open (fallback to FA path) if Triton verify init fails.
+                if self.speculative_step_id == 0 and not self._logged_dflash_verify_triton_once:
+                    logger.warning(
+                        "FlashAttentionBackend: Triton verify override init failed; falling back to FA. err=%s",
+                        e,
+                    )
+                self._dflash_verify_triton_backend = None
+
     def forward_extend(
         self,
         q: torch.Tensor,
@@ -754,8 +1056,14 @@ class FlashAttentionBackend(AttentionBackend):
                     else forward_batch.encoder_out_cache_loc
                 )
                 if not self.use_mla:
+                    k_scale = getattr(layer, 'k_scale_vec', None)
+                    v_scale = getattr(layer, 'v_scale_vec', None)
+                    if k_scale is None:
+                        k_scale = layer.k_scale
+                    if v_scale is None:
+                        v_scale = layer.v_scale
                     forward_batch.token_to_kv_pool.set_kv_buffer(
-                        layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+                        layer, cache_loc, k, v, k_scale, v_scale
                     )
                 else:
                     forward_batch.token_to_kv_pool.set_mla_kv_buffer(
@@ -768,6 +1076,43 @@ class FlashAttentionBackend(AttentionBackend):
         # Use precomputed metadata across all layers
         metadata = self.forward_metadata
 
+        # Verify-only attention override: in paged-KV multi-token TARGET_VERIFY, some FA kernels
+        # can diverge from token-by-token decode semantics (notably with sink/SWA models).
+        # Route attention through Triton kernels as a correctness-first fallback.
+        if self._should_use_triton_for_target_verify(forward_batch) and q.dtype in (
+            torch.float16,
+            torch.bfloat16,
+        ):
+            if self._dflash_verify_triton_backend is None:
+                try:
+                    from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
+
+                    self._dflash_verify_triton_backend = TritonAttnBackend(self._model_runner)
+                    self._dflash_verify_triton_backend.init_forward_metadata(forward_batch)
+                except Exception as e:
+                    self._dflash_verify_triton_backend = None
+                    logger.warning(
+                        "FlashAttentionBackend: failed to initialize Triton verify override; falling back to FA. err=%s",
+                        e,
+                    )
+            if self._dflash_verify_triton_backend is not None:
+                if not self._logged_dflash_verify_triton_once and self.speculative_step_id == 0:
+                    logger.warning(
+                        "FlashAttentionBackend: USING TRITON override for TARGET_VERIFY attention "
+                        "(SGLANG_DFLASH_VERIFY_FORCE_TRITON_ATTENTION=1 page_size=%s).",
+                        int(self.page_size),
+                    )
+                    self._logged_dflash_verify_triton_once = True
+                return self._dflash_verify_triton_backend.forward_extend(
+                    q=q,
+                    k=k,
+                    v=v,
+                    layer=layer,
+                    forward_batch=forward_batch,
+                    save_kv_cache=False,
+                    sinks=sinks,
+                )
+
         # Calculate window size (can be moved to metadata if layer properties don't change)
         # we don't do layer.sliding_window_size - 1 since in model.get_attention_sliding_window_size() we already - 1
         # here is two side inclusive
@@ -775,23 +1120,156 @@ class FlashAttentionBackend(AttentionBackend):
             layer.sliding_window_size is not None and layer.sliding_window_size > -1
         )
         window_size = (layer.sliding_window_size, 0) if is_swa_layer else (-1, -1)
-        k_descale, v_descale = None, None
-        # only use kv scaling if: 1) fp8 kv is explicitly enabled, 2) RadixAttention
-        # has corresponding quantization method so that layer.k_scale is not None,
-        # 3) layer.head_dim <= 256 since fa3 kernel require fp16 and bf16 data type in this case,
-        # 4) fa_impl_ver != 4 since fa4 does not currently support fp8 queries and keys.
+        q_descale, k_descale, v_descale = None, None, None
+        # Only use kv scaling if:
+        # 1) fp8 kv is explicitly enabled,
+        # 2) RadixAttention has corresponding quantization method so that layer.k_scale is not None,
+        # 3) layer.head_dim <= 256,
+        # 4) FA4 is only allowed here when the official Hopper stable interface is active.
         if (
             self.kv_cache_dtype_str != "auto"
             and layer.head_dim <= 256
-            and self.fa_impl_ver != 4
+            and (self.fa_impl_ver != 4 or fa4_hopper_stable_enabled())
         ):
             if layer.k_scale is not None:
                 descale_shape = (forward_batch.batch_size, layer.tp_k_head_num)
-                k_descale = layer.k_scale.expand(descale_shape)
-                v_descale = layer.v_scale.expand(descale_shape)
-            q = q.to(self.kv_cache_dtype)
-            q_rope = q_rope.to(self.kv_cache_dtype) if q_rope is not None else None
-            k_rope = k_rope.to(self.kv_cache_dtype) if k_rope is not None else None
+                k_scale = getattr(layer, 'k_scale_vec', None)
+                v_scale = getattr(layer, 'v_scale_vec', None)
+                if k_scale is None:
+                    k_scale = layer.k_scale
+                if v_scale is None:
+                    v_scale = layer.v_scale
+                k_descale = k_scale.expand(descale_shape)
+                v_descale = v_scale.expand(descale_shape)
+
+                # Optional accuracy mode: keep Q in bf16 while KV cache is FP8.
+                # This can reduce numeric drift (and improve speculative accept_len),
+                # at the cost of not taking the full FP8-Q path.
+                keep_q_bf16 = (os.environ.get("SGLANG_FP8_KEEP_Q_BF16") or "").strip().lower() in (
+                    "1",
+                    "true",
+                    "yes",
+                )
+                if not keep_q_bf16:
+                    dynamic_q_scale = (os.environ.get("SGLANG_FP8_DYNAMIC_Q_SCALE") or "").strip().lower() in (
+                        "1",
+                        "true",
+                        "yes",
+                    )
+                    if dynamic_q_scale:
+                        # Use a per-call (per-layer) Q scale instead of reusing KV scale.
+                        # This improves Q utilization of the FP8 range when |Q| << |K,V|.
+                        per_head_q_scale = (os.environ.get("SGLANG_FP8_Q_SCALE_PER_HEAD") or "").strip().lower() in (
+                            "1",
+                            "true",
+                            "yes",
+                        )
+                        max_fp8 = float(torch.finfo(self.kv_cache_dtype).max)
+                        with torch.no_grad():
+                            if per_head_q_scale:
+                                q3 = q.detach().reshape(
+                                    -1, layer.tp_q_head_num, layer.head_dim
+                                )
+                                q_heads = int(layer.tp_q_head_num)
+                                kv_heads = int(layer.tp_k_head_num)
+                                if kv_heads > 0 and q_heads % kv_heads == 0:
+                                    group = q_heads // kv_heads
+                                    q4 = q3.reshape(-1, kv_heads, group, layer.head_dim)
+                                    # Per KV-head scale: max over tokens, grouped Q-heads, and head_dim.
+                                    amax_q_h = q4.abs().amax(dim=(0, 2, 3)).to(
+                                        torch.float32
+                                    )
+                                    q_scale = (amax_q_h / (max_fp8 * 0.95)).clamp(
+                                        min=1e-6
+                                    )
+                                else:
+                                    # Fallback: cannot form KV-head groups.
+                                    per_head_q_scale = False
+                                    amax_q = q3.abs().amax().to(torch.float32)
+                                    q_scale = (amax_q / (max_fp8 * 0.95)).clamp(min=1e-6)
+                            else:
+                                amax_q = q.detach().abs().amax().to(torch.float32)
+                                q_scale = (amax_q / (max_fp8 * 0.95)).clamp(min=1e-6)
+
+                        if per_head_q_scale:
+                            q_scale_vec = q_scale.to(device=q.device, dtype=torch.float32)
+                            q_descale = q_scale_vec.expand(descale_shape)
+
+                            q_shape = q.shape
+                            q = (
+                                q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
+                                .reshape(-1, layer.tp_k_head_num, q_heads // kv_heads, layer.head_dim)
+                                .div(q_scale_vec.view(1, -1, 1, 1))
+                                .to(self.kv_cache_dtype)
+                                .reshape(-1, layer.tp_q_head_num, layer.head_dim)
+                                .reshape(q_shape)
+                            )
+                            if q_rope is not None:
+                                q_rope_shape = q_rope.shape
+                                q_rope = (
+                                    q_rope.reshape(
+                                        -1, layer.tp_q_head_num, layer.head_dim
+                                    )
+                                    .reshape(-1, layer.tp_k_head_num, q_heads // kv_heads, layer.head_dim)
+                                    .div(q_scale_vec.view(1, -1, 1, 1))
+                                    .to(self.kv_cache_dtype)
+                                    .reshape(-1, layer.tp_q_head_num, layer.head_dim)
+                                    .reshape(q_rope_shape)
+                                )
+                        else:
+                            q_descale = q_scale.expand(descale_shape)
+                            q = (q / q_scale).to(self.kv_cache_dtype)
+                            q_rope = (
+                                (q_rope / q_scale).to(self.kv_cache_dtype)
+                                if q_rope is not None
+                                else None
+                            )
+                        if k_rope is not None:
+                            if (
+                                isinstance(k_scale, torch.Tensor)
+                                and k_scale.ndim == 1
+                                and k_rope.ndim == 3
+                                and k_scale.numel() == k_rope.shape[1]
+                            ):
+                                k_rope = (k_rope / k_scale.view(1, -1, 1)).to(
+                                    self.kv_cache_dtype
+                                )
+                            else:
+                                k_rope = (k_rope / k_scale).to(self.kv_cache_dtype)
+                        else:
+                            k_rope = None
+                    else:
+                        q_descale = layer.k_scale.expand(descale_shape)
+                        # Quantize Q with the same per-layer scale used for KV cache so we
+                        # can use FA3 FP8 path without losing too much precision.
+                        q = (q / layer.k_scale).to(self.kv_cache_dtype)
+                        q_rope = (
+                            (q_rope / layer.k_scale).to(self.kv_cache_dtype)
+                            if q_rope is not None
+                            else None
+                        )
+                        if k_rope is not None:
+                            if (
+                                isinstance(k_scale, torch.Tensor)
+                                and k_scale.ndim == 1
+                                and k_rope.ndim == 3
+                                and k_scale.numel() == k_rope.shape[1]
+                            ):
+                                k_rope = (k_rope / k_scale.view(1, -1, 1)).to(
+                                    self.kv_cache_dtype
+                                )
+                            else:
+                                k_rope = (k_rope / k_scale).to(self.kv_cache_dtype)
+                        else:
+                            k_rope = None
+            else:
+                q = q.to(self.kv_cache_dtype)
+                q_rope = (
+                    q_rope.to(self.kv_cache_dtype) if q_rope is not None else None
+                )
+                k_rope = (
+                    k_rope.to(self.kv_cache_dtype) if k_rope is not None else None
+                )
         causal = True
         if layer.is_cross_attention or layer.attn_type == AttentionType.ENCODER_ONLY:
             causal = False
@@ -891,6 +1369,7 @@ class FlashAttentionBackend(AttentionBackend):
                 causal=False if use_cascade_attn else causal,
                 window_size=window_size,
                 softcap=layer.logit_cap,
+                q_descale=q_descale,
                 k_descale=k_descale,
                 v_descale=v_descale,
                 return_softmax_lse=use_cascade_attn,
@@ -918,6 +1397,7 @@ class FlashAttentionBackend(AttentionBackend):
                     causal=False,
                     window_size=window_size,
                     softcap=layer.logit_cap,
+                    q_descale=q_descale,
                     k_descale=k_descale,
                     v_descale=v_descale,
                     return_softmax_lse=True,
@@ -994,7 +1474,9 @@ class FlashAttentionBackend(AttentionBackend):
                     return output, lse
                 return output
             else:
-                assert self.fa_impl_ver in [3], "Only FA3 support here"
+                assert self.fa_impl_ver in [3, 4], (
+                    "Only FA3/FA4 support here"
+                )
                 # Do absorbed multi-latent attention
                 kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(
                     layer.layer_id
@@ -1033,6 +1515,7 @@ class FlashAttentionBackend(AttentionBackend):
                     softmax_scale=layer.scaling,
                     causal=False if use_cascade_attn else causal,
                     softcap=layer.logit_cap,
+                    q_descale=q_descale,
                     k_descale=k_descale,
                     v_descale=v_descale,
                     return_softmax_lse=use_cascade_attn,
@@ -1055,6 +1538,7 @@ class FlashAttentionBackend(AttentionBackend):
                             causal=False,
                             window_size=window_size,
                             softcap=layer.logit_cap,
+                            q_descale=q_descale,
                             k_descale=k_descale,
                             v_descale=v_descale,
                             return_softmax_lse=True,
@@ -1094,8 +1578,14 @@ class FlashAttentionBackend(AttentionBackend):
                     else forward_batch.encoder_out_cache_loc
                 )
                 if not self.use_mla:
+                    k_scale = getattr(layer, 'k_scale_vec', None)
+                    v_scale = getattr(layer, 'v_scale_vec', None)
+                    if k_scale is None:
+                        k_scale = layer.k_scale
+                    if v_scale is None:
+                        v_scale = layer.v_scale
                     forward_batch.token_to_kv_pool.set_kv_buffer(
-                        layer, cache_loc, k, v, layer.k_scale, layer.v_scale
+                        layer, cache_loc, k, v, k_scale, v_scale
                     )
                 else:
                     forward_batch.token_to_kv_pool.set_mla_kv_buffer(
@@ -1117,7 +1607,7 @@ class FlashAttentionBackend(AttentionBackend):
 
         # When Spec Decode enabled, forward_decode would be called with two mode:
         # 1. DRAFT_DECODE: we enable cascade attention when top_k > 1
-        # 2. IDLE: we don’t need cascade attention, spec_info will be none in this case
+        # 2. IDLE: we donâ€™t need cascade attention, spec_info will be none in this case
         use_cascade_attn = forward_batch.spec_info is not None and self.topk > 1
 
         # Calculate window size (can be moved to metadata if layer properties don't change)
@@ -1136,18 +1626,141 @@ class FlashAttentionBackend(AttentionBackend):
         if sinks is not None:
             kwargs["sinks"] = sinks
 
-        k_descale, v_descale = None, None
+        q_descale, k_descale, v_descale = None, None, None
         # only use kv scaling if: 1) fp8 kv is explicitly enabled, 2) RadixAttention
         # has corresponding quantization method so that layer.k_scale is not None,
-        # 3) layer.head_dim <= 256 since fa3 kernel require fp16 and bf16 data type in this case.
+        # 3) layer.head_dim <= 256 since FA3 kernel requires fp16/bf16 inputs for larger head dims.
         if self.kv_cache_dtype_str != "auto" and layer.head_dim <= 256:
             if layer.k_scale is not None:
                 descale_shape = (forward_batch.batch_size, layer.tp_k_head_num)
-                k_descale = layer.k_scale.expand(descale_shape)
-                v_descale = layer.v_scale.expand(descale_shape)
-            q = q.to(self.kv_cache_dtype)
-            q_rope = q_rope.to(self.kv_cache_dtype) if q_rope is not None else None
-            k_rope = k_rope.to(self.kv_cache_dtype) if k_rope is not None else None
+                k_scale = getattr(layer, 'k_scale_vec', None)
+                v_scale = getattr(layer, 'v_scale_vec', None)
+                if k_scale is None:
+                    k_scale = layer.k_scale
+                if v_scale is None:
+                    v_scale = layer.v_scale
+                k_descale = k_scale.expand(descale_shape)
+                v_descale = v_scale.expand(descale_shape)
+
+                keep_q_bf16 = (os.environ.get("SGLANG_FP8_KEEP_Q_BF16") or "").strip().lower() in (
+                    "1",
+                    "true",
+                    "yes",
+                )
+                if not keep_q_bf16:
+                    dynamic_q_scale = (os.environ.get("SGLANG_FP8_DYNAMIC_Q_SCALE") or "").strip().lower() in (
+                        "1",
+                        "true",
+                        "yes",
+                    )
+                    if dynamic_q_scale:
+                        per_head_q_scale = (os.environ.get("SGLANG_FP8_Q_SCALE_PER_HEAD") or "").strip().lower() in (
+                            "1",
+                            "true",
+                            "yes",
+                        )
+                        max_fp8 = float(torch.finfo(self.kv_cache_dtype).max)
+                        with torch.no_grad():
+                            if per_head_q_scale:
+                                q3 = q.detach().reshape(
+                                    -1, layer.tp_q_head_num, layer.head_dim
+                                )
+                                q_heads = int(layer.tp_q_head_num)
+                                kv_heads = int(layer.tp_k_head_num)
+                                if kv_heads > 0 and q_heads % kv_heads == 0:
+                                    group = q_heads // kv_heads
+                                    q4 = q3.reshape(-1, kv_heads, group, layer.head_dim)
+                                    amax_q_h = q4.abs().amax(dim=(0, 2, 3)).to(
+                                        torch.float32
+                                    )
+                                    q_scale = (amax_q_h / (max_fp8 * 0.95)).clamp(
+                                        min=1e-6
+                                    )
+                                else:
+                                    per_head_q_scale = False
+                                    amax_q = q3.abs().amax().to(torch.float32)
+                                    q_scale = (amax_q / (max_fp8 * 0.95)).clamp(min=1e-6)
+                            else:
+                                amax_q = q.detach().abs().amax().to(torch.float32)
+                                q_scale = (amax_q / (max_fp8 * 0.95)).clamp(min=1e-6)
+
+                        if per_head_q_scale:
+                            q_scale_vec = q_scale.to(device=q.device, dtype=torch.float32)
+                            q_descale = q_scale_vec.expand(descale_shape)
+
+                            q_shape = q.shape
+                            q = (
+                                q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
+                                .reshape(-1, layer.tp_k_head_num, q_heads // kv_heads, layer.head_dim)
+                                .div(q_scale_vec.view(1, -1, 1, 1))
+                                .to(self.kv_cache_dtype)
+                                .reshape(-1, layer.tp_q_head_num, layer.head_dim)
+                                .reshape(q_shape)
+                            )
+                            if q_rope is not None:
+                                q_rope_shape = q_rope.shape
+                                q_rope = (
+                                    q_rope.reshape(
+                                        -1, layer.tp_q_head_num, layer.head_dim
+                                    )
+                                    .reshape(-1, layer.tp_k_head_num, q_heads // kv_heads, layer.head_dim)
+                                    .div(q_scale_vec.view(1, -1, 1, 1))
+                                    .to(self.kv_cache_dtype)
+                                    .reshape(-1, layer.tp_q_head_num, layer.head_dim)
+                                    .reshape(q_rope_shape)
+                                )
+                        else:
+                            q_descale = q_scale.expand(descale_shape)
+                            q = (q / q_scale).to(self.kv_cache_dtype)
+                            q_rope = (
+                                (q_rope / q_scale).to(self.kv_cache_dtype)
+                                if q_rope is not None
+                                else None
+                            )
+                        if k_rope is not None:
+                            if (
+                                isinstance(k_scale, torch.Tensor)
+                                and k_scale.ndim == 1
+                                and k_rope.ndim == 3
+                                and k_scale.numel() == k_rope.shape[1]
+                            ):
+                                k_rope = (k_rope / k_scale.view(1, -1, 1)).to(
+                                    self.kv_cache_dtype
+                                )
+                            else:
+                                k_rope = (k_rope / k_scale).to(self.kv_cache_dtype)
+                        else:
+                            k_rope = None
+                    else:
+                        q_descale = layer.k_scale.expand(descale_shape)
+                        q = (q / layer.k_scale).to(self.kv_cache_dtype)
+                        q_rope = (
+                            (q_rope / layer.k_scale).to(self.kv_cache_dtype)
+                            if q_rope is not None
+                            else None
+                        )
+                        if k_rope is not None:
+                            if (
+                                isinstance(k_scale, torch.Tensor)
+                                and k_scale.ndim == 1
+                                and k_rope.ndim == 3
+                                and k_scale.numel() == k_rope.shape[1]
+                            ):
+                                k_rope = (k_rope / k_scale.view(1, -1, 1)).to(
+                                    self.kv_cache_dtype
+                                )
+                            else:
+                                k_rope = (k_rope / k_scale).to(self.kv_cache_dtype)
+                        else:
+                            k_rope = None
+            else:
+                q = q.to(self.kv_cache_dtype)
+                q_rope = (
+                    q_rope.to(self.kv_cache_dtype) if q_rope is not None else None
+                )
+                k_rope = (
+                    k_rope.to(self.kv_cache_dtype) if k_rope is not None else None
+                )
         if not self.use_mla:
             # Do multi-head attention
 
@@ -1176,6 +1789,7 @@ class FlashAttentionBackend(AttentionBackend):
                     causal=False,
                     window_size=(-1, -1),
                     softcap=layer.logit_cap,
+                    q_descale=q_descale,
                     k_descale=k_descale,
                     v_descale=v_descale,
                     num_splits=self.num_splits,
@@ -1196,6 +1810,7 @@ class FlashAttentionBackend(AttentionBackend):
                     causal=True,
                     window_size=(-1, -1),
                     softcap=layer.logit_cap,
+                    q_descale=q_descale,
                     k_descale=k_descale,
                     v_descale=v_descale,
                     num_splits=self.num_splits,
@@ -1218,6 +1833,20 @@ class FlashAttentionBackend(AttentionBackend):
                 q_reshaped = q.contiguous().view(
                     -1, layer.tp_q_head_num, layer.head_dim
                 )
+                self._maybe_refresh_fa4_scheduler_metadata_replay(
+                    metadata,
+                    layer,
+                    q_reshaped.dtype,
+                    page_table,
+                    False if use_cascade_attn else causal,
+                    window_size,
+                    is_swa_layer=is_swa_layer,
+                )
+                scheduler_metadata = (
+                    metadata.swa_scheduler_metadata
+                    if is_swa_layer
+                    else metadata.scheduler_metadata
+                )
 
                 # Default: single-token self-attention
                 result = flash_attn_with_kvcache(
@@ -1232,8 +1861,10 @@ class FlashAttentionBackend(AttentionBackend):
                     causal=False if use_cascade_attn else causal,
                     window_size=window_size,
                     softcap=layer.logit_cap,
+                    q_descale=q_descale,
                     k_descale=k_descale,
                     v_descale=v_descale,
+                    scheduler_metadata=scheduler_metadata,
                     return_softmax_lse=use_cascade_attn,
                     num_splits=self.num_splits,
                     **kwargs,
@@ -1254,8 +1885,10 @@ class FlashAttentionBackend(AttentionBackend):
                             causal=False,
                             window_size=window_size,
                             softcap=layer.logit_cap,
+                            q_descale=q_descale,
                             k_descale=k_descale,
                             v_descale=v_descale,
+                            scheduler_metadata=scheduler_metadata,
                             return_softmax_lse=True,
                             num_splits=self.num_splits,
                             **kwargs,
@@ -1310,6 +1943,7 @@ class FlashAttentionBackend(AttentionBackend):
                 softmax_scale=layer.scaling,
                 causal=False if use_cascade_attn else causal,
                 softcap=layer.logit_cap,
+                q_descale=q_descale,
                 k_descale=k_descale,
                 v_descale=v_descale,
                 return_softmax_lse=use_cascade_attn,  # softmax_lse is needed for merge states
@@ -1331,6 +1965,7 @@ class FlashAttentionBackend(AttentionBackend):
                     causal=False,
                     window_size=window_size,
                     softcap=layer.logit_cap,
+                    q_descale=q_descale,
                     k_descale=k_descale,
                     v_descale=v_descale,
                     return_softmax_lse=True,
@@ -1502,6 +2137,18 @@ class FlashAttentionBackend(AttentionBackend):
                     0, self.max_context_len, self.page_size, device=self.device
                 ),
             }
+            if self.use_sliding_window_kv_pool:
+                # Target-verify CUDA-graph replay uses preallocated metadata buffers. For hybrid
+                # SWA models, we must also preallocate and populate an SWA page table; otherwise
+                # SWA layers will incorrectly fall back to translating the already-strided
+                # page_table (page indices), which produces wrong KV reads and breaks DFlash
+                # exactness under paged KV.
+                self.target_verify_metadata["swa_page_table"] = torch.zeros(
+                    max_bs,
+                    max_num_pages,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
 
             self.draft_extend_metadata = {
                 "cache_seqlens": torch.zeros(
@@ -1755,6 +2402,10 @@ class FlashAttentionBackend(AttentionBackend):
                 ]
 
                 metadata.page_table = self.target_verify_metadata["page_table"][:bs, :]
+                if self.use_sliding_window_kv_pool:
+                    metadata.swa_page_table = self.target_verify_metadata[
+                        "swa_page_table"
+                    ][:bs, :]
 
                 self.target_verify_metadata[bs] = metadata
             else:
@@ -1973,6 +2624,9 @@ class FlashAttentionBackend(AttentionBackend):
                     metadata.swa_page_table,
                     self.token_to_kv_pool if self.use_sliding_window_kv_pool else None,
                 )
+                self._maybe_refresh_fa4_scheduler_metadata_replay_graph_metadata(
+                    metadata
+                )
 
                 self._maybe_update_local_attn_metadata_for_replay(
                     metadata,
@@ -1994,12 +2648,27 @@ class FlashAttentionBackend(AttentionBackend):
                 max_seq_pages = (
                     metadata.max_seq_len_k + self.page_size - 1
                 ) // self.page_size
-                page_indices = self.req_to_token[
+                page_token_indices = self.req_to_token[
                     req_pool_indices[:, None],
                     self.decode_cuda_graph_metadata["strided_indices"][:max_seq_pages],
                 ]
-                page_indices //= self.page_size
-                metadata.page_table[:, :max_seq_pages].copy_(page_indices)
+                metadata.page_table[:, :max_seq_pages].copy_(
+                    page_token_indices // self.page_size
+                )
+                if max_seq_pages < metadata.page_table.shape[1]:
+                    metadata.page_table[:, max_seq_pages:].fill_(0)
+
+                if self.use_sliding_window_kv_pool and getattr(metadata, "swa_page_table", None) is not None:
+                    swa_page_token_indices = (
+                        self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                            page_token_indices
+                        )
+                    )
+                    metadata.swa_page_table[:, :max_seq_pages].copy_(
+                        swa_page_token_indices // self.page_size
+                    )
+                    if max_seq_pages < metadata.swa_page_table.shape[1]:
+                        metadata.swa_page_table[:, max_seq_pages:].fill_(0)
             else:
                 # When topk > 1, we need two specific target verify metadata, and then merge states
                 # 1. The first half of metadata for prefix tokens
@@ -2531,19 +3200,34 @@ def prepare_swa_spec_page_table_triton(
 class FlashAttentionMultiStepBackend:
 
     def __init__(
-        self, model_runner: ModelRunner, topk: int, speculative_num_steps: int
+        self,
+        model_runner: ModelRunner,
+        topk: int,
+        speculative_num_steps: int,
+        fa_impl_ver: int = 3,
+        backend_cls=None,
+        backend_kwargs: Optional[dict] = None,
     ):
         self.model_runner = model_runner
         self.topk = topk
         self.speculative_num_steps = speculative_num_steps
+        self.fa_impl_ver = fa_impl_ver
+        self.backend_cls = backend_cls or FlashAttentionBackend
+        self.backend_kwargs = dict(backend_kwargs or {})
         self.attn_backends = []
         for i in range(self.speculative_num_steps - 1):
+            init_kwargs = {
+                "speculative_step_id": i,
+                "topk": self.topk,
+                "speculative_num_steps": self.speculative_num_steps,
+            }
+            if self.backend_cls is FlashAttentionBackend:
+                init_kwargs["fa_impl_ver"] = self.fa_impl_ver
+            init_kwargs.update(self.backend_kwargs)
             self.attn_backends.append(
-                FlashAttentionBackend(
+                self.backend_cls(
                     model_runner,
-                    speculative_step_id=i,
-                    topk=self.topk,
-                    speculative_num_steps=self.speculative_num_steps,
+                    **init_kwargs,
                 )
             )
 
@@ -2619,11 +3303,15 @@ def normal_decode_set_metadata(
         strided_indices[:max_seq_pages][None, :],
     ]
     page_table[:, :max_seq_pages].copy_(page_indices // page_size)
+    if max_seq_pages < page_table.shape[1]:
+        page_table[:, max_seq_pages:].fill_(0)
 
     if swa_page_table is not None and token_to_kv_pool is not None:
         assert isinstance(token_to_kv_pool, SWAKVPool)
         swa_page_indices = token_to_kv_pool.translate_loc_from_full_to_swa(page_indices)
         swa_page_table[:, :max_seq_pages].copy_(swa_page_indices // page_size)
+        if max_seq_pages < swa_page_table.shape[1]:
+            swa_page_table[:, max_seq_pages:].fill_(0)
 
 
 @torch.compile(dynamic=True, backend=get_compiler_backend())

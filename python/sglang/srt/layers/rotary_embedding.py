@@ -38,12 +38,19 @@ _is_xpu = is_xpu()
 _is_musa = is_musa()
 
 if _is_cuda:
-    from sglang.jit_kernel.rope import (
-        FusedSetKVBufferArg,
-        apply_rope_with_cos_sin_cache_inplace,
-    )
+    try:
+        from sglang.jit_kernel.rope import (
+            FusedSetKVBufferArg,
+            apply_rope_with_cos_sin_cache_inplace,
+        )
+    except ModuleNotFoundError as exc:
+        if exc.name != "tvm_ffi":
+            raise
+        FusedSetKVBufferArg = None
+        apply_rope_with_cos_sin_cache_inplace = None
 else:
     FusedSetKVBufferArg = None
+    apply_rope_with_cos_sin_cache_inplace = None
 
 if _use_aiter:
     from aiter.rotary_embedding import get_rope as aiter_get_rope
@@ -361,7 +368,7 @@ class RotaryEmbedding(MultiPlatformOp):
         offsets: Optional[torch.Tensor] = None,
         fused_set_kv_buffer_arg: Optional[FusedSetKVBufferArg] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        if not self.use_fallback_kernel:
+        if apply_rope_with_cos_sin_cache_inplace is not None and not self.use_fallback_kernel:
             apply_rope_with_cos_sin_cache_inplace(
                 positions=positions,
                 query=query,
@@ -376,7 +383,7 @@ class RotaryEmbedding(MultiPlatformOp):
                     else {}
                 ),
             )
-        else:
+        elif self.use_fallback_kernel:
             assert (
                 fused_set_kv_buffer_arg is None
             ), "save kv cache is not supported for fallback_rotary_embedding."
@@ -388,6 +395,10 @@ class RotaryEmbedding(MultiPlatformOp):
                 self.head_size,
                 self.cos_sin_cache,
                 self.is_neox_style,
+            )
+        else:
+            return self.forward_native(
+                positions, query, key, offsets, fused_set_kv_buffer_arg
             )
         return query, key
 

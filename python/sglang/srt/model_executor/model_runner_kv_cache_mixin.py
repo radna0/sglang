@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import TYPE_CHECKING
 
 import torch
@@ -24,6 +25,7 @@ from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool, SWATokenToKVPoolAllocator
+from sglang.srt.speculative.dflash_utils import scale_kv_cell_size_per_token_for_dflash
 from sglang.srt.utils.common import (
     get_available_gpu_memory,
     is_float4_e2m1fn_x2,
@@ -139,10 +141,41 @@ class ModelRunnerKVCacheMixin:
             num_layers = self.num_effective_layers
 
         cell_size = self.get_cell_size_per_token(num_layers)
+        if self.spec_algorithm.is_dflash() and not self.is_draft_worker:
+            draft_num_layers = getattr(self, "dflash_draft_num_layers", None)
+            if (
+                draft_num_layers is not None
+                and int(draft_num_layers) > 0
+                and int(num_layers) > 0
+            ):
+                cell_size = scale_kv_cell_size_per_token_for_dflash(
+                    target_cell_size_per_token=cell_size,
+                    target_num_layers=int(num_layers),
+                    draft_num_layers=int(draft_num_layers),
+                )
 
         rest_memory = available_gpu_memory - total_gpu_memory * (
             1 - self.mem_fraction_static
         )
+
+        # FlexAttention backends (especially with CUDA graphs enabled) can require extra temporary
+        # VRAM headroom for compiled/fused kernels during decode. Reserve headroom by *reducing*
+        # KV sizing (do NOT allocate a persistent tensor, which would negate the headroom).
+        try:
+            backend = str(getattr(self.server_args, "attention_backend", "") or "").lower()
+            reserve_gb = float((os.environ.get("SGLANG_FLEX_TEMP_RESERVED_GB") or "0").strip() or "0")
+            if reserve_gb > 0 and "flex" in backend and not is_npu():
+                before = float(rest_memory)
+                rest_memory = max(0.0, float(rest_memory) - float(reserve_gb))
+                logger.info(
+                    "Flex KV sizing headroom: reserve_gb=%.2f backend=%s rest_memory_gb=%.2f->%.2f",
+                    float(reserve_gb),
+                    backend,
+                    before,
+                    float(rest_memory),
+                )
+        except Exception:
+            pass
         if self.mambaish_config is not None:
             rest_memory = self.handle_max_mamba_cache(rest_memory)
 
@@ -339,6 +372,7 @@ class ModelRunnerKVCacheMixin:
     def init_memory_pool(self: ModelRunner, total_gpu_memory: int):
         max_num_reqs = self.server_args.max_running_requests
         max_total_tokens = self.server_args.max_total_tokens
+
         self.max_total_num_tokens = self.profile_max_num_token(total_gpu_memory)
 
         if max_num_reqs is None:
@@ -445,6 +479,7 @@ class ModelRunnerKVCacheMixin:
                         speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
                         enable_mamba_extra_buffer=self.server_args.enable_mamba_extra_buffer(),
                         pre_alloc_size=pre_alloc_size,
+                        enable_overlap_schedule=not self.server_args.disable_overlap_schedule,
                         mamba_size=self.server_args.max_mamba_cache_size,
                     )
                 else:
@@ -468,6 +503,7 @@ class ModelRunnerKVCacheMixin:
                     cache_params=config.mamba2_cache_params,
                     enable_mamba_extra_buffer=self.server_args.enable_mamba_extra_buffer(),
                     speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
+                    enable_overlap_schedule=not self.server_args.disable_overlap_schedule,
                 )
             else:
                 self.req_to_token_pool = ReqToTokenPool(

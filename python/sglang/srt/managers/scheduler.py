@@ -155,7 +155,7 @@ from sglang.srt.managers.schedule_policy import (
 )
 from sglang.srt.managers.scheduler_dp_attn_mixin import SchedulerDPAttnMixin
 from sglang.srt.managers.scheduler_input_blocker import SchedulerInputBlocker
-from sglang.srt.managers.scheduler_metrics_mixin import (
+from sglang.srt.observability.scheduler_metrics_mixin import (
     RECORD_STEP_TIME,
     PrefillStats,
     SchedulerMetricsMixin,
@@ -176,7 +176,6 @@ from sglang.srt.managers.scheduler_update_weights_mixin import (
 from sglang.srt.managers.session_controller import Session
 from sglang.srt.managers.utils import GenerationBatchResult, validate_input_length
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
@@ -1563,6 +1562,26 @@ class Scheduler(
                 self._add_request_to_queue(req)
                 return
 
+        if self.spec_algorithm.is_dflash() and req.return_logprob:
+            req.set_finish_with_abort(
+                "DFLASH speculative decoding does not support return_logprob yet."
+            )
+            self.init_req_max_new_tokens(req)
+            self._add_request_to_queue(req)
+            return
+        if self.spec_algorithm.is_dflash() and (
+            req.sampling_params.json_schema is not None
+            or req.sampling_params.regex is not None
+            or req.sampling_params.ebnf is not None
+            or req.sampling_params.structural_tag is not None
+        ):
+            req.set_finish_with_abort(
+                "DFLASH speculative decoding does not support grammar-constrained decoding yet."
+            )
+            self.init_req_max_new_tokens(req)
+            self._add_request_to_queue(req)
+            return
+
         # Handle multimodal inputs
         if recv_req.mm_inputs is not None:
             image_inputs = self._get_multimodal_inputs(recv_req.mm_inputs)
@@ -2754,7 +2773,7 @@ class Scheduler(
             self.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
             # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
             if self.disaggregation_mode == DisaggregationMode.DECODE:
-                release_kv_cache(req, self.tree_cache)
+                self._release_kv_cache_and_draft(req)
             # For disaggregation prefill mode, free the metadata buffer index
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 release_req_to_metadata_buffer(
@@ -2766,7 +2785,7 @@ class Scheduler(
                 req.mamba_pool_idx is not None
                 and self.disaggregation_mode != DisaggregationMode.DECODE
             ):
-                release_kv_cache(req, self.tree_cache, is_insert=False)
+                self._release_kv_cache_and_draft(req, is_insert=False)
             logger.debug(f"Abort queued request. {req.rid=}")
 
         # Delete the requests in the grammar queue
@@ -3125,6 +3144,25 @@ def run_scheduler_process(
             thread_label = "Decode Scheduler"
         trace_set_thread_info(thread_label, tp_rank, dp_rank)
 
+    def _write_scheduler_exception_dump(traceback_text: str) -> str:
+        dump_name = (
+            f"sglang_scheduler_exception_gpu{gpu_id}_tp{tp_rank}_pp{pp_rank}_"
+            f"dp{dp_rank if dp_rank is not None else 'na'}_{int(time.time())}.log"
+        )
+        dump_path = os.path.join("/tmp", dump_name)
+        try:
+            with open(dump_path, "w", encoding="utf-8") as fp:
+                fp.write(traceback_text)
+                if not traceback_text.endswith("\n"):
+                    fp.write("\n")
+                fp.flush()
+                os.fsync(fp.fileno())
+        except Exception:
+            return ""
+        return dump_path
+
+    ready_sent = False
+
     # Create a scheduler and run the event loop
     try:
         scheduler = Scheduler(
@@ -3157,6 +3195,7 @@ def run_scheduler_process(
             )
 
         pipe_writer.send(result_dict)
+        ready_sent = True
 
         # Dispatch to the appropriate event loop based on the disaggregation mode
         disaggregation_mode: DisaggregationMode = scheduler.disaggregation_mode
@@ -3187,5 +3226,29 @@ def run_scheduler_process(
 
     except Exception:
         traceback = get_exception_traceback()
+        dump_path = _write_scheduler_exception_dump(traceback)
         logger.error(f"Scheduler hit an exception: {traceback}")
+        if dump_path:
+            logger.error(f"Scheduler exception dump written to: {dump_path}")
+            print(
+                f"[Scheduler] exception dump written to: {dump_path}",
+                file=sys.stderr,
+                flush=True,
+            )
+        if not ready_sent:
+            try:
+                pipe_writer.send(
+                    {
+                        "status": "error",
+                        "traceback": traceback,
+                        "traceback_path": dump_path,
+                        "tp_rank": tp_rank,
+                        "gpu_id": gpu_id,
+                    }
+                )
+                pipe_writer.close()
+                time.sleep(0.2)
+                raise SystemExit(1)
+            except Exception:
+                pass
         parent_process.send_signal(signal.SIGQUIT)
