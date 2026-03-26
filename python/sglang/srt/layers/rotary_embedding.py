@@ -44,7 +44,7 @@ if _is_cuda:
             apply_rope_with_cos_sin_cache_inplace,
         )
     except ModuleNotFoundError as exc:
-        if exc.name != "tvm_ffi":
+        if exc.name not in {"tvm_ffi", "flashinfer"}:
             raise
         FusedSetKVBufferArg = None
         apply_rope_with_cos_sin_cache_inplace = None
