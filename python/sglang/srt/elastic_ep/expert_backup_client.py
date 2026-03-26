@@ -12,9 +12,14 @@ from sglang.srt.distributed.parallel_state import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
-from sglang.srt.managers.io_struct import UpdateExpertBackupReq
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_local_ip_auto
+
+try:
+    from sglang.srt.managers.io_struct import UpdateExpertBackupReq
+except Exception:
+    class UpdateExpertBackupReq:
+        pass
 
 PORT_BASE = envs.SGLANG_BACKUP_PORT_BASE.get()
 logger = logging.getLogger(__name__)
