@@ -301,9 +301,12 @@ class SchedulerRuntimeCheckerMixin:
 
         self._check_req_pool()
 
+        metrics_collector = getattr(self, "metrics_collector", None)
         if (
-            self.current_scheduler_metrics_enabled
-            and time.perf_counter() > self.metrics_collector.last_log_time + 30
+            getattr(self, "enable_metrics", False)
+            and self.current_scheduler_metrics_enabled
+            and metrics_collector is not None
+            and time.perf_counter() > metrics_collector.last_log_time + 30
         ):
             # During idle time, also collect metrics every 30 seconds.
             if self.is_hybrid_swa:
@@ -353,7 +356,7 @@ class SchedulerRuntimeCheckerMixin:
                 self.stats.num_decode_transfer_queue_reqs = len(
                     self.disagg_decode_transfer_queue.queue
                 )
-            self.metrics_collector.log_stats(self.stats)
+            metrics_collector.log_stats(self.stats)
         self._publish_kv_events()
 
     def check_tree_cache(self: Scheduler):
