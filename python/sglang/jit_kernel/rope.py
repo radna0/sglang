@@ -234,3 +234,33 @@ def apply_rope_with_cos_sin_cache_inplace(
             (not is_neox),
             enable_pdl,
         )
+
+
+def rotary_embedding(
+    positions: torch.Tensor,
+    query: torch.Tensor,
+    key: Optional[torch.Tensor],
+    head_size: int,
+    cos_sin_cache: torch.Tensor,
+    is_neox: bool = True,
+):
+    """Compatibility wrapper matching the legacy `sglang.jit_kernel.rope` API."""
+    if key is None:
+        apply_rope_with_cos_sin_cache_inplace(
+            positions,
+            query,
+            query,
+            head_size,
+            cos_sin_cache,
+            is_neox=is_neox,
+        )
+    else:
+        apply_rope_with_cos_sin_cache_inplace(
+            positions,
+            query,
+            key,
+            head_size,
+            cos_sin_cache,
+            is_neox=is_neox,
+        )
+    return query, key
