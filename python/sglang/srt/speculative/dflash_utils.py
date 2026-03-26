@@ -372,6 +372,22 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
     )
 
 
+def resolve_dflash_target_layer_ids(
+    *,
+    draft_hf_config: Any,
+    target_num_layers: int,
+    draft_num_layers: Optional[int] = None,
+) -> List[int]:
+    draft_cfg = parse_dflash_draft_config(draft_hf_config=draft_hf_config)
+    resolved_target_num_layers = int(target_num_layers)
+    if draft_cfg.num_target_layers is not None:
+        resolved_target_num_layers = int(draft_cfg.num_target_layers)
+    return draft_cfg.resolve_target_layer_ids(
+        target_num_layers=resolved_target_num_layers,
+        draft_num_layers=draft_num_layers,
+    )
+
+
 def can_dflash_slice_qkv_weight(qkv_proj: Any) -> Tuple[bool, str]:
     """Validate whether DFlash can slice KV weights from a fused QKV linear layer."""
     quant_method = getattr(qkv_proj, "quant_method", None)
