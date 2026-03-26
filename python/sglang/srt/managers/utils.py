@@ -49,6 +49,18 @@ class GenerationBatchResult:
     # metrics
     expert_distribution_metrics: Optional[ExpertDistributionMetrics] = None
 
+    # DFLASH SSD speculative stats
+    spec_ssd_hit_ct: Optional[List[int]] = None
+    spec_ssd_prepare_ct: Optional[List[int]] = None
+    spec_ssd_prepare_failure_ct: Optional[List[int]] = None
+    spec_ssd_cache_pending: Optional[List[int]] = None
+    spec_ssd_overlap_launch_ct: Optional[List[int]] = None
+    spec_ssd_overlap_wait_ct: Optional[List[int]] = None
+    spec_ssd_difficulty_gate_skip_ct: Optional[List[int]] = None
+    spec_ssd_fanout_gate_skip_ct: Optional[List[int]] = None
+    spec_ssd_fanout_escalation_ct: Optional[List[int]] = None
+    spec_ssd_fanout_alt_budget: Optional[List[int]] = None
+
     def copy_to_cpu(self, return_logprob: bool):
         """Copy tensors to CPU in overlap scheduling.
         Only the tensors which are needed for processing results are copied,
