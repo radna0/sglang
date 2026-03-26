@@ -163,6 +163,7 @@ class DFlashWorker:
         self._ssd_batch_misses = 0
         self._ssd_req_hits = 0
         self._ssd_req_misses = 0
+        self._verify_step = 0
         try:
             self._ssd_max_entries = max(
                 1, int((os.environ.get("SGLANG_DFLASH_SSD_MAX_ENTRIES") or "4").strip())
