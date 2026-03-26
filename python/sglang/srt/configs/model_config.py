@@ -193,6 +193,11 @@ class ModelConfig:
         self.is_local_attention_model = is_local_attention_model(
             self.hf_config.architectures
         )
+        self.use_ngram_embedding = getattr(self.hf_config, "use_ngram_embedding", False)
+        self.is_piecewise_cuda_graph_disabled_model = (
+            is_piecewise_cuda_graph_disabled_model(self.hf_config.architectures)
+            or is_deepseek_nsa(self.hf_text_config)
+        )
         self.dtype = _get_and_verify_dtype(self.hf_text_config, dtype)
 
         # Derive context length and model shapes
@@ -1349,6 +1354,20 @@ def is_hybrid_swa_model(model_architectures: List[str]):
         "Step3p5MTP",
     }
     return any(arch in hybrid_swa_archs for arch in model_architectures)
+
+
+def is_piecewise_cuda_graph_disabled_model(model_architectures: List[str]):
+    disabled_archs = {
+        "LlavaForConditionalGeneration",
+        "LlavaLlamaForCausalLM",
+        "LlavaMistralForCausalLM",
+        "LlavaQwenForCausalLM",
+        "LlavaVidForCausalLM",
+        "MllamaForConditionalGeneration",
+        "MiniCPMO",
+        "GlmAsrForConditionalGeneration",
+    }
+    return any(arch in disabled_archs for arch in model_architectures)
 
 
 def get_hybrid_layer_ids(
