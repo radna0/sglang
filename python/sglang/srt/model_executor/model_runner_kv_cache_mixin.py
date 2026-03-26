@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
@@ -43,6 +44,13 @@ MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_OVERLAP = 1
 logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
+
+
+@dataclass
+class MemoryPoolConfig:
+    """Compatibility placeholder for memory pool configuration plumbing."""
+
+    pass
 
 
 class ModelRunnerKVCacheMixin:
@@ -432,6 +440,7 @@ class ModelRunnerKVCacheMixin:
                 )
             self.max_total_num_tokens = min(self.max_total_num_tokens, max_total_tokens)
 
+        self.max_running_requests = max_num_reqs
         self.max_total_num_tokens = (
             self.max_total_num_tokens
             // self.server_args.page_size

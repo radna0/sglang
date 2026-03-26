@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
@@ -53,6 +54,7 @@ from sglang.srt.utils.common import get_bool_env_var
 from sglang.srt.utils.custom_op import register_custom_op
 
 has_triton_kernels = is_triton_kernels_available()
+logger = logging.getLogger(__name__)
 
 
 if is_flashinfer_available():
@@ -315,7 +317,16 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         self.prefix = prefix
         self.topk_indices_dtype = None
-        self.use_triton_kernels = get_moe_runner_backend().is_triton_kernels()
+        moe_backend = get_moe_runner_backend()
+        self.use_triton_kernels = moe_backend.is_triton_kernels() or (
+            moe_backend.is_auto()
+            and is_sm90_supported()
+            and is_triton_kernels_available()
+        )
+        if self.use_triton_kernels and moe_backend.is_auto():
+            logger.warning(
+                "Auto-selecting triton_kernels MXFP4 MoE backend on Hopper so weights stay swizzled and avoid BF16 upcast during load."
+            )
         self.with_bias = False
         self.use_flashinfer = get_moe_runner_backend().is_flashinfer_mxfp4()
         self.flashinfer_mxfp4_moe_precision = (

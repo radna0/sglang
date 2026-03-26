@@ -201,6 +201,8 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_int_env_var,
     get_zmq_socket,
+    is_blackwell_supported,
+    is_triton_kernels_available,
     kill_itself_when_parent_died,
     numa_bind_to_node,
     point_to_point_pyobj,
@@ -506,6 +508,20 @@ class Scheduler(
         )
 
         if hasattr(config_to_check, "num_experts_per_tok"):
+            quantization_config = getattr(
+                self.model_config.hf_config, "quantization_config", None
+            )
+            if (
+                self.server_args.moe_runner_backend == "auto"
+                and isinstance(quantization_config, dict)
+                and quantization_config.get("quant_method") == "mxfp4"
+                and not is_blackwell_supported()
+                and is_triton_kernels_available()
+            ):
+                self.server_args.moe_runner_backend = "triton_kernel"
+                logger.warning(
+                    "Detected GPT-OSS MXFP4 checkpoint on Hopper, selecting triton_kernels MoE backend before initialize_moe_config so top-k output format matches the preswizzled path."
+                )
             initialize_moe_config(self.server_args)
 
         # Initialize GEMM-related configuration for FP8 and FP4 backends.

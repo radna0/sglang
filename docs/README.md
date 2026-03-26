@@ -5,6 +5,13 @@ This is the documentation website for the SGLang project (https://github.com/sgl
 We recommend new contributors start from writing documentation, which helps you quickly understand SGLang codebase.
 Most documentation files are located under the `docs/` folder.
 
+## GPT-OSS CARE / MLA Notes
+
+If you are working on the GPT-OSS-120B MLA effort, start here:
+
+- [`GPTOSS120B_MLA_EXPERIMENTS_README.md`](./GPTOSS120B_MLA_EXPERIMENTS_README.md)
+- [`GPTOSS120B_MLA_REPRODUCTION_README.md`](./GPTOSS120B_MLA_REPRODUCTION_README.md)
+
 ## Docs Workflow
 
 ### Install Dependency

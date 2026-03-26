@@ -197,6 +197,20 @@ def build_target_layer_ids(num_target_layers: int, num_draft_layers: int) -> Lis
     ]
 
 
+def resolve_dflash_target_layer_ids(
+    *,
+    draft_hf_config: Any,
+    target_num_layers: int,
+    draft_num_layers: int,
+) -> List[int]:
+    """Compatibility wrapper used by the model runner and DFlash loaders."""
+    draft_cfg = parse_dflash_draft_config(draft_hf_config=draft_hf_config)
+    return draft_cfg.resolve_target_layer_ids(
+        target_num_layers=target_num_layers,
+        draft_num_layers=draft_num_layers,
+    )
+
+
 def _cfg_get(config: Any, key: str, default: Any = None) -> Any:
     if isinstance(config, dict):
         return config.get(key, default)

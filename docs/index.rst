@@ -121,6 +121,13 @@ Its core features include:
 
 .. toctree::
    :maxdepth: 1
+   :caption: GPT-OSS CARE / MLA
+
+   GPTOSS120B_MLA_EXPERIMENTS_README.md
+   GPTOSS120B_MLA_REPRODUCTION_README.md
+
+.. toctree::
+   :maxdepth: 1
    :caption: References
 
    references/faq.md

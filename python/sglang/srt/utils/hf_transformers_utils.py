@@ -584,7 +584,6 @@ def get_tokenizer(
                 tokenizer_mode="slow",
                 trust_remote_code=trust_remote_code,
                 tokenizer_revision=tokenizer_revision,
-                clean_up_tokenization_spaces=False,
                 **kwargs,
             )
         raise e

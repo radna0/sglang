@@ -1443,6 +1443,15 @@ class ServerArgs:
                         "Detected Blackwell and MXFP4 quantization format for GPT-OSS model, enabling FlashInfer MXFP4 MOE kernel."
                     )
                 elif (
+                    is_mxfp4_quant_format
+                    and self.ep_size == 1
+                    and is_triton_kernels_available()
+                ):
+                    self.moe_runner_backend = "triton_kernel"
+                    logger.warning(
+                        "Detected GPT-OSS MXFP4 quantization on CUDA, enabling triton_kernels MOE kernel so weights stay swizzled and avoid BF16 upcast during load."
+                    )
+                elif (
                     is_hip() and get_bool_env_var("SGLANG_USE_AITER")
                 ) and is_mxfp4_quant_format:
                     self.moe_runner_backend = "auto"

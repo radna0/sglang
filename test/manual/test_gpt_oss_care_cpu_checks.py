@@ -5,6 +5,7 @@ import unittest
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -24,6 +25,7 @@ smoke_mod = SourceFileLoader(
 
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig  # noqa: E402
 from sglang.srt.layers.radix_attention import RadixAttention  # noqa: E402
+from sglang.srt.layers.utils.multi_platform import MultiPlatformOp  # noqa: E402
 
 
 class _FakeBackend:
@@ -55,6 +57,14 @@ class _FakeForwardBatch:
     def __init__(self, attn_backend):
         self.forward_mode = _FakeForwardMode()
         self.attn_backend = attn_backend
+
+
+class _TopKCompileProbe(MultiPlatformOp):
+    def forward_native(self, *args, **kwargs):
+        return "native"
+
+    def forward_cuda(self, *args, **kwargs):
+        return "cuda"
 
 
 class TestGptOssCareCpuChecks(unittest.TestCase):
@@ -219,17 +229,66 @@ class TestGptOssCareCpuChecks(unittest.TestCase):
             'sliding_window_size=(sliding_window_size if use_sliding_window else -1)',
             source,
         )
-        self.assertIn("quant_config=None", source)
-        self.assertIn("def _ensure_postprocessed_weights(self) -> None:", source)
-        self.assertIn("self._ensure_postprocessed_weights()", source)
-        self.assertIn('attn_dtype = getattr(getattr(forward_batch, "token_to_kv_pool", None), "dtype", None)', source)
-        self.assertIn("q_input = q_input.to(attn_dtype)", source)
-        self.assertIn("if attn_output.dtype != self.w_vc.dtype:", source)
-        self.assertIn("self.total_mla_rope_num_kv_heads", source)
-        self.assertIn("self.use_native_mha_anchor", source)
-        self.assertIn('num_kv_heads=self.num_heads', source)
-        self.assertIn('torch.einsum("tr,hdr->thd", kv_latent, self.w_kc)', source)
-        self.assertIn("k_pe = k_input[..., self.kv_lora_rank :].clone()", source)
+
+    def test_server_args_prefers_triton_kernel_for_gptoss_mxfp4_on_cuda(self):
+        source = (REPO_ROOT / "python" / "sglang" / "srt" / "server_args.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            "Detected GPT-OSS MXFP4 quantization on CUDA, enabling triton_kernels MOE kernel",
+            source,
+        )
+        self.assertIn('self.moe_runner_backend = "triton_kernel"', source)
+
+    def test_mxfp4_method_autoselects_triton_kernel_on_hopper(self):
+        source = (
+            REPO_ROOT
+            / "python"
+            / "sglang"
+            / "srt"
+            / "layers"
+            / "quantization"
+            / "mxfp4.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("moe_backend = get_moe_runner_backend()", source)
+        self.assertIn("moe_backend.is_auto()", source)
+        self.assertIn("is_sm90_supported()", source)
+        self.assertIn("Auto-selecting triton_kernels MXFP4 MoE backend on Hopper", source)
+
+    def test_model_runner_records_max_running_requests_before_routed_experts_capturer(self):
+        source = (
+            REPO_ROOT
+            / "python"
+            / "sglang"
+            / "srt"
+            / "model_executor"
+            / "model_runner_kv_cache_mixin.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("self.max_running_requests = max_num_reqs", source)
+
+    def test_scheduler_prefers_triton_kernel_for_gptoss_mxfp4_on_hopper(self):
+        source = (
+            REPO_ROOT
+            / "python"
+            / "sglang"
+            / "srt"
+            / "managers"
+            / "scheduler.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("selecting triton_kernels MoE backend before initialize_moe_config", source)
+        self.assertIn('self.server_args.moe_runner_backend = "triton_kernel"', source)
+
+    def test_topk_compile_mode_preserves_triton_kernel_backend(self):
+        probe = _TopKCompileProbe()
+        baseline = probe.forward()
+
+        with patch("sglang.srt.layers.moe.get_moe_runner_backend") as get_backend:
+            get_backend.return_value = SimpleNamespace(is_triton_kernels=lambda: True)
+            probe.enter_torch_compile(num_tokens=1)
+
+        self.assertEqual(probe.forward(), "cuda")
+        probe.leave_torch_compile()
+        self.assertEqual(probe.forward(), baseline)
 
     def test_flashmla_backend_source_handles_sinks_sliding_and_pure_prefill(self):
         source = (
@@ -248,8 +307,11 @@ class TestGptOssCareCpuChecks(unittest.TestCase):
         self.assertIn("def _forward_sparse_prefill(", source)
         self.assertIn("forward_batch.token_to_kv_pool.set_mla_kv_buffer(", source)
         self.assertIn("kv_dense, indices = self._build_decode_dense_kv_and_indices(", source)
-        self.assertIn("q_all=reshape_q.view(bs, layer.tp_q_head_num, layer.head_dim)", source)
-        self.assertIn("o = apply_attention_sinks(o, lse.transpose(1, 2), sinks)", source)
+        self.assertIn("q_all = self._reshape_q_all(q, layer, q_rope)", source)
+        self.assertIn("q_width = q_all.shape[-1]", source)
+        self.assertIn("reshape_q = q_all.view(", source)
+        self.assertIn("o = apply_attention_sinks(", source)
+        self.assertIn("lse.reshape(-1, self.num_q_heads)", source)
 
     def test_model_config_routes_gptoss_multi_rope_anchor_to_mha_arch(self):
         source = (

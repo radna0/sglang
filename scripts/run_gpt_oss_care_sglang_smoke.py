@@ -29,12 +29,15 @@ def _parse_args() -> argparse.Namespace:
         description="Launch an SGLang server for a GPT-OSS CARE MLA checkpoint and run a single completion smoke."
     )
     parser.add_argument("--model-path", required=True)
+    parser.add_argument("--tokenizer-path", default=None)
+    parser.add_argument("--tokenizer-mode", default="auto")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=30000)
     parser.add_argument("--tp-size", type=int, default=8)
     parser.add_argument("--page-size", type=int, default=64)
     parser.add_argument("--dtype", default="bfloat16")
     parser.add_argument("--kv-cache-dtype", default="bfloat16")
+    parser.add_argument("--mem-fraction-static", type=float, default=0.95)
     parser.add_argument("--attention-backend", default="auto")
     parser.add_argument("--disable-piecewise-cuda-graph", action="store_true")
     parser.add_argument("--server-timeout-s", type=int, default=900)
@@ -200,10 +203,16 @@ def _launch_server(args: argparse.Namespace) -> subprocess.Popen[str]:
         str(args.dtype),
         "--kv-cache-dtype",
         str(args.kv_cache_dtype),
+        "--mem-fraction-static",
+        str(args.mem_fraction_static),
         "--attention-backend",
         args.attention_backend,
         "--trust-remote-code",
     ]
+    if args.tokenizer_path:
+        cmd.extend(["--tokenizer-path", args.tokenizer_path])
+    if args.tokenizer_mode:
+        cmd.extend(["--tokenizer-mode", args.tokenizer_mode])
     if getattr(args, "disable_cuda_graph", False):
         cmd.append("--disable-cuda-graph")
     print("[server]", " ".join(cmd), flush=True)

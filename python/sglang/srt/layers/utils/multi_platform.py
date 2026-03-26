@@ -52,7 +52,16 @@ class MultiPlatformOp(nn.Module):
                 self._forward_method = fused_moe_forward_native
         elif "TopK" in self.__class__.__name__:
             if num_tokens == 1:
-                self._forward_method = self.forward_native
+                from sglang.srt.layers.moe import get_moe_runner_backend
+
+                # Keep the triton-kernel top-k output format when the backend has
+                # already been preswizzled for GPT-OSS MXFP4. Falling back to the
+                # native path here would silently change the dispatch contract during
+                # compile warmup and break the triton-kernel MoE runner.
+                if get_moe_runner_backend().is_triton_kernels():
+                    self._forward_method = self.forward_cuda
+                else:
+                    self._forward_method = self.forward_native
         else:
             self._forward_method = self.forward_native
         self.is_torch_compile = True

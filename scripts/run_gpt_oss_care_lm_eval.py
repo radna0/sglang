@@ -31,9 +31,12 @@ def _parse_args() -> argparse.Namespace:
         description="Launch an SGLang server and run lm-eval against a GPT-OSS CARE checkpoint."
     )
     parser.add_argument("--model-path", default=None)
+    parser.add_argument("--tokenizer-path", default=None)
+    parser.add_argument("--tokenizer-mode", default="auto")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=30000)
     parser.add_argument("--tp-size", type=int, default=8)
+    parser.add_argument("--mem-fraction-static", type=float, default=0.95)
     parser.add_argument("--attention-backend", default="triton")
     parser.add_argument("--batch-size", default="auto")
     parser.add_argument("--num-concurrent", type=int, default=1)
@@ -77,10 +80,16 @@ def _launch_server(args: argparse.Namespace) -> subprocess.Popen[str]:
         str(args.port),
         "--tp",
         str(args.tp_size),
+        "--mem-fraction-static",
+        str(args.mem_fraction_static),
         "--attention-backend",
         args.attention_backend,
         "--trust-remote-code",
     ]
+    if args.tokenizer_path:
+        cmd.extend(["--tokenizer-path", args.tokenizer_path])
+    if args.tokenizer_mode:
+        cmd.extend(["--tokenizer-mode", args.tokenizer_mode])
     print("[server]", " ".join(cmd), flush=True)
     return subprocess.Popen(cmd, env=env)
 
