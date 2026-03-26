@@ -1,7 +1,11 @@
 import logging
 import math
 import os
+import threading
+import time
 
+from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+from contextlib import nullcontext
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import Optional, Union
@@ -3460,6 +3464,8 @@ class DFlashWorker:
         seq_lens_pre_verify = (
             batch.seq_lens.clone() if need_mamba_verify_commit else None
         )
+        timing_flag = False
+        t0 = 0.0
 
         batch_result = self.target_worker.forward_batch_generation(
             model_worker_batch, is_verify=True, **kwargs
