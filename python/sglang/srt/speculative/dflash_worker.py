@@ -3,6 +3,7 @@ import math
 import os
 
 from copy import deepcopy
+from dataclasses import dataclass
 from typing import Optional, Union
 
 import torch
