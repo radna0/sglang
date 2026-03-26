@@ -765,6 +765,27 @@ class ModelConfig:
         else:
             return None
 
+    def get_quantization_config_log_str(self) -> Optional[str]:
+        """
+        Get a concise string representation of the quantization config for logging.
+        Returns something like "quant=fp8, fmt=e4m3" or "quant=gptq, bits=4".
+        """
+        try:
+            quant_cfg = self._parse_quant_hf_config()
+            if not quant_cfg:
+                return None
+
+            quant_method = quant_cfg.get("quant_method", "quantized")
+            log_str = f"quant={quant_method}"
+
+            for field in ["bits", "quant_algo", "fmt"]:
+                if field in quant_cfg:
+                    log_str += f", {field}={quant_cfg[field]}"
+
+            return log_str
+        except Exception:
+            return None
+
     def _is_already_quantized(self) -> bool:
         """Check if the model is already quantized based on config files."""
         # Check for quantization in hf_config (config.json)

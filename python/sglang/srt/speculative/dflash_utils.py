@@ -388,6 +388,25 @@ def resolve_dflash_target_layer_ids(
     )
 
 
+def resolve_dflash_block_size(
+    *,
+    draft_hf_config: Any | None = None,
+    draft_config_json: Any | None = None,
+    default: Optional[int] = None,
+) -> Optional[int]:
+    """Resolve the DFlash block size from either HF config or raw config.json.
+
+    This keeps compatibility with both older callsites that pass
+    `draft_config_json=...` and newer ones that pass `draft_hf_config=...`.
+    """
+    cfg_src = draft_hf_config if draft_hf_config is not None else draft_config_json
+    if cfg_src is None:
+        return default
+    return parse_dflash_draft_config(draft_hf_config=cfg_src).resolve_block_size(
+        default=default
+    )
+
+
 def can_dflash_slice_qkv_weight(qkv_proj: Any) -> Tuple[bool, str]:
     """Validate whether DFlash can slice KV weights from a fused QKV linear layer."""
     quant_method = getattr(qkv_proj, "quant_method", None)
