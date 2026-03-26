@@ -452,6 +452,10 @@ class ModelRunnerKVCacheMixin:
             self.server_args.draft_runner_cache_size = self.max_total_num_tokens
             self.server_args.max_num_reqs = max_num_reqs
 
+        # Newer model_runner/tp_worker paths expect the resolved request capacity to
+        # be materialized on the runner instance, not just held in a local variable.
+        self.max_running_requests = int(max_num_reqs)
+
         if self.max_total_num_tokens <= 0:
             raise RuntimeError(
                 f"Not enough memory. Please try to increase --mem-fraction-static. "
