@@ -21,7 +21,8 @@ except Exception:
     class UpdateExpertBackupReq:
         pass
 
-PORT_BASE = envs.SGLANG_BACKUP_PORT_BASE.get()
+_backup_port_env = getattr(envs, "SGLANG_BACKUP_PORT_BASE", None)
+PORT_BASE = _backup_port_env.get() if _backup_port_env is not None else 0
 logger = logging.getLogger(__name__)
 
 
