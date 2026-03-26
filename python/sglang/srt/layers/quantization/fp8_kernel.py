@@ -65,9 +65,12 @@ if _is_cuda:
 
         enable_sgl_per_token_group_quant_8bit = False
 
-    from sglang.jit_kernel.per_token_group_quant_8bit import (
-        per_token_group_quant_8bit as sgl_per_token_group_quant_8bit_jit,
-    )
+    try:
+        from sglang.jit_kernel.per_token_group_quant_8bit import (
+            per_token_group_quant_8bit as sgl_per_token_group_quant_8bit_jit,
+        )
+    except ImportError:
+        sgl_per_token_group_quant_8bit_jit = None
 
 if _is_hip:
     _has_vllm = False
@@ -506,7 +509,7 @@ def sglang_per_token_group_quant_fp8(
 
     if x.shape[0] > 0:
         # Temporary
-        if enable_sgl_per_token_group_quant_8bit:
+        if enable_sgl_per_token_group_quant_8bit and sgl_per_token_group_quant_8bit_jit is not None:
             if enable_v2:
                 sgl_per_token_group_quant_8bit(
                     x,
