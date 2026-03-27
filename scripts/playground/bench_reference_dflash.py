@@ -192,6 +192,16 @@ def _compute_output_lens(
     return output_lens
 
 
+def _effective_draft_share_pools(page_size: int, draft_page_size: int | None) -> bool:
+    draft_ps = int(page_size if draft_page_size is None else draft_page_size)
+    if draft_ps != int(page_size):
+        return False
+    env_val = os.environ.get("SGLANG_DFLASH_DRAFT_SHARE_POOLS")
+    if env_val is None:
+        return True
+    return str(env_val).strip().lower() not in {"0", "false", "no", "off"}
+
+
 def _launch_server(
     *,
     model_path: str,
@@ -883,6 +893,11 @@ def main() -> int:
             "kv_cache_dtype": args.kv_cache_dtype,
             "draft_kv_cache_dtype": args.draft_kv_cache_dtype,
             "draft_page_size": args.draft_page_size,
+            "draft_share_pools_env": os.environ.get("SGLANG_DFLASH_DRAFT_SHARE_POOLS"),
+            "draft_share_pools_effective": _effective_draft_share_pools(
+                page_size=args.page_size,
+                draft_page_size=args.draft_page_size,
+            ),
             "attention_backend": args.attention_backend,
             "moe_runner_backend": args.moe_runner_backend,
             "draft_attention_backend": args.draft_attention_backend,
