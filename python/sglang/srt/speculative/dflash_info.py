@@ -1228,7 +1228,33 @@ class DFlashVerifyInput(SpecInput):
                 next_power_of_2(self.draft_token_num),
             )
             if bool(evict_mask.any()):
-                batch.token_to_kv_pool_allocator.free(batch.out_cache_loc[evict_mask])
+                evicted_slots = batch.out_cache_loc[evict_mask]
+                fast_free_used = False
+                if (
+                    hasattr(batch.token_to_kv_pool_allocator, "free_page_indices")
+                    and int(evicted_slots.numel()) % int(page_size) == 0
+                ):
+                    evicted_pages = evicted_slots.view(-1, int(page_size))[:, 0] // int(
+                        page_size
+                    )
+                    if bool(
+                        os.environ.get("SGLANG_DFLASH_DEBUG_PAGE_FREE", "")
+                        .strip()
+                        .lower()
+                        not in ("", "0", "false", "off", "no")
+                    ):
+                        page_rows = evicted_slots.view(-1, int(page_size))
+                        same_page = (
+                            page_rows // int(page_size)
+                        ) == evicted_pages[:, None]
+                        if not bool(torch.all(same_page)):
+                            raise RuntimeError(
+                                "DFLASH paged fast-free invariant failed: evicted slots are not page-aligned."
+                            )
+                    batch.token_to_kv_pool_allocator.free_page_indices(evicted_pages)
+                    fast_free_used = True
+                if not fast_free_used:
+                    batch.token_to_kv_pool_allocator.free(evicted_slots)
 
             # Compact the committed token slots for downstream mapping updates.
             batch.out_cache_loc = out_cache_loc[keep_mask]
