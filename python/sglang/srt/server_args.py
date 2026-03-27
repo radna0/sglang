@@ -488,6 +488,7 @@ class ServerArgs:
     speculative_attention_mode: str = "prefill"
     speculative_draft_attention_backend: Optional[str] = None
     speculative_draft_kv_cache_dtype: Optional[str] = None
+    speculative_draft_page_size: Optional[int] = None
     speculative_moe_runner_backend: Optional[str] = None
     speculative_moe_a2a_backend: Optional[str] = None
     speculative_draft_model_quantization: Optional[str] = None
@@ -2648,6 +2649,14 @@ class ServerArgs:
                     "DFLASH speculative decoding requires setting --speculative-draft-model-path."
                 )
 
+            if self.speculative_draft_page_size is not None and int(
+                self.speculative_draft_page_size
+            ) <= 0:
+                raise ValueError(
+                    "DFLASH requires --speculative-draft-page-size to be positive, "
+                    f"got {self.speculative_draft_page_size}."
+                )
+
             # DFLASH does not use EAGLE-style `num_steps`/`topk`, but those fields still
             # affect generic scheduler/KV-cache accounting (buffer sizing, KV freeing,
             # RoPE reservation). Force them to 1 to avoid surprising memory behavior.
@@ -2689,6 +2698,8 @@ class ServerArgs:
                 self.speculative_num_draft_tokens = int(
                     self.speculative_dflash_block_size
                 )
+
+            draft_model_type = None
 
             if self.speculative_num_draft_tokens is None:
                 from sglang.srt.speculative.dflash_utils import (
@@ -2783,6 +2794,19 @@ class ServerArgs:
                         inferred_block_size,
                     )
                 self.speculative_num_draft_tokens = inferred_block_size
+
+            if (
+                draft_model_type == "gpt_oss"
+                and self.page_size is not None
+                and int(self.page_size) > 1
+                and self.speculative_draft_page_size is None
+            ):
+                self.speculative_draft_page_size = 1
+                logger.warning(
+                    "GPT-OSS DFLASH defaulting speculative_draft_page_size=1 for paged target page_size=%s "
+                    "to improve draft acceptance. Override with --speculative-draft-page-size.",
+                    int(self.page_size),
+                )
 
             if self.max_running_requests is None:
                 self.max_running_requests = 48
@@ -4729,6 +4753,16 @@ class ServerArgs:
             default=ServerArgs.speculative_draft_kv_cache_dtype,
             choices=["auto", "fp8_e5m2", "fp8_e4m3", "bf16", "bfloat16", "fp4_e2m1"],
             help='Override the KV cache dtype for the draft worker. If unset, uses --kv-cache-dtype.',
+        )
+        parser.add_argument(
+            "--speculative-draft-page-size",
+            type=int,
+            default=ServerArgs.speculative_draft_page_size,
+            help=(
+                "Override the page size for the DFLASH draft worker. "
+                "If unset, the draft inherits the target page size unless a model-specific "
+                "auto override applies."
+            ),
         )
         parser.add_argument(
             "--speculative-moe-runner-backend",

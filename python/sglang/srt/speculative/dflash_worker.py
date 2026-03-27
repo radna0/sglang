@@ -399,7 +399,9 @@ class DFlashWorker:
         # For single-GPU bring-up and debugging we often want a *smaller* draft KV pool to fit
         # alongside the target worker. Allow opting out of pool-sharing so the draft worker can
         # use its own allocator + req_to_token_pool safely.
-        share_pools_env = (os.environ.get("SGLANG_DFLASH_DRAFT_SHARE_POOLS") or "1").strip().lower()
+        share_pools_env = (
+            os.environ.get("SGLANG_DFLASH_DRAFT_SHARE_POOLS") or "1"
+        ).strip().lower()
         share_pools = share_pools_env not in {"0", "false", "no", "off"}
         # Whether the draft worker shares req_to_token_pool + KV allocator semantics with the target.
         # When False, draft KV locations must be allocated and tracked independently.
@@ -423,12 +425,33 @@ class DFlashWorker:
         # This is particularly useful when the target runs paged KV (page_size>1) but the
         # DFlash draft was trained/validated mostly in the non-paged regime (page_size=1).
         target_page_size = int(getattr(server_args, "page_size", 1) or 1)
-        draft_page_size_env = (os.environ.get("SGLANG_DFLASH_DRAFT_PAGE_SIZE") or "").strip()
-        if draft_page_size_env:
+        draft_page_size_source = "inherit_target"
+        cli_draft_page_size = getattr(server_args, "speculative_draft_page_size", None)
+        draft_page_size_env = (
+            os.environ.get("SGLANG_DFLASH_DRAFT_PAGE_SIZE") or ""
+        ).strip()
+        if cli_draft_page_size is not None:
+            draft_page_size = int(cli_draft_page_size)
+            draft_page_size_source = "cli"
+            draft_server_args.page_size = draft_page_size
+            if int(draft_page_size) != target_page_size:
+                # Pool sharing requires allocator semantics (including page_size) to match.
+                share_pools = False
+                self._dflash_draft_share_pools = False
+                shared_req_to_token_pool = None
+                shared_token_to_kv_pool_allocator = None
+                if self.tp_rank == 0:
+                    logger.warning(
+                        "DFLASH draft page_size overridden via CLI to %s (target page_size=%s); disabling pool sharing.",
+                        int(draft_page_size),
+                        int(target_page_size),
+                    )
+        elif draft_page_size_env:
             try:
                 draft_page_size = int(draft_page_size_env)
                 if draft_page_size < 1:
                     raise ValueError("page_size must be >= 1")
+                draft_page_size_source = "env"
                 draft_server_args.page_size = draft_page_size
                 if int(draft_page_size) != target_page_size:
                     # Pool sharing requires allocator semantics (including page_size) to match.
@@ -458,6 +481,7 @@ class DFlashWorker:
             auto_env = (os.environ.get("SGLANG_DFLASH_DRAFT_PAGE_SIZE_AUTO") or "").strip().lower()
             auto_enable = auto_env not in ("", "0", "false", "off", "no")
             if auto_enable:
+                draft_page_size_source = "env_auto"
                 draft_server_args.page_size = 1
                 # Pool sharing requires allocator semantics (including page_size) to match.
                 share_pools = False
@@ -476,6 +500,14 @@ class DFlashWorker:
                     "or SGLANG_DFLASH_DRAFT_PAGE_SIZE_AUTO=1.",
                     int(target_page_size),
                 )
+        if self.tp_rank == 0:
+            logger.info(
+                "DFLASH draft page config: target_page_size=%s draft_page_size=%s share_pools=%s source=%s",
+                int(target_page_size),
+                int(getattr(draft_server_args, "page_size", target_page_size)),
+                bool(self._dflash_draft_share_pools),
+                draft_page_size_source,
+            )
         draft_backend = draft_server_args.speculative_draft_attention_backend
         supported_draft_backends = ("flashinfer", "fa3", "fa4")
         if draft_backend is None:
