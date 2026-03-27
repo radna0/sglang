@@ -65,6 +65,65 @@ So the right read is:
 - eager runs are the controller-validation measurements
 - do not compare eager controller rows against graph-on throughput rows without saying so explicitly
 
+For the latest graph-on controller comparisons, I pinned:
+
+- `PYTHONPATH=/workspace/sglang-dflash-line/python`
+- `disable_stream=True` in the local harness
+
+That matters because:
+
+- the installed site-package copy of `sglang` can diverge from this repo checkout
+- the local non-stream `/generate` path correctly reports `completion_tokens=2048`
+- the earlier `128`-token graph artifact came from using the wrong import path during local replay, not from the DFlash server path itself
+
+## Current Production Verdict On Adaptive Cap
+
+The current adaptive logical-cap controller is **not** production-ready on the graph-on path.
+
+Two production-path fixes were required first:
+
+- DFlash CUDA-graph replay must use the actual logical token count on replay, not `bs * physical_block`
+- manual DFlash draft `ForwardBatch` construction must carry `num_token_non_padded`
+
+Code paths:
+
+- `/workspace/sglang-dflash-line/python/sglang/srt/model_executor/cuda_graph_runner.py`
+- `/workspace/sglang-dflash-line/python/sglang/srt/speculative/dflash_worker.py`
+- `/workspace/sglang-dflash-line/scripts/playground/bench_reference_dflash.py`
+
+### Graph-On Local Harness Results, `context_length=65536`, `decode_len=2048`, `page=1`, `draft_page=1`, `block=16`
+
+Artifacts:
+
+- `/workspace/dflash_block_investigate_20260327_graph_v1/92ba6a_block16_fixed_graph_ctx65536_local.json`
+- `/workspace/dflash_block_investigate_20260327_graph_v1/92ba6a_block16_adaptive_graph_ctx65536.json`
+- `/workspace/dflash_block_investigate_20260327_graph_v1/a295e9_block16_fixed_graph_ctx65536_local.json`
+- `/workspace/dflash_block_investigate_20260327_graph_v1/a295e9_block16_adaptive_graph_ctx65536.json`
+
+| prompt | regime | wall tok/s | accept | verify | max_steps_mean | q_entropy | q_max |
+|---|---|---:|---:|---:|---:|---:|---:|
+| `92ba6a` | fixed | 237.941 | 3.388 | 571 | 15.000 | 1.705 | 0.599 |
+| `92ba6a` | adaptive | 102.182 | 2.102 | 1975 | 8.227 | 2.677 | 0.440 |
+| `a295e9` | fixed | 186.482 | 3.022 | 783 | 15.000 | 2.219 | 0.484 |
+| `a295e9` | adaptive | 183.043 | 2.595 | 777 | 9.712 | 2.234 | 0.482 |
+
+Interpretation:
+
+- the eager-tuned adaptive gate does **not** transfer to the graph-on production path
+- on the easy prompt, it is decisively wrong:
+  - throughput drops from `237.941` to `102.182 tok/s`
+  - verify count jumps from `571` to `1975`
+  - logical width collapses to about `8.2` even though fixed `16` is clearly better
+- on the hard prompt, it is also not a win on the production path:
+  - throughput slips from `186.482` to `183.043 tok/s`
+  - acceptance drops from `3.022` to `2.595`
+
+So the current production conclusion is:
+
+- keep `block_size=16` fixed on the graph-on path for now
+- do **not** enable the current adaptive logical-cap controller by default
+- the eager gains were real for controller-isolation, but they do not survive the graph-on serving path yet
+
 The corrected long-decode benchmark on this branch is now `showtime.py`-faithful in the
 important sense:
 

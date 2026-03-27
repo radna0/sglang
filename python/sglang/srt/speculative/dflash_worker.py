@@ -2634,6 +2634,11 @@ class DFlashWorker:
                     spec_algorithm=SpeculativeAlgorithm.DFLASH,
                     spec_info=draft_spec_info,
                     capture_hidden_mode=CaptureHiddenMode.NULL,
+                    num_token_non_padded=torch.tensor(
+                        [int(block_ids.numel())],
+                        dtype=torch.int32,
+                        device=block_ids.device,
+                    ),
                 )
 
                 with torch.inference_mode():
@@ -2672,6 +2677,11 @@ class DFlashWorker:
                     spec_algorithm=SpeculativeAlgorithm.DFLASH,
                     spec_info=draft_spec_info,
                     capture_hidden_mode=CaptureHiddenMode.NULL,
+                    num_token_non_padded=torch.tensor(
+                        [int(block_ids.numel())],
+                        dtype=torch.int32,
+                        device=block_ids.device,
+                    ),
                 )
 
 

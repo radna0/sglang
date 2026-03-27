@@ -471,6 +471,7 @@ def _bench_one(
     top_p: float,
     top_k: int,
     min_p: float,
+    disable_stream: bool = False,
 ) -> BenchRun:
     if len(prompts) != len(output_lens):
         raise ValueError("prompts and output_lens must have the same length")
@@ -478,7 +479,7 @@ def _bench_one(
 
     args = argparse.Namespace(
         disable_ignore_eos=False,
-        disable_stream=False,
+        disable_stream=bool(disable_stream),
         return_logprob=False,
         return_routed_experts=False,
         logprob_start_len=-1,
@@ -619,6 +620,7 @@ def _run_single(
     top_p: float,
     top_k: int,
     min_p: float,
+    disable_stream: bool,
 ) -> BenchRun:
     proc = _launch_server(
         model_path=model_path,
@@ -656,6 +658,7 @@ def _run_single(
             top_p=top_p,
             top_k=top_k,
             min_p=min_p,
+            disable_stream=disable_stream,
         )
     finally:
         kill_process_tree(proc.pid)
@@ -697,6 +700,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--top-k", type=int, default=1)
     p.add_argument("--min-p", type=float, default=0.0)
     p.add_argument("--disable-cuda-graph", action="store_true")
+    p.add_argument("--disable-stream", action="store_true")
     return p.parse_args()
 
 
@@ -760,6 +764,7 @@ def main() -> int:
             top_p=args.top_p,
             top_k=args.top_k,
             min_p=args.min_p,
+            disable_stream=bool(args.disable_stream),
         )
 
     dflash = _run_single(
@@ -791,6 +796,7 @@ def main() -> int:
         top_p=args.top_p,
         top_k=args.top_k,
         min_p=args.min_p,
+        disable_stream=bool(args.disable_stream),
     )
 
     report = {
@@ -827,6 +833,7 @@ def main() -> int:
             "top_p": args.top_p,
             "top_k": args.top_k,
             "min_p": args.min_p,
+            "disable_stream": bool(args.disable_stream),
         },
         "baseline": asdict(baseline.summary),
         "baseline_request_metrics": baseline.request_metrics,

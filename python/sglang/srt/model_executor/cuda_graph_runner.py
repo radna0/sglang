@@ -1003,6 +1003,8 @@ class CudaGraphRunner:
 
         raw_bs = forward_batch.batch_size
         raw_num_token = raw_bs * self.num_tokens_per_bs
+        if self.model_runner.spec_algorithm.is_dflash():
+            raw_num_token = len(forward_batch.input_ids)
 
         # Pad
         if self.require_mlp_tp_gather:
