@@ -2700,49 +2700,56 @@ class ServerArgs:
                 )
 
             draft_model_type = None
+            draft_hf_config = None
+            model_override_args = json.loads(self.json_model_override_args)
+            try:
+                from sglang.srt.utils.hf_transformers_utils import get_config
+
+                draft_hf_config = get_config(
+                    self.speculative_draft_model_path,
+                    trust_remote_code=self.trust_remote_code,
+                    revision=self.speculative_draft_model_revision,
+                    model_override_args=model_override_args,
+                )
+                draft_model_type = getattr(draft_hf_config, "model_type", None)
+            except Exception:
+                draft_hf_config = None
+                draft_model_type = None
 
             if self.speculative_num_draft_tokens is None:
                 from sglang.srt.speculative.dflash_utils import (
                     parse_dflash_draft_config,
                 )
 
-                model_override_args = json.loads(self.json_model_override_args)
                 inferred_block_size = None
-                try:
-                    from sglang.srt.utils.hf_transformers_utils import get_config
-
-                    draft_hf_config = get_config(
-                        self.speculative_draft_model_path,
-                        trust_remote_code=self.trust_remote_code,
-                        revision=self.speculative_draft_model_revision,
-                        model_override_args=model_override_args,
-                    )
-                    inferred_block_size = parse_dflash_draft_config(
-                        draft_hf_config=draft_hf_config
-                    ).resolve_block_size(default=None)
-                    draft_model_type = getattr(draft_hf_config, "model_type", None)
-                except Exception as e:
-                    logger.warning(
-                        "Failed to infer DFLASH block_size from draft model config; "
-                        "defaulting speculative_num_draft_tokens to 16. Error: %s",
-                        e,
-                    )
+                if draft_hf_config is not None:
+                    try:
+                        inferred_block_size = parse_dflash_draft_config(
+                            draft_hf_config=draft_hf_config
+                        ).resolve_block_size(default=None)
+                    except Exception as e:
+                        logger.warning(
+                            "Failed to infer DFLASH block_size from draft model config; "
+                            "defaulting speculative_num_draft_tokens to 16. Error: %s",
+                            e,
+                        )
 
                 if inferred_block_size is None:
                     try:
-                        from sglang.srt.utils.hf_transformers_utils import get_config
+                        if draft_hf_config is None:
+                            from sglang.srt.utils.hf_transformers_utils import get_config
 
-                        draft_hf_config = get_config(
-                            self.speculative_draft_model_path,
-                            trust_remote_code=self.trust_remote_code,
-                            revision=self.speculative_draft_model_revision,
-                            model_override_args=model_override_args,
-                        )
+                            draft_hf_config = get_config(
+                                self.speculative_draft_model_path,
+                                trust_remote_code=self.trust_remote_code,
+                                revision=self.speculative_draft_model_revision,
+                                model_override_args=model_override_args,
+                            )
+                            draft_model_type = getattr(draft_hf_config, "model_type", None)
                         inferred_block_size = resolve_dflash_block_size(
                             draft_hf_config=draft_hf_config,
                             default=None,
                         )
-                        draft_model_type = getattr(draft_hf_config, "model_type", None)
                     except Exception as e:
                         logger.warning(
                             "Failed to infer DFLASH block_size from transformers config loader; "
@@ -2750,13 +2757,6 @@ class ServerArgs:
                             e,
                         )
                         draft_model_type = None
-                else:
-                    if draft_model_type is None:
-                        try:
-                            if "draft_config_json" in locals():
-                                draft_model_type = (draft_config_json or {}).get("model_type")
-                        except Exception:
-                            draft_model_type = None
 
                 # GPT-OSS requires attention sink behavior. Historically we enforced FA3,
                 # but FlexAttention backends can also implement sinks correctly.
