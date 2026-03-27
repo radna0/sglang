@@ -560,6 +560,8 @@ class DFlashWorker:
             )
             draft_backend = "flashinfer"
 
+        self._draft_attention_backend = draft_backend
+
         # Make the draft worker backend explicit and self-contained (no further overrides).
         draft_server_args.speculative_draft_attention_backend = None
         draft_server_args.prefill_attention_backend = None
@@ -3497,8 +3499,14 @@ class DFlashWorker:
         seq_lens_pre_verify = (
             batch.seq_lens.clone() if need_mamba_verify_commit else None
         )
-        timing_flag = False
-        t0 = 0.0
+        timing_flag = (os.environ.get("SGLANG_DFLASH_TIMING") or "").strip().lower() not in (
+            "",
+            "0",
+            "false",
+            "off",
+            "no",
+        )
+        t0 = time.perf_counter() if timing_flag else 0.0
 
         batch_result = self.target_worker.forward_batch_generation(
             model_worker_batch, is_verify=True, **kwargs
@@ -3525,6 +3533,7 @@ class DFlashWorker:
                 int(sum(accept_length_per_req_cpu)),
                 str(getattr(verify_input, "verify_mode", None)),
             )
+            setattr(self, "_logged_verify_wall", True)
 
         # Update draft state for the next iteration. Also materialize the committed verify tokens
         # into the draft KV cache immediately so radix cache entries are safe to reuse.

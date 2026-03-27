@@ -105,6 +105,7 @@ class RequestFuncOutput:
     error: str = ""
     output_len: int = 0
     start_time: float = 0.0
+    meta_info: Dict[str, Any] = field(default_factory=dict)
 
     @staticmethod
     def init_new(request_func_input: RequestFuncInput):
@@ -650,7 +651,8 @@ async def async_request_sglang_generate(
                             if "text" in data and data["text"]:
                                 timestamp = time.perf_counter()
                                 generated_text = data["text"]
-                                output_len = data["meta_info"]["completion_tokens"]
+                                output.meta_info = data.get("meta_info") or {}
+                                output_len = output.meta_info["completion_tokens"]
 
                                 # First token
                                 if ttft == 0.0:
@@ -2744,6 +2746,7 @@ async def benchmark(
         "ttfts": [output.ttft for output in outputs],
         "itls": [output.itl for output in outputs],
         "generated_texts": [output.generated_text for output in outputs],
+        "meta_infos": [output.meta_info for output in outputs],
         "errors": [output.error for output in outputs],
     }
 

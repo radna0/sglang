@@ -211,6 +211,7 @@ class FusedKVMaterializeHelper:
 
         # Pre-extract and stack weights for batched projection.
         kv_weights = []
+        kv_biases = []
         self.k_norm_weights = []
         self.eps_values = []
 
@@ -244,11 +245,25 @@ class FusedKVMaterializeHelper:
             qkv_w = attn.qkv_proj.weight
             kv_weight = qkv_w[attn.q_size : attn.q_size + 2 * attn.kv_size]
             kv_weights.append(kv_weight)
+            qkv_b = getattr(attn.qkv_proj, "bias", None)
+            if qkv_b is not None:
+                kv_bias = qkv_b[attn.q_size : attn.q_size + 2 * attn.kv_size]
+                kv_biases.append(kv_bias)
+            else:
+                kv_biases.append(None)
             self.k_norm_weights.append(attn.k_norm.weight)
             self.eps_values.append(attn.k_norm.variance_epsilon)
 
         # Stack for batched einsum: [n_layers, kv_size*2, hidden_size]
         self.batched_kv_weight = torch.stack(kv_weights)
+        if any(bias is not None for bias in kv_biases):
+            if not all(bias is not None for bias in kv_biases):
+                raise ValueError(
+                    "qkv bias presence mismatch across layers for fused KV path."
+                )
+            self.batched_kv_bias = torch.stack(kv_biases)  # type: ignore[arg-type]
+        else:
+            self.batched_kv_bias = None
 
     def materialize(
         self,
@@ -287,6 +302,8 @@ class FusedKVMaterializeHelper:
 
         # Batched KV projection: [n_layers, total_ctx, kv_size*2]
         kv_all = torch.einsum("th,loh->lto", ctx_hidden, self.batched_kv_weight)
+        if self.batched_kv_bias is not None:
+            kv_all = kv_all + self.batched_kv_bias[:, None, :]
 
         # Per-layer fused norm/RoPE/materialize, then delegate writes to the KV pool.
         for layer_id in range(self.n_layers):

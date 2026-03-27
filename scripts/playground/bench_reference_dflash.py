@@ -1,0 +1,648 @@
+#!/usr/bin/env python3
+"""Benchmark GPT-OSS DFLASH on the local reference problems."""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import contextlib
+import csv
+import json
+import os
+import time
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any, Optional
+
+import numpy as np
+import requests
+from transformers import AutoTokenizer
+
+from sglang.bench_serving import benchmark, set_global_args
+from sglang.benchmark.datasets import DatasetRow
+from sglang.test.test_utils import (
+    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+    kill_process_tree,
+    popen_launch_server,
+)
+
+
+REFERENCE_IDS = ("92ba6a", "9c1c5f", "a295e9")
+
+SHOWTIME_SYSTEM_PROMPT = (
+    "You are an elite mathematical problem solver with expertise at the "
+    "International Mathematical Olympiad (IMO) level. Your goal is to find "
+    "the correct answer through rigorous mathematical reasoning.\n\n"
+    "The final answer must be a non-negative integer between 0 and 99999.\n"
+    "Place your final numerical answer inside \\boxed{}, e.g., \\boxed{42}.\n\n"
+    "Think step-by-step and show your complete reasoning process. Quality of "
+    "reasoning is as important as the final answer."
+)
+
+
+@dataclass(frozen=True)
+class BenchResult:
+    completed: int
+    wall_s: float
+    req_s: float
+    wall_tok_s: float
+    accept_length: float
+    accept_length_min_step: Optional[int]
+    accept_length_max_step: Optional[int]
+    accept_draft_tokens_min: Optional[int]
+    accept_draft_tokens_max: Optional[int]
+    verify_ct_sum: Optional[int]
+    verify_ct_avg: Optional[float]
+    verify_ct_min: Optional[int]
+    verify_ct_max: Optional[int]
+    accept_token_sum: Optional[int]
+    step_time_p20_s: float | None
+    output_tok_s_p20: float | None
+    avg_output_tokens: float
+
+
+def _bench_result_from_payload(payload: dict[str, Any]) -> BenchResult:
+    defaults = {
+        "accept_length_min_step": None,
+        "accept_length_max_step": None,
+        "accept_draft_tokens_min": None,
+        "accept_draft_tokens_max": None,
+        "verify_ct_sum": None,
+        "verify_ct_avg": None,
+        "verify_ct_min": None,
+        "verify_ct_max": None,
+        "accept_token_sum": None,
+    }
+    return BenchResult(**(defaults | payload))
+
+
+def _build_prompt(problem: str) -> str:
+    return (
+        f"{SHOWTIME_SYSTEM_PROMPT}\n\n"
+        "Solve the following problem. Give a concise but complete derivation, "
+        "then end with the final integer answer in \\boxed{}.\n\n"
+        f"Problem:\n{problem.strip()}\n"
+    )
+
+
+def _load_reference_prompts(
+    csv_path: Path, question_ids: tuple[str, ...], num_prompts: int
+) -> list[str]:
+    rows: dict[str, dict[str, str]] = {}
+    with csv_path.open("r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            qid = str(row.get("id") or "").strip()
+            if qid:
+                rows[qid] = {
+                    "problem": str(row.get("problem") or ""),
+                    "answer": str(row.get("answer") or ""),
+                }
+
+    problems: list[str] = []
+    for qid in question_ids:
+        row = rows.get(qid)
+        if not row:
+            raise KeyError(f"Reference problem {qid!r} not found in {csv_path}")
+        problems.append(_build_prompt(row["problem"]))
+
+    if not problems:
+        raise RuntimeError("No reference prompts loaded.")
+
+    repeated = (problems * ((int(num_prompts) + len(problems) - 1) // len(problems)))[
+        : int(num_prompts)
+    ]
+    return repeated
+
+
+def _build_sampling_params(
+    *, decode_len: int, temperature: float, top_p: float, top_k: int, min_p: float
+) -> dict[str, Any]:
+    return {
+        "temperature": float(temperature),
+        "top_p": float(top_p),
+        "top_k": int(top_k),
+        "min_p": float(min_p),
+        "max_new_tokens": int(decode_len),
+        "ignore_eos": True,
+    }
+
+
+def _launch_server(
+    *,
+    model_path: str,
+    port: int,
+    attention_backend: str,
+    moe_runner_backend: str,
+    kv_cache_dtype: str,
+    context_length: int,
+    cuda_graph_max_bs: int,
+    max_running_requests: int,
+    page_size: int,
+    enable_piecewise_cuda_graph: bool,
+    piecewise_cuda_graph_max_tokens: int | None,
+    speculative: bool,
+    draft_model_path: str | None,
+    draft_attention_backend: str | None,
+    draft_kv_cache_dtype: str | None,
+    draft_page_size: int | None,
+    speculative_moe_runner_backend: str | None,
+    speculative_dflash_block_size: int | None,
+    mem_fraction_static: float | None,
+) -> object:
+    base_url = f"http://127.0.0.1:{int(port)}"
+    cmd = [
+        "--tensor-parallel-size",
+        "1",
+        "--attention-backend",
+        str(attention_backend),
+        "--moe-runner-backend",
+        str(moe_runner_backend),
+        "--kv-cache-dtype",
+        str(kv_cache_dtype),
+        "--context-length",
+        str(int(context_length)),
+        "--cuda-graph-max-bs",
+        str(int(cuda_graph_max_bs)),
+        "--max-running-requests",
+        str(int(max_running_requests)),
+        "--page-size",
+        str(int(page_size)),
+        "--trust-remote-code",
+    ]
+    if mem_fraction_static is not None:
+        cmd += ["--mem-fraction-static", str(float(mem_fraction_static))]
+    if enable_piecewise_cuda_graph:
+        cmd.append("--enable-piecewise-cuda-graph")
+    if piecewise_cuda_graph_max_tokens is not None:
+        cmd += [
+            "--piecewise-cuda-graph-max-tokens",
+            str(int(piecewise_cuda_graph_max_tokens)),
+        ]
+    if speculative:
+        if not draft_model_path:
+            raise ValueError("draft_model_path is required for speculative launch")
+        cmd += [
+            "--speculative-algorithm",
+            "DFLASH",
+            "--speculative-draft-model-path",
+            str(draft_model_path),
+        ]
+        if draft_attention_backend:
+            cmd += [
+                "--speculative-draft-attention-backend",
+                str(draft_attention_backend),
+            ]
+        if draft_kv_cache_dtype:
+            cmd += ["--speculative-draft-kv-cache-dtype", str(draft_kv_cache_dtype)]
+        if draft_page_size is not None:
+            cmd += ["--speculative-draft-page-size", str(int(draft_page_size))]
+        if speculative_moe_runner_backend:
+            cmd += [
+                "--speculative-moe-runner-backend",
+                str(speculative_moe_runner_backend),
+            ]
+        if speculative_dflash_block_size is not None:
+            cmd += [
+                "--speculative-dflash-block-size",
+                str(int(speculative_dflash_block_size)),
+            ]
+
+    env = {"SGLANG_RECORD_STEP_TIME": "1", **os.environ}
+    proc = popen_launch_server(
+        model_path,
+        base_url,
+        timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+        other_args=cmd,
+        env=env,
+    )
+    return proc
+
+
+def _summarize_spec_meta(meta_infos: list[dict[str, Any]]) -> dict[str, Any]:
+    verify_counts: list[int] = []
+    accept_token_counts: list[int] = []
+    aggregate_hist: list[int] = []
+
+    for meta in meta_infos:
+        if not isinstance(meta, dict) or not meta:
+            continue
+
+        if "spec_verify_ct" in meta:
+            try:
+                verify_counts.append(int(meta["spec_verify_ct"]))
+            except Exception:
+                pass
+
+        if "spec_accept_token_num" in meta:
+            try:
+                accept_token_counts.append(int(meta["spec_accept_token_num"]))
+            except Exception:
+                pass
+
+        hist = meta.get("spec_accept_histogram")
+        if isinstance(hist, list) and hist:
+            for idx, count in enumerate(hist):
+                count_i = int(count)
+                if len(aggregate_hist) <= idx:
+                    aggregate_hist.extend([0] * (idx - len(aggregate_hist) + 1))
+                aggregate_hist[idx] += count_i
+
+    accept_draft_tokens_min: Optional[int] = None
+    accept_draft_tokens_max: Optional[int] = None
+    if aggregate_hist:
+        nonzero = [idx for idx, count in enumerate(aggregate_hist) if int(count) > 0]
+        if nonzero:
+            accept_draft_tokens_min = int(nonzero[0])
+            accept_draft_tokens_max = int(nonzero[-1])
+
+    return {
+        "accept_draft_tokens_min": accept_draft_tokens_min,
+        "accept_draft_tokens_max": accept_draft_tokens_max,
+        "accept_length_min_step": (
+            None
+            if accept_draft_tokens_min is None
+            else int(accept_draft_tokens_min + 1)
+        ),
+        "accept_length_max_step": (
+            None
+            if accept_draft_tokens_max is None
+            else int(accept_draft_tokens_max + 1)
+        ),
+        "verify_ct_sum": (sum(verify_counts) if verify_counts else None),
+        "verify_ct_avg": (
+            float(sum(verify_counts)) / float(len(verify_counts))
+            if verify_counts
+            else None
+        ),
+        "verify_ct_min": (min(verify_counts) if verify_counts else None),
+        "verify_ct_max": (max(verify_counts) if verify_counts else None),
+        "accept_token_sum": (sum(accept_token_counts) if accept_token_counts else None),
+    }
+
+
+def _bench_one(
+    *,
+    base_url: str,
+    tokenizer,
+    prompts: list[str],
+    concurrency: int,
+    decode_len: int,
+    temperature: float,
+    top_p: float,
+    top_k: int,
+    min_p: float,
+) -> BenchResult:
+    reqs = [DatasetRow(p, 0, int(decode_len)) for p in prompts]
+
+    args = argparse.Namespace(
+        disable_ignore_eos=False,
+        disable_stream=False,
+        return_logprob=False,
+        return_routed_experts=False,
+        logprob_start_len=-1,
+        top_logprobs_num=0,
+        token_ids_logprob=None,
+        plot_throughput=False,
+        backend="sglang",
+        dataset_name="custom",
+        num_prompts=None,
+        sharegpt_output_len=None,
+        random_input_len=None,
+        random_output_len=None,
+        random_range_ratio=None,
+        output_file=None,
+        warmup_requests=1,
+        output_details=True,
+    )
+    set_global_args(args)
+
+    extra_request_body = {
+        "sampling_params": _build_sampling_params(
+            decode_len=decode_len,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            min_p=min_p,
+        )
+    }
+
+    t0 = time.perf_counter()
+    results = asyncio.run(
+        benchmark(
+            backend="sglang",
+            api_url=f"{base_url}/generate",
+            base_url=base_url,
+            model_id="default",
+            tokenizer=tokenizer,
+            input_requests=reqs,
+            request_rate=float("inf"),
+            max_concurrency=int(concurrency),
+            disable_tqdm=False,
+            lora_names=None,
+            lora_request_distribution=None,
+            lora_zipf_alpha=None,
+            extra_request_body=extra_request_body,
+            profile=False,
+        )
+    )
+    wall_s = time.perf_counter() - t0
+
+    if int(results.get("completed", 0)) != len(reqs):
+        raise RuntimeError(
+            f"Benchmark incomplete: completed={results.get('completed')} expected={len(reqs)}"
+        )
+
+    server_info = requests.get(base_url + "/get_server_info", timeout=60).json()
+    step_time_p20_s: float | None = None
+    output_tok_s_p20: float | None = None
+    with contextlib.suppress(Exception):
+        step_times = server_info["internal_states"][0]["step_time_dict"][
+            str(int(concurrency))
+        ]
+        step_time_p20_s = float(np.percentile(step_times, 20))
+        accept_length = float(results.get("accept_length") or 1.0)
+        output_tok_s_p20 = (1.0 / step_time_p20_s) * accept_length
+
+    completed = int(results["completed"])
+    total_output_tokens = float(results["total_output_tokens"])
+    accept_length = float(results.get("accept_length") or 1.0)
+    spec_meta = _summarize_spec_meta(results.get("meta_infos") or [])
+
+    return BenchResult(
+        completed=completed,
+        wall_s=round(wall_s, 6),
+        req_s=round(completed / wall_s, 3),
+        wall_tok_s=round(total_output_tokens / wall_s, 3),
+        accept_length=round(accept_length, 3),
+        accept_length_min_step=spec_meta["accept_length_min_step"],
+        accept_length_max_step=spec_meta["accept_length_max_step"],
+        accept_draft_tokens_min=spec_meta["accept_draft_tokens_min"],
+        accept_draft_tokens_max=spec_meta["accept_draft_tokens_max"],
+        verify_ct_sum=spec_meta["verify_ct_sum"],
+        verify_ct_avg=(
+            round(spec_meta["verify_ct_avg"], 3)
+            if spec_meta["verify_ct_avg"] is not None
+            else None
+        ),
+        verify_ct_min=spec_meta["verify_ct_min"],
+        verify_ct_max=spec_meta["verify_ct_max"],
+        accept_token_sum=spec_meta["accept_token_sum"],
+        step_time_p20_s=(
+            round(step_time_p20_s, 6) if step_time_p20_s is not None else None
+        ),
+        output_tok_s_p20=(
+            round(output_tok_s_p20, 3) if output_tok_s_p20 is not None else None
+        ),
+        avg_output_tokens=round(total_output_tokens / completed, 3),
+    )
+
+
+def _run_single(
+    *,
+    model_path: str,
+    port: int,
+    attention_backend: str,
+    moe_runner_backend: str,
+    kv_cache_dtype: str,
+    context_length: int,
+    cuda_graph_max_bs: int,
+    max_running_requests: int,
+    page_size: int,
+    enable_piecewise_cuda_graph: bool,
+    piecewise_cuda_graph_max_tokens: int | None,
+    speculative: bool,
+    draft_model_path: str | None,
+    draft_attention_backend: str | None,
+    draft_kv_cache_dtype: str | None,
+    draft_page_size: int | None,
+    speculative_moe_runner_backend: str | None,
+    speculative_dflash_block_size: int | None,
+    mem_fraction_static: float | None,
+    prompts: list[str],
+    concurrency: int,
+    decode_len: int,
+    temperature: float,
+    top_p: float,
+    top_k: int,
+    min_p: float,
+) -> BenchResult:
+    proc = _launch_server(
+        model_path=model_path,
+        port=port,
+        attention_backend=attention_backend,
+        moe_runner_backend=moe_runner_backend,
+        kv_cache_dtype=kv_cache_dtype,
+        context_length=context_length,
+        cuda_graph_max_bs=cuda_graph_max_bs,
+        max_running_requests=max_running_requests,
+        page_size=page_size,
+        enable_piecewise_cuda_graph=enable_piecewise_cuda_graph,
+        piecewise_cuda_graph_max_tokens=piecewise_cuda_graph_max_tokens,
+        speculative=speculative,
+        draft_model_path=draft_model_path,
+        draft_attention_backend=draft_attention_backend,
+        draft_kv_cache_dtype=draft_kv_cache_dtype,
+        draft_page_size=draft_page_size,
+        speculative_moe_runner_backend=speculative_moe_runner_backend,
+        speculative_dflash_block_size=speculative_dflash_block_size,
+        mem_fraction_static=mem_fraction_static,
+    )
+    base_url = f"http://127.0.0.1:{int(port)}"
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+        return _bench_one(
+            base_url=base_url,
+            tokenizer=tokenizer,
+            prompts=prompts,
+            concurrency=concurrency,
+            decode_len=decode_len,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            min_p=min_p,
+        )
+    finally:
+        kill_process_tree(proc.pid)
+
+
+def _parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="Benchmark GPT-OSS DFlash on the local reference problems."
+    )
+    p.add_argument("--model-path", required=True)
+    p.add_argument("--draft-model-path", required=True)
+    p.add_argument("--reference-csv", default="/root/reference.csv")
+    p.add_argument("--question-ids", default="92ba6a,9c1c5f,a295e9")
+    p.add_argument("--out-json", default=None)
+    p.add_argument("--baseline-json-in", default=None)
+    p.add_argument("--baseline-port", type=int, default=21000)
+    p.add_argument("--dflash-port", type=int, default=21001)
+    p.add_argument("--context-length", type=int, default=8192)
+    p.add_argument("--decode-len", type=int, default=2048)
+    p.add_argument("--concurrency", type=int, default=8)
+    p.add_argument("--num-prompts", type=int, default=8)
+    p.add_argument("--page-size", type=int, default=256)
+    p.add_argument("--cuda-graph-max-bs", type=int, default=8)
+    p.add_argument("--max-running-requests", type=int, default=8)
+    p.add_argument("--piecewise-cuda-graph-max-tokens", type=int, default=8192)
+    p.add_argument("--kv-cache-dtype", default="fp8_e4m3")
+    p.add_argument("--draft-kv-cache-dtype", default="bfloat16")
+    p.add_argument("--draft-page-size", type=int, default=None)
+    p.add_argument("--attention-backend", default="fa3")
+    p.add_argument("--moe-runner-backend", default="triton_kernel")
+    p.add_argument("--draft-attention-backend", default="fa3")
+    p.add_argument("--speculative-moe-runner-backend", default="triton_kernel")
+    p.add_argument("--speculative-dflash-block-size", type=int, default=8)
+    p.add_argument("--mem-fraction-static", type=float, default=None)
+    p.add_argument("--temperature", type=float, default=0.0)
+    p.add_argument("--top-p", type=float, default=1.0)
+    p.add_argument("--top-k", type=int, default=1)
+    p.add_argument("--min-p", type=float, default=0.0)
+    p.add_argument("--disable-cuda-graph", action="store_true")
+    return p.parse_args()
+
+
+def main() -> int:
+    args = _parse_args()
+    csv_path = Path(args.reference_csv)
+    question_ids = tuple(
+        q.strip() for q in str(args.question_ids).split(",") if q.strip()
+    )
+    prompts = _load_reference_prompts(csv_path, question_ids, args.num_prompts)
+
+    if args.baseline_json_in:
+        baseline_payload = json.loads(
+            Path(args.baseline_json_in).read_text(encoding="utf-8")
+        )
+        baseline = _bench_result_from_payload(baseline_payload["baseline"])
+    else:
+        baseline = _run_single(
+            model_path=args.model_path,
+            port=args.baseline_port,
+            attention_backend=args.attention_backend,
+            moe_runner_backend=args.moe_runner_backend,
+            kv_cache_dtype=args.kv_cache_dtype,
+            context_length=args.context_length,
+            cuda_graph_max_bs=args.cuda_graph_max_bs,
+            max_running_requests=args.max_running_requests,
+            page_size=args.page_size,
+            enable_piecewise_cuda_graph=not args.disable_cuda_graph,
+            piecewise_cuda_graph_max_tokens=args.piecewise_cuda_graph_max_tokens,
+            speculative=False,
+            draft_model_path=None,
+            draft_attention_backend=None,
+            draft_kv_cache_dtype=None,
+            draft_page_size=None,
+            speculative_moe_runner_backend=None,
+            speculative_dflash_block_size=None,
+            mem_fraction_static=args.mem_fraction_static,
+            prompts=prompts,
+            concurrency=args.concurrency,
+            decode_len=args.decode_len,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            top_k=args.top_k,
+            min_p=args.min_p,
+        )
+
+    dflash = _run_single(
+        model_path=args.model_path,
+        port=args.dflash_port,
+        attention_backend=args.attention_backend,
+        moe_runner_backend=args.moe_runner_backend,
+        kv_cache_dtype=args.kv_cache_dtype,
+        context_length=args.context_length,
+        cuda_graph_max_bs=args.cuda_graph_max_bs,
+        max_running_requests=args.max_running_requests,
+        page_size=args.page_size,
+        enable_piecewise_cuda_graph=not args.disable_cuda_graph,
+        piecewise_cuda_graph_max_tokens=args.piecewise_cuda_graph_max_tokens,
+        speculative=True,
+        draft_model_path=args.draft_model_path,
+        draft_attention_backend=args.draft_attention_backend,
+        draft_kv_cache_dtype=args.draft_kv_cache_dtype,
+        draft_page_size=args.draft_page_size,
+        speculative_moe_runner_backend=args.speculative_moe_runner_backend,
+        speculative_dflash_block_size=args.speculative_dflash_block_size,
+        mem_fraction_static=args.mem_fraction_static,
+        prompts=prompts,
+        concurrency=args.concurrency,
+        decode_len=args.decode_len,
+        temperature=args.temperature,
+        top_p=args.top_p,
+        top_k=args.top_k,
+        min_p=args.min_p,
+    )
+
+    report = {
+        "regime": {
+            "model_path": args.model_path,
+            "draft_model_path": args.draft_model_path,
+            "reference_csv": str(csv_path),
+            "question_ids": list(question_ids),
+            "context_length": args.context_length,
+            "decode_len": args.decode_len,
+            "concurrency": args.concurrency,
+            "num_prompts": args.num_prompts,
+            "page_size": args.page_size,
+            "kv_cache_dtype": args.kv_cache_dtype,
+            "draft_kv_cache_dtype": args.draft_kv_cache_dtype,
+            "draft_page_size": args.draft_page_size,
+            "attention_backend": args.attention_backend,
+            "moe_runner_backend": args.moe_runner_backend,
+            "draft_attention_backend": args.draft_attention_backend,
+            "speculative_moe_runner_backend": args.speculative_moe_runner_backend,
+            "speculative_dflash_block_size": args.speculative_dflash_block_size,
+            "cuda_graph": not args.disable_cuda_graph,
+            "cuda_graph_max_bs": args.cuda_graph_max_bs,
+            "max_running_requests": args.max_running_requests,
+            "piecewise_cuda_graph_max_tokens": args.piecewise_cuda_graph_max_tokens,
+            "temperature": args.temperature,
+            "top_p": args.top_p,
+            "top_k": args.top_k,
+            "min_p": args.min_p,
+        },
+        "baseline": asdict(baseline),
+        "dflash": asdict(dflash),
+        "speedup_req_s": (
+            round(dflash.req_s / baseline.req_s, 4) if baseline.req_s else None
+        ),
+        "speedup_wall_tok_s": (
+            round(dflash.wall_tok_s / baseline.wall_tok_s, 4)
+            if baseline.wall_tok_s
+            else None
+        ),
+        "speedup_output_tok_s_p20": (
+            round((dflash.output_tok_s_p20 or 0.0) / (baseline.output_tok_s_p20 or 1.0), 4)
+            if baseline.output_tok_s_p20
+            else None
+        ),
+    }
+
+    print(json.dumps(report, indent=2))
+    print(
+        "\n| Mode | req/s | wall tok/s | accept len | accept min/max | verify sum | verify avg | p20 step (s) | p20 tok/s | avg out tok |"
+    )
+    print("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+    for name, bench in (("baseline", baseline), ("dflash", dflash)):
+        accept_min_max = (
+            "n/a"
+            if bench.accept_length_min_step is None or bench.accept_length_max_step is None
+            else f"{bench.accept_length_min_step}/{bench.accept_length_max_step}"
+        )
+        print(
+            f"| {name} | {bench.req_s:.3f} | {bench.wall_tok_s:.3f} | {bench.accept_length:.3f} | "
+            f"{accept_min_max} | {bench.verify_ct_sum if bench.verify_ct_sum is not None else 'n/a'} | "
+            f"{bench.verify_ct_avg if bench.verify_ct_avg is not None else 'n/a'} | "
+            f"{bench.step_time_p20_s if bench.step_time_p20_s is not None else 'n/a'} | "
+            f"{bench.output_tok_s_p20 if bench.output_tok_s_p20 is not None else 'n/a'} | {bench.avg_output_tokens:.3f} |"
+        )
+
+    if args.out_json:
+        Path(args.out_json).write_text(json.dumps(report, indent=2), encoding="utf-8")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

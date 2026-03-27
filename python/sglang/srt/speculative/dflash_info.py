@@ -1181,6 +1181,8 @@ class DFlashVerifyInput(SpecInput):
             accept_length_per_req_cpu.append(max(0, appended - 1))
             req.spec_verify_ct += 1
             req.spec_accepted_tokens += accept_length_per_req_cpu[-1]
+            if hasattr(req, "update_spec_acceptance_histogram"):
+                req.update_spec_acceptance_histogram(accept_length_per_req_cpu[-1])
 
         if timing_detail:
             t_after_commit = time.perf_counter()

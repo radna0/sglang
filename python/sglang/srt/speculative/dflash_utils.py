@@ -429,8 +429,6 @@ def can_dflash_use_fused_qkv_proj(qkv_proj: Any) -> Tuple[bool, str]:
     eligible, reason = can_dflash_slice_qkv_weight(qkv_proj)
     if not eligible:
         return False, reason
-    if getattr(qkv_proj, "bias", None) is not None:
-        return False, "qkv bias is not supported for fused KV path"
     return True, ""
 
 
