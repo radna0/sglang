@@ -1841,8 +1841,19 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             and len(recv_obj.spec_accepted_tokens) > i
         ):
             # The draft tokens per speculative step (excluding the target-sampled token).
-            num_guess_tokens = self.server_args.speculative_num_draft_tokens - 1
-            total_draft_tokens = recv_obj.spec_verify_ct[i] * num_guess_tokens
+            total_draft_tokens = None
+            if (
+                getattr(recv_obj, "customized_info", None)
+                and recv_obj.customized_info.get("spec_dflash_total_draft_token_num")
+                and recv_obj.customized_info["spec_dflash_total_draft_token_num"][i]
+                is not None
+            ):
+                total_draft_tokens = int(
+                    recv_obj.customized_info["spec_dflash_total_draft_token_num"][i]
+                )
+            else:
+                num_guess_tokens = self.server_args.speculative_num_draft_tokens - 1
+                total_draft_tokens = recv_obj.spec_verify_ct[i] * num_guess_tokens
             accepted_tokens = recv_obj.spec_accepted_tokens[i]
 
             # Calculate per-request acceptance rate and average acceptance length.

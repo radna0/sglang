@@ -590,6 +590,17 @@ class DFlashVerifyInput(SpecInput):
                 setattr(self, "_logged_paged_verify_stats", True)
 
         if sampling_info is None or sampling_info.is_all_greedy or not use_pq:
+            targetonly_scalar_stats = (
+                (os.environ.get("SGLANG_DFLASH_TARGETONLY_SCALAR_STATS") or "")
+                .strip()
+                .lower()
+                not in ("", "0", "false", "off", "no")
+            ) or (
+                (os.environ.get("SGLANG_DFLASH_ADAPTIVE_CAP_ENABLE") or "")
+                .strip()
+                .lower()
+                not in ("", "0", "false", "off", "no")
+            )
             if sampling_info is None or sampling_info.is_all_greedy:
                 target_predict = torch.argmax(
                     logits_output.next_token_logits, dim=-1
@@ -635,6 +646,24 @@ class DFlashVerifyInput(SpecInput):
             # Ensure we always return basic debug scalars so harnesses can correlate
             # accept collapse with paged-KV geometry.
             dflash_debug = dict(dbg_base)
+            if targetonly_scalar_stats and int(self.draft_token_num) > 1:
+                try:
+                    step_count = int(self.draft_token_num - 1)
+                    target_logits = logits_output.next_token_logits.view(
+                        bs, self.draft_token_num, -1
+                    )[:, :step_count, :].reshape(
+                        -1, logits_output.next_token_logits.shape[-1]
+                    )
+                    target_log_probs = torch.log_softmax(
+                        target_logits.to(torch.float32), dim=-1
+                    )
+                    target_probs = torch.exp(target_log_probs)
+                    p_entropy = -(target_probs * target_log_probs).sum(dim=-1)
+                    p_max = target_probs.max(dim=-1).values
+                    dflash_debug["p_entropy_mean"] = float(p_entropy.mean().item())
+                    dflash_debug["p_max_mean"] = float(p_max.mean().item())
+                except Exception:
+                    pass
 
             accept_len, bonus = compute_dflash_accept_len_and_bonus(
                 candidates=candidates,

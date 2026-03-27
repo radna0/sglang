@@ -211,6 +211,78 @@ class TestDFlashAdaptivePqController(unittest.TestCase):
             4,
         )
 
+    def test_compute_adaptive_max_steps_uses_q_entropy_high_hard_gate(self):
+        st = DFlashReqDifficultyState(
+            accept_len_ema=4.5, verify_ct_last=12, q_entropy_mean_last=2.3
+        )
+        self.assertEqual(
+            compute_adaptive_max_steps_for_req(
+                st,
+                step_count=8,
+                verify_ct_ge=8,
+                accept_ema_hard_le=2.0,
+                accept_ema_medium_le=5.0,
+                hard_cap_steps=4,
+                medium_cap_steps=6,
+                q_entropy_hard_ge=2.0,
+            ),
+            4,
+        )
+
+    def test_compute_adaptive_max_steps_uses_q_max_hard_gate(self):
+        st = DFlashReqDifficultyState(
+            accept_len_ema=4.5, verify_ct_last=12, q_max_mean_last=0.95
+        )
+        self.assertEqual(
+            compute_adaptive_max_steps_for_req(
+                st,
+                step_count=8,
+                verify_ct_ge=8,
+                accept_ema_hard_le=2.0,
+                accept_ema_medium_le=5.0,
+                hard_cap_steps=4,
+                medium_cap_steps=6,
+                q_max_hard_ge=0.9,
+            ),
+            4,
+        )
+
+    def test_compute_adaptive_max_steps_uses_q_max_low_hard_gate(self):
+        st = DFlashReqDifficultyState(
+            accept_len_ema=4.5, verify_ct_last=12, q_max_mean_last=0.35
+        )
+        self.assertEqual(
+            compute_adaptive_max_steps_for_req(
+                st,
+                step_count=8,
+                verify_ct_ge=8,
+                accept_ema_hard_le=2.0,
+                accept_ema_medium_le=5.0,
+                hard_cap_steps=4,
+                medium_cap_steps=6,
+                q_max_hard_le=0.4,
+            ),
+            4,
+        )
+
+    def test_compute_adaptive_max_steps_uses_tv_hard_gate(self):
+        st = DFlashReqDifficultyState(
+            accept_len_ema=4.5, verify_ct_last=12, tv_mean_last=0.85
+        )
+        self.assertEqual(
+            compute_adaptive_max_steps_for_req(
+                st,
+                step_count=8,
+                verify_ct_ge=8,
+                accept_ema_hard_le=2.0,
+                accept_ema_medium_le=5.0,
+                hard_cap_steps=4,
+                medium_cap_steps=6,
+                tv_hard_ge=0.8,
+            ),
+            4,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

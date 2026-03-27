@@ -264,28 +264,47 @@ So the corrected conclusion is:
 
 ### Corrected Easy Prefix Probe: `92ba6a`, decode `2048`
 
+Important regime note:
+
+- the natural `block=8` / `block=16` rows below were run at `context_length=65536`
+- the newer proposal-cap validation rows were run at `context_length=8192`
+- use the `65536` rows to compare natural physical block choices
+- use the `8192` rows to validate proposal-side capping, entropy export, and adaptive policy behavior
+
 Artifacts:
 
 - `/workspace/dflash_block_investigate_20260327/92ba6a_block8_eager2048.json`
 - `/workspace/dflash_block_investigate_20260327/92ba6a_block16_eager2048.json`
-- `/workspace/dflash_block_investigate_20260327/92ba6a_block16_force8_eager2048.json`
+- `/workspace/dflash_block_investigate_20260327_easy_v4/92ba6a_block16_force8_eager2048.json`
+- `/workspace/dflash_block_investigate_20260327_easy_v4/92ba6a_block16_adaptive_eager2048.json`
 
-Results:
+Natural physical block comparison (`context_length=65536`):
 
 | run | physical block | logical cap | wall tok/s | accept len | step max | verify sum |
 |---|---:|---:|---:|---:|---:|---:|
 | `92ba6a_block8` | 8 | 8 | 269.906 | 3.537 | 7 | 579 |
 | `92ba6a_block16` | 16 | 16 | 230.305 | 3.850 | 15 | 532 |
-| `92ba6a_block16_force8` | 16 | 8 | 225.239 | 3.772 | 8 | 543 |
 
 Interpretation:
 
 - On the easy prefix, `block=16` accepts slightly more than `block=8`.
 - But it is slower overall, so the extra physical width is mostly overhead here.
-- The corrected `physical16/logical8` row now really is capped:
-  - `spec_dflash_max_steps_mean = 8`
-  - `spec_accept_length_step_max = 8`
-- So the cap bug is fixed.
+
+Proposal-side logical cap validation (`context_length=8192`):
+
+| run | physical block | controller | effective step mean | total draft tokens | wall tok/s | accept len | q_entropy_mean | q_max_mean |
+|---|---:|---|---:|---:|---:|---:|---:|---:|
+| `92ba6a_block16_force8` | 16 | forced `8` | 8.000 | 4968 | 57.951 | 3.231 | 1.682 | 0.601 |
+| `92ba6a_block16_adaptive` | 16 | adaptive | 11.440 | 6658 | 60.823 | 3.450 | 1.653 | 0.606 |
+
+Interpretation:
+
+- proposal-side capping now works for greedy `target_only`
+- the draft path is no longer generating the full physical width when the logical cap is `8`
+- on this easy prompt, the current adaptive thresholds still dip into the capped regime early, but recover:
+  - `spec_dflash_max_steps_min = 8`
+  - `spec_dflash_max_steps_last = 15`
+- so the controller is active, but still too aggressive on easy prompts
 
 ### Corrected Hard Prefix Probe: `a295e9`, decode `2048`
 
@@ -293,15 +312,15 @@ Artifacts:
 
 - `/workspace/dflash_block_investigate_20260327_hard_v2/a295e9_block8_eager2048.json`
 - `/workspace/dflash_block_investigate_20260327_hard_v2/a295e9_block16_eager2048.json`
-- `/workspace/dflash_block_investigate_20260327_hard_v2/a295e9_block16_force8_eager2048.json`
+- `/workspace/dflash_block_investigate_20260327_hard_v4/a295e9_block16_force8_eager2048.json`
+- `/workspace/dflash_block_investigate_20260327_hard_v4/a295e9_block16_adaptive_eager2048.json`
 
-Results:
+Natural physical block comparison (`context_length=65536`):
 
 | run | physical block | logical cap | wall tok/s | accept len | step max | verify sum |
 |---|---:|---:|---:|---:|---:|---:|
 | `a295e9_block8` | 8 | 8 | 21.687 | 1.159 | 7 | 1767 |
 | `a295e9_block16` | 16 | 16 | 22.713 | 1.172 | 15 | 1747 |
-| `a295e9_block16_force8` | 16 | 8 | 21.877 | 1.159 | 8 | 1767 |
 
 Interpretation:
 
@@ -310,23 +329,25 @@ Interpretation:
   - slightly higher accept length
   - slightly fewer verifies
   - slightly better throughput
-- The capped `physical16/logical8` row matches the `block=8` acceptance/verify behavior almost exactly.
-- That means the corrected cap path is behaving as expected.
 
-Important implementation detail:
+Proposal-side logical cap validation (`context_length=8192`):
 
-- the current logical cap is applied on the verify side, not the draft proposal side
-- so `physical16/logical8` still spends almost the full `block=16` draft work
-- you can see that directly on `a295e9`:
-  - `block8`: `spec_draft_token_num = 12369`
-  - `physical16/logical8`: `spec_draft_token_num = 26505`
-  - but accepted tokens and verify count stay effectively identical
+| run | physical block | controller | effective step mean | total draft tokens | wall tok/s | accept len | q_entropy_mean | q_max_mean |
+|---|---:|---|---:|---:|---:|---:|---:|---:|
+| `a295e9_block16_force8` | 16 | forced `8` | 8.000 | 5824 | 51.417 | 2.843 | 2.116 | 0.502 |
+| `a295e9_block16_adaptive` | 16 | adaptive | 9.353 | 6725 | 52.016 | 2.864 | 2.133 | 0.498 |
 
-This matters for adaptive DFlash:
+Interpretation:
 
-- a logical cap is still the right first control to reduce bad verify behavior exactly
-- but it will not deliver the full savings of a true shorter draft path by itself
-- to get that full win later, the draft runner must also avoid generating the full physical width on hard rounds
+- proposal-side capping now works on the hard prompt
+- compared with the older uncapped `block16` run, draft work is materially lower:
+  - old uncapped `block16` at `65536`: `spec_draft_token_num = 26205`
+  - forced logical `8` at `8192`: `spec_dflash_total_draft_token_num = 5824`
+- the adaptive controller also triggers the cap without a forced override:
+  - `spec_dflash_max_steps_min = 8`
+  - `spec_dflash_max_steps_last = 8`
+  - `spec_dflash_max_steps_mean = 9.353`
+- so the controller is functional on hard prompts, but it still leaves some overhead on the table before it settles down
 
 ### Final Read
 
@@ -336,21 +357,24 @@ The right read now is:
 - the earlier bad `block16` conclusion came from:
   - dead greedy logical-cap plumbing
   - a bad eager benchmark path
-- on easy/predictable continuations, larger physical blocks can raise acceptance but also add enough overhead that `block=8` still wins
-- on hard/unpredictable continuations, both `block=8` and `block=16` are fundamentally draft-limited, so acceptance stays close to `1`
+- the proposal-side logical cap is now real for greedy `target_only`
+- the branch now exports per-request entropy / confidence signals into the benchmark JSON
+- on hard/unpredictable continuations, high `q_entropy` and low `q_max` are useful hard-prompt signals
+- on easy/predictable continuations, the current thresholds are still too aggressive and can cap early before relaxing later
 
 So the remaining work is not "make block 16 work at all." That part is now demonstrated.
 The remaining work is:
 
 - reduce verify overhead when acceptance is already good
+- retune the adaptive controller so easy prompts stay wider
 - adapt the logical speculative depth when acceptance is bad
 - export entropy/confidence signals and use them to drive that cap
 
-This lines up with the same general signal family emphasized by EAFT:
+This lines up with the same general signal family emphasized by EAFT, with one important
+GPT-OSS greedy distinction:
 
-- low entropy
-- high confidence
-- locally stable token distribution
+- low entropy / high confidence predicts the easy, locally stable continuation regime
+- high entropy / low confidence is the useful hard-prompt gate for the current target-only greedy controller
 
 Reference:
 

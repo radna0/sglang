@@ -56,6 +56,7 @@ _FusedKVMaterializeHelper = None
 @dataclass
 class _DFlashDraftProposal:
     draft_tokens: torch.Tensor
+    draft_token_num: int
     verify_mode: str
     draft_topk: int = 0
     draft_topk_ids: torch.Tensor | None = None
@@ -69,6 +70,7 @@ class _DFlashSsdCachedProposal:
     expected_seq_len: int
     expected_verified_id: int
     draft_tokens: torch.Tensor
+    draft_token_num: int
     verify_mode: str
     draft_topk: int = 0
     draft_topk_ids: torch.Tensor | None = None
@@ -1305,60 +1307,13 @@ class DFlashWorker:
             return None
 
         bs = int(batch.batch_size())
-        draft_tokens = torch.empty(
-            (bs, int(self.block_size)),
-            dtype=torch.long,
-            device=self.device,
+        single_proposals: dict[int, _DFlashDraftProposal] = {}
+        proposal_token_num = max(
+            1, int(getattr(ref_entry, "draft_token_num", int(self.block_size)))
         )
-
-        draft_topk_ids = None
-        draft_topk_probs = None
-        if draft_topk > 0:
-            if ref_entry.draft_topk_ids is None or ref_entry.draft_topk_probs is None:
-                # Unexpected: cached proposal claims topk but lacks tensors.
-                self._ssd_batch_misses += 1
-                self._ssd_req_misses += int(batch.batch_size())
-                return None
-            ids_dtype = ref_entry.draft_topk_ids.dtype
-            probs_dtype = ref_entry.draft_topk_probs.dtype
-            draft_topk_ids = torch.empty(
-                (bs, int(self.block_size), int(draft_topk)),
-                dtype=ids_dtype,
-                device=self.device,
-            )
-            draft_topk_probs = torch.empty(
-                (bs, int(self.block_size), int(draft_topk)),
-                dtype=probs_dtype,
-                device=self.device,
-            )
-
-        max_steps_per_req = None
-        if any((e is not None and e.max_steps is not None) for e in entries):
-            max_steps_per_req = torch.full(
-                (bs,),
-                int(self.block_size - 1),
-                dtype=torch.int32,
-                device=self.device,
-            )
-
-        # Partial-SSD support: allow hits on a subset of requests in the batch.
-        # For misses, fall back to per-request draft proposal and then merge.
         for i, req in enumerate(batch.reqs):
-            entry = entries[i]
-            if entry is not None:
-                draft_tokens[i].copy_(entry.draft_tokens)
-                if draft_topk_ids is not None and entry.draft_topk_ids is not None:
-                    draft_topk_ids[i].copy_(entry.draft_topk_ids)
-                if draft_topk_probs is not None and entry.draft_topk_probs is not None:
-                    draft_topk_probs[i].copy_(entry.draft_topk_probs)
-                if max_steps_per_req is not None and entry.max_steps is not None:
-                    max_steps_per_req[i] = int(entry.max_steps)
-                req.spec_ssd_hit_ct = int(getattr(req, "spec_ssd_hit_ct", 0)) + 1
-                req.spec_ssd_miss_streak = 0
-                setattr(req, "dflash_ssd_cached_proposal", None)
+            if entries[i] is not None:
                 continue
-
-            # Miss: compute a single-request proposal and merge it.
             self._ssd_req_misses += 1
             single_batch = self._build_single_req_batch_view(
                 req=req,
@@ -1376,24 +1331,112 @@ class DFlashWorker:
                 prefix_lens=batch.seq_lens[i : i + 1],
                 seq_lens_cpu=batch.seq_lens_cpu[i : i + 1],
             )
-            draft_tokens[i].copy_(single_proposal.draft_tokens[0])
+            if (
+                str(single_proposal.verify_mode) != verify_mode
+                or int(single_proposal.draft_topk) != draft_topk
+            ):
+                self._ssd_batch_misses += 1
+                self._ssd_req_misses += int(batch.batch_size())
+                return None
+            single_proposals[i] = single_proposal
+            proposal_token_num = max(
+                proposal_token_num, int(single_proposal.draft_token_num)
+            )
+
+        draft_tokens = torch.full(
+            (bs, int(proposal_token_num)),
+            fill_value=int(self._mask_token_id),
+            dtype=torch.long,
+            device=self.device,
+        )
+
+        draft_topk_ids = None
+        draft_topk_probs = None
+        if draft_topk > 0:
+            if ref_entry.draft_topk_ids is None or ref_entry.draft_topk_probs is None:
+                # Unexpected: cached proposal claims topk but lacks tensors.
+                self._ssd_batch_misses += 1
+                self._ssd_req_misses += int(batch.batch_size())
+                return None
+            ids_dtype = ref_entry.draft_topk_ids.dtype
+            probs_dtype = ref_entry.draft_topk_probs.dtype
+            draft_topk_ids = torch.empty(
+                (bs, max(0, int(proposal_token_num) - 1), int(draft_topk)),
+                dtype=ids_dtype,
+                device=self.device,
+            )
+            draft_topk_probs = torch.empty(
+                (bs, max(0, int(proposal_token_num) - 1), int(draft_topk)),
+                dtype=probs_dtype,
+                device=self.device,
+            )
+
+        max_steps_per_req = None
+        if any((e is not None and e.max_steps is not None) for e in entries) or bool(
+            single_proposals
+        ) or int(proposal_token_num) != int(self.block_size):
+            max_steps_per_req = torch.full(
+                (bs,),
+                max(0, int(proposal_token_num) - 1),
+                dtype=torch.int32,
+                device=self.device,
+            )
+
+        # Partial-SSD support: allow hits on a subset of requests in the batch.
+        # For misses, fall back to per-request draft proposal and then merge.
+        for i, req in enumerate(batch.reqs):
+            entry = entries[i]
+            if entry is not None:
+                row_token_num = int(
+                    getattr(entry, "draft_token_num", entry.draft_tokens.shape[0])
+                )
+                draft_tokens[i, :row_token_num].copy_(entry.draft_tokens[:row_token_num])
+                if draft_topk_ids is not None and entry.draft_topk_ids is not None:
+                    row_steps = max(0, row_token_num - 1)
+                    draft_topk_ids[i, :row_steps].copy_(entry.draft_topk_ids[:row_steps])
+                if draft_topk_probs is not None and entry.draft_topk_probs is not None:
+                    row_steps = max(0, row_token_num - 1)
+                    draft_topk_probs[i, :row_steps].copy_(
+                        entry.draft_topk_probs[:row_steps]
+                    )
+                if max_steps_per_req is not None:
+                    row_max_steps = (
+                        int(entry.max_steps)
+                        if entry.max_steps is not None
+                        else max(0, row_token_num - 1)
+                    )
+                    max_steps_per_req[i] = int(row_max_steps)
+                req.spec_ssd_hit_ct = int(getattr(req, "spec_ssd_hit_ct", 0)) + 1
+                req.spec_ssd_miss_streak = 0
+                setattr(req, "dflash_ssd_cached_proposal", None)
+                continue
+
+            single_proposal = single_proposals[i]
+            row_token_num = int(single_proposal.draft_token_num)
+            draft_tokens[i, :row_token_num].copy_(
+                single_proposal.draft_tokens[0, :row_token_num]
+            )
             if draft_topk_ids is not None:
                 if single_proposal.draft_topk_ids is None:
                     self._ssd_batch_misses += 1
                     self._ssd_req_misses += int(batch.batch_size())
                     return None
-                draft_topk_ids[i].copy_(single_proposal.draft_topk_ids[0])
+                draft_topk_ids[i, : max(0, row_token_num - 1)].copy_(
+                    single_proposal.draft_topk_ids[0, : max(0, row_token_num - 1)]
+                )
             if draft_topk_probs is not None:
                 if single_proposal.draft_topk_probs is None:
                     self._ssd_batch_misses += 1
                     self._ssd_req_misses += int(batch.batch_size())
                     return None
-                draft_topk_probs[i].copy_(single_proposal.draft_topk_probs[0])
-            if (
-                max_steps_per_req is not None
-                and single_proposal.max_steps_per_req is not None
-            ):
-                max_steps_per_req[i] = int(single_proposal.max_steps_per_req[0].item())
+                draft_topk_probs[i, : max(0, row_token_num - 1)].copy_(
+                    single_proposal.draft_topk_probs[0, : max(0, row_token_num - 1)]
+                )
+            if max_steps_per_req is not None:
+                if single_proposal.max_steps_per_req is not None:
+                    max_steps_per_req[i] = int(single_proposal.max_steps_per_req[0].item())
+                else:
+                    max_steps_per_req[i] = max(0, row_token_num - 1)
 
         hit_ct = int(sum(1 for e in entries if e is not None))
         if hit_ct >= int(batch.batch_size()):
@@ -1414,6 +1457,7 @@ class DFlashWorker:
 
         return _DFlashDraftProposal(
             draft_tokens=draft_tokens,
+            draft_token_num=int(proposal_token_num),
             verify_mode=verify_mode,
             draft_topk=draft_topk,
             draft_topk_ids=draft_topk_ids,
@@ -1461,6 +1505,7 @@ class DFlashWorker:
                 expected_seq_len=cache_key[0],
                 expected_verified_id=cache_key[1],
                 draft_tokens=draft_tokens[i].clone(),
+                draft_token_num=int(proposal.draft_token_num),
                 verify_mode=str(proposal.verify_mode),
                 draft_topk=int(proposal.draft_topk),
                 draft_topk_ids=(
@@ -1665,6 +1710,18 @@ class DFlashWorker:
         q_entropy_hard_le = _env_float(
             "SGLANG_DFLASH_ADAPTIVE_CAP_Q_ENTROPY_HARD_LE", -1.0
         )
+        q_entropy_hard_ge = _env_float(
+            "SGLANG_DFLASH_ADAPTIVE_CAP_Q_ENTROPY_HARD_GE", -1.0
+        )
+        q_max_hard_ge = _env_float(
+            "SGLANG_DFLASH_ADAPTIVE_CAP_Q_MAX_HARD_GE", -1.0
+        )
+        q_max_hard_le = _env_float(
+            "SGLANG_DFLASH_ADAPTIVE_CAP_Q_MAX_HARD_LE", -1.0
+        )
+        tv_hard_ge = _env_float(
+            "SGLANG_DFLASH_ADAPTIVE_CAP_TV_HARD_GE", -1.0
+        )
 
         if max_steps_per_req is None:
             max_steps_per_req = torch.full(
@@ -1689,6 +1746,10 @@ class DFlashWorker:
                         hard_cap_steps=int(hard_cap_steps),
                         medium_cap_steps=int(medium_cap_steps),
                         q_entropy_hard_le=float(q_entropy_hard_le),
+                        q_entropy_hard_ge=float(q_entropy_hard_ge),
+                        q_max_hard_ge=float(q_max_hard_ge),
+                        q_max_hard_le=float(q_max_hard_le),
+                        tv_hard_ge=float(tv_hard_ge),
                     )
                 )
             )
@@ -1796,6 +1857,10 @@ class DFlashWorker:
                 if max_steps_cpu is not None and i < len(max_steps_cpu)
                 else int(self.block_size - 1)
             )
+            effective_draft_token_num_i = int(
+                getattr(verify_input, "draft_token_num", self.block_size)
+            )
+            effective_step_count_i = max(0, effective_draft_token_num_i - 1)
             req.spec_dflash_max_steps_last = max_steps_i
             prev_min_steps = getattr(req, "spec_dflash_max_steps_min", None)
             prev_max_steps = getattr(req, "spec_dflash_max_steps_max", None)
@@ -1810,12 +1875,76 @@ class DFlashWorker:
                 else max(int(prev_max_steps), max_steps_i)
             )
             self._update_req_running_mean(req, "spec_dflash_max_steps_mean", max_steps_i)
+            req.spec_dflash_effective_draft_token_num_last = effective_draft_token_num_i
+            prev_min_token_num = getattr(
+                req, "spec_dflash_effective_draft_token_num_min", None
+            )
+            prev_max_token_num = getattr(
+                req, "spec_dflash_effective_draft_token_num_max", None
+            )
+            req.spec_dflash_effective_draft_token_num_min = (
+                effective_draft_token_num_i
+                if prev_min_token_num is None
+                else min(int(prev_min_token_num), effective_draft_token_num_i)
+            )
+            req.spec_dflash_effective_draft_token_num_max = (
+                effective_draft_token_num_i
+                if prev_max_token_num is None
+                else max(int(prev_max_token_num), effective_draft_token_num_i)
+            )
+            self._update_req_running_mean(
+                req,
+                "spec_dflash_effective_draft_token_num_mean",
+                effective_draft_token_num_i,
+            )
+            req.spec_dflash_effective_step_count_last = effective_step_count_i
+            prev_min_eff_steps = getattr(
+                req, "spec_dflash_effective_step_count_min", None
+            )
+            prev_max_eff_steps = getattr(
+                req, "spec_dflash_effective_step_count_max", None
+            )
+            req.spec_dflash_effective_step_count_min = (
+                effective_step_count_i
+                if prev_min_eff_steps is None
+                else min(int(prev_min_eff_steps), effective_step_count_i)
+            )
+            req.spec_dflash_effective_step_count_max = (
+                effective_step_count_i
+                if prev_max_eff_steps is None
+                else max(int(prev_max_eff_steps), effective_step_count_i)
+            )
+            self._update_req_running_mean(
+                req,
+                "spec_dflash_effective_step_count_mean",
+                effective_step_count_i,
+            )
+            req.spec_dflash_total_draft_token_num = int(
+                getattr(req, "spec_dflash_total_draft_token_num", 0)
+            ) + int(effective_step_count_i)
 
             if dflash_debug is not None:
                 for key in debug_scalar_keys:
                     self._update_req_running_mean(
                         req, f"spec_dflash_{key}", dflash_debug.get(key)
                     )
+            if sig is not None:
+                self._update_req_running_mean(
+                    req, "spec_dflash_accept_ratio_mean", sig.accept_mean
+                )
+                self._update_req_running_mean(req, "spec_dflash_tv_mean", sig.tv_mean)
+                self._update_req_running_mean(
+                    req, "spec_dflash_p_entropy_mean", sig.p_entropy_mean
+                )
+                self._update_req_running_mean(
+                    req, "spec_dflash_q_entropy_mean", sig.q_entropy_mean
+                )
+                self._update_req_running_mean(
+                    req, "spec_dflash_p_max_mean", sig.p_max_mean
+                )
+                self._update_req_running_mean(
+                    req, "spec_dflash_q_max_mean", sig.q_max_mean
+                )
             if draft_conf_debug is not None:
                 for key in draft_scalar_keys:
                     self._update_req_running_mean(
@@ -2365,6 +2494,27 @@ class DFlashWorker:
         use_ssd_overlap_path: bool = False,
     ) -> _DFlashDraftProposal:
         bs = batch.batch_size()
+        physical_step_count = int(self.block_size - 1)
+        max_steps_per_req = self._apply_adaptive_logical_cap(
+            batch=batch,
+            max_steps_per_req=None,
+            step_count=physical_step_count,
+        )
+        max_steps_per_req = self._apply_late_enable_dflash_cap(
+            batch=batch,
+            max_steps_per_req=max_steps_per_req,
+            step_count=physical_step_count,
+        )
+        effective_step_count = int(physical_step_count)
+        if max_steps_per_req is not None and int(max_steps_per_req.numel()) > 0:
+            effective_step_count = int(
+                torch.clamp(
+                    max_steps_per_req.max().to(torch.int64),
+                    min=1,
+                    max=int(physical_step_count),
+                ).item()
+            )
+        draft_token_num = int(effective_step_count + 1)
 
 
         # --- 1) Append any newly committed tokens into the draft KV cache.
@@ -2391,19 +2541,20 @@ class DFlashWorker:
             bs=bs, use_ssd_overlap_path=bool(use_ssd_overlap_path)
         )
 
-        block_ids = buffers.block_ids
+        block_ids = buffers.block_ids[:, :draft_token_num]
         block_ids.fill_(int(self._mask_token_id))
         block_ids[:, 0].copy_(draft_input.verified_id.to(torch.long))
 
         noise_embedding = embed_module(block_ids)
         input_embeds = noise_embedding.view(-1, noise_embedding.shape[-1])
 
-        positions_2d = buffers.positions
-        torch.add(prefix_lens.unsqueeze(1), self._block_pos_offsets, out=positions_2d)
+        pos_offsets = self._block_pos_offsets[:draft_token_num]
+        positions_2d = buffers.positions[:, :draft_token_num]
+        torch.add(prefix_lens.unsqueeze(1), pos_offsets, out=positions_2d)
 
         block_start = prefix_lens
         block_end = buffers.block_end
-        torch.add(block_start, int(self.block_size), out=block_end)
+        torch.add(block_start, int(draft_token_num), out=block_end)
 
         seq_lens_cpu_buf = buffers.seq_lens_cpu
         if seq_lens_cpu.dtype == torch.int32:
@@ -2413,7 +2564,13 @@ class DFlashWorker:
 
         allocator = self.draft_model_runner.token_to_kv_pool_allocator
 
-        draft_spec_info = self._draft_block_spec_info
+        draft_spec_info = DFlashVerifyInput(
+            draft_token=torch.empty((0,), dtype=torch.long, device=self.device),
+            positions=torch.empty((0,), dtype=torch.int64, device=self.device),
+            draft_token_num=int(draft_token_num),
+            custom_mask=None,
+            capture_hidden_mode=CaptureHiddenMode.NULL,
+        )
         seq_lens_sum = int(prefix_lens.to(torch.int64).sum().item())
         device_module = torch.get_device_module(self.device)
         stream_ctx = nullcontext()
@@ -2432,16 +2589,19 @@ class DFlashWorker:
 
                 scratch = self._draft_block_cache_loc_scratch[:bs]
                 if int(getattr(allocator, "page_size", 1)) == 1:
-                    block_cache_loc = scratch.reshape(-1)
+                    block_cache_loc = scratch[:, :draft_token_num].reshape(-1)
                 else:
                     page_size = int(getattr(allocator, "page_size", 1))
                     # Align scratch locs so `loc % page_size == position % page_size` for each
                     # token position in the draft block.
                     start = (prefix_lens.to(torch.int64) % page_size).to(torch.int64)
-                    offs = start.unsqueeze(1) + self._block_pos_offsets.unsqueeze(0)
+                    offs = start.unsqueeze(1) + pos_offsets.unsqueeze(0)
                     block_cache_loc_2d = torch.gather(scratch, 1, offs)
                     if os.environ.get("SGLANG_DFLASH_DEBUG_SCRATCH", "").strip():
-                        pos_mod = (prefix_lens.to(torch.int64).unsqueeze(1) + self._block_pos_offsets.unsqueeze(0)) % page_size
+                        pos_mod = (
+                            prefix_lens.to(torch.int64).unsqueeze(1)
+                            + pos_offsets.unsqueeze(0)
+                        ) % page_size
                         loc_mod = block_cache_loc_2d % page_size
                         assert torch.all(loc_mod == pos_mod), (
                             "DFLASH scratch loc mod mismatch for paged KV. "
@@ -2480,11 +2640,12 @@ class DFlashWorker:
                     draft_hidden = self.draft_model_runner.forward(forward_batch).logits_output
             else:
                 block_cache_loc = out_cache_loc_override.view(-1)
-                if int(block_cache_loc.numel()) != int(bs * self.block_size):
+                if int(block_cache_loc.numel()) < int(bs * draft_token_num):
                     raise RuntimeError(
                         "DFLASH SSD shadow scratch size mismatch: "
-                        f"expected {int(bs * self.block_size)} slots, got {int(block_cache_loc.numel())}."
+                        f"expected at least {int(bs * draft_token_num)} slots, got {int(block_cache_loc.numel())}."
                     )
+                block_cache_loc = block_cache_loc[: int(bs * draft_token_num)]
                 assign_req_to_token_pool_func(
                     batch.req_pool_indices,
                     req_to_token_pool.req_to_token,
@@ -2517,11 +2678,11 @@ class DFlashWorker:
                 with torch.inference_mode():
                     draft_hidden = self.draft_model_runner.forward(forward_batch).logits_output
 
-            draft_hidden = draft_hidden.view(bs, self.block_size, -1).clone()
+            draft_hidden = draft_hidden.view(bs, draft_token_num, -1).clone()
             first_verified = block_ids[:, 0].clone()
 
         draft_tokens = torch.empty(
-            (bs, self.block_size), dtype=torch.long, device=draft_hidden.device
+            (bs, draft_token_num), dtype=torch.long, device=draft_hidden.device
         )
         draft_tokens[:, 0].copy_(first_verified)
 
@@ -2571,7 +2732,6 @@ class DFlashWorker:
         draft_topk = 0
         draft_topk_ids = None
         draft_topk_probs = None
-        max_steps_per_req = None
 
         if use_pq:
             draft_temp_mul = float(self._adaptive_pq.cfg.temp_mul or 1.0)
@@ -2606,7 +2766,7 @@ class DFlashWorker:
                 use_pq = False
                 verify_mode = "target_only"
             else:
-                step_count = int(self.block_size - 1)
+                step_count = int(draft_token_num - 1)
                 hs = draft_hidden[:, 1:, :].reshape(-1, draft_hidden.shape[-1])
                 topk_p_flat, topk_id_flat = self._topk_from_vocab_parallel_head(
                     hidden_states=hs,
@@ -2675,7 +2835,9 @@ class DFlashWorker:
                     sampled_col = torch.argmax(filtered_p, dim=1, keepdim=True)
                 sampled_ids = topk_id_flat.gather(1, sampled_col.to(torch.int64)).view(-1)
 
-                draft_tokens[:, 1:].copy_(sampled_ids.view(bs, step_count).to(torch.long))
+                draft_tokens[:, 1:].copy_(
+                    sampled_ids.view(bs, step_count).to(torch.long)
+                )
                 draft_topk = int(topk)
                 draft_topk_ids = topk_id_flat.view(bs, step_count, int(topk))
                 if use_multinomial:
@@ -2722,11 +2884,17 @@ class DFlashWorker:
                         qmax = q.max(dim=-1).values
                         min_first = qmax[:, :look].min(dim=1).values
                         hard = min_first < float(qmax_lt)
-                        max_steps_per_req = torch.where(
+                        dawn_caps = torch.where(
                             hard,
                             torch.full((bs,), int(cap_steps), device=q.device, dtype=torch.int32),
                             torch.full((bs,), int(step_count), device=q.device, dtype=torch.int32),
                         )
+                        if max_steps_per_req is None:
+                            max_steps_per_req = dawn_caps
+                        else:
+                            max_steps_per_req = torch.minimum(
+                                max_steps_per_req, dawn_caps
+                            )
                 if (os.environ.get("SGLANG_DFLASH_DRAFT_CONF_DEBUG") or "").strip().lower() not in (
                     "",
                     "0",
@@ -2747,26 +2915,16 @@ class DFlashWorker:
                         }
 
         if not use_pq:
-            draft_next = self._greedy_sample_from_vocab_parallel_head(
+            draft_next, draft_conf_debug = self._greedy_sample_from_vocab_parallel_head(
                 hidden_states=draft_hidden[:, 1:, :].reshape(-1, draft_hidden.shape[-1]),
                 lm_head=lm_head,
-            ).view(bs, self.block_size - 1)
-            draft_tokens[:, 1:].copy_(draft_next)
-
-        max_steps_per_req = self._apply_adaptive_logical_cap(
-            batch=batch,
-            max_steps_per_req=max_steps_per_req,
-            step_count=int(self.block_size - 1),
-        )
-
-        max_steps_per_req = self._apply_late_enable_dflash_cap(
-            batch=batch,
-            max_steps_per_req=max_steps_per_req,
-            step_count=int(self.block_size - 1),
-        )
+                return_conf_debug=True,
+            )
+            draft_tokens[:, 1:].copy_(draft_next.view(bs, draft_token_num - 1))
 
         return _DFlashDraftProposal(
             draft_tokens=draft_tokens.clone(),
+            draft_token_num=int(draft_token_num),
             verify_mode=verify_mode,
             draft_topk=draft_topk,
             draft_topk_ids=(draft_topk_ids.clone() if draft_topk_ids is not None else None),
@@ -2783,14 +2941,19 @@ class DFlashWorker:
         proposal: _DFlashDraftProposal,
     ) -> None:
         bs = batch.batch_size()
-        positions_2d = self._draft_block_positions_buf[:bs]
-        torch.add(batch.seq_lens.unsqueeze(1), self._block_pos_offsets, out=positions_2d)
+        draft_token_num = int(proposal.draft_token_num)
+        positions_2d = self._draft_block_positions_buf[:bs, :draft_token_num]
+        torch.add(
+            batch.seq_lens.unsqueeze(1),
+            self._block_pos_offsets[:draft_token_num],
+            out=positions_2d,
+        )
         positions = positions_2d.reshape(-1)
 
         verify_input = DFlashVerifyInput(
             draft_token=proposal.draft_tokens.reshape(-1),
             positions=positions,
-            draft_token_num=self.block_size,
+            draft_token_num=draft_token_num,
 
             verify_mode=proposal.verify_mode,
             draft_topk=proposal.draft_topk,
@@ -2959,7 +3122,8 @@ class DFlashWorker:
         hidden_states: torch.Tensor,
         lm_head,
         chunk_size: int = 256,
-    ) -> torch.Tensor:
+        return_conf_debug: bool = False,
+    ) -> tuple[torch.Tensor, dict | None]:
         """Greedy argmax over the target LM head in a TP-safe way.
 
         We cannot materialize full logits for large vocabularies efficiently, and with
@@ -2968,7 +3132,10 @@ class DFlashWorker:
         """
 
         if hidden_states.numel() == 0:
-            return torch.empty((0,), dtype=torch.long, device=hidden_states.device)
+            return (
+                torch.empty((0,), dtype=torch.long, device=hidden_states.device),
+                None,
+            )
 
         tp_group = get_tp_group()
         tp_size = int(tp_group.world_size)
@@ -2999,6 +3166,12 @@ class DFlashWorker:
         def _cast_hs(x: torch.Tensor) -> torch.Tensor:
             return x if x.dtype == weight_dtype else x.to(weight_dtype)
 
+        q_max_sum = 0.0
+        q_ent_sum = 0.0
+        q_max_first_vals: list[torch.Tensor] = []
+        q_ent_first_vals: list[torch.Tensor] = []
+        conf_token_ct = 0
+
         # Fast path (common): single-rank greedy sampling over the base vocab shard.
         # Avoids extra max/id bookkeeping that is only needed for TP sync or added vocab.
         if tp_size == 1 and num_added == 0:
@@ -3007,13 +3180,37 @@ class DFlashWorker:
                 hs = _cast_hs(hidden_states[start:end])
                 if num_org > 0:
                     base_logits = torch.matmul(hs, weight[:num_org].T)
-                    out_token_ids[start:end] = (
-                        torch.argmax(base_logits, dim=-1).to(torch.long)
-                        + org_vocab_start
-                    )
+                    max_idx = torch.argmax(base_logits, dim=-1)
+                    out_token_ids[start:end] = max_idx.to(torch.long) + org_vocab_start
+                    if return_conf_debug:
+                        logits_f = base_logits.to(torch.float32)
+                        max_vals = logits_f.gather(
+                            1, max_idx.to(torch.int64).view(-1, 1)
+                        ).view(-1)
+                        log_probs = torch.log_softmax(logits_f, dim=-1)
+                        probs = torch.exp(log_probs)
+                        q_max = torch.exp(max_vals - torch.logsumexp(logits_f, dim=-1))
+                        q_ent = -(probs * log_probs).sum(dim=-1)
+                        q_max_sum += float(q_max.sum().item())
+                        q_ent_sum += float(q_ent.sum().item())
+                        conf_token_ct += int(q_max.numel())
+                        q_max_first_vals.append(q_max.detach().cpu())
+                        q_ent_first_vals.append(q_ent.detach().cpu())
                 else:
                     out_token_ids[start:end] = 0
-            return out_token_ids
+            conf_debug = None
+            if return_conf_debug and conf_token_ct > 0:
+                q_max_first = torch.cat(q_max_first_vals, dim=0)
+                q_ent_first = torch.cat(q_ent_first_vals, dim=0)
+                first = min(int(q_max_first.numel()), 4)
+                conf_debug = {
+                    "q_max_mean": q_max_sum / float(conf_token_ct),
+                    "q_entropy_mean": q_ent_sum / float(conf_token_ct),
+                    "q_max_mean_first": float(q_max_first[:first].mean().item()),
+                    "q_max_min_first": float(q_max_first[:first].min().item()),
+                    "q_ent_mean_first": float(q_ent_first[:first].mean().item()),
+                }
+            return out_token_ids, conf_debug
 
         for start in range(0, num_tokens, int(chunk_size)):
             end = min(num_tokens, start + int(chunk_size))
@@ -3125,7 +3322,7 @@ class DFlashWorker:
             torch.gather(gathered_ids, 0, rank_index, out=selected_ids)
             out_token_ids[start:end].copy_(selected_ids.view(-1))
 
-        return out_token_ids
+        return out_token_ids, None
 
     def _append_target_hidden_to_draft_kv(
         self,

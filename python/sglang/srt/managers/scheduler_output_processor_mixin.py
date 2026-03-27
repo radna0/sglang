@@ -1201,6 +1201,20 @@ class SchedulerOutputProcessorMixin:
                         getattr(req, "spec_dflash_max_steps_mean", None)
                     )
                     for key in (
+                        "spec_dflash_effective_draft_token_num_last",
+                        "spec_dflash_effective_draft_token_num_min",
+                        "spec_dflash_effective_draft_token_num_max",
+                        "spec_dflash_effective_draft_token_num_mean",
+                        "spec_dflash_effective_step_count_last",
+                        "spec_dflash_effective_step_count_min",
+                        "spec_dflash_effective_step_count_max",
+                        "spec_dflash_effective_step_count_mean",
+                        "spec_dflash_total_draft_token_num",
+                    ):
+                        customized_info.setdefault(key, []).append(
+                            getattr(req, key, None)
+                        )
+                    for key in (
                         "spec_dflash_accept_ratio_mean",
                         "spec_dflash_tv_mean",
                         "spec_dflash_p_entropy_mean",

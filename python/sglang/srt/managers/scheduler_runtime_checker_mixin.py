@@ -133,7 +133,14 @@ class SchedulerRuntimeCheckerMixin:
         swa_protected = self.tree_cache.swa_protected_size()
         full_leaked = full_num_used - full_protected - session_held_full
         swa_leaked = swa_num_used - swa_protected - session_held_swa
-        memory_leak = (full_leaked - reserved_tokens) != 0 or (swa_leaked - reserved_tokens) != 0
+        # DFLASH may reserve persistent scratch tokens for the draft worker. Depending on
+        # allocator/pool mode, those reservations can appear either:
+        #   1. directly in the "used minus protected" count, or
+        #   2. only as a separate reserved_tokens budget with leaked==0.
+        # Accept both accounting modes to avoid false-positive idle leak reports.
+        full_ok = int(full_leaked) in (0, int(reserved_tokens))
+        swa_ok = int(swa_leaked) in (0, int(reserved_tokens))
+        memory_leak = not (full_ok and swa_ok)
         token_msg = (
             f"{full_leaked=}, {swa_leaked=}\n"
             f"{self.full_tokens_per_layer=}, {full_available_size=}, {full_evictable_size=}, {full_protected=}, {session_held_full=}, {reserved_tokens=}\n"

@@ -332,6 +332,10 @@ def compute_adaptive_max_steps_for_req(
     hard_cap_steps: int,
     medium_cap_steps: int,
     q_entropy_hard_le: float = -1.0,
+    q_entropy_hard_ge: float = -1.0,
+    q_max_hard_ge: float = -1.0,
+    q_max_hard_le: float = -1.0,
+    tv_hard_ge: float = -1.0,
 ) -> int:
     """Choose a logical speculative cap while keeping the physical block fixed.
 
@@ -354,11 +358,45 @@ def compute_adaptive_max_steps_for_req(
 
     accept_ema = float(getattr(req_state, "accept_len_ema", 0.0))
     q_entropy = getattr(req_state, "q_entropy_mean_last", None)
+    q_max = getattr(req_state, "q_max_mean_last", None)
+    tv_mean = getattr(req_state, "tv_mean_last", None)
     if (
         q_entropy_hard_le >= 0.0
         and q_entropy is not None
         and math.isfinite(float(q_entropy))
         and float(q_entropy) <= float(q_entropy_hard_le)
+        and accept_ema <= float(accept_ema_medium_le)
+    ):
+        return hard_cap_steps
+    if (
+        q_entropy_hard_ge >= 0.0
+        and q_entropy is not None
+        and math.isfinite(float(q_entropy))
+        and float(q_entropy) >= float(q_entropy_hard_ge)
+        and accept_ema <= float(accept_ema_medium_le)
+    ):
+        return hard_cap_steps
+    if (
+        q_max_hard_ge >= 0.0
+        and q_max is not None
+        and math.isfinite(float(q_max))
+        and float(q_max) >= float(q_max_hard_ge)
+        and accept_ema <= float(accept_ema_medium_le)
+    ):
+        return hard_cap_steps
+    if (
+        q_max_hard_le >= 0.0
+        and q_max is not None
+        and math.isfinite(float(q_max))
+        and float(q_max) <= float(q_max_hard_le)
+        and accept_ema <= float(accept_ema_medium_le)
+    ):
+        return hard_cap_steps
+    if (
+        tv_hard_ge >= 0.0
+        and tv_mean is not None
+        and math.isfinite(float(tv_mean))
+        and float(tv_mean) >= float(tv_hard_ge)
         and accept_ema <= float(accept_ema_medium_le)
     ):
         return hard_cap_steps
