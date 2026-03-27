@@ -9,6 +9,7 @@ import contextlib
 import csv
 import json
 import os
+import re
 import shlex
 import time
 from dataclasses import asdict, dataclass
@@ -96,7 +97,7 @@ def _build_prompt(problem: str) -> str:
 
 def _load_reference_prompts(
     csv_path: Path, question_ids: tuple[str, ...], num_prompts: int
-) -> tuple[list[str], list[str]]:
+) -> tuple[list[str], list[str], list[str]]:
     rows: dict[str, dict[str, str]] = {}
     with csv_path.open("r", encoding="utf-8", newline="") as f:
         reader = csv.DictReader(f)
@@ -109,11 +110,13 @@ def _load_reference_prompts(
                 }
 
     problems: list[str] = []
+    answers: list[str] = []
     for qid in question_ids:
         row = rows.get(qid)
         if not row:
             raise KeyError(f"Reference problem {qid!r} not found in {csv_path}")
         problems.append(_build_prompt(row["problem"]))
+        answers.append(row["answer"].strip())
 
     if not problems:
         raise RuntimeError("No reference prompts loaded.")
@@ -124,7 +127,32 @@ def _load_reference_prompts(
     repeated_qids = (
         list(question_ids) * ((int(num_prompts) + len(question_ids) - 1) // len(question_ids))
     )[: int(num_prompts)]
-    return repeated, repeated_qids
+    repeated_answers = (
+        list(answers) * ((int(num_prompts) + len(answers) - 1) // len(answers))
+    )[: int(num_prompts)]
+    return repeated, repeated_qids, repeated_answers
+
+
+_BOXED_RE = re.compile(r"\\boxed\{([^{}]+)\}")
+_INT_RE = re.compile(r"(?<!\d)(\d{1,5})(?!\d)")
+
+
+def _extract_boxed_answer(text: str) -> str | None:
+    matches = _BOXED_RE.findall(text or "")
+    if not matches:
+        return None
+    candidate = matches[-1].strip()
+    int_matches = _INT_RE.findall(candidate)
+    if int_matches:
+        return int_matches[-1]
+    return None
+
+
+def _extract_fallback_answer(text: str) -> str | None:
+    matches = _INT_RE.findall(text or "")
+    if not matches:
+        return None
+    return matches[-1]
 
 
 def _build_sampling_params(
@@ -346,6 +374,8 @@ def _extract_request_metrics(
     meta_infos: list[dict[str, Any]],
     request_question_ids: list[str],
     output_lens: list[int],
+    generated_texts: list[str],
+    expected_answers: list[str],
 ) -> list[dict[str, Any]]:
     metric_keys = (
         "spec_accept_rate",
@@ -393,6 +423,23 @@ def _extract_request_metrics(
                 int(output_lens[i]) if i < len(output_lens) else None
             ),
         }
+        generated_text = generated_texts[i] if i < len(generated_texts) else ""
+        expected_answer = expected_answers[i] if i < len(expected_answers) else None
+        boxed_answer = _extract_boxed_answer(generated_text)
+        fallback_answer = _extract_fallback_answer(generated_text)
+        row["expected_answer"] = expected_answer
+        row["boxed_answer"] = boxed_answer
+        row["fallback_answer"] = fallback_answer
+        row["is_correct_boxed"] = (
+            bool(boxed_answer == expected_answer)
+            if expected_answer is not None and boxed_answer is not None
+            else False
+        )
+        row["is_correct_fallback"] = (
+            bool(fallback_answer == expected_answer)
+            if expected_answer is not None and fallback_answer is not None
+            else False
+        )
         if isinstance(meta, dict):
             for key in metric_keys:
                 if key in meta:
@@ -456,6 +503,11 @@ def _aggregate_request_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
         out[f"{key}_mean"] = round(float(sum(vals)) / float(len(vals)), 6)
         out[f"{key}_min"] = round(float(min(vals)), 6)
         out[f"{key}_max"] = round(float(max(vals)), 6)
+    if rows:
+        boxed_correct = [1.0 for row in rows if row.get("is_correct_boxed")]
+        fallback_correct = [1.0 for row in rows if row.get("is_correct_fallback")]
+        out["correct_boxed_rate"] = round(len(boxed_correct) / len(rows), 6)
+        out["correct_fallback_rate"] = round(len(fallback_correct) / len(rows), 6)
     return out
 
 
@@ -465,6 +517,7 @@ def _bench_one(
     tokenizer,
     prompts: list[str],
     prompt_question_ids: list[str],
+    prompt_expected_answers: list[str],
     concurrency: int,
     output_lens: list[int],
     temperature: float,
@@ -554,6 +607,8 @@ def _bench_one(
         meta_infos=raw_meta_infos,
         request_question_ids=prompt_question_ids,
         output_lens=output_lens,
+        generated_texts=list(results.get("generated_texts") or []),
+        expected_answers=prompt_expected_answers,
     )
 
     summary = BenchResult(
@@ -614,6 +669,7 @@ def _run_single(
     mem_fraction_static: float | None,
     prompts: list[str],
     prompt_question_ids: list[str],
+    prompt_expected_answers: list[str],
     concurrency: int,
     output_lens: list[int],
     temperature: float,
@@ -652,6 +708,7 @@ def _run_single(
             tokenizer=tokenizer,
             prompts=prompts,
             prompt_question_ids=prompt_question_ids,
+            prompt_expected_answers=prompt_expected_answers,
             concurrency=concurrency,
             output_lens=output_lens,
             temperature=temperature,
@@ -674,6 +731,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--question-ids", default="92ba6a,9c1c5f,a295e9")
     p.add_argument("--out-json", default=None)
     p.add_argument("--baseline-json-in", default=None)
+    p.add_argument("--skip-baseline", action="store_true")
     p.add_argument("--baseline-port", type=int, default=21000)
     p.add_argument("--dflash-port", type=int, default=21001)
     p.add_argument("--context-length", type=int, default=8192)
@@ -710,7 +768,7 @@ def main() -> int:
     question_ids = tuple(
         q.strip() for q in str(args.question_ids).split(",") if q.strip()
     )
-    prompts, prompt_question_ids = _load_reference_prompts(
+    prompts, prompt_question_ids, prompt_expected_answers = _load_reference_prompts(
         csv_path, question_ids, args.num_prompts
     )
     tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
@@ -723,7 +781,10 @@ def main() -> int:
         buffer_tokens=args.buffer_tokens,
     )
 
-    if args.baseline_json_in:
+    baseline: BenchRun | None
+    if args.skip_baseline:
+        baseline = None
+    elif args.baseline_json_in:
         baseline_payload = json.loads(
             Path(args.baseline_json_in).read_text(encoding="utf-8")
         )
@@ -758,6 +819,7 @@ def main() -> int:
             mem_fraction_static=args.mem_fraction_static,
             prompts=prompts,
             prompt_question_ids=prompt_question_ids,
+            prompt_expected_answers=prompt_expected_answers,
             concurrency=args.concurrency,
             output_lens=output_lens,
             temperature=args.temperature,
@@ -790,6 +852,7 @@ def main() -> int:
         mem_fraction_static=args.mem_fraction_static,
         prompts=prompts,
         prompt_question_ids=prompt_question_ids,
+        prompt_expected_answers=prompt_expected_answers,
         concurrency=args.concurrency,
         output_lens=output_lens,
         temperature=args.temperature,
@@ -829,26 +892,30 @@ def main() -> int:
             "cuda_graph_max_bs": args.cuda_graph_max_bs,
             "max_running_requests": args.max_running_requests,
             "piecewise_cuda_graph_max_tokens": args.piecewise_cuda_graph_max_tokens,
+            "mem_fraction_static": args.mem_fraction_static,
             "temperature": args.temperature,
             "top_p": args.top_p,
             "top_k": args.top_k,
             "min_p": args.min_p,
             "disable_stream": bool(args.disable_stream),
+            "skip_baseline": bool(args.skip_baseline),
         },
-        "baseline": asdict(baseline.summary),
-        "baseline_request_metrics": baseline.request_metrics,
-        "baseline_request_metric_aggregate": baseline.request_metric_aggregate,
+        "baseline": asdict(baseline.summary) if baseline is not None else None,
+        "baseline_request_metrics": baseline.request_metrics if baseline is not None else [],
+        "baseline_request_metric_aggregate": (
+            baseline.request_metric_aggregate if baseline is not None else {}
+        ),
         "dflash": asdict(dflash.summary),
         "dflash_request_metrics": dflash.request_metrics,
         "dflash_request_metric_aggregate": dflash.request_metric_aggregate,
         "speedup_req_s": (
             round(dflash.summary.req_s / baseline.summary.req_s, 4)
-            if baseline.summary.req_s
+            if baseline is not None and baseline.summary.req_s
             else None
         ),
         "speedup_wall_tok_s": (
             round(dflash.summary.wall_tok_s / baseline.summary.wall_tok_s, 4)
-            if baseline.summary.wall_tok_s
+            if baseline is not None and baseline.summary.wall_tok_s
             else None
         ),
         "speedup_output_tok_s_p20": (
@@ -857,7 +924,7 @@ def main() -> int:
                 / (baseline.summary.output_tok_s_p20 or 1.0),
                 4,
             )
-            if baseline.summary.output_tok_s_p20
+            if baseline is not None and baseline.summary.output_tok_s_p20
             else None
         ),
     }
@@ -867,7 +934,11 @@ def main() -> int:
         "\n| Mode | req/s | wall tok/s | accept len | accept min/max | verify sum | verify avg | p20 step (s) | p20 tok/s | avg out tok |"
     )
     print("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
-    for name, bench in (("baseline", baseline.summary), ("dflash", dflash.summary)):
+    rows: list[tuple[str, BenchResult]] = []
+    if baseline is not None:
+        rows.append(("baseline", baseline.summary))
+    rows.append(("dflash", dflash.summary))
+    for name, bench in rows:
         accept_min_max = (
             "n/a"
             if bench.accept_length_min_step is None or bench.accept_length_max_step is None

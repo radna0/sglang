@@ -29,6 +29,161 @@ This is a greedy benchmark setup:
 - `min_p=0.0`
 - `ignore_eos=True`
 
+Important:
+
+- the current reference-harness numbers in this README are **no-tool** runs
+- they use plain `/generate`
+- they are **greedy** unless a section explicitly says otherwise
+- they do **not** yet tell us the DFlash behavior for tool-calling or for sampled decoding
+
+## Regime Separation: No-Tool vs Tool-Calling, Greedy vs Sampled
+
+There are at least four materially different serving regimes here:
+
+1. no-tool + greedy
+2. no-tool + sampled
+3. tool-calling + greedy-ish control
+4. tool-calling + sampled
+
+The current benchmark matrix on this branch is only measuring the first one:
+
+- no-tool
+- greedy
+- long decode to remaining context budget
+- DFlash on the target model directly
+
+That matters because DFlash acceptance is a **draft-target agreement** signal, not a correctness oracle.
+
+### No-Tool, Greedy
+
+This is the cleanest regime for interpreting acceptance.
+
+Why:
+
+- the continuation is produced directly by the model
+- there is no external tool response perturbing the token stream
+- `temperature=0.0`, `top_p=1.0`, `top_k=1` means the target path is deterministic
+- high acceptance here is the strongest evidence that the local continuation is low-entropy and easy for the draft to predict
+
+This is why the current EAFT-style interpretation is meaningful on the existing runs:
+
+- low entropy
+- high `q_max`
+- high acceptance
+
+But even here, high acceptance still means:
+
+- high local predictability
+
+It does **not** automatically mean:
+
+- globally correct reasoning
+- correct final answer
+
+A wrong continuation can also become low-entropy later if the model has already locked itself into a confident but wrong branch.
+
+### No-Tool, Sampled
+
+This is a different regime and should not be mixed with the greedy numbers.
+
+Why:
+
+- temperature / top-p sampling widens the active support of the next-token distribution
+- that generally lowers local predictability for the draft
+- acceptance should usually drop compared with greedy
+- variance across runs matters much more
+
+This regime is relevant if the goal is self-consistency or majority-vote accuracy, but the serving interpretation changes:
+
+- lower acceptance does not necessarily mean worse quality
+- it may just mean the sampler is exploring a wider candidate space
+
+So for sampled evaluation we should record separately:
+
+- `temperature`
+- `top_p`
+- number of samples / branches
+- best-of / majority-vote policy
+
+### Tool-Calling
+
+Tool-calling is also a separate regime and should not be inferred from the current no-tool numbers.
+
+Why:
+
+- tool call boundaries introduce structured control tokens
+- tool argument spans often behave differently from ordinary free-form text
+- tool outputs feed new information back into the next target continuation
+- the continuation becomes partly a function of tool observations, not just prior model text
+
+Expected effect on quality:
+
+- often **better** task accuracy / final correctness, especially for math, retrieval, search, code execution, or calculator-style tasks
+
+Expected effect on DFlash drafting:
+
+- potentially **worse** draft-target agreement around:
+  - tool selection tokens
+  - argument serialization
+  - response-boundary tokens
+  - immediately after tool results are injected
+
+So it is completely plausible that:
+
+- tool-calling improves correctness
+- while also reducing average acceptance length
+
+That would not contradict the current no-tool DFlash results. It would just mean the serving regime changed.
+
+### What Must Be Reported Separately
+
+For every future DFlash study, do not mix these settings in one table without labeling them:
+
+- tool usage: `no-tool` vs `tool-calling`
+- decode policy: `greedy` vs `sampled`
+- sampler settings: `temperature`, `top_p`, `top_k`, `min_p`
+- whether quality is:
+  - single-run exact correctness
+  - best-of-k
+  - majority vote
+  - tool-augmented correctness
+
+If we fail to separate those axes, acceptance statistics become ambiguous.
+
+### Practical Interpretation for This Branch
+
+Current branch numbers mean:
+
+- DFlash is working on the **no-tool, greedy** regime
+- those acceptance numbers are most useful as a proxy for:
+  - local predictability
+  - serving efficiency
+  - draft-target alignment
+
+Current branch numbers do **not** yet mean:
+
+- the same acceptance behavior will hold under tool-calling
+- the same throughput/acceptance tradeoff will hold under sampling
+- high acceptance automatically implies final-answer correctness
+
+### Recommended Follow-Up Matrix
+
+The next quality-conditioned matrix should be split explicitly into:
+
+1. no-tool + greedy
+2. no-tool + sampled (`temperature > 0`)
+3. tool-calling + greedy-style control
+4. tool-calling + sampled
+
+For each quadrant, record:
+
+- final-answer correctness
+- acceptance length
+- verify count
+- `q_entropy`
+- `q_max`
+- whether the request entered a stable high-accept regime or collapsed to `accept≈1`
+
 ## Execution Mode Matrix
 
 I used two different execution modes on this branch, and they answer different questions.
