@@ -9,6 +9,7 @@ import contextlib
 import csv
 import json
 import os
+import shlex
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -22,8 +23,9 @@ from sglang.bench_serving import benchmark, set_global_args
 from sglang.benchmark.datasets import DatasetRow
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+    _launch_server_process,
+    _wait_for_server_health,
     kill_process_tree,
-    popen_launch_server,
 )
 
 
@@ -61,6 +63,13 @@ class BenchResult:
     avg_output_tokens: float
 
 
+@dataclass(frozen=True)
+class BenchRun:
+    summary: BenchResult
+    request_metrics: list[dict[str, Any]]
+    request_metric_aggregate: dict[str, Any]
+
+
 def _bench_result_from_payload(payload: dict[str, Any]) -> BenchResult:
     defaults = {
         "accept_length_min_step": None,
@@ -87,7 +96,7 @@ def _build_prompt(problem: str) -> str:
 
 def _load_reference_prompts(
     csv_path: Path, question_ids: tuple[str, ...], num_prompts: int
-) -> list[str]:
+) -> tuple[list[str], list[str]]:
     rows: dict[str, dict[str, str]] = {}
     with csv_path.open("r", encoding="utf-8", newline="") as f:
         reader = csv.DictReader(f)
@@ -112,7 +121,10 @@ def _load_reference_prompts(
     repeated = (problems * ((int(num_prompts) + len(problems) - 1) // len(problems)))[
         : int(num_prompts)
     ]
-    return repeated
+    repeated_qids = (
+        list(question_ids) * ((int(num_prompts) + len(question_ids) - 1) // len(question_ids))
+    )[: int(num_prompts)]
+    return repeated, repeated_qids
 
 
 def _build_sampling_params(
@@ -165,6 +177,7 @@ def _launch_server(
     page_size: int,
     enable_piecewise_cuda_graph: bool,
     piecewise_cuda_graph_max_tokens: int | None,
+    disable_cuda_graph: bool,
     speculative: bool,
     draft_model_path: str | None,
     draft_attention_backend: str | None,
@@ -176,6 +189,11 @@ def _launch_server(
 ) -> object:
     base_url = f"http://127.0.0.1:{int(port)}"
     cmd = [
+        "python3",
+        "-m",
+        "sglang.launch_server",
+        "--model-path",
+        str(model_path),
         "--tensor-parallel-size",
         "1",
         "--attention-backend",
@@ -193,9 +211,17 @@ def _launch_server(
         "--page-size",
         str(int(page_size)),
         "--trust-remote-code",
+        "--device",
+        "cuda",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        str(int(port)),
     ]
     if mem_fraction_static is not None:
         cmd += ["--mem-fraction-static", str(float(mem_fraction_static))]
+    if disable_cuda_graph:
+        cmd.append("--disable-cuda-graph")
     if enable_piecewise_cuda_graph:
         cmd.append("--enable-piecewise-cuda-graph")
     if piecewise_cuda_graph_max_tokens is not None:
@@ -232,15 +258,25 @@ def _launch_server(
                 str(int(speculative_dflash_block_size)),
             ]
 
+    repo_python = str((Path(__file__).resolve().parents[2] / "python"))
     env = {"SGLANG_RECORD_STEP_TIME": "1", **os.environ}
-    proc = popen_launch_server(
-        model_path,
-        base_url,
-        timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-        other_args=cmd,
-        env=env,
+    env["PYTHONPATH"] = (
+        repo_python
+        if not env.get("PYTHONPATH")
+        else f"{repo_python}:{env['PYTHONPATH']}"
     )
-    return proc
+    print(f"command={shlex.join(cmd)}")
+    proc = _launch_server_process(cmd, env, None, model_path)
+    success, error_msg = _wait_for_server_health(
+        proc, base_url, None, DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
+    )
+    if success:
+        return proc
+    try:
+        kill_process_tree(proc.pid)
+    except Exception:
+        pass
+    raise RuntimeError(error_msg or "server failed to start")
 
 
 def _summarize_spec_meta(meta_infos: list[dict[str, Any]]) -> dict[str, Any]:
@@ -305,18 +341,119 @@ def _summarize_spec_meta(meta_infos: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _extract_request_metrics(
+    *,
+    meta_infos: list[dict[str, Any]],
+    request_question_ids: list[str],
+    output_lens: list[int],
+) -> list[dict[str, Any]]:
+    metric_keys = (
+        "spec_accept_rate",
+        "spec_accept_length",
+        "spec_accept_token_num",
+        "spec_draft_token_num",
+        "spec_verify_ct",
+        "spec_accept_length_step_min",
+        "spec_accept_length_step_max",
+        "spec_dflash_verify_mode_last",
+        "spec_dflash_debug_stat_ct",
+        "spec_dflash_max_steps_last",
+        "spec_dflash_max_steps_min",
+        "spec_dflash_max_steps_max",
+        "spec_dflash_max_steps_mean",
+        "spec_dflash_accept_ratio_mean",
+        "spec_dflash_tv_mean",
+        "spec_dflash_p_entropy_mean",
+        "spec_dflash_q_entropy_mean",
+        "spec_dflash_p_max_mean",
+        "spec_dflash_q_max_mean",
+        "spec_dflash_q_max_mean_first",
+        "spec_dflash_q_max_min_first",
+        "spec_dflash_q_ent_mean_first",
+        "spec_dflash_adaptive_temp_mul",
+        "spec_dflash_pq_disabled_rounds_left",
+    )
+    rows: list[dict[str, Any]] = []
+    for i, meta in enumerate(meta_infos):
+        row = {
+            "request_index": int(i),
+            "question_id": (
+                request_question_ids[i] if i < len(request_question_ids) else None
+            ),
+            "requested_output_len": (
+                int(output_lens[i]) if i < len(output_lens) else None
+            ),
+        }
+        if isinstance(meta, dict):
+            for key in metric_keys:
+                if key in meta:
+                    row[key] = meta.get(key)
+            if "completion_tokens" in meta:
+                row["completion_tokens"] = meta.get("completion_tokens")
+            if "cached_tokens" in meta:
+                row["cached_tokens"] = meta.get("cached_tokens")
+        rows.append(row)
+    return rows
+
+
+def _aggregate_request_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    numeric_keys = (
+        "spec_accept_rate",
+        "spec_accept_length",
+        "spec_accept_token_num",
+        "spec_draft_token_num",
+        "spec_verify_ct",
+        "spec_accept_length_step_min",
+        "spec_accept_length_step_max",
+        "spec_dflash_debug_stat_ct",
+        "spec_dflash_max_steps_last",
+        "spec_dflash_max_steps_min",
+        "spec_dflash_max_steps_max",
+        "spec_dflash_max_steps_mean",
+        "spec_dflash_accept_ratio_mean",
+        "spec_dflash_tv_mean",
+        "spec_dflash_p_entropy_mean",
+        "spec_dflash_q_entropy_mean",
+        "spec_dflash_p_max_mean",
+        "spec_dflash_q_max_mean",
+        "spec_dflash_q_max_mean_first",
+        "spec_dflash_q_max_min_first",
+        "spec_dflash_q_ent_mean_first",
+        "spec_dflash_adaptive_temp_mul",
+        "spec_dflash_pq_disabled_rounds_left",
+    )
+    out: dict[str, Any] = {}
+    for key in numeric_keys:
+        vals = []
+        for row in rows:
+            val = row.get(key)
+            if val is None:
+                continue
+            try:
+                vals.append(float(val))
+            except Exception:
+                continue
+        if not vals:
+            continue
+        out[f"{key}_mean"] = round(float(sum(vals)) / float(len(vals)), 6)
+        out[f"{key}_min"] = round(float(min(vals)), 6)
+        out[f"{key}_max"] = round(float(max(vals)), 6)
+    return out
+
+
 def _bench_one(
     *,
     base_url: str,
     tokenizer,
     prompts: list[str],
+    prompt_question_ids: list[str],
     concurrency: int,
     output_lens: list[int],
     temperature: float,
     top_p: float,
     top_k: int,
     min_p: float,
-) -> BenchResult:
+) -> BenchRun:
     if len(prompts) != len(output_lens):
         raise ValueError("prompts and output_lens must have the same length")
     reqs = [DatasetRow(p, 0, int(out)) for p, out in zip(prompts, output_lens)]
@@ -392,9 +529,15 @@ def _bench_one(
     completed = int(results["completed"])
     total_output_tokens = float(results["total_output_tokens"])
     accept_length = float(results.get("accept_length") or 1.0)
-    spec_meta = _summarize_spec_meta(results.get("meta_infos") or [])
+    raw_meta_infos = results.get("meta_infos") or []
+    spec_meta = _summarize_spec_meta(raw_meta_infos)
+    request_metrics = _extract_request_metrics(
+        meta_infos=raw_meta_infos,
+        request_question_ids=prompt_question_ids,
+        output_lens=output_lens,
+    )
 
-    return BenchResult(
+    summary = BenchResult(
         completed=completed,
         wall_s=round(wall_s, 6),
         req_s=round(completed / wall_s, 3),
@@ -421,6 +564,11 @@ def _bench_one(
         ),
         avg_output_tokens=round(total_output_tokens / completed, 3),
     )
+    return BenchRun(
+        summary=summary,
+        request_metrics=request_metrics,
+        request_metric_aggregate=_aggregate_request_metrics(request_metrics),
+    )
 
 
 def _run_single(
@@ -436,6 +584,7 @@ def _run_single(
     page_size: int,
     enable_piecewise_cuda_graph: bool,
     piecewise_cuda_graph_max_tokens: int | None,
+    disable_cuda_graph: bool,
     speculative: bool,
     draft_model_path: str | None,
     draft_attention_backend: str | None,
@@ -445,13 +594,14 @@ def _run_single(
     speculative_dflash_block_size: int | None,
     mem_fraction_static: float | None,
     prompts: list[str],
+    prompt_question_ids: list[str],
     concurrency: int,
     output_lens: list[int],
     temperature: float,
     top_p: float,
     top_k: int,
     min_p: float,
-) -> BenchResult:
+) -> BenchRun:
     proc = _launch_server(
         model_path=model_path,
         port=port,
@@ -464,6 +614,7 @@ def _run_single(
         page_size=page_size,
         enable_piecewise_cuda_graph=enable_piecewise_cuda_graph,
         piecewise_cuda_graph_max_tokens=piecewise_cuda_graph_max_tokens,
+        disable_cuda_graph=disable_cuda_graph,
         speculative=speculative,
         draft_model_path=draft_model_path,
         draft_attention_backend=draft_attention_backend,
@@ -480,6 +631,7 @@ def _run_single(
             base_url=base_url,
             tokenizer=tokenizer,
             prompts=prompts,
+            prompt_question_ids=prompt_question_ids,
             concurrency=concurrency,
             output_lens=output_lens,
             temperature=temperature,
@@ -536,7 +688,9 @@ def main() -> int:
     question_ids = tuple(
         q.strip() for q in str(args.question_ids).split(",") if q.strip()
     )
-    prompts = _load_reference_prompts(csv_path, question_ids, args.num_prompts)
+    prompts, prompt_question_ids = _load_reference_prompts(
+        csv_path, question_ids, args.num_prompts
+    )
     tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
     output_lens = _compute_output_lens(
         prompts=prompts,
@@ -551,7 +705,13 @@ def main() -> int:
         baseline_payload = json.loads(
             Path(args.baseline_json_in).read_text(encoding="utf-8")
         )
-        baseline = _bench_result_from_payload(baseline_payload["baseline"])
+        baseline = BenchRun(
+            summary=_bench_result_from_payload(baseline_payload["baseline"]),
+            request_metrics=list(baseline_payload.get("baseline_request_metrics") or []),
+            request_metric_aggregate=dict(
+                baseline_payload.get("baseline_request_metric_aggregate") or {}
+            ),
+        )
     else:
         baseline = _run_single(
             model_path=args.model_path,
@@ -565,6 +725,7 @@ def main() -> int:
             page_size=args.page_size,
             enable_piecewise_cuda_graph=not args.disable_cuda_graph,
             piecewise_cuda_graph_max_tokens=args.piecewise_cuda_graph_max_tokens,
+            disable_cuda_graph=bool(args.disable_cuda_graph),
             speculative=False,
             draft_model_path=None,
             draft_attention_backend=None,
@@ -574,6 +735,7 @@ def main() -> int:
             speculative_dflash_block_size=None,
             mem_fraction_static=args.mem_fraction_static,
             prompts=prompts,
+            prompt_question_ids=prompt_question_ids,
             concurrency=args.concurrency,
             output_lens=output_lens,
             temperature=args.temperature,
@@ -594,6 +756,7 @@ def main() -> int:
         page_size=args.page_size,
         enable_piecewise_cuda_graph=not args.disable_cuda_graph,
         piecewise_cuda_graph_max_tokens=args.piecewise_cuda_graph_max_tokens,
+        disable_cuda_graph=bool(args.disable_cuda_graph),
         speculative=True,
         draft_model_path=args.draft_model_path,
         draft_attention_backend=args.draft_attention_backend,
@@ -603,6 +766,7 @@ def main() -> int:
         speculative_dflash_block_size=args.speculative_dflash_block_size,
         mem_fraction_static=args.mem_fraction_static,
         prompts=prompts,
+        prompt_question_ids=prompt_question_ids,
         concurrency=args.concurrency,
         output_lens=output_lens,
         temperature=args.temperature,
@@ -646,19 +810,29 @@ def main() -> int:
             "top_k": args.top_k,
             "min_p": args.min_p,
         },
-        "baseline": asdict(baseline),
-        "dflash": asdict(dflash),
+        "baseline": asdict(baseline.summary),
+        "baseline_request_metrics": baseline.request_metrics,
+        "baseline_request_metric_aggregate": baseline.request_metric_aggregate,
+        "dflash": asdict(dflash.summary),
+        "dflash_request_metrics": dflash.request_metrics,
+        "dflash_request_metric_aggregate": dflash.request_metric_aggregate,
         "speedup_req_s": (
-            round(dflash.req_s / baseline.req_s, 4) if baseline.req_s else None
+            round(dflash.summary.req_s / baseline.summary.req_s, 4)
+            if baseline.summary.req_s
+            else None
         ),
         "speedup_wall_tok_s": (
-            round(dflash.wall_tok_s / baseline.wall_tok_s, 4)
-            if baseline.wall_tok_s
+            round(dflash.summary.wall_tok_s / baseline.summary.wall_tok_s, 4)
+            if baseline.summary.wall_tok_s
             else None
         ),
         "speedup_output_tok_s_p20": (
-            round((dflash.output_tok_s_p20 or 0.0) / (baseline.output_tok_s_p20 or 1.0), 4)
-            if baseline.output_tok_s_p20
+            round(
+                (dflash.summary.output_tok_s_p20 or 0.0)
+                / (baseline.summary.output_tok_s_p20 or 1.0),
+                4,
+            )
+            if baseline.summary.output_tok_s_p20
             else None
         ),
     }
@@ -668,7 +842,7 @@ def main() -> int:
         "\n| Mode | req/s | wall tok/s | accept len | accept min/max | verify sum | verify avg | p20 step (s) | p20 tok/s | avg out tok |"
     )
     print("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
-    for name, bench in (("baseline", baseline), ("dflash", dflash)):
+    for name, bench in (("baseline", baseline.summary), ("dflash", dflash.summary)):
         accept_min_max = (
             "n/a"
             if bench.accept_length_min_step is None or bench.accept_length_max_step is None

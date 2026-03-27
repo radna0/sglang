@@ -240,6 +240,97 @@ So the right interpretation is:
   easy-to-draft regime
 - that can happen even after a genuinely hard problem, once the model is deep in a predictable tail
 
+## Block Size 16 Investigation
+
+The earlier `block_size=16` regression result was not trustworthy.
+
+Two separate code issues were contaminating that conclusion:
+
+1. Greedy `target_only` verify was ignoring `max_steps_per_req`.
+   - That meant `physical_block=16 / logical_cap=8` was not actually capped in greedy mode.
+   - The fix is in:
+     - `python/sglang/srt/speculative/dflash_utils.py`
+     - `python/sglang/srt/speculative/dflash_info.py`
+2. The eager control path was also wrong.
+   - `--disable-cuda-graph` still allowed piecewise CUDA graph capture to initialize.
+   - That fix is in:
+     - `python/sglang/srt/model_executor/model_runner.py`
+
+So the corrected conclusion is:
+
+- `block_size=16` is **not** collapsing because it is "unsupported"
+- the earlier `16/8` measurements were invalid because the logical cap was dead on the greedy path
+- after fixing that, `block=16` behaves normally on both the easy and hard controls below
+
+### Corrected Easy Prefix Probe: `92ba6a`, decode `2048`
+
+Artifacts:
+
+- `/workspace/dflash_block_investigate_20260327/92ba6a_block8_eager2048.json`
+- `/workspace/dflash_block_investigate_20260327/92ba6a_block16_eager2048.json`
+- `/workspace/dflash_block_investigate_20260327/92ba6a_block16_force8_eager2048.json`
+
+Results:
+
+| run | physical block | logical cap | wall tok/s | accept len | step max | verify sum |
+|---|---:|---:|---:|---:|---:|---:|
+| `92ba6a_block8` | 8 | 8 | 269.906 | 3.537 | 7 | 579 |
+| `92ba6a_block16` | 16 | 16 | 230.305 | 3.850 | 15 | 532 |
+| `92ba6a_block16_force8` | 16 | 8 | 225.239 | 3.772 | 8 | 543 |
+
+Interpretation:
+
+- On the easy prefix, `block=16` accepts slightly more than `block=8`.
+- But it is slower overall, so the extra physical width is mostly overhead here.
+- The corrected `physical16/logical8` row now really is capped:
+  - `spec_dflash_max_steps_mean = 8`
+  - `spec_accept_length_step_max = 8`
+- So the cap bug is fixed.
+
+### Corrected Hard Prefix Probe: `a295e9`, decode `2048`
+
+Artifacts:
+
+- `/workspace/dflash_block_investigate_20260327_hard_v2/a295e9_block8_eager2048.json`
+- `/workspace/dflash_block_investigate_20260327_hard_v2/a295e9_block16_eager2048.json`
+- `/workspace/dflash_block_investigate_20260327_hard_v2/a295e9_block16_force8_eager2048.json`
+
+Results:
+
+| run | physical block | logical cap | wall tok/s | accept len | step max | verify sum |
+|---|---:|---:|---:|---:|---:|---:|
+| `a295e9_block8` | 8 | 8 | 21.687 | 1.159 | 7 | 1767 |
+| `a295e9_block16` | 16 | 16 | 22.713 | 1.172 | 15 | 1747 |
+| `a295e9_block16_force8` | 16 | 8 | 21.877 | 1.159 | 8 | 1767 |
+
+Interpretation:
+
+- On the hard prefix, `block=16` also does **not** collapse.
+- `block=16` is slightly better than `block=8` on this probe:
+  - slightly higher accept length
+  - slightly fewer verifies
+  - slightly better throughput
+- The capped `physical16/logical8` row matches the `block=8` acceptance/verify behavior almost exactly.
+- That means the corrected cap path is behaving as expected.
+
+### Final Read
+
+The right read now is:
+
+- `block=16` itself is not broken
+- the earlier bad `block16` conclusion came from:
+  - dead greedy logical-cap plumbing
+  - a bad eager benchmark path
+- on easy/predictable continuations, larger physical blocks can raise acceptance but also add enough overhead that `block=8` still wins
+- on hard/unpredictable continuations, both `block=8` and `block=16` are fundamentally draft-limited, so acceptance stays close to `1`
+
+So the remaining work is not "make block 16 work at all." That part is now demonstrated.
+The remaining work is:
+
+- reduce verify overhead when acceptance is already good
+- adapt the logical speculative depth when acceptance is bad
+- export entropy/confidence signals and use them to drive that cap
+
 This lines up with the same general signal family emphasized by EAFT:
 
 - low entropy

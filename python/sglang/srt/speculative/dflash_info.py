@@ -639,6 +639,7 @@ class DFlashVerifyInput(SpecInput):
             accept_len, bonus = compute_dflash_accept_len_and_bonus(
                 candidates=candidates,
                 target_predict=target_predict,
+                max_steps_per_req=self.max_steps_per_req,
             )
             if timing_detail:
                 t_after_accept = time.perf_counter()

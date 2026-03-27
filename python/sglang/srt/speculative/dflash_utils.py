@@ -436,6 +436,7 @@ def compute_dflash_accept_len_and_bonus(
     *,
     candidates: torch.Tensor,
     target_predict: torch.Tensor,
+    max_steps_per_req: torch.Tensor | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Compute DFlash accept lengths and bonus tokens (greedy verify rule).
 
@@ -468,6 +469,16 @@ def compute_dflash_accept_len_and_bonus(
         raise ValueError(f"block_size must be positive, got {block_size}.")
 
     matches = candidates[:, 1:] == target_predict[:, :-1]
+    if max_steps_per_req is not None:
+        if max_steps_per_req.ndim != 1 or int(max_steps_per_req.shape[0]) != int(bs):
+            raise ValueError(
+                "max_steps_per_req must be a 1D tensor with shape [bs]. "
+                f"Got shape={tuple(max_steps_per_req.shape)} for bs={bs}."
+            )
+        caps = max_steps_per_req.to(device=matches.device, dtype=torch.int64)
+        caps = caps.clamp(min=0, max=int(block_size - 1))
+        step_ids = torch.arange(int(block_size - 1), device=matches.device, dtype=torch.int64)
+        matches = matches & (step_ids.unsqueeze(0) < caps.unsqueeze(1))
     accept_len = matches.to(torch.int32).cumprod(dim=1).sum(dim=1)
     bonus = target_predict[torch.arange(bs, device=target_predict.device), accept_len]
     return accept_len, bonus.to(torch.int64)

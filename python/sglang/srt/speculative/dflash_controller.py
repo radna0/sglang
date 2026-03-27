@@ -232,6 +232,9 @@ class DFlashReqDifficultyState:
     accept_len_ema: float = 0.0
     verify_ct_last: int = 0
     fanout_hard_latch_ct: int = 0
+    q_entropy_mean_last: Optional[float] = None
+    q_max_mean_last: Optional[float] = None
+    tv_mean_last: Optional[float] = None
 
     def update(self, *, accept_len: int, verify_ct: int, ema_beta: float = 0.9) -> None:
         a = float(max(0, int(accept_len)))
@@ -240,6 +243,16 @@ class DFlashReqDifficultyState:
         self.accept_len_ema = float(self.accept_len_ema) * float(ema_beta) + a * float(
             1.0 - float(ema_beta)
         )
+
+    def update_verify_debug(self, sig: Optional[DFlashDifficultySignals]) -> None:
+        if sig is None:
+            return
+        if sig.q_entropy_mean is not None and math.isfinite(float(sig.q_entropy_mean)):
+            self.q_entropy_mean_last = float(sig.q_entropy_mean)
+        if sig.q_max_mean is not None and math.isfinite(float(sig.q_max_mean)):
+            self.q_max_mean_last = float(sig.q_max_mean)
+        if sig.tv_mean is not None and math.isfinite(float(sig.tv_mean)):
+            self.tv_mean_last = float(sig.tv_mean)
 
     def update_fanout_hard_phase(
         self, *, hard_now: bool, latch_rounds: int
@@ -307,3 +320,51 @@ def req_is_hard_enough_for_fanout(
             accept_last_le
         )
     return bool(hard)
+
+
+def compute_adaptive_max_steps_for_req(
+    req_state: Optional[DFlashReqDifficultyState],
+    *,
+    step_count: int,
+    verify_ct_ge: int,
+    accept_ema_hard_le: float,
+    accept_ema_medium_le: float,
+    hard_cap_steps: int,
+    medium_cap_steps: int,
+    q_entropy_hard_le: float = -1.0,
+) -> int:
+    """Choose a logical speculative cap while keeping the physical block fixed.
+
+    This is intentionally conservative:
+    - without enough verify history, keep the full physical width
+    - hard requests get a small logical cap
+    - medium requests get a medium logical cap
+    - easy / predictable requests keep the full width
+    """
+
+    step_count = max(1, int(step_count))
+    hard_cap_steps = max(1, min(step_count, int(hard_cap_steps)))
+    medium_cap_steps = max(hard_cap_steps, min(step_count, int(medium_cap_steps)))
+    verify_ct_ge = max(0, int(verify_ct_ge))
+
+    if req_state is None:
+        return step_count
+    if int(getattr(req_state, "verify_ct_last", 0)) < verify_ct_ge:
+        return step_count
+
+    accept_ema = float(getattr(req_state, "accept_len_ema", 0.0))
+    q_entropy = getattr(req_state, "q_entropy_mean_last", None)
+    if (
+        q_entropy_hard_le >= 0.0
+        and q_entropy is not None
+        and math.isfinite(float(q_entropy))
+        and float(q_entropy) <= float(q_entropy_hard_le)
+        and accept_ema <= float(accept_ema_medium_le)
+    ):
+        return hard_cap_steps
+
+    if accept_ema <= float(accept_ema_hard_le):
+        return hard_cap_steps
+    if accept_ema <= float(accept_ema_medium_le):
+        return medium_cap_steps
+    return step_count

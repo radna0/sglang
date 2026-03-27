@@ -2436,6 +2436,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         """Initialize piecewise CUDA graph runner."""
         self.piecewise_cuda_graph_runner = None
 
+        if self.server_args.disable_cuda_graph:
+            logger.info(
+                "Disable piecewise CUDA graph because --disable-cuda-graph is set"
+            )
+            return
+
+        if not self.server_args.enable_piecewise_cuda_graph:
+            logger.info(
+                "Disable piecewise CUDA graph because --enable-piecewise-cuda-graph is not set"
+            )
+            return
+
         if getattr(self.server_args, "disable_piecewise_cuda_graph", False):
             logger.info(
                 "Disable piecewise CUDA graph because --disable-piecewise-cuda-graph is set"

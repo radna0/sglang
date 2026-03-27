@@ -1,6 +1,7 @@
 import unittest
 
 from sglang.srt.speculative.dflash_controller import (
+    compute_adaptive_max_steps_for_req,
     DFlashAdaptivePqConfig,
     DFlashAdaptivePqController,
     DFlashDifficultySignals,
@@ -146,6 +147,69 @@ class TestDFlashAdaptivePqController(unittest.TestCase):
         st2 = DFlashReqDifficultyState(accept_len_ema=1.5)
         self.assertFalse(survival_should_force_target_only([st1, st2], accept_ema_le=0.5))
         self.assertTrue(survival_should_force_target_only([st1, st2], accept_ema_le=1.0))
+
+    def test_compute_adaptive_max_steps_hard_request(self):
+        st = DFlashReqDifficultyState(accept_len_ema=1.5, verify_ct_last=12)
+        self.assertEqual(
+            compute_adaptive_max_steps_for_req(
+                st,
+                step_count=8,
+                verify_ct_ge=8,
+                accept_ema_hard_le=2.0,
+                accept_ema_medium_le=5.0,
+                hard_cap_steps=4,
+                medium_cap_steps=6,
+            ),
+            4,
+        )
+
+    def test_compute_adaptive_max_steps_medium_request(self):
+        st = DFlashReqDifficultyState(accept_len_ema=4.0, verify_ct_last=12)
+        self.assertEqual(
+            compute_adaptive_max_steps_for_req(
+                st,
+                step_count=8,
+                verify_ct_ge=8,
+                accept_ema_hard_le=2.0,
+                accept_ema_medium_le=5.0,
+                hard_cap_steps=4,
+                medium_cap_steps=6,
+            ),
+            6,
+        )
+
+    def test_compute_adaptive_max_steps_easy_request(self):
+        st = DFlashReqDifficultyState(accept_len_ema=7.0, verify_ct_last=12)
+        self.assertEqual(
+            compute_adaptive_max_steps_for_req(
+                st,
+                step_count=8,
+                verify_ct_ge=8,
+                accept_ema_hard_le=2.0,
+                accept_ema_medium_le=5.0,
+                hard_cap_steps=4,
+                medium_cap_steps=6,
+            ),
+            8,
+        )
+
+    def test_compute_adaptive_max_steps_uses_q_entropy_hard_gate(self):
+        st = DFlashReqDifficultyState(
+            accept_len_ema=4.5, verify_ct_last=12, q_entropy_mean_last=0.2
+        )
+        self.assertEqual(
+            compute_adaptive_max_steps_for_req(
+                st,
+                step_count=8,
+                verify_ct_ge=8,
+                accept_ema_hard_le=2.0,
+                accept_ema_medium_le=5.0,
+                hard_cap_steps=4,
+                medium_cap_steps=6,
+                q_entropy_hard_le=0.5,
+            ),
+            4,
+        )
 
 
 if __name__ == "__main__":

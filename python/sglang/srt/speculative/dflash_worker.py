@@ -33,6 +33,7 @@ from sglang.srt.speculative.dflash_controller import (
     DFlashAdaptivePqController,
     DFlashDifficultySignals,
     DFlashReqDifficultyState,
+    compute_adaptive_max_steps_for_req,
     req_is_hard_enough_for_fanout,
     survival_should_force_target_only,
 )
@@ -1599,6 +1600,237 @@ class DFlashWorker:
         )
         return max_steps_per_req
 
+    def _apply_adaptive_logical_cap(
+        self,
+        *,
+        batch: ScheduleBatch,
+        max_steps_per_req: torch.Tensor | None,
+        step_count: int,
+    ) -> torch.Tensor | None:
+        force_max_steps = (os.environ.get("SGLANG_DFLASH_FORCE_MAX_STEPS") or "").strip()
+        if force_max_steps:
+            try:
+                force_max_steps_i = int(force_max_steps)
+            except Exception:
+                force_max_steps_i = -1
+            if force_max_steps_i > 0 and step_count > 0 and int(batch.batch_size()) > 0:
+                force_max_steps_i = max(1, min(int(step_count), int(force_max_steps_i)))
+                if max_steps_per_req is None:
+                    max_steps_per_req = torch.full(
+                        (int(batch.batch_size()),),
+                        int(force_max_steps_i),
+                        dtype=torch.int32,
+                        device=self.device,
+                    )
+                else:
+                    max_steps_per_req = torch.full_like(
+                        max_steps_per_req, int(force_max_steps_i), dtype=torch.int32
+                    )
+                if self.tp_rank == 0 and not getattr(self, "_logged_force_max_steps", False):
+                    logger.info(
+                        "DFLASH forcing logical max_steps_per_req=%s with physical_block=%s",
+                        int(force_max_steps_i),
+                        int(step_count + 1),
+                    )
+                    setattr(self, "_logged_force_max_steps", True)
+                return max_steps_per_req
+
+        enabled = (
+            os.environ.get("SGLANG_DFLASH_ADAPTIVE_CAP_ENABLE") or ""
+        ).strip().lower() not in ("", "0", "false", "off", "no")
+        if not enabled or step_count <= 0 or int(batch.batch_size()) <= 0:
+            return max_steps_per_req
+
+        def _env_float(name: str, default: float) -> float:
+            try:
+                return float((os.environ.get(name) or str(default)).strip())
+            except Exception:
+                return float(default)
+
+        def _env_int(name: str, default: int) -> int:
+            try:
+                return int((os.environ.get(name) or str(default)).strip())
+            except Exception:
+                return int(default)
+
+        verify_ct_ge = _env_int("SGLANG_DFLASH_ADAPTIVE_CAP_VERIFY_CT_GE", 8)
+        accept_ema_hard_le = _env_float(
+            "SGLANG_DFLASH_ADAPTIVE_CAP_ACCEPT_EMA_HARD_LE", 2.0
+        )
+        accept_ema_medium_le = _env_float(
+            "SGLANG_DFLASH_ADAPTIVE_CAP_ACCEPT_EMA_MEDIUM_LE", 5.0
+        )
+        hard_cap_steps = _env_int("SGLANG_DFLASH_ADAPTIVE_CAP_HARD_STEPS", 4)
+        medium_cap_steps = _env_int("SGLANG_DFLASH_ADAPTIVE_CAP_MEDIUM_STEPS", 6)
+        q_entropy_hard_le = _env_float(
+            "SGLANG_DFLASH_ADAPTIVE_CAP_Q_ENTROPY_HARD_LE", -1.0
+        )
+
+        if max_steps_per_req is None:
+            max_steps_per_req = torch.full(
+                (int(batch.batch_size()),),
+                int(step_count),
+                dtype=torch.int32,
+                device=self.device,
+            )
+        else:
+            max_steps_per_req = max_steps_per_req.clone()
+
+        caps_cpu = []
+        for req in batch.reqs:
+            caps_cpu.append(
+                int(
+                    compute_adaptive_max_steps_for_req(
+                        getattr(req, "dflash_difficulty_state", None),
+                        step_count=int(step_count),
+                        verify_ct_ge=int(verify_ct_ge),
+                        accept_ema_hard_le=float(accept_ema_hard_le),
+                        accept_ema_medium_le=float(accept_ema_medium_le),
+                        hard_cap_steps=int(hard_cap_steps),
+                        medium_cap_steps=int(medium_cap_steps),
+                        q_entropy_hard_le=float(q_entropy_hard_le),
+                    )
+                )
+            )
+        caps = torch.tensor(caps_cpu, dtype=torch.int32, device=self.device)
+        max_steps_per_req = torch.minimum(max_steps_per_req, caps)
+        return max_steps_per_req
+
+    @staticmethod
+    def _update_req_running_mean(req, attr_name: str, value: float | None) -> None:
+        if value is None:
+            return
+        try:
+            value_f = float(value)
+        except Exception:
+            return
+        if not math.isfinite(value_f):
+            return
+        sum_attr = f"{attr_name}_sum"
+        ct_attr = f"{attr_name}_ct"
+        new_sum = float(getattr(req, sum_attr, 0.0)) + value_f
+        new_ct = int(getattr(req, ct_attr, 0)) + 1
+        setattr(req, sum_attr, new_sum)
+        setattr(req, ct_attr, new_ct)
+        setattr(req, attr_name, new_sum / float(new_ct))
+
+    def _update_req_dflash_debug_stats(
+        self,
+        *,
+        batch: ScheduleBatch,
+        verify_input: DFlashVerifyInput,
+        accept_length_per_req_cpu: list[int],
+        dflash_debug: dict | None,
+    ) -> None:
+        verify_mode = str(getattr(verify_input, "verify_mode", "target_only") or "target_only")
+        draft_conf_debug = getattr(verify_input, "draft_conf_debug", None)
+        sig = None
+        pq_ctrl_debug = None
+        if dflash_debug is not None:
+            try:
+                sig = DFlashDifficultySignals.from_debug(
+                    verify_mode=verify_mode,
+                    dflash_debug=dflash_debug,
+                    draft_conf_debug=draft_conf_debug,
+                )
+            except Exception:
+                sig = None
+        if verify_mode == "pq" and sig is not None:
+            try:
+                _, pq_ctrl_debug = self._adaptive_pq.on_verify_end(sig)
+            except Exception:
+                pq_ctrl_debug = None
+
+        max_steps_cpu = None
+        if getattr(verify_input, "max_steps_per_req", None) is not None:
+            with torch.no_grad():
+                max_steps_cpu = (
+                    verify_input.max_steps_per_req.detach()
+                    .to("cpu", non_blocking=False)
+                    .to(torch.int64)
+                    .tolist()
+                )
+
+        debug_scalar_keys = (
+            "accept_ratio_mean",
+            "tv_mean",
+            "p_entropy_mean",
+            "q_entropy_mean",
+            "p_max_mean",
+            "q_max_mean",
+        )
+        draft_scalar_keys = (
+            "q_max_mean_first",
+            "q_max_min_first",
+            "q_ent_mean_first",
+        )
+
+        for i, req in enumerate(batch.reqs):
+            req.spec_dflash_debug_stat_ct = int(
+                getattr(req, "spec_dflash_debug_stat_ct", 0)
+            ) + (1 if dflash_debug is not None else 0)
+            req.spec_dflash_verify_mode_last = verify_mode
+
+            st = getattr(req, "dflash_difficulty_state", None)
+            if st is None:
+                st = DFlashReqDifficultyState()
+                setattr(req, "dflash_difficulty_state", st)
+
+            accept_len_i = int(accept_length_per_req_cpu[i])
+            st.update(accept_len=accept_len_i, verify_ct=int(getattr(req, "spec_verify_ct", 0)))
+            if sig is not None:
+                st.update_verify_debug(sig)
+
+            req.spec_accept_length_step_last = accept_len_i
+            prev_min = getattr(req, "spec_accept_length_step_min", None)
+            prev_max = getattr(req, "spec_accept_length_step_max", None)
+            req.spec_accept_length_step_min = (
+                accept_len_i if prev_min is None else min(int(prev_min), accept_len_i)
+            )
+            req.spec_accept_length_step_max = (
+                accept_len_i if prev_max is None else max(int(prev_max), accept_len_i)
+            )
+
+            max_steps_i = (
+                int(max_steps_cpu[i])
+                if max_steps_cpu is not None and i < len(max_steps_cpu)
+                else int(self.block_size - 1)
+            )
+            req.spec_dflash_max_steps_last = max_steps_i
+            prev_min_steps = getattr(req, "spec_dflash_max_steps_min", None)
+            prev_max_steps = getattr(req, "spec_dflash_max_steps_max", None)
+            req.spec_dflash_max_steps_min = (
+                max_steps_i
+                if prev_min_steps is None
+                else min(int(prev_min_steps), max_steps_i)
+            )
+            req.spec_dflash_max_steps_max = (
+                max_steps_i
+                if prev_max_steps is None
+                else max(int(prev_max_steps), max_steps_i)
+            )
+            self._update_req_running_mean(req, "spec_dflash_max_steps_mean", max_steps_i)
+
+            if dflash_debug is not None:
+                for key in debug_scalar_keys:
+                    self._update_req_running_mean(
+                        req, f"spec_dflash_{key}", dflash_debug.get(key)
+                    )
+            if draft_conf_debug is not None:
+                for key in draft_scalar_keys:
+                    self._update_req_running_mean(
+                        req, f"spec_dflash_{key}", draft_conf_debug.get(key)
+                    )
+            if pq_ctrl_debug is not None:
+                self._update_req_running_mean(
+                    req,
+                    "spec_dflash_adaptive_temp_mul",
+                    pq_ctrl_debug.get("temp_mul"),
+                )
+                req.spec_dflash_pq_disabled_rounds_left = int(
+                    pq_ctrl_debug.get("pq_disabled_rounds_left", 0) or 0
+                )
+
     def _prepare_ssd_shadow_req_to_token(
         self,
         *,
@@ -2520,6 +2752,12 @@ class DFlashWorker:
                 lm_head=lm_head,
             ).view(bs, self.block_size - 1)
             draft_tokens[:, 1:].copy_(draft_next)
+
+        max_steps_per_req = self._apply_adaptive_logical_cap(
+            batch=batch,
+            max_steps_per_req=max_steps_per_req,
+            step_count=int(self.block_size - 1),
+        )
 
         max_steps_per_req = self._apply_late_enable_dflash_cap(
             batch=batch,
@@ -3524,6 +3762,12 @@ class DFlashWorker:
 
             dflash_debug,
         ) = verify_input.verify(batch=batch, logits_output=logits_output, page_size=self.page_size)
+        self._update_req_dflash_debug_stats(
+            batch=batch,
+            verify_input=verify_input,
+            accept_length_per_req_cpu=accept_length_per_req_cpu,
+            dflash_debug=dflash_debug,
+        )
         if timing_flag and self.tp_rank == 0 and not getattr(self, "_logged_verify_wall", False):
             dt = time.perf_counter() - t0
             logger.info(
@@ -3601,6 +3845,61 @@ class DFlashWorker:
                 if hasattr(commit_lens, "detach")
                 else commit_lens,
             )
+
+        trace_first_steps = int(
+            (os.environ.get("SGLANG_DFLASH_TRACE_FIRST_STEPS") or "0").strip() or 0
+        )
+        if (
+            trace_first_steps > 0
+            and self.tp_rank == 0
+            and int(self._verify_step) <= int(trace_first_steps)
+        ):
+            try:
+                max_steps_trace = None
+                if getattr(verify_input, "max_steps_per_req", None) is not None:
+                    max_steps_trace = (
+                        verify_input.max_steps_per_req.detach()
+                        .to("cpu", non_blocking=False)
+                        .to(torch.int64)
+                        .tolist()
+                    )
+                req0 = batch.reqs[0] if batch.reqs else None
+                req0_state = getattr(req0, "dflash_difficulty_state", None) if req0 is not None else None
+                logger.info(
+                    "DFLASH trace: step=%s block=%s verify_mode=%s accept=%s commit=%s max_steps=%s verified=%s seq_lens=%s req0_accept_ema=%s req0_q_ent=%s req0_q_max=%s",
+                    int(self._verify_step),
+                    int(self.block_size),
+                    str(getattr(verify_input, "verify_mode", None)),
+                    [int(x) for x in accept_length_per_req_cpu],
+                    commit_lens.detach().to("cpu", non_blocking=False).tolist()
+                    if hasattr(commit_lens, "detach")
+                    else commit_lens,
+                    max_steps_trace,
+                    new_verified_id.detach()
+                    .to("cpu", non_blocking=False)
+                    .to(torch.int64)
+                    .tolist(),
+                    batch.seq_lens.detach().to("cpu", non_blocking=False).tolist()
+                    if hasattr(batch.seq_lens, "detach")
+                    else None,
+                    (
+                        float(getattr(req0_state, "accept_len_ema", 0.0))
+                        if req0_state is not None
+                        else None
+                    ),
+                    (
+                        getattr(req0_state, "q_entropy_mean_last", None)
+                        if req0_state is not None
+                        else None
+                    ),
+                    (
+                        getattr(req0_state, "q_max_mean_last", None)
+                        if req0_state is not None
+                        else None
+                    ),
+                )
+            except Exception as e:
+                logger.warning("DFLASH trace logging failed: %s", e)
 
         if self._ssd_enabled and self._ssd_prepare_next:
             try:

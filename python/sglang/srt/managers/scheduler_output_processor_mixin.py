@@ -1150,6 +1150,76 @@ class SchedulerOutputProcessorMixin:
                     customized_info.setdefault(
                         "spec_ssd_fanout_alt_budget", []
                     ).append(int(getattr(req, "spec_ssd_fanout_alt_budget", 0)))
+                    customized_info.setdefault(
+                        "spec_accept_length_step_min", []
+                    ).append(
+                        (
+                            None
+                            if getattr(req, "spec_accept_length_step_min", None)
+                            is None
+                            else int(getattr(req, "spec_accept_length_step_min", 0))
+                        )
+                    )
+                    customized_info.setdefault(
+                        "spec_accept_length_step_max", []
+                    ).append(
+                        (
+                            None
+                            if getattr(req, "spec_accept_length_step_max", None)
+                            is None
+                            else int(getattr(req, "spec_accept_length_step_max", 0))
+                        )
+                    )
+                    customized_info.setdefault("spec_dflash_verify_mode_last", []).append(
+                        getattr(req, "spec_dflash_verify_mode_last", None)
+                    )
+                    customized_info.setdefault("spec_dflash_debug_stat_ct", []).append(
+                        int(getattr(req, "spec_dflash_debug_stat_ct", 0))
+                    )
+                    customized_info.setdefault("spec_dflash_max_steps_last", []).append(
+                        (
+                            None
+                            if getattr(req, "spec_dflash_max_steps_last", None) is None
+                            else int(getattr(req, "spec_dflash_max_steps_last", 0))
+                        )
+                    )
+                    customized_info.setdefault("spec_dflash_max_steps_min", []).append(
+                        (
+                            None
+                            if getattr(req, "spec_dflash_max_steps_min", None) is None
+                            else int(getattr(req, "spec_dflash_max_steps_min", 0))
+                        )
+                    )
+                    customized_info.setdefault("spec_dflash_max_steps_max", []).append(
+                        (
+                            None
+                            if getattr(req, "spec_dflash_max_steps_max", None) is None
+                            else int(getattr(req, "spec_dflash_max_steps_max", 0))
+                        )
+                    )
+                    customized_info.setdefault("spec_dflash_max_steps_mean", []).append(
+                        getattr(req, "spec_dflash_max_steps_mean", None)
+                    )
+                    for key in (
+                        "spec_dflash_accept_ratio_mean",
+                        "spec_dflash_tv_mean",
+                        "spec_dflash_p_entropy_mean",
+                        "spec_dflash_q_entropy_mean",
+                        "spec_dflash_p_max_mean",
+                        "spec_dflash_q_max_mean",
+                        "spec_dflash_q_max_mean_first",
+                        "spec_dflash_q_max_min_first",
+                        "spec_dflash_q_ent_mean_first",
+                        "spec_dflash_adaptive_temp_mul",
+                    ):
+                        customized_info.setdefault(key, []).append(
+                            getattr(req, key, None)
+                        )
+                    customized_info.setdefault(
+                        "spec_dflash_pq_disabled_rounds_left", []
+                    ).append(
+                        int(getattr(req, "spec_dflash_pq_disabled_rounds_left", 0))
+                    )
 
                 if return_logprob:
                     if (
