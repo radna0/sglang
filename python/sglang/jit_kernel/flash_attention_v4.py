@@ -15,6 +15,20 @@ else:
     _flash_attn_import_error = None
 
 
+def fa4_hopper_stable_enabled() -> bool:
+    return False
+
+
+def fa4_hopper_scheduler_metadata_enabled() -> bool:
+    return False
+
+
+def hopper_get_scheduler_metadata(*args, **kwargs):
+    raise NotImplementedError(
+        "FA4 Hopper scheduler metadata is not available in this build."
+    )
+
+
 def _maybe_contiguous(x: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
 
