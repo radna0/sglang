@@ -2720,6 +2720,7 @@ class ServerArgs:
                     inferred_block_size = parse_dflash_draft_config(
                         draft_hf_config=draft_hf_config
                     ).resolve_block_size(default=None)
+                    draft_model_type = getattr(draft_hf_config, "model_type", None)
                 except Exception as e:
                     logger.warning(
                         "Failed to infer DFLASH block_size from draft model config; "
@@ -2750,13 +2751,12 @@ class ServerArgs:
                         )
                         draft_model_type = None
                 else:
-                    # If we inferred from raw config.json, try to read model_type from it.
-                    draft_model_type = None
-                    try:
-                        if "draft_config_json" in locals():
-                            draft_model_type = (draft_config_json or {}).get("model_type")
-                    except Exception:
-                        draft_model_type = None
+                    if draft_model_type is None:
+                        try:
+                            if "draft_config_json" in locals():
+                                draft_model_type = (draft_config_json or {}).get("model_type")
+                        except Exception:
+                            draft_model_type = None
 
                 # GPT-OSS requires attention sink behavior. Historically we enforced FA3,
                 # but FlexAttention backends can also implement sinks correctly.
