@@ -29,6 +29,14 @@ This is a greedy benchmark setup:
 - `min_p=0.0`
 - `ignore_eos=True`
 
+The corrected long-decode benchmark on this branch is now `showtime.py`-faithful in the
+important sense:
+
+- it keeps the original reference prompts unchanged
+- it does **not** pad prompts out to `65k`
+- it greedily decodes to the remaining context budget
+- so the long-run measurements below are about long output continuation, not fake long input
+
 ## Current Status
 
 - original GPT-OSS GQA works on `fa3` + `triton_kernel`
@@ -38,6 +46,7 @@ This is a greedy benchmark setup:
 - `block_size=8` is the best current default on the short reference benchmark
 - on the long-budget local reference harness, `page_size=1 / draft_page_size=1 / share_pools=False` is currently better than the paged-target setup
 - DFlash overlap scheduling is still not production-ready on this branch
+- on the corrected long-decode harness, the key acceptance variable is local continuation predictability, not simply "question difficulty"
 
 ## Why GPT-OSS DFlash Was Slow
 
@@ -101,6 +110,7 @@ Artifacts:
 - `/workspace/dflash_longctx_20260327_metrics_v4/ctx65536_dec8192.json`
 - `/workspace/dflash_longctx_20260327_metrics_v4/ctx131072_dec8192.json`
 - `/workspace/dflash_longctx_20260327_controls/ctx65536_dec8192_page1_noshare.json`
+- `/workspace/dflash_showtime_decodefill_20260327/ctx65536_page1_noshare_decodefill.json`
 
 ### Paged Target, Non-Paged Draft
 
@@ -152,6 +162,197 @@ So the current best-known regimes are now split:
 
 - short-context throughput: `page=256 / draft_page=1 / block=8`
 - local long-budget reference harness: `page=1 / draft_page=1 / share_pools=False / block=8`
+
+## Corrected Showtime-Style Long Decode
+
+This is the important regime for the reference problems:
+
+- source prompts: `/root/reference.csv`
+- prompt text unchanged
+- no prompt padding
+- greedy decode to remaining context budget
+- `context_length=65536`
+- `buffer_tokens=512`
+- target `page_size=1`
+- draft `page_size=1`
+- `share_pools=False`
+- `block_size=8`
+
+Artifact:
+
+- `/workspace/dflash_showtime_decodefill_20260327/ctx65536_page1_noshare_decodefill.json`
+
+Aggregate result:
+
+| run | baseline tok/s | dflash tok/s | accept | verify sum | verify avg | speedup |
+|---|---:|---:|---:|---:|---:|---:|
+| `ctx65536_page1_noshare_decodefill` | 183.648 | 310.940 | 3.388 | 57385 | 19128.333 | 1.693x |
+
+Requested output budget per prompt:
+
+- min: `64786`
+- max: `64839`
+- avg: `64813.0`
+
+This is a real long-output decode-fill run, not the earlier fixed-`8192` decode budget.
+
+## Per-Problem Acceptance Split
+
+These are all plain no-tool `/generate` runs on the corrected long-decode harness. So the
+long-accept behavior below is **not** a tool-calling effect.
+
+Artifacts:
+
+- `/workspace/dflash_showtime_decodefill_20260327/per_problem/92ba6a_block8.json`
+- `/workspace/dflash_showtime_decodefill_20260327/per_problem/9c1c5f_block8.json`
+- `/workspace/dflash_showtime_decodefill_20260327/ctx65536_page1_noshare_decodefill.json`
+
+Per-problem summary:
+
+| problem | rough level | accept | verify sum | wall tok/s | notes |
+|---|---|---:|---:|---:|---|
+| `92ba6a` | easy | 7.086 | 9125 | 642.082 | spends long stretches at `7.9-8.0` acceptance |
+| `9c1c5f` | medium | 5.914 | 10947 | 540.101 | starts verify-heavy, later climbs into near-cap acceptance |
+| `a295e9` | medium-hard | 1.738 | 37313 | 160.321 | remains verify-heavy overall |
+
+Notes:
+
+- `a295e9` is inferred exactly from the completed 3-problem aggregate minus the two direct
+  per-problem runs. It does not need a redundant second full rerun.
+- `92ba6a` and `9c1c5f` both eventually enter a near-cap acceptance regime during forced
+  long decode.
+- `a295e9` does not do so enough to matter overall.
+
+## What Actually Drives Long Acceptance
+
+The best explanation is **local predictability of the continuation**.
+
+That is more precise than just saying "easy question" or "hard question".
+
+The empirical pattern is:
+
+- early or mid active reasoning: lower acceptance, more verifies
+- late stable tail: higher acceptance, sometimes near perfect
+
+So the right interpretation is:
+
+- high acceptance happens when the continuation has fallen into a low-entropy, high-confidence,
+  easy-to-draft regime
+- that can happen even after a genuinely hard problem, once the model is deep in a predictable tail
+
+This lines up with the same general signal family emphasized by EAFT:
+
+- low entropy
+- high confidence
+- locally stable token distribution
+
+Reference:
+
+- https://github.com/PRIS-CV/EAFT
+
+## Entropy / Confidence Hooks Already In Tree
+
+The branch already computes the right DFlash-side difficulty signals for EAFT- or FailFast-style
+policies.
+
+Verify-side stats in:
+
+- `python/sglang/srt/speculative/dflash_info.py`
+
+Available scalar diagnostics:
+
+- `accept_ratio_mean`
+- `p_y_mean`
+- `q_y_mean`
+- `frac_p_y_zero`
+- `frac_q_y_zero`
+- `tv_mean`
+- `p_entropy_mean`
+- `q_entropy_mean`
+- `p_max_mean`
+- `q_max_mean`
+
+Available step-wise diagnostics:
+
+- `accept_ratio_mean_by_step`
+- `tv_mean_by_step`
+- `p_entropy_mean_by_step`
+- `q_entropy_mean_by_step`
+- `p_max_mean_by_step`
+- `q_max_mean_by_step`
+
+Draft-side confidence debug in:
+
+- `python/sglang/srt/speculative/dflash_worker.py`
+
+Available draft debug signals:
+
+- `q_max_mean_first`
+- `q_ent_mean_first`
+
+Relevant env flags:
+
+- `SGLANG_DFLASH_PQ_SCALAR_STATS=1`
+- `SGLANG_DFLASH_PQ_DIAG_STATS=1`
+- `SGLANG_DFLASH_PQ_STEP_STATS=1`
+- `SGLANG_DFLASH_DRAFT_CONF_DEBUG=1`
+
+So the entropy/probability instrumentation already exists. The next productization step is to
+surface these per-request signals into benchmark JSON directly instead of only keeping them in
+verify-side debug structures or logs.
+
+## Adaptive Design Choice
+
+Best next design:
+
+- keep a fixed physical max block
+- vary a logical effective length per request / per round
+
+Why this is the right first move:
+
+1. `DFlashWorker` is built around a fixed physical `block_size`.
+2. `block_size` is threaded through:
+   - buffer allocation
+   - KV-slot accounting
+   - proposal tensor shapes
+   - CUDA-graph capture shapes
+3. The verifier already supports exact early stop through `max_steps_per_req`.
+4. The worker already contains DAWN/FailFast-style cap plumbing.
+5. Pre-capturing multiple physical block widths would increase:
+   - graph capture time
+   - memory pressure
+   - switching complexity
+   - duplicated runtime paths
+
+That means the fastest safe path is:
+
+1. fixed physical block
+2. adaptive logical cap
+3. only later, if needed, multi-width capture
+
+## How FailFast Maps to GPT-OSS DFlash
+
+FailFast-style logic is most useful on the hard regime, not the easy one.
+
+For `a295e9`-like segments:
+
+- low acceptance
+- many verifies
+- high speculative overhead
+
+That is where we should shrink the effective speculative length aggressively.
+
+For `92ba6a`-like late tails:
+
+- acceptance is already near the block cap
+- shrinking does not help much
+- larger physical block may help more than additional caution
+
+So the policy should be asymmetric:
+
+- hard regime: shrink logical speculative length
+- easy regime: allow the full block
+- easy late tails are also the best candidates for testing larger physical blocks
 
 ## Fused vs Unfused KV Materialization
 

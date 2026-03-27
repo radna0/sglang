@@ -594,21 +594,27 @@ async def async_request_sglang_generate(
 ) -> RequestFuncOutput:
     api_url = request_func_input.api_url
     prompt = request_func_input.prompt
+    extra_request_body = dict(request_func_input.extra_request_body or {})
+    extra_sampling_params = extra_request_body.pop("sampling_params", None)
+    if not isinstance(extra_sampling_params, dict):
+        extra_sampling_params = {}
+    sampling_params = {
+        "temperature": 0.0,
+        "max_new_tokens": request_func_input.output_len,
+        "ignore_eos": not args.disable_ignore_eos,
+    }
+    sampling_params.update(extra_sampling_params)
 
     async with _create_bench_client_session() as session:
         payload = {
             ("text" if isinstance(prompt, str) else "input_ids"): prompt,
-            "sampling_params": {
-                "temperature": 0.0,
-                "max_new_tokens": request_func_input.output_len,
-                "ignore_eos": not args.disable_ignore_eos,
-            },
+            "sampling_params": sampling_params,
             "stream": not args.disable_stream,
             "lora_path": request_func_input.lora_name,
             "return_logprob": args.return_logprob,
             "return_routed_experts": args.return_routed_experts,
             "logprob_start_len": -1,
-            **request_func_input.extra_request_body,
+            **extra_request_body,
         }
 
         # Add image data if available (list of image urls/base64)

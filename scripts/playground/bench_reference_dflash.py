@@ -116,16 +116,40 @@ def _load_reference_prompts(
 
 
 def _build_sampling_params(
-    *, decode_len: int, temperature: float, top_p: float, top_k: int, min_p: float
+    *, temperature: float, top_p: float, top_k: int, min_p: float
 ) -> dict[str, Any]:
     return {
         "temperature": float(temperature),
         "top_p": float(top_p),
         "top_k": int(top_k),
         "min_p": float(min_p),
-        "max_new_tokens": int(decode_len),
         "ignore_eos": True,
     }
+
+
+def _compute_output_lens(
+    *,
+    prompts: list[str],
+    tokenizer,
+    context_length: int,
+    decode_len: int,
+    decode_to_context_limit: bool,
+    buffer_tokens: int,
+) -> list[int]:
+    if not decode_to_context_limit:
+        return [int(decode_len)] * len(prompts)
+
+    output_lens: list[int] = []
+    for prompt in prompts:
+        prompt_len = int(len(tokenizer.encode(prompt, add_special_tokens=False)))
+        remaining = int(context_length) - int(prompt_len) - int(buffer_tokens)
+        if remaining <= 0:
+            raise ValueError(
+                f"Prompt length {prompt_len} leaves no decode budget under "
+                f"context_length={context_length} buffer_tokens={buffer_tokens}"
+            )
+        output_lens.append(int(remaining))
+    return output_lens
 
 
 def _launch_server(
@@ -287,13 +311,15 @@ def _bench_one(
     tokenizer,
     prompts: list[str],
     concurrency: int,
-    decode_len: int,
+    output_lens: list[int],
     temperature: float,
     top_p: float,
     top_k: int,
     min_p: float,
 ) -> BenchResult:
-    reqs = [DatasetRow(p, 0, int(decode_len)) for p in prompts]
+    if len(prompts) != len(output_lens):
+        raise ValueError("prompts and output_lens must have the same length")
+    reqs = [DatasetRow(p, 0, int(out)) for p, out in zip(prompts, output_lens)]
 
     args = argparse.Namespace(
         disable_ignore_eos=False,
@@ -319,7 +345,6 @@ def _bench_one(
 
     extra_request_body = {
         "sampling_params": _build_sampling_params(
-            decode_len=decode_len,
             temperature=temperature,
             top_p=top_p,
             top_k=top_k,
@@ -421,7 +446,7 @@ def _run_single(
     mem_fraction_static: float | None,
     prompts: list[str],
     concurrency: int,
-    decode_len: int,
+    output_lens: list[int],
     temperature: float,
     top_p: float,
     top_k: int,
@@ -456,7 +481,7 @@ def _run_single(
             tokenizer=tokenizer,
             prompts=prompts,
             concurrency=concurrency,
-            decode_len=decode_len,
+            output_lens=output_lens,
             temperature=temperature,
             top_p=top_p,
             top_k=top_k,
@@ -480,6 +505,8 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--dflash-port", type=int, default=21001)
     p.add_argument("--context-length", type=int, default=8192)
     p.add_argument("--decode-len", type=int, default=2048)
+    p.add_argument("--decode-to-context-limit", action="store_true")
+    p.add_argument("--buffer-tokens", type=int, default=512)
     p.add_argument("--concurrency", type=int, default=8)
     p.add_argument("--num-prompts", type=int, default=8)
     p.add_argument("--page-size", type=int, default=256)
@@ -510,6 +537,15 @@ def main() -> int:
         q.strip() for q in str(args.question_ids).split(",") if q.strip()
     )
     prompts = _load_reference_prompts(csv_path, question_ids, args.num_prompts)
+    tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
+    output_lens = _compute_output_lens(
+        prompts=prompts,
+        tokenizer=tokenizer,
+        context_length=args.context_length,
+        decode_len=args.decode_len,
+        decode_to_context_limit=args.decode_to_context_limit,
+        buffer_tokens=args.buffer_tokens,
+    )
 
     if args.baseline_json_in:
         baseline_payload = json.loads(
@@ -539,7 +575,7 @@ def main() -> int:
             mem_fraction_static=args.mem_fraction_static,
             prompts=prompts,
             concurrency=args.concurrency,
-            decode_len=args.decode_len,
+            output_lens=output_lens,
             temperature=args.temperature,
             top_p=args.top_p,
             top_k=args.top_k,
@@ -568,7 +604,7 @@ def main() -> int:
         mem_fraction_static=args.mem_fraction_static,
         prompts=prompts,
         concurrency=args.concurrency,
-        decode_len=args.decode_len,
+        output_lens=output_lens,
         temperature=args.temperature,
         top_p=args.top_p,
         top_k=args.top_k,
@@ -583,6 +619,13 @@ def main() -> int:
             "question_ids": list(question_ids),
             "context_length": args.context_length,
             "decode_len": args.decode_len,
+            "decode_to_context_limit": bool(args.decode_to_context_limit),
+            "buffer_tokens": args.buffer_tokens,
+            "requested_output_len_min": int(min(output_lens)),
+            "requested_output_len_max": int(max(output_lens)),
+            "requested_output_len_avg": round(
+                float(sum(output_lens)) / float(len(output_lens)), 3
+            ),
             "concurrency": args.concurrency,
             "num_prompts": args.num_prompts,
             "page_size": args.page_size,
