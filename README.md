@@ -29,6 +29,42 @@ This is a greedy benchmark setup:
 - `min_p=0.0`
 - `ignore_eos=True`
 
+## Execution Mode Matrix
+
+I used two different execution modes on this branch, and they answer different questions.
+
+Production-style throughput runs, with CUDA graph enabled:
+
+- `/workspace/dflash_reference_bench_20260327_draftpage1_mem090_nostrict/result.json`
+- `/workspace/dflash_reference_bench_20260327_ctx65536_dec8192_page1_mem090_nostrict/result.json`
+- `/workspace/dflash_longctx_20260327_metrics_v4/ctx65536_dec8192.json`
+- `/workspace/dflash_longctx_20260327_metrics_v4/ctx131072_dec8192.json`
+- `/workspace/dflash_longctx_20260327_controls/ctx65536_dec8192_page1_noshare.json`
+- `/workspace/dflash_showtime_decodefill_20260327/ctx65536_page1_noshare_decodefill.json`
+
+For those runs:
+
+- `cuda_graph = true`
+- piecewise CUDA graph was enabled with `piecewise_cuda_graph_max_tokens = 8192`
+
+Controller-isolation runs, with CUDA graph disabled on purpose:
+
+- `/workspace/dflash_block_investigate_20260327_easy_v7/92ba6a_block16_adaptive_tuned_fastq_eager2048_ctx65536.json`
+- `/workspace/dflash_block_investigate_20260327_easy_v8/92ba6a_block16_fixed_eager2048_ctx65536.json`
+- `/workspace/dflash_block_investigate_20260327_hard_v7/a295e9_block16_adaptive_tuned_fastq_eager2048_ctx65536.json`
+- `/workspace/dflash_block_investigate_20260327_hard_v8/a295e9_block16_fixed_eager2048_ctx65536.json`
+
+For those runs:
+
+- `cuda_graph = false`
+- `--disable-cuda-graph` was used intentionally to isolate controller overhead and proposal-shaping logic without mixing in graph-capture effects
+
+So the right read is:
+
+- graph-on runs are the production throughput measurements
+- eager runs are the controller-validation measurements
+- do not compare eager controller rows against graph-on throughput rows without saying so explicitly
+
 The corrected long-decode benchmark on this branch is now `showtime.py`-faithful in the
 important sense:
 
@@ -308,7 +344,7 @@ Interpretation:
   - `spec_dflash_max_steps_last = 15`
 - so the controller is active, but still too aggressive on easy prompts
 
-Current-code apples-to-apples rerun (`context_length=65536`):
+Current-code apples-to-apples rerun (`context_length=65536`, eager on purpose):
 
 | run | physical block | controller | effective step mean | total draft tokens | wall tok/s | accept len | q_entropy_mean | q_max_mean |
 |---|---:|---|---:|---:|---:|---:|---:|---:|
@@ -370,7 +406,7 @@ Interpretation:
   - `spec_dflash_max_steps_mean = 9.353`
 - so the controller is functional on hard prompts, but it still leaves some overhead on the table before it settles down
 
-Current-code apples-to-apples rerun (`context_length=65536`):
+Current-code apples-to-apples rerun (`context_length=65536`, eager on purpose):
 
 | run | physical block | controller | effective step mean | total draft tokens | wall tok/s | accept len | q_entropy_mean | q_max_mean |
 |---|---:|---|---:|---:|---:|---:|---:|---:|
