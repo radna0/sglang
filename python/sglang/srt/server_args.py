@@ -2788,12 +2788,23 @@ class ServerArgs:
                         )
 
                 if inferred_block_size is None:
-                    inferred_block_size = 16
-                    logger.warning(
-                        "speculative_num_draft_tokens is not set; defaulting to %d for DFLASH.",
-                        inferred_block_size,
-                    )
+                    if draft_model_type == "gpt_oss":
+                        inferred_block_size = 8
+                        logger.warning(
+                            "GPT-OSS DFLASH defaulting speculative_num_draft_tokens/block_size to %d. "
+                            "This is the current best-performing default on the local reference benchmark. "
+                            "Override with --speculative-dflash-block-size if needed.",
+                            inferred_block_size,
+                        )
+                    else:
+                        inferred_block_size = 16
+                        logger.warning(
+                            "speculative_num_draft_tokens is not set; defaulting to %d for DFLASH.",
+                            inferred_block_size,
+                        )
                 self.speculative_num_draft_tokens = inferred_block_size
+                if self.speculative_dflash_block_size is None:
+                    self.speculative_dflash_block_size = inferred_block_size
 
             if (
                 draft_model_type == "gpt_oss"
