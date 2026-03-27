@@ -590,13 +590,11 @@ class DFlashVerifyInput(SpecInput):
                 setattr(self, "_logged_paged_verify_stats", True)
 
         if sampling_info is None or sampling_info.is_all_greedy or not use_pq:
+            # Adaptive cap currently uses accept EMA plus draft-side q stats. Computing
+            # full target-side entropy/max over the whole vocab on every greedy verify
+            # round is much more expensive and should stay opt-in.
             targetonly_scalar_stats = (
                 (os.environ.get("SGLANG_DFLASH_TARGETONLY_SCALAR_STATS") or "")
-                .strip()
-                .lower()
-                not in ("", "0", "false", "off", "no")
-            ) or (
-                (os.environ.get("SGLANG_DFLASH_ADAPTIVE_CAP_ENABLE") or "")
                 .strip()
                 .lower()
                 not in ("", "0", "false", "off", "no")

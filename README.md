@@ -277,6 +277,8 @@ Artifacts:
 - `/workspace/dflash_block_investigate_20260327/92ba6a_block16_eager2048.json`
 - `/workspace/dflash_block_investigate_20260327_easy_v4/92ba6a_block16_force8_eager2048.json`
 - `/workspace/dflash_block_investigate_20260327_easy_v4/92ba6a_block16_adaptive_eager2048.json`
+- `/workspace/dflash_block_investigate_20260327_easy_v7/92ba6a_block16_adaptive_tuned_fastq_eager2048_ctx65536.json`
+- `/workspace/dflash_block_investigate_20260327_easy_v8/92ba6a_block16_fixed_eager2048_ctx65536.json`
 
 Natural physical block comparison (`context_length=65536`):
 
@@ -306,6 +308,23 @@ Interpretation:
   - `spec_dflash_max_steps_last = 15`
 - so the controller is active, but still too aggressive on easy prompts
 
+Current-code apples-to-apples rerun (`context_length=65536`):
+
+| run | physical block | controller | effective step mean | total draft tokens | wall tok/s | accept len | q_entropy_mean | q_max_mean |
+|---|---:|---|---:|---:|---:|---:|---:|---:|
+| `92ba6a_block16_fixed_current` | 16 | fixed `16` | 15.000 | 8280 | 63.730 | 3.598 | 1.597 | 0.621 |
+| `92ba6a_block16_adaptive_current` | 16 | adaptive | 12.345 | 6901 | 62.723 | 3.555 | 1.606 | 0.619 |
+
+Interpretation:
+
+- on the current code path, the tuned adaptive controller is effectively throughput-neutral on the easy prompt
+- it trims draft work meaningfully:
+  - `spec_dflash_total_draft_token_num`: `8280 -> 6901`
+- while keeping easy-prompt confidence in the same band:
+  - `q_entropy_mean`: `1.597 -> 1.606`
+  - `q_max_mean`: `0.621 -> 0.619`
+- so the tuned gate is no longer the source of the easy-path slowdown; it stays wide enough and barely changes throughput
+
 ### Corrected Hard Prefix Probe: `a295e9`, decode `2048`
 
 Artifacts:
@@ -314,6 +333,8 @@ Artifacts:
 - `/workspace/dflash_block_investigate_20260327_hard_v2/a295e9_block16_eager2048.json`
 - `/workspace/dflash_block_investigate_20260327_hard_v4/a295e9_block16_force8_eager2048.json`
 - `/workspace/dflash_block_investigate_20260327_hard_v4/a295e9_block16_adaptive_eager2048.json`
+- `/workspace/dflash_block_investigate_20260327_hard_v7/a295e9_block16_adaptive_tuned_fastq_eager2048_ctx65536.json`
+- `/workspace/dflash_block_investigate_20260327_hard_v8/a295e9_block16_fixed_eager2048_ctx65536.json`
 
 Natural physical block comparison (`context_length=65536`):
 
@@ -348,6 +369,28 @@ Interpretation:
   - `spec_dflash_max_steps_last = 8`
   - `spec_dflash_max_steps_mean = 9.353`
 - so the controller is functional on hard prompts, but it still leaves some overhead on the table before it settles down
+
+Current-code apples-to-apples rerun (`context_length=65536`):
+
+| run | physical block | controller | effective step mean | total draft tokens | wall tok/s | accept len | q_entropy_mean | q_max_mean |
+|---|---:|---|---:|---:|---:|---:|---:|---:|
+| `a295e9_block16_fixed_current` | 16 | fixed `16` | 15.000 | 11610 | 46.904 | 2.617 | 2.239 | 0.474 |
+| `a295e9_block16_adaptive_current` | 16 | adaptive | 9.968 | 7127 | 52.998 | 2.875 | 2.122 | 0.500 |
+
+Interpretation:
+
+- on the current code path, the tuned adaptive controller is materially helpful on the hard prompt
+- it reduces draft work and verify pressure:
+  - `spec_dflash_total_draft_token_num`: `11610 -> 7127`
+  - `verify_ct_sum`: `774 -> 715`
+- and improves throughput:
+  - `wall_tok_s`: `46.904 -> 52.998`
+- the hard-prompt signal stays clearly separated from the easy prompt:
+  - higher `q_entropy_mean`
+  - lower `q_max_mean`
+- so the current best read is:
+  - easy prompts: keep the block wide
+  - hard prompts: contract the logical cap
 
 ### Final Read
 

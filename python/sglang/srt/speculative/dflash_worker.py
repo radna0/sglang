@@ -3162,6 +3162,17 @@ class DFlashWorker:
         out_token_ids = torch.empty(
             (num_tokens,), dtype=torch.long, device=hidden_states.device
         )
+        conf_budget = 0
+        if return_conf_debug:
+            try:
+                conf_budget = int(
+                    (os.environ.get("SGLANG_DFLASH_DRAFT_CONF_TOKENS") or "4").strip()
+                )
+            except Exception:
+                conf_budget = 4
+            if conf_budget <= 0:
+                conf_budget = 4
+            conf_budget = min(conf_budget, num_tokens)
 
         def _cast_hs(x: torch.Tensor) -> torch.Tensor:
             return x if x.dtype == weight_dtype else x.to(weight_dtype)
@@ -3182,14 +3193,15 @@ class DFlashWorker:
                     base_logits = torch.matmul(hs, weight[:num_org].T)
                     max_idx = torch.argmax(base_logits, dim=-1)
                     out_token_ids[start:end] = max_idx.to(torch.long) + org_vocab_start
-                    if return_conf_debug:
-                        logits_f = base_logits.to(torch.float32)
-                        max_vals = logits_f.gather(
-                            1, max_idx.to(torch.int64).view(-1, 1)
-                        ).view(-1)
+                    if return_conf_debug and conf_token_ct < conf_budget:
+                        take = min(conf_budget - conf_token_ct, int(base_logits.shape[0]))
+                        logits_f = base_logits[:take].to(torch.float32)
+                        max_idx_f = max_idx[:take].to(torch.int64)
+                        max_vals = logits_f.gather(1, max_idx_f.view(-1, 1)).view(-1)
+                        log_z = torch.logsumexp(logits_f, dim=-1)
                         log_probs = torch.log_softmax(logits_f, dim=-1)
                         probs = torch.exp(log_probs)
-                        q_max = torch.exp(max_vals - torch.logsumexp(logits_f, dim=-1))
+                        q_max = torch.exp(max_vals - log_z)
                         q_ent = -(probs * log_probs).sum(dim=-1)
                         q_max_sum += float(q_max.sum().item())
                         q_ent_sum += float(q_ent.sum().item())
