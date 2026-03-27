@@ -14,6 +14,13 @@ The current best short-context regime is:
 - `share_pools=False`
 - `block_size=8`
 
+The current best long-budget reference regime on the local 3-problem harness is:
+
+- target `page_size=1`
+- draft `page_size=1`
+- `share_pools=False`
+- `block_size=8`
+
 This is a greedy benchmark setup:
 
 - `temperature=0.0`
@@ -29,6 +36,7 @@ This is a greedy benchmark setup:
 - paged target + inherited draft paging is still bad
 - paged target + non-paged draft (`draft_page_size=1`) is the good regime
 - `block_size=8` is the best current default on the short reference benchmark
+- on the long-budget local reference harness, `page_size=1 / draft_page_size=1 / share_pools=False` is currently better than the paged-target setup
 - DFlash overlap scheduling is still not production-ready on this branch
 
 ## Why GPT-OSS DFlash Was Slow
@@ -79,6 +87,71 @@ Conclusion:
 
 - `draft_page_size=1` is required for GPT-OSS DFlash on paged targets
 - `block_size=8` is the best current short-context default
+
+## Long-Budget Reference Harness
+
+Important: these `65k` / `131k` runs match the `showtime.py` serving budget style, not a filled-context stress test.
+
+- the harness raises the server `context_length`
+- it does **not** pad the prompt itself out to `65k` or `131k` tokens
+- so these numbers are valid for the same budget regime, but not for a true full-context occupancy benchmark
+
+Artifacts:
+
+- `/workspace/dflash_longctx_20260327_metrics_v4/ctx65536_dec8192.json`
+- `/workspace/dflash_longctx_20260327_metrics_v4/ctx131072_dec8192.json`
+- `/workspace/dflash_longctx_20260327_controls/ctx65536_dec8192_page1_noshare.json`
+
+### Paged Target, Non-Paged Draft
+
+Regime:
+
+- target `page_size=256`
+- draft `page_size=1`
+- `share_pools=False`
+- `block_size=8`
+- greedy decode
+
+Results:
+
+| run | baseline tok/s | dflash tok/s | accept | verify sum | verify avg | speedup |
+|---|---:|---:|---:|---:|---:|---:|
+| `ctx65536_dec8192` | 149.581 | 209.309 | 3.056 | 8353 | 2784.333 | 1.399x |
+| `ctx131072_dec8192` | 150.882 | 211.339 | 3.056 | 8353 | 2784.333 | 1.401x |
+
+Interpretation:
+
+- the nearly identical `65k` and `131k` rows confirm this harness is budget-matched, not prompt-filled
+- the good short-context regime remains good here
+- but it is not the best local long-budget regime we tested
+
+### Non-Paged Target, Non-Paged Draft, No Sharing
+
+Regime:
+
+- target `page_size=1`
+- draft `page_size=1`
+- `share_pools=False`
+- `block_size=8`
+- greedy decode
+
+Result:
+
+| run | baseline tok/s | dflash tok/s | accept | verify sum | verify avg | speedup |
+|---|---:|---:|---:|---:|---:|---:|
+| `ctx65536_dec8192_page1_noshare` | 149.299 | 226.235 | 3.212 | 7831 | 2610.333 | 1.515x |
+
+Interpretation:
+
+- on this local long-budget harness, disabling paging on the target as well is currently better
+- acceptance improves from `3.056` to `3.212`
+- verify count drops from `8353` to `7831`
+- the speedup rises from about `1.40x` to about `1.52x`
+
+So the current best-known regimes are now split:
+
+- short-context throughput: `page=256 / draft_page=1 / block=8`
+- local long-budget reference harness: `page=1 / draft_page=1 / share_pools=False / block=8`
 
 ## Fused vs Unfused KV Materialization
 
@@ -208,7 +281,9 @@ Implemented:
 
 ## Recommended Launch Regime
 
-For GPT-OSS DFlash on this branch, prefer:
+For GPT-OSS DFlash on this branch, prefer one of two regimes.
+
+Short-context / throughput-oriented:
 
 ```bash
 sglang serve \
@@ -217,6 +292,26 @@ sglang serve \
   --moe-runner-backend triton_kernel \
   --kv-cache-dtype fp8_e4m3 \
   --page-size 256 \
+  --speculative-algorithm DFLASH \
+  --speculative-draft-model-path /root/epoch_65_step_23760 \
+  --speculative-draft-attention-backend fa3 \
+  --speculative-draft-kv-cache-dtype bfloat16 \
+  --speculative-draft-page-size 1 \
+  --speculative-dflash-block-size 8 \
+  --speculative-moe-runner-backend triton_kernel
+```
+
+Long-budget local reference harness:
+
+```bash
+export SGLANG_DFLASH_DRAFT_SHARE_POOLS=0
+
+sglang serve \
+  --model-path /workspace/offload_root/gpt-oss-120b \
+  --attention-backend fa3 \
+  --moe-runner-backend triton_kernel \
+  --kv-cache-dtype fp8_e4m3 \
+  --page-size 1 \
   --speculative-algorithm DFLASH \
   --speculative-draft-model-path /root/epoch_65_step_23760 \
   --speculative-draft-attention-backend fa3 \
@@ -269,12 +364,13 @@ Key artifacts:
 - `/workspace/dflash_pagesize_matrix_20260327/target256_draft1_block16_timed.json`
 - `/workspace/dflash_timing_ab_20260327/short_ctx8192_dec2048_fused.json`
 - `/workspace/dflash_timing_ab_20260327/short_ctx8192_dec2048_nofused.json`
-- `/workspace/dflash_longctx_20260327_fixeddraft1_block8_v3/ctx65536_dec8192.json`
-- `/workspace/dflash_longctx_20260327_fixeddraft1_block8_v3/ctx131072_dec8192.json`
+- `/workspace/dflash_longctx_20260327_metrics_v4/ctx65536_dec8192.json`
+- `/workspace/dflash_longctx_20260327_metrics_v4/ctx131072_dec8192.json`
+- `/workspace/dflash_longctx_20260327_controls/ctx65536_dec8192_page1_noshare.json`
 
 ## Immediate Next Work
 
-1. Re-run the `65k` reference benchmark on the corrected `page=256 / draft_page=1 / block=8` regime and record verify counts there too.
-2. Re-run the `131k` reference benchmark on the same regime.
+1. Build a true filled-context stress harness instead of only changing `context_length`.
+2. Compare `page=1 / draft=1 / no-share` against `page=256 / draft=1` on that filled-context harness.
 3. Optimize DFlash verify / allocator behavior in the good regime.
 4. Investigate adaptive block-size selection. `failfast` is now cloned at `/workspace/failfast` for that follow-up work.
