@@ -184,6 +184,215 @@ For each quadrant, record:
 - `q_max`
 - whether the request entered a stable high-accept regime or collapsed to `accept≈1`
 
+## Hypothesis: Acceptance as a Quality-And-Branching Signal
+
+This is the working hypothesis for the next phase. It is **not proven yet**. It is the thing we want to test directly with the correctness-conditioned harness.
+
+### Core Hypothesis
+
+EAFT-style reasoning suggests that the continuation quality regime matters more than a single scalar like "difficulty".
+
+The working claim is:
+
+- high acceptance is usually a sign of:
+  - low local entropy
+  - high local next-token probability
+  - strong draft-target agreement
+  - stable continuation structure
+- `accept≈1` is usually a sign of:
+  - high entropy / low-confidence continuation
+  - confident conflict regions
+  - unstable reasoning trajectory
+  - expensive verify-heavy generation
+
+The stronger version we want to test is:
+
+- branches that enter a sustained high-accept regime are **more likely** to end correct than branches that remain stuck near `accept≈1`
+
+That is plausible, but it is not automatic.
+
+Why it might be true:
+
+- good branches may move from:
+  - high-entropy / high-probability early exploration
+  - into low-entropy / high-probability stable continuation
+- bad branches may stay trapped in:
+  - high-entropy / low-probability
+  - or confident-conflict regions
+
+Why it is not guaranteed:
+
+- a wrong branch can also become low-entropy later if the model becomes confidently wrong
+- so acceptance is a useful signal, but not a correctness oracle by itself
+
+### What We Actually Need To Prove
+
+The right empirical test is per-request, not aggregate:
+
+- does sustained high acceptance correlate with final-answer correctness?
+- does persistent `accept≈1` correlate with final-answer failure?
+- do `q_entropy`, `q_max`, and `verify_ct` improve that prediction?
+- is the relationship different for:
+  - no-tool vs tool-calling
+  - greedy vs sampled
+
+This is why the harness now needs per-request:
+
+- expected answer
+- extracted boxed answer
+- fallback integer answer
+- correctness flag
+- acceptance / entropy / confidence metrics on the same row
+
+### Operational Hypothesis
+
+If the correlation holds, then DFlash acceptance is not just a speed signal. It becomes a routing / search signal.
+
+That would let us treat the first chunk of decode as an exploration phase:
+
+- example: first `8192` decode tokens
+- launch more branches than the final serving budget
+- observe which branches fall into the good regime
+- then allocate more long-decode budget to the branches that look structurally promising
+
+### Case 1: One Tail Request Stalls The Whole Batch
+
+Observed pattern:
+
+- several requests climb into high-accept, high-throughput regimes
+- one remaining request collapses to `accept≈1`
+- the whole batch wall time then gets dominated by that last hard tail
+
+If the quality correlation holds, then the hard tail is doubly bad:
+
+- slower
+- less likely to finish correct
+
+That suggests a branch-management policy:
+
+- do not always keep decoding the worst tail to the same depth
+- instead, consider replacing it with:
+  - another fresh branch
+  - a restarted sample
+  - a tool-augmented branch
+  - a different search trajectory
+
+This is only justified if the low-accept branch is empirically less likely to be correct.
+
+### Case 2: Good Regime Requests Accelerate Over Time
+
+The current long-decode traces already suggest a pattern:
+
+- early decode: lower acceptance
+- later decode: some requests climb into much higher acceptance
+
+The working interpretation is:
+
+- early reasoning is exploratory and locally harder to draft
+- later stable continuation is easier to draft
+
+If that pattern also predicts correctness, then entering the good regime means:
+
+- more likely to be on a productive reasoning path
+- more likely to stay fast under DFlash
+
+That is exactly the kind of regime transition suggested by the EAFT framing:
+
+- move from harder, higher-entropy regions
+- into lower-entropy, higher-probability continuation
+
+### Exploration-Phase Strategy
+
+One concrete hypothesis to test:
+
+- for the first `8192` decode tokens, use a larger exploration batch
+- example:
+  - sample `32` instead of `8`
+  - or `16` instead of `4`
+- score branches by:
+  - acceptance
+  - `q_entropy`
+  - `q_max`
+  - verify burden
+
+Then transition into an exploitation phase.
+
+### Exploitation Option 1: Hard Cap For Strict Latency
+
+- explore with a large branch pool
+- after the exploration window, keep only the top `K`
+- discard the rest
+
+This optimizes for latency / bounded serving cost.
+
+Example:
+
+- explore `32`
+- keep best `8`
+- continue long decode only on those `8`
+
+### Exploitation Option 2: Soft Cap For Throughput
+
+- explore with a large branch pool
+- keep all branches that clear the "good regime" threshold
+- do not force a hard cap if many are promising
+
+This optimizes for total throughput / answer yield instead of strict latency.
+
+Example:
+
+- explore `32`
+- if `17` look good, keep all `17`
+
+### Special Case To Test
+
+If no branch escapes the bad regime, then brute-force continuation may be the wrong policy.
+
+That special-case policy should be tested explicitly:
+
+- if the entire exploration set stays near `accept≈1`
+- and entropy/confidence do not improve
+- then escalate rather than continue the same path
+
+Possible escalation routes:
+
+- restart with new samples
+- enable tool-calling
+- raise search diversity
+- switch to a different exploration budget
+- hand the request to a non-speculative or different speculative policy
+
+### FailFast / Adaptive Block-Size Implication
+
+If the hypothesis is right, then FailFast-style control should be used asymmetrically:
+
+- good regime:
+  - allow larger speculative length
+  - potentially scale toward much larger accepted blocks
+- bad regime:
+  - shrink speculative length aggressively
+  - stop wasting draft/verify work on hopeless tails
+
+That means the best architecture is probably:
+
+- fixed physical max block
+- adaptive logical speculative length
+- branch selection based on acceptance + entropy + confidence
+
+not:
+
+- one static block size for all requests forever
+
+### What This README Treats As Hypothesis, Not Result
+
+The following are **hypotheses to test**, not established findings yet:
+
+- high-accept branches are more likely to be correct
+- low-accept tails are less likely to be worth continuing
+- exploration-phase oversampling improves final quality or latency
+- tool-calling changes the acceptance/correctness frontier in a useful way
+- FailFast-style dynamic scaling can exploit the good regime without hurting quality
+
 ## Execution Mode Matrix
 
 I used two different execution modes on this branch, and they answer different questions.
