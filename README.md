@@ -313,6 +313,21 @@ Interpretation:
 - The capped `physical16/logical8` row matches the `block=8` acceptance/verify behavior almost exactly.
 - That means the corrected cap path is behaving as expected.
 
+Important implementation detail:
+
+- the current logical cap is applied on the verify side, not the draft proposal side
+- so `physical16/logical8` still spends almost the full `block=16` draft work
+- you can see that directly on `a295e9`:
+  - `block8`: `spec_draft_token_num = 12369`
+  - `physical16/logical8`: `spec_draft_token_num = 26505`
+  - but accepted tokens and verify count stay effectively identical
+
+This matters for adaptive DFlash:
+
+- a logical cap is still the right first control to reduce bad verify behavior exactly
+- but it will not deliver the full savings of a true shorter draft path by itself
+- to get that full win later, the draft runner must also avoid generating the full physical width on hard rounds
+
 ### Final Read
 
 The right read now is:
