@@ -423,7 +423,15 @@ def _extract_request_metrics(
         "spec_dflash_pq_disabled_rounds_left",
     )
     rows: list[dict[str, Any]] = []
-    for i, meta in enumerate(meta_infos):
+    row_count = max(
+        len(meta_infos),
+        len(request_question_ids),
+        len(output_lens),
+        len(generated_texts),
+        len(expected_answers),
+    )
+    for i in range(row_count):
+        meta = meta_infos[i] if i < len(meta_infos) else {}
         row = {
             "request_index": int(i),
             "question_id": (

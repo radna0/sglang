@@ -287,6 +287,7 @@ def _run_phase(
     mem_fraction_static: float,
     speculative: bool = True,
     server_env: dict[str, str] | None = None,
+    disable_stream: bool = False,
 ) -> PhaseRun:
     with _server_session(
         model_path=model_path,
@@ -314,7 +315,7 @@ def _run_phase(
             top_p=1.0,
             top_k=1,
             min_p=0.0,
-            disable_stream=True,
+            disable_stream=bool(disable_stream),
         )
 
 
@@ -343,7 +344,8 @@ def _run_chunked_exploration(
     prompts: list[str],
     prompt_question_ids: list[str],
     prompt_expected_answers: list[str],
-    total_output_lens: list[int],
+    full_output_lens: list[int],
+    exploration_output_lens: list[int],
     round_output_len: int,
     min_rounds: int,
     stop_accept_le: float,
@@ -351,10 +353,12 @@ def _run_chunked_exploration(
     stop_selected_margin_ge: float,
     mem_fraction_static: float,
     policy: RoutePolicy,
+    disable_stream: bool = False,
 ) -> tuple[ChunkedPhaseRun, list[dict[str, Any]], list[dict[str, Any]], list[str], list[int]]:
     current_prompts = list(prompts)
     cumulative_texts = [""] * len(prompts)
-    remaining_output_lens = [int(v) for v in total_output_lens]
+    remaining_exploration_lens = [int(v) for v in exploration_output_lens]
+    remaining_full_lens = [int(v) for v in full_output_lens]
     rounds: list[dict[str, Any]] = []
     total_wall_s = 0.0
     last_phase: PhaseRun | None = None
@@ -369,7 +373,7 @@ def _run_chunked_exploration(
         port=port,
         context_length=context_length,
         concurrency=concurrency,
-        output_lens=total_output_lens,
+        output_lens=exploration_output_lens,
         prompts=prompts,
         prompt_question_ids=prompt_question_ids,
         prompt_expected_answers=prompt_expected_answers,
@@ -379,7 +383,7 @@ def _run_chunked_exploration(
     ) as (base_url, tokenizer):
         round_idx = 0
         while True:
-            active = [i for i, rem in enumerate(remaining_output_lens) if int(rem) > 0]
+            active = [i for i, rem in enumerate(remaining_exploration_lens) if int(rem) > 0]
             if not active:
                 stop_reason = "completed_exploration_budget"
                 break
@@ -388,7 +392,7 @@ def _run_chunked_exploration(
             round_qids = [prompt_question_ids[i] for i in active]
             round_answers = [prompt_expected_answers[i] for i in active]
             round_output_lens = [
-                min(int(round_output_len), int(remaining_output_lens[i])) for i in active
+                min(int(round_output_len), int(remaining_exploration_lens[i])) for i in active
             ]
             phase = _bench_one_with_texts(
                 base_url=base_url,
@@ -402,7 +406,7 @@ def _run_chunked_exploration(
                 top_p=1.0,
                 top_k=1,
                 min_p=0.0,
-                disable_stream=True,
+                disable_stream=bool(disable_stream),
             )
             total_wall_s += float(phase.summary.wall_s)
             round_idx += 1
@@ -412,8 +416,11 @@ def _run_chunked_exploration(
             for active_pos, req_idx in enumerate(active):
                 cumulative_texts[req_idx] += phase.generated_texts[active_pos]
                 current_prompts[req_idx] += phase.generated_texts[active_pos]
-                remaining_output_lens[req_idx] = max(
-                    0, int(remaining_output_lens[req_idx]) - int(round_output_lens[active_pos])
+                remaining_exploration_lens[req_idx] = max(
+                    0, int(remaining_exploration_lens[req_idx]) - int(round_output_lens[active_pos])
+                )
+                remaining_full_lens[req_idx] = max(
+                    0, int(remaining_full_lens[req_idx]) - int(round_output_lens[active_pos])
                 )
 
             idx_to_metric = {req_idx: phase.request_metrics[pos] for pos, req_idx in enumerate(active)}
@@ -442,7 +449,7 @@ def _run_chunked_exploration(
                 prompts=prompts,
                 question_ids=prompt_question_ids,
                 expected_answers=prompt_expected_answers,
-                output_lens=total_output_lens,
+                output_lens=remaining_full_lens,
                 phase=merged_phase,
                 policy=policy,
             )
@@ -507,7 +514,7 @@ def _run_chunked_exploration(
         last_branches,
         last_selected,
         current_prompts,
-        remaining_output_lens,
+        remaining_full_lens,
     )
 
 
@@ -714,6 +721,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--continuation-adaptive-cap-q-entropy-hard-le", type=float, default=-1.0)
     p.add_argument("--continuation-adaptive-cap-q-max-hard-ge", type=float, default=-1.0)
     p.add_argument("--continuation-adaptive-cap-tv-hard-ge", type=float, default=-1.0)
+    p.add_argument("--disable-stream", action="store_true", default=False)
     return p.parse_args()
 
 
@@ -761,7 +769,8 @@ def main() -> int:
         prompts=prompts,
         prompt_question_ids=qids,
         prompt_expected_answers=answers,
-        total_output_lens=exploration_output_lens,
+        full_output_lens=full_output_lens,
+        exploration_output_lens=exploration_output_lens,
         round_output_len=int(args.exploration_round_len),
         min_rounds=int(args.exploration_min_rounds),
         stop_accept_le=float(args.exploration_stop_accept_le),
@@ -769,6 +778,7 @@ def main() -> int:
         stop_selected_margin_ge=float(args.exploration_stop_selected_margin_ge),
         mem_fraction_static=float(args.mem_fraction_static),
         policy=policy,
+        disable_stream=bool(args.disable_stream),
     )
 
     continuation_prompts, continuation_qids, continuation_answers = _build_continuation_prompts(
@@ -791,6 +801,7 @@ def main() -> int:
         mem_fraction_static=float(args.mem_fraction_static),
         speculative=True,
         server_env=continuation_server_env,
+        disable_stream=bool(args.disable_stream),
     )
 
     selected_rows = []
