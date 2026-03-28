@@ -11,6 +11,7 @@ import json
 import os
 import re
 import shlex
+import sys
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -224,10 +225,14 @@ def _launch_server(
     speculative_moe_runner_backend: str | None,
     speculative_dflash_block_size: int | None,
     mem_fraction_static: float | None,
+    tool_server: str | None = None,
 ) -> object:
     base_url = f"http://127.0.0.1:{int(port)}"
+    server_python = (
+        os.environ.get("SGLANG_SERVER_PYTHON_EXECUTABLE") or sys.executable or "python3"
+    )
     cmd = [
-        "python3",
+        str(server_python),
         "-m",
         "sglang.launch_server",
         "--model-path",
@@ -258,6 +263,8 @@ def _launch_server(
     ]
     if mem_fraction_static is not None:
         cmd += ["--mem-fraction-static", str(float(mem_fraction_static))]
+    if tool_server:
+        cmd += ["--tool-server", str(tool_server)]
     if disable_cuda_graph:
         cmd.append("--disable-cuda-graph")
     if enable_piecewise_cuda_graph:

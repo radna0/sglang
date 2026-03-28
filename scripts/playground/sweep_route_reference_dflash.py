@@ -176,6 +176,7 @@ def main() -> int:
     repo_python = str(Path(__file__).resolve().parents[2] / "python")
     env = dict(os.environ)
     env["PYTHONPATH"] = repo_python if not env.get("PYTHONPATH") else f"{repo_python}:{env['PYTHONPATH']}"
+    env.setdefault("SGLANG_SERVER_PYTHON_EXECUTABLE", sys.executable)
 
     rows: list[dict[str, Any]] = []
     for qid in question_ids:
