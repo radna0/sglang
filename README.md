@@ -174,6 +174,28 @@ The current data therefore supports a stricter EAFT-style claim:
 - specifically guard against confident-conflict branches
 - do not assume low entropy + high `q_max` is sufficient
 
+Current branch-level routing implication from this sample:
+
+- the only clearly safe green zone so far is **very high** acceptance
+  - `accept >= 6`: `21 / 21` correct on this sample
+- a naive hard-tail drop policy is **not** supported
+  - `accept < 3`: `4 / 5` correct on this sample
+- the real ambiguous band is the mid-high confident region
+  - `3.5 <= accept < 6`, `q_entropy < 0.7`, `q_max > 0.85`
+  - `24` requests in this band
+  - `16` correct, `8` wrong
+
+So the current evidence does **not** support:
+
+- dropping every low-accept tail
+- trusting every low-entropy / high-`q_max` branch
+
+It does support:
+
+- promoting clearly green high-accept branches
+- keeping hard tails alive unless another stronger signal says otherwise
+- treating the mid-high confident band as the main place where branch-selection needs a better conflict detector
+
 In practice, the next branch-selection policy should score with at least:
 
 - acceptance length
