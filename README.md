@@ -1373,9 +1373,47 @@ Key artifacts:
 - `/workspace/dflash_longctx_20260327_metrics_v4/ctx131072_dec8192.json`
 - `/workspace/dflash_longctx_20260327_controls/ctx65536_dec8192_page1_noshare.json`
 
+## Exploration Router Prototype
+
+`scripts/playground/route_reference_dflash.py` is the current application-layer
+prototype for EAFT/FailFast-style branch routing on GPT-OSS DFLASH.
+
+Current policy shape:
+
+1. Run an oversampled exploration pool (for example `c32`) on the real reference
+   prompts with greedy decode.
+2. Stop exploration early once the pool is no longer clearly improving and a
+   promoted subset outperforms the full pool.
+3. Promote the selected subset into a smaller continuation pool (for example `c8`).
+4. Run continuation with DFLASH adaptive logical caps enabled so hard survivors
+   shrink toward near-target-only behavior while easy survivors keep using the
+   larger physical block ceiling.
+
+Current implementation details:
+
+- Physical block ceiling stays fixed at `16`.
+- Exploration is chunked by `--exploration-round-len` instead of always spending
+  the full exploration budget.
+- Promotion is triggered from exploration-round acceptance / score deltas, not
+  from the final `8192`-token exploration budget alone.
+- Continuation can enable the built-in server-side adaptive cap controller via:
+  - `--continuation-adaptive-cap-enable`
+  - `--continuation-adaptive-cap-verify-ct-ge`
+  - `--continuation-adaptive-cap-accept-ema-hard-le`
+  - `--continuation-adaptive-cap-accept-ema-medium-le`
+  - `--continuation-adaptive-cap-hard-steps`
+  - `--continuation-adaptive-cap-medium-steps`
+
+This is still an application-layer prototype:
+
+- it does not preserve KV across exploration -> continuation
+- it is for routing-policy validation, not final serving efficiency
+- it is where we should test early-promotion and hard-tail downgrade policies
+  before moving them into the server/scheduler path
+
 ## Immediate Next Work
 
-1. Build a true filled-context stress harness instead of only changing `context_length`.
-2. Compare `page=1 / draft=1 / no-share` against `page=256 / draft=1` on that filled-context harness.
-3. Optimize DFlash verify / allocator behavior in the good regime.
-4. Investigate adaptive block-size selection. `failfast` is now cloned at `/workspace/failfast` for that follow-up work.
+1. Finish validating the chunked exploration router on the `65536` long-decode lane.
+2. Use the router results to decide the early-promotion trigger before retract-heavy `c32` linger.
+3. Tune per-request hard-tail shrink / near-target-only fallback inside the promoted continuation pool.
+4. Only after that, compare `block=16` exploration against a smaller exploration block such as `8`.
