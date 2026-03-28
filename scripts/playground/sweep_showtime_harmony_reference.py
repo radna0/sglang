@@ -699,6 +699,7 @@ def _solve_one_problem(
     row: dict[str, str],
     attempts: int,
     early_stop: int,
+    full_round: bool,
     pacore_widths: list[int],
     pacore_max_refs: int,
     pacore_max_ref_chars: int,
@@ -727,6 +728,7 @@ def _solve_one_problem(
         )
         attempts_out: list[dict[str, Any]] = []
         vote_hist: Counter[int] = Counter()
+        round_terminated_by = "full_width"
         with ThreadPoolExecutor(max_workers=int(width)) as executor:
             futures = [
                 executor.submit(
@@ -759,7 +761,13 @@ def _solve_one_problem(
                 attempts_out.append(result)
                 if isinstance(result.get("answer"), int):
                     vote_hist[int(result["answer"])] += 1
-                if vote_hist and vote_hist.most_common(1)[0][1] >= int(early_stop):
+                if (
+                    not full_round
+                    and int(early_stop) > 0
+                    and vote_hist
+                    and vote_hist.most_common(1)[0][1] >= int(early_stop)
+                ):
+                    round_terminated_by = "early_stop"
                     break
 
         majority = _majority_answer(attempts_out)
@@ -769,6 +777,8 @@ def _solve_one_problem(
                 "stage": "final_synthesis" if is_final else f"round_{round_idx}",
                 "width": int(width),
                 "input_ref_count": int(len(refs)),
+                "attempts_completed": int(len(attempts_out)),
+                "round_terminated_by": round_terminated_by,
                 "majority": majority,
                 "attempts": attempts_out,
             }
@@ -812,6 +822,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--mem-fraction-static", type=float, default=0.90)
     p.add_argument("--attempts", type=int, default=8)
     p.add_argument("--early-stop", type=int, default=4)
+    p.add_argument("--full-round", action="store_true")
     p.add_argument("--pacore-widths", default="8")
     p.add_argument("--pacore-max-refs", type=int, default=32)
     p.add_argument("--pacore-max-ref-chars", type=int, default=2000)
@@ -899,6 +910,7 @@ def main() -> int:
                 row=row,
                 attempts=int(args.attempts),
                 early_stop=int(args.early_stop),
+                full_round=bool(args.full_round),
                 pacore_widths=Helpers.parse_widths(str(args.pacore_widths)),
                 pacore_max_refs=int(args.pacore_max_refs),
                 pacore_max_ref_chars=int(args.pacore_max_ref_chars),
