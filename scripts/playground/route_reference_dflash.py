@@ -650,6 +650,48 @@ def _build_continuation_prompts(
     return prompts, qids, answers
 
 
+def _resolved_answer(row: dict[str, Any]) -> str | None:
+    boxed = row.get("boxed_answer")
+    if boxed is not None and str(boxed).strip():
+        return str(boxed).strip()
+    fallback = row.get("fallback_answer")
+    if fallback is not None and str(fallback).strip():
+        return str(fallback).strip()
+    return None
+
+
+def _majority_vote_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    hist: dict[str, int] = {}
+    expected: str | None = None
+    for row in rows:
+        answer = _resolved_answer(row)
+        if answer is None:
+            continue
+        hist[answer] = int(hist.get(answer, 0)) + 1
+        if expected is None and row.get("expected_answer") is not None:
+            expected = str(row.get("expected_answer")).strip()
+
+    majority_answer: str | None = None
+    majority_support = 0
+    if hist:
+        majority_answer, majority_support = max(
+            hist.items(), key=lambda kv: (int(kv[1]), str(kv[0]))
+        )
+
+    return {
+        "answer_hist": hist,
+        "majority_answer": majority_answer,
+        "majority_support": int(majority_support),
+        "valid_answer_count": int(sum(int(v) for v in hist.values())),
+        "expected_answer": expected,
+        "is_correct_majority": (
+            bool(majority_answer == expected)
+            if majority_answer is not None and expected is not None
+            else False
+        ),
+    }
+
+
 def _build_continuation_server_env(args: argparse.Namespace) -> dict[str, str]:
     env: dict[str, str] = {}
     if bool(args.continuation_adaptive_cap_enable):
@@ -824,6 +866,9 @@ def main() -> int:
             }
         )
 
+    continuation_majority = _majority_vote_summary(continuation.request_metrics)
+    selected_majority = _majority_vote_summary(selected_rows)
+
     report = {
         "policy": asdict(policy),
         "regime": {
@@ -849,11 +894,13 @@ def main() -> int:
                 label: sum(1 for row in selected_rows if row["route_label"] == label)
                 for label in ("green", "neutral", "hard_tail", "confident_conflict")
             },
+            "majority_vote": selected_majority,
             "selected_rows": selected_rows,
         },
         "continuation": {
             "summary": asdict(continuation.summary),
             "request_metric_aggregate": continuation.request_metric_aggregate,
+            "majority_vote": continuation_majority,
             "request_metrics": continuation.request_metrics,
             "server_env": continuation_server_env,
         },
