@@ -211,16 +211,17 @@ def _call_responses(
     *,
     base_url: str,
     model: str,
-    user_prompt: str,
+    input_payload: Any,
     instructions: str,
     max_output_tokens: int,
     reasoning_effort: str,
     timeout_s: float,
     use_python_tool: bool,
+    previous_response_id: str | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "model": str(model),
-        "input": str(user_prompt),
+        "input": input_payload,
         "instructions": str(instructions),
         "max_output_tokens": int(max_output_tokens),
         "reasoning": {"effort": str(reasoning_effort)},
@@ -233,6 +234,8 @@ def _call_responses(
     }
     if use_python_tool:
         payload["tools"] = [{"type": "code_interpreter"}]
+    if previous_response_id:
+        payload["previous_response_id"] = str(previous_response_id)
 
     t0 = time.time()
     response = requests.post(
@@ -240,13 +243,29 @@ def _call_responses(
         json=payload,
         timeout=float(timeout_s),
     )
-    response.raise_for_status()
+    if not response.ok:
+        body = ""
+        with contextlib.suppress(Exception):
+            body = str(response.text or "")
+        return {
+            "response": None,
+            "transcript": "",
+            "answer": None,
+            "python_calls": 0,
+            "python_errors": 0,
+            "wall_s": float(time.time() - t0),
+            "completion_tokens": 0,
+            "prompt_tokens": 0,
+            "reasoning_tokens": 0,
+            "error": f"http_{response.status_code}: {body[:4000]}",
+        }
     result = response.json()
     transcript, python_calls, python_errors = _parse_response_payload(result)
     usage = result.get("usage") or {}
     answer = _scan_for_answer(transcript)
     return {
         "response": result,
+        "response_id": result.get("id"),
         "transcript": transcript,
         "answer": answer,
         "python_calls": int(python_calls),
@@ -255,6 +274,81 @@ def _call_responses(
         "completion_tokens": int(usage.get("completion_tokens") or 0),
         "prompt_tokens": int(usage.get("prompt_tokens") or 0),
         "reasoning_tokens": int(usage.get("reasoning_tokens") or 0),
+        "error": "",
+    }
+
+
+def _run_harmony_attempt(
+    *,
+    base_url: str,
+    model: str,
+    user_prompt: str,
+    instructions: str,
+    max_turn_output_tokens: int,
+    turns: int,
+    reasoning_effort: str,
+    timeout_s: float,
+    use_python_tool: bool,
+) -> dict[str, Any]:
+    transcript_parts: list[str] = []
+    response_ids: list[str] = []
+    total_python_calls = 0
+    total_python_errors = 0
+    total_completion_tokens = 0
+    total_prompt_tokens = 0
+    total_reasoning_tokens = 0
+    total_wall_s = 0.0
+    final_answer: int | None = None
+    last_error = ""
+    last_response = None
+    prev_response_id: str | None = None
+
+    for turn_idx in range(int(turns)):
+        result = _call_responses(
+            base_url=base_url,
+            model=model,
+            input_payload=(str(user_prompt) if turn_idx == 0 else []),
+            instructions=instructions,
+            max_output_tokens=int(max_turn_output_tokens),
+            reasoning_effort=reasoning_effort,
+            timeout_s=timeout_s,
+            use_python_tool=use_python_tool,
+            previous_response_id=prev_response_id,
+        )
+        total_wall_s += float(result.get("wall_s") or 0.0)
+        total_python_calls += int(result.get("python_calls") or 0)
+        total_python_errors += int(result.get("python_errors") or 0)
+        total_completion_tokens += int(result.get("completion_tokens") or 0)
+        total_prompt_tokens += int(result.get("prompt_tokens") or 0)
+        total_reasoning_tokens += int(result.get("reasoning_tokens") or 0)
+        if result.get("transcript"):
+            transcript_parts.append(str(result["transcript"]))
+        if result.get("response_id"):
+            response_ids.append(str(result["response_id"]))
+            prev_response_id = str(result["response_id"])
+        if result.get("error"):
+            last_error = str(result["error"])
+            last_response = result.get("response")
+            break
+        final_answer = _scan_for_answer("\n".join(transcript_parts))
+        last_response = result.get("response")
+        if final_answer is not None:
+            break
+        if not result.get("response") or not (result["response"].get("output") or []):
+            break
+
+    return {
+        "response": last_response,
+        "response_ids": response_ids,
+        "transcript": "\n".join(part for part in transcript_parts if part).strip(),
+        "answer": final_answer,
+        "python_calls": int(total_python_calls),
+        "python_errors": int(total_python_errors),
+        "wall_s": float(total_wall_s),
+        "completion_tokens": int(total_completion_tokens),
+        "prompt_tokens": int(total_prompt_tokens),
+        "reasoning_tokens": int(total_reasoning_tokens),
+        "error": last_error,
     }
 
 
@@ -290,7 +384,8 @@ def _solve_one_problem(
     pacore_max_ref_chars: int,
     pacore_max_dup_per_answer: int,
     reasoning_effort: str,
-    max_output_tokens: int,
+    max_turn_output_tokens: int,
+    turns: int,
     timeout_s: float,
     use_python_tool: bool,
 ) -> dict[str, Any]:
@@ -314,12 +409,13 @@ def _solve_one_problem(
         with ThreadPoolExecutor(max_workers=int(width)) as executor:
             futures = [
                 executor.submit(
-                    _call_responses,
+                    _run_harmony_attempt,
                     base_url=base_url,
                     model=model_path,
                     user_prompt=user_prompt,
                     instructions=instructions,
-                    max_output_tokens=max_output_tokens,
+                    max_turn_output_tokens=max_turn_output_tokens,
+                    turns=turns,
                     reasoning_effort=reasoning_effort,
                     timeout_s=timeout_s,
                     use_python_tool=use_python_tool,
@@ -327,7 +423,21 @@ def _solve_one_problem(
                 for _ in range(int(width))
             ]
             for future in as_completed(futures):
-                result = future.result()
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    result = {
+                        "response": None,
+                        "transcript": "",
+                        "answer": None,
+                        "python_calls": 0,
+                        "python_errors": 0,
+                        "wall_s": 0.0,
+                        "completion_tokens": 0,
+                        "prompt_tokens": 0,
+                        "reasoning_tokens": 0,
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
                 result["is_correct"] = (
                     str(result.get("answer")) == str(problem_row["answer"])
                 )
@@ -442,6 +552,8 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--cuda-graph-max-bs", type=int, default=8)
     p.add_argument("--mem-fraction-static", type=float, default=0.90)
     p.add_argument("--max-output-tokens", type=int, default=8192)
+    p.add_argument("--max-turn-output-tokens", type=int, default=96)
+    p.add_argument("--turns", type=int, default=128)
     p.add_argument("--attempts", type=int, default=8)
     p.add_argument("--early-stop", type=int, default=4)
     p.add_argument("--pacore-widths", default="")
@@ -452,6 +564,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--timeout-s", type=float, default=900.0)
     p.add_argument("--disable-dflash", action="store_true")
     p.add_argument("--disable-python-tool", action="store_true")
+    p.add_argument("--disable-piecewise-cuda-graph", action="store_true")
     return p.parse_args()
 
 
@@ -474,8 +587,10 @@ def main() -> int:
         cuda_graph_max_bs=int(args.cuda_graph_max_bs),
         max_running_requests=int(args.max_running_requests),
         page_size=1,
-        enable_piecewise_cuda_graph=True,
-        piecewise_cuda_graph_max_tokens=8192,
+        enable_piecewise_cuda_graph=not bool(args.disable_piecewise_cuda_graph),
+        piecewise_cuda_graph_max_tokens=(
+            None if args.disable_piecewise_cuda_graph else 8192
+        ),
         disable_cuda_graph=False,
         speculative=not bool(args.disable_dflash),
         draft_model_path=None if args.disable_dflash else str(args.draft_model_path),
@@ -504,7 +619,8 @@ def main() -> int:
                 pacore_max_ref_chars=int(args.pacore_max_ref_chars),
                 pacore_max_dup_per_answer=int(args.pacore_max_dup_per_answer),
                 reasoning_effort=str(args.reasoning_effort),
-                max_output_tokens=int(args.max_output_tokens),
+                max_turn_output_tokens=int(args.max_turn_output_tokens),
+                turns=int(args.turns),
                 timeout_s=float(args.timeout_s),
                 use_python_tool=not bool(args.disable_python_tool),
             )
