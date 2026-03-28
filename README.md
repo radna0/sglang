@@ -81,6 +81,24 @@ Prepared launcher:
 This run is meant to answer whether the current explore/route policy is already helping on
 these cases before we mix in stronger FailFast / adaptive block-size logic.
 
+## Prepared Sampled Baseline
+
+Prepared but not yet launched:
+
+- no DFLASH
+- no PaCoRe
+- `attempts=8`
+- `early_stop=4`
+- sampled decode:
+  - `temperature=1.0`
+  - `top_p=1.0`
+  - `top_k=50`
+  - `min_p=0.02`
+
+Prepared launcher:
+
+- [run_showtime_baseline10_earlystop_nodflash_sampled.sh](/workspace/sglang-dflash-line/scripts/playground/run_showtime_baseline10_earlystop_nodflash_sampled.sh)
+
 ## Share-Enabled Decode-Fill Concurrency Matrix
 
 The completed long-decode matrix on this branch is now:

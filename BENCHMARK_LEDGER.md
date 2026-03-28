@@ -119,6 +119,7 @@ Append new rows here. Keep failed and superseded runs; do not erase them.
 | run_id | status | serving_path | tool_regime | pacore | early_stop | speculative | quality target | speed target | out_dir | notes |
 |---|---|---|---|---|---|---|---|---|---|---|
 | `showtime_smoke_92_nodflash` | planned | `baseline` | `showtime-harmony-tool` | `off` | `4` | `off` | `final_accuracy` | `wall_s_total` | `/workspace/showtime_baseline10_20260328_earlystop_nodflash` | canonical baseline lane over all 10 |
+| `showtime_baseline10_nodflash_sampled` | prepared | `baseline` | `showtime-harmony-tool` | `off` | `4` | `off` | `final_accuracy + majority_vote + pass@8` | `wall_s_total` | `/workspace/showtime_baseline10_20260328_earlystop_nodflash_sampled` | sampled baseline: `temperature=1.0`, `top_p=1.0`, `top_k=50`, `min_p=0.02` |
 | `showtime_route10_pacore8` | running/partial | `DFLASH` | `showtime-harmony-tool` | `8->1` | `4` | `DFLASH` | `final_accuracy` | `wall_s_total + DFlash metrics` | `/workspace/showtime_harmony_route10_20260328` | current optimized PaCoRe lane |
 | `showtime_smoke_92_dflash` | finished | `DFLASH` | `showtime-harmony-tool` | `off` | `4` | `DFLASH` | `final_accuracy` | `wall_s_total + DFlash metrics` | `/workspace/showtime_harmony_smoke_20260328` | `92ba6a` correct, Python tools exercised |
 | `route5_explore32_route8_block8` | prepared | `explore32->route8` | `no-tool` | `off` | `router early-promotion` | `DFLASH` | `route selection quality + final routed quality` | `wall_s_total + route/explore/continue split` | `/workspace/route5_explore32_route8_block8_20260328` | focused 5-problem difficulty ladder with fixed physical block `8`, adaptive cap off |
@@ -179,3 +180,19 @@ The purpose is to answer:
 Prepared launcher:
 
 - [run_route5_explore32_route8_block8.sh](/workspace/sglang-dflash-line/scripts/playground/run_route5_explore32_route8_block8.sh)
+
+Another prepared baseline lane, separate from the greedy baseline:
+
+- no DFLASH
+- no PaCoRe
+- `attempts=8`
+- `early_stop=4`
+- sampled decode:
+  - `temperature=1.0`
+  - `top_p=1.0`
+  - `top_k=50`
+  - `min_p=0.02`
+
+Prepared launcher:
+
+- [run_showtime_baseline10_earlystop_nodflash_sampled.sh](/workspace/sglang-dflash-line/scripts/playground/run_showtime_baseline10_earlystop_nodflash_sampled.sh)

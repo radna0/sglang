@@ -476,13 +476,21 @@ def _majority_answer(attempts: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def _sampling_params(*, max_new_tokens: int, stop_token_ids: list[int]) -> dict[str, Any]:
+def _sampling_params(
+    *,
+    max_new_tokens: int,
+    stop_token_ids: list[int],
+    temperature: float,
+    top_p: float,
+    top_k: int,
+    min_p: float,
+) -> dict[str, Any]:
     return {
         "max_new_tokens": int(max_new_tokens),
-        "temperature": 0.0,
-        "top_p": 1.0,
-        "top_k": 1,
-        "min_p": 0.01,
+        "temperature": float(temperature),
+        "top_p": float(top_p),
+        "top_k": int(top_k),
+        "min_p": float(min_p),
         "stop_token_ids": [int(x) for x in stop_token_ids],
     }
 
@@ -502,6 +510,10 @@ def _run_attempt(
     max_turn_output_tokens: int,
     turns: int,
     jupyter_timeout_s: float,
+    temperature: float,
+    top_p: float,
+    top_k: int,
+    min_p: float,
 ) -> dict[str, Any]:
     sandbox = sandbox_pool.get()
     t0 = time.time()
@@ -547,7 +559,12 @@ def _run_attempt(
                     break
 
                 params = _sampling_params(
-                    max_new_tokens=int(chunk_tokens), stop_token_ids=stop_token_ids
+                    max_new_tokens=int(chunk_tokens),
+                    stop_token_ids=stop_token_ids,
+                    temperature=float(temperature),
+                    top_p=float(top_p),
+                    top_k=int(top_k),
+                    min_p=float(min_p),
                 )
                 last_request_debug = {
                     "conversation_messages": int(len(conversation.messages)),
@@ -691,6 +708,10 @@ def _solve_one_problem(
     max_turn_output_tokens: int,
     turns: int,
     jupyter_timeout_s: float,
+    temperature: float,
+    top_p: float,
+    top_k: int,
+    min_p: float,
 ) -> dict[str, Any]:
     widths = [*pacore_widths, 1] if pacore_widths else [int(attempts)]
     refs: list[str] = []
@@ -723,6 +744,10 @@ def _solve_one_problem(
                     max_turn_output_tokens=int(max_turn_output_tokens),
                     turns=int(turns),
                     jupyter_timeout_s=float(jupyter_timeout_s),
+                    temperature=float(temperature),
+                    top_p=float(top_p),
+                    top_k=int(top_k),
+                    min_p=float(min_p),
                 )
                 for _ in range(int(width))
             ]
@@ -796,6 +821,10 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--buffer-tokens", type=int, default=512)
     p.add_argument("--jupyter-timeout-s", type=float, default=6.0)
     p.add_argument("--timeout-s", type=float, default=1800.0)
+    p.add_argument("--temperature", type=float, default=0.0)
+    p.add_argument("--top-p", type=float, default=1.0)
+    p.add_argument("--top-k", type=int, default=1)
+    p.add_argument("--min-p", type=float, default=0.01)
     p.add_argument("--attention-backend", default="fa3")
     p.add_argument("--moe-runner-backend", default="triton_kernel")
     p.add_argument("--kv-cache-dtype", default="fp8_e4m3")
@@ -879,6 +908,10 @@ def main() -> int:
                 max_turn_output_tokens=int(args.max_turn_output_tokens),
                 turns=int(args.turns),
                 jupyter_timeout_s=float(args.jupyter_timeout_s),
+                temperature=float(args.temperature),
+                top_p=float(args.top_p),
+                top_k=int(args.top_k),
+                min_p=float(args.min_p),
             )
             results.append(result)
             (out_dir / f"{row['id']}.json").write_text(
