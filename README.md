@@ -37,6 +37,25 @@ Important:
 - they are **greedy** unless a section explicitly says otherwise
 - they do **not** yet tell us the DFlash behavior for tool-calling or for sampled decoding
 
+## Benchmark Ledger
+
+Use [BENCHMARK_LEDGER.md](/workspace/sglang-dflash-line/BENCHMARK_LEDGER.md) as the
+canonical run registry for:
+
+- baseline `showtime.py` Harmony tool-calling
+- DFlash `showtime.py` Harmony tool-calling
+- PaCoRe synthesis rounds
+- `explore32 -> route8`
+- later combined route + PaCoRe lanes
+
+Every future sweep should add a row there with:
+
+- exact regime
+- quality target
+- total / per-question wall time
+- early-stop vs full-round policy
+- and DFlash acceptance / verify metrics when speculative decoding is enabled
+
 ## Share-Enabled Decode-Fill Concurrency Matrix
 
 The completed long-decode matrix on this branch is now:

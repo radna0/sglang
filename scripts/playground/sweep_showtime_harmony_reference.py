@@ -801,6 +801,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--kv-cache-dtype", default="fp8_e4m3")
     p.add_argument("--draft-kv-cache-dtype", default="bfloat16")
     p.add_argument("--block-size", type=int, default=16)
+    p.add_argument("--disable-dflash", action="store_true")
     p.add_argument("--disable-piecewise-cuda-graph", action="store_true")
     return p.parse_args()
 
@@ -838,7 +839,7 @@ def main() -> int:
         enable_piecewise_cuda_graph=not bool(args.disable_piecewise_cuda_graph),
         piecewise_cuda_graph_max_tokens=None if args.disable_piecewise_cuda_graph else 8192,
         disable_cuda_graph=False,
-        speculative=True,
+        speculative=not bool(args.disable_dflash),
         draft_model_path=str(args.draft_model_path),
         draft_attention_backend=str(args.attention_backend),
         draft_kv_cache_dtype=str(args.draft_kv_cache_dtype),
