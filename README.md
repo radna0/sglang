@@ -18,8 +18,9 @@ The current best long-budget reference regime on the local 3-problem harness is:
 
 - target `page_size=1`
 - draft `page_size=1`
-- `share_pools=False`
-- `block_size=8`
+- `share_pools=True`
+- `block_size=16`
+- `mem_fraction_static=0.90` for most rows, `0.85` for `ctx=65536, concurrency=8`
 
 This is a greedy benchmark setup:
 
@@ -35,6 +36,155 @@ Important:
 - they use plain `/generate`
 - they are **greedy** unless a section explicitly says otherwise
 - they do **not** yet tell us the DFlash behavior for tool-calling or for sampled decoding
+
+## Share-Enabled Decode-Fill Concurrency Matrix
+
+The completed long-decode matrix on this branch is now:
+
+- target `page_size=1`
+- draft `page_size=1`
+- `share_pools=True`
+- target KV `fp8_e4m3`
+- draft KV `bfloat16`
+- target attention `fa3`
+- target MoE `triton_kernel`
+- DFlash `block_size=16`
+- CUDA graph enabled
+- piecewise CUDA graph enabled
+- decode-to-context-limit, no prompt padding
+
+Artifacts:
+
+- [matrix.md](/workspace/dflash_ctxfill_concurrency_matrix_share_20260327/matrix.md)
+- [ctx65536_decfill_c1.json](/workspace/dflash_ctxfill_concurrency_matrix_share_20260327/ctx65536_decfill_c1.json)
+- [ctx65536_decfill_c4.json](/workspace/dflash_ctxfill_concurrency_matrix_share_20260327/ctx65536_decfill_c4.json)
+- [ctx65536_decfill_c8.json](/workspace/dflash_ctxfill_concurrency_matrix_share_20260327/ctx65536_decfill_c8.json)
+- [ctx65536_decfill_c16.json](/workspace/dflash_ctxfill_concurrency_matrix_share_20260327/ctx65536_decfill_c16.json)
+- [ctx131072_decfill_c1.json](/workspace/dflash_ctxfill_concurrency_matrix_share_20260327/ctx131072_decfill_c1.json)
+- [ctx131072_decfill_c4.json](/workspace/dflash_ctxfill_concurrency_matrix_share_20260327/ctx131072_decfill_c4.json)
+- [ctx131072_decfill_c8.json](/workspace/dflash_ctxfill_concurrency_matrix_share_20260327/ctx131072_decfill_c8.json)
+- [ctx131072_decfill_c16.json](/workspace/dflash_ctxfill_concurrency_matrix_share_20260327/ctx131072_decfill_c16.json)
+
+| ctx | requested out min/max | conc | mem frac | share pools | dflash tok/s | accept | verify sum |
+|---:|---:|---:|---:|:---:|---:|---:|---:|
+| 65536 | `64814/64814` | `1` | `0.90` | `True` | `387.298` | `5.031` | `12867` |
+| 65536 | `64786/64839` | `4` | `0.90` | `True` | `1056.599` | `7.142` | `36281` |
+| 65536 | `64786/64839` | `8` | `0.85` | `True` | `613.464` | `3.178` | `163143` |
+| 65536 | `64786/64839` | `16` | `0.90` | `True` | `1474.585` | `5.010` | `206959` |
+| 131072 | `130350/130350` | `1` | `0.90` | `True` | `362.775` | `4.937` | `26389` |
+| 131072 | `130322/130375` | `4` | `0.90` | `True` | `965.801` | `7.678` | `67888` |
+| 131072 | `130322/130375` | `8` | `0.90` | `True` | `632.854` | `3.929` | `265361` |
+| 131072 | `130322/130375` | `16` | `0.90` | `True` | `958.972` | `5.182` | `402484` |
+
+What this matrix means:
+
+- the scalable long-decode regime is the shared-pool `page_size=1` path, not the earlier no-share path
+- concurrency scaling is **not monotonic**
+- `c4` is the cleanest throughput point on these three problems
+- `c8` is the most pathological point here because it accumulates large verify burden and tail stalls
+- `c16` can still win throughput on `ctx=65536`, but it does so while paying a much larger verify bill
+
+This matches the live behavior observed during the run:
+
+- while several requests are in easy low-entropy continuation, throughput climbs sharply
+- once the batch drains into a few hard tails, aggregate throughput collapses
+- DFlash can still be fast overall, but the hardest tails dominate wall time
+
+## Correctness-Conditioned Findings From The Share Matrix
+
+The harness now exports per-request:
+
+- boxed answer
+- fallback answer
+- exact correctness flag
+- `spec_accept_length`
+- `spec_verify_ct`
+- `spec_dflash_q_entropy_mean`
+- `spec_dflash_q_max_mean`
+
+On the completed share-enabled matrix:
+
+- total requests: `58`
+- correct boxed answers: `48 / 58 = 82.76%`
+
+Per-problem:
+
+- `92ba6a`: `18 / 24` correct
+- `9c1c5f`: `18 / 18` correct
+- `a295e9`: `12 / 16` correct
+
+Per row:
+
+- `ctx=65536, c1`: `1 / 1` correct
+- `ctx=65536, c4`: `4 / 4` correct
+- `ctx=65536, c8`: `8 / 8` correct
+- `ctx=65536, c16`: `10 / 16` correct
+- `ctx=131072, c1`: `1 / 1` correct
+- `ctx=131072, c4`: `4 / 4` correct
+- `ctx=131072, c8`: `7 / 8` correct
+- `ctx=131072, c16`: `13 / 16` correct
+
+This is the important result:
+
+- high acceptance is useful, but it is **not** a correctness oracle
+- some wrong branches are exactly the EAFT-style `confident conflict` regime:
+  - relatively high acceptance
+  - low entropy
+  - high `q_max`
+  - wrong final boxed answer
+
+Examples from the current matrix:
+
+- `92ba6a`, `ctx=131072`, `c16`
+  - `accept=5.467`
+  - `q_entropy=0.308`
+  - `q_max=0.929`
+  - wrong answer `100` instead of `50`
+- `92ba6a`, `ctx=65536`, `c16`
+  - several repeats at `accept≈4.8-5.3`
+  - `q_entropy≈0.52-0.65`
+  - `q_max≈0.86-0.88`
+  - wrong answer `100` instead of `50`
+- `a295e9`, `ctx=65536`, `c16`
+  - `accept≈3.9-4.15`
+  - `q_entropy≈0.49-0.51`
+  - `q_max≈0.876-0.880`
+  - wrong answer `580` instead of `520`
+
+So the current evidence is:
+
+- `accept>=6` looked very strong on this sample
+  - `21 / 21` correct
+- but the mid-high band `accept in [4, 6)` was **not** safe
+  - `20 / 28` correct
+- very low acceptance was not automatically wrong either
+  - tiny sample, `3 / 3` correct for `accept < 2`
+
+That means the current branch should **not** use acceptance alone for branch dropping or quality routing.
+
+The safe interpretation is narrower:
+
+- very high sustained acceptance is promising
+- mid-high acceptance still needs a conflict detector
+- low acceptance means expensive / unstable generation, but not automatically wrong
+
+The current data therefore supports a stricter EAFT-style claim:
+
+- use acceptance together with entropy/confidence
+- specifically guard against confident-conflict branches
+- do not assume low entropy + high `q_max` is sufficient
+
+In practice, the next branch-selection policy should score with at least:
+
+- acceptance length
+- verify count
+- `q_entropy`
+- `q_max`
+- eventual correctness outcome on held-out runs
+
+Not just:
+
+- acceptance length alone
 
 ## Regime Separation: No-Tool vs Tool-Calling, Greedy vs Sampled
 
