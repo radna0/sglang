@@ -103,6 +103,41 @@ Prepared launcher:
 
 - [run_showtime_baseline10_earlystop_nodflash_sampled.sh](/workspace/sglang-dflash-line/scripts/playground/run_showtime_baseline10_earlystop_nodflash_sampled.sh)
 
+## Important Baseline Finding
+
+This branch now has a very important baseline result for showtime-faithful Harmony tool-calling:
+
+No-DFLASH greedy baseline:
+
+- run: `/workspace/showtime_baseline10_20260328_earlystop_nodflash`
+- `7/10` final selected correct
+- `8/10` any-correct / pass@8
+- wall time: `5227s` = `1h27m07s`
+
+No-DFLASH sampled baseline:
+
+- run: `/workspace/showtime_baseline10_20260328_earlystop_nodflash_sampled`
+- `10/10` final selected correct
+- wall time: `5627s` = `1h33m47s`
+- delta vs greedy: `+400s` = `+6m40s` = about `+7.7%`
+
+Interpretation:
+
+- moving from greedy to sampled baseline produced a major quality gain for a relatively modest
+  wall-time increase
+- this must become the reference point when we later judge:
+  - DFLASH
+  - PaCoRe
+  - DFLASH + PaCoRe
+  - sampled-target DFLASH variants
+
+Important future speculative-design split:
+
+- sampled target with greedy draft
+- sampled target with sampled draft
+
+Those are different speculative regimes and must be benchmarked separately.
+
 ## Share-Enabled Decode-Fill Concurrency Matrix
 
 The completed long-decode matrix on this branch is now:

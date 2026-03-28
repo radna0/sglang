@@ -124,6 +124,68 @@ Append new rows here. Keep failed and superseded runs; do not erase them.
 | `showtime_smoke_92_dflash` | finished | `DFLASH` | `showtime-harmony-tool` | `off` | `4` | `DFLASH` | `final_accuracy` | `wall_s_total + DFlash metrics` | `/workspace/showtime_harmony_smoke_20260328` | `92ba6a` correct, Python tools exercised |
 | `route5_explore32_route8_block8` | prepared | `explore32->route8` | `no-tool` | `off` | `router early-promotion` | `DFLASH` | `route selection quality + final routed quality` | `wall_s_total + route/explore/continue split` | `/workspace/route5_explore32_route8_block8_20260328` | focused 5-problem difficulty ladder with fixed physical block `8`, adaptive cap off |
 
+## Important Baseline Finding
+
+The branch now has a strong baseline result that must be preserved when evaluating DFlash,
+PaCoRe, and sampled-target speculative variants.
+
+### No-DFLASH Greedy Baseline
+
+- run: `/workspace/showtime_baseline10_20260328_earlystop_nodflash`
+- regime:
+  - no DFLASH
+  - no PaCoRe
+  - `attempts=8`
+  - `early_stop=4`
+  - greedy:
+    - `temperature=0.0`
+    - `top_p=1.0`
+    - `top_k=1`
+- result:
+  - final selected accuracy: `7/10`
+  - any-correct / pass@8: `8/10`
+  - wall time: `5227s` = `1h27m07s`
+
+### No-DFLASH Sampled Baseline
+
+- run: `/workspace/showtime_baseline10_20260328_earlystop_nodflash_sampled`
+- regime:
+  - no DFLASH
+  - no PaCoRe
+  - `attempts=8`
+  - `early_stop=4`
+  - sampled:
+    - `temperature=1.0`
+    - `top_p=1.0`
+    - `top_k=50`
+    - `min_p=0.02`
+- result:
+  - final selected accuracy: `10/10`
+  - wall time: `5627s` = `1h33m47s`
+  - delta vs greedy: `+400s` = `+6m40s` = about `+7.7%`
+
+### Why This Matters
+
+- sampled baseline achieved a large quality gain for a relatively modest wall-time increase
+- this is the reference point for all later:
+  - DFLASH runs
+  - PaCoRe runs
+  - DFLASH + PaCoRe runs
+  - sampled-target speculative runs
+- we should not evaluate a speculative path only against greedy quality if the non-speculative
+  sampled baseline is already materially better
+
+### Future DFLASH Sampling Note
+
+For later sampled DFLASH experiments, the key design split is:
+
+1. target samples as normal, draft remains greedy
+2. target samples as normal, draft also samples
+
+This distinction must be benchmarked explicitly. The first option matches the common
+\"sampled target, greedy draft\" design used by systems such as vLLM; the second is possible
+but must be treated as a separate regime.
+
 ## Comparison Protocol
 
 Before claiming one regime is better than another, compare all of:
