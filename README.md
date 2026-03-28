@@ -56,6 +56,10 @@ Every future sweep should add a row there with:
 - early-stop vs full-round policy
 - and DFlash acceptance / verify metrics when speculative decoding is enabled
 
+Documented benchmark JSON outputs are mirrored into:
+
+- [benchmark_artifacts/README.md](/workspace/sglang-dflash-line/benchmark_artifacts/README.md)
+
 ## Prepared Next Route Study
 
 Prepared but not yet launched:
