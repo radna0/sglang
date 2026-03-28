@@ -121,6 +121,7 @@ Append new rows here. Keep failed and superseded runs; do not erase them.
 | `showtime_smoke_92_nodflash` | planned | `baseline` | `showtime-harmony-tool` | `off` | `4` | `off` | `final_accuracy` | `wall_s_total` | `/workspace/showtime_baseline10_20260328_earlystop_nodflash` | canonical baseline lane over all 10 |
 | `showtime_route10_pacore8` | running/partial | `DFLASH` | `showtime-harmony-tool` | `8->1` | `4` | `DFLASH` | `final_accuracy` | `wall_s_total + DFlash metrics` | `/workspace/showtime_harmony_route10_20260328` | current optimized PaCoRe lane |
 | `showtime_smoke_92_dflash` | finished | `DFLASH` | `showtime-harmony-tool` | `off` | `4` | `DFLASH` | `final_accuracy` | `wall_s_total + DFlash metrics` | `/workspace/showtime_harmony_smoke_20260328` | `92ba6a` correct, Python tools exercised |
+| `route5_explore32_route8_block8` | prepared | `explore32->route8` | `no-tool` | `off` | `router early-promotion` | `DFLASH` | `route selection quality + final routed quality` | `wall_s_total + route/explore/continue split` | `/workspace/route5_explore32_route8_block8_20260328` | focused 5-problem difficulty ladder with fixed physical block `8`, adaptive cap off |
 
 ## Comparison Protocol
 
@@ -150,3 +151,31 @@ Keep this section brutally concrete.
 - comparing PaCoRe vs non-PaCoRe without normalizing rounds, early-stop policy, and wall time
 - interpreting high acceptance as guaranteed correctness
 
+## Next Prepared Run
+
+The next prepared route-focused study before the full 10-problem DFlash route sweep is:
+
+- `explore=32`
+- `explore_tokens=8192`
+- `route=8`
+- fixed physical `DFLASH block_size=8`
+- adaptive / FailFast continuation disabled for this first focused pass
+
+Problems:
+
+- hardest: `86e8e5`
+- harder: `dd7f5e`
+- decently hard: `a295e9`
+- medium: `9c1c5f`
+- easiest: `92ba6a`
+
+The purpose is to answer:
+
+1. Is explore/route actually helping on this difficulty ladder?
+2. Do we really get enough high-confidence / low-entropy routes to justify `route=8`?
+3. Where do we already see hard tails inside the exploration pool?
+4. Does fixed physical block `8` behave better than the current `16` ceiling before proper FailFast / adaptive scaling is enabled?
+
+Prepared launcher:
+
+- [run_route5_explore32_route8_block8.sh](/workspace/sglang-dflash-line/scripts/playground/run_route5_explore32_route8_block8.sh)

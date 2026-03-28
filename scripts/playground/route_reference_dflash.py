@@ -239,6 +239,7 @@ def _server_session(
     prompt_question_ids: list[str],
     prompt_expected_answers: list[str],
     mem_fraction_static: float,
+    dflash_block_size: int,
     speculative: bool = True,
     server_env: dict[str, str] | None = None,
 ):
@@ -262,7 +263,7 @@ def _server_session(
             draft_kv_cache_dtype="bfloat16",
             draft_page_size=1,
             speculative_moe_runner_backend="triton_kernel",
-            speculative_dflash_block_size=16,
+            speculative_dflash_block_size=int(dflash_block_size),
             mem_fraction_static=mem_fraction_static,
         )
     base_url = f"http://127.0.0.1:{int(port)}"
@@ -285,6 +286,7 @@ def _run_phase(
     prompt_question_ids: list[str],
     prompt_expected_answers: list[str],
     mem_fraction_static: float,
+    dflash_block_size: int,
     speculative: bool = True,
     server_env: dict[str, str] | None = None,
     disable_stream: bool = False,
@@ -300,6 +302,7 @@ def _run_phase(
         prompt_question_ids=prompt_question_ids,
         prompt_expected_answers=prompt_expected_answers,
         mem_fraction_static=mem_fraction_static,
+        dflash_block_size=dflash_block_size,
         speculative=speculative,
         server_env=server_env,
     ) as (base_url, tokenizer):
@@ -352,6 +355,7 @@ def _run_chunked_exploration(
     stop_selected_mean_accept_ge: float,
     stop_selected_margin_ge: float,
     mem_fraction_static: float,
+    dflash_block_size: int,
     policy: RoutePolicy,
     disable_stream: bool = False,
 ) -> tuple[ChunkedPhaseRun, list[dict[str, Any]], list[dict[str, Any]], list[str], list[int]]:
@@ -378,6 +382,7 @@ def _run_chunked_exploration(
         prompt_question_ids=prompt_question_ids,
         prompt_expected_answers=prompt_expected_answers,
         mem_fraction_static=mem_fraction_static,
+        dflash_block_size=dflash_block_size,
         speculative=True,
         server_env=None,
     ) as (base_url, tokenizer):
@@ -740,6 +745,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--exploration-num-prompts", type=int, default=32)
     p.add_argument("--buffer-tokens", type=int, default=512)
     p.add_argument("--mem-fraction-static", type=float, default=0.90)
+    p.add_argument("--dflash-block-size", type=int, default=16)
     p.add_argument("--promotion-mode", choices=("strict", "throughput"), default="strict")
     p.add_argument("--promote-total-k", type=int, default=8)
     p.add_argument("--min-keep-per-qid", type=int, default=1)
@@ -819,6 +825,7 @@ def main() -> int:
         stop_selected_mean_accept_ge=float(args.exploration_stop_selected_mean_accept_ge),
         stop_selected_margin_ge=float(args.exploration_stop_selected_margin_ge),
         mem_fraction_static=float(args.mem_fraction_static),
+        dflash_block_size=int(args.dflash_block_size),
         policy=policy,
         disable_stream=bool(args.disable_stream),
     )
@@ -841,6 +848,7 @@ def main() -> int:
         prompt_question_ids=continuation_qids,
         prompt_expected_answers=continuation_answers,
         mem_fraction_static=float(args.mem_fraction_static),
+        dflash_block_size=int(args.dflash_block_size),
         speculative=True,
         server_env=continuation_server_env,
         disable_stream=bool(args.disable_stream),

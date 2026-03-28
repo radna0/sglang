@@ -56,6 +56,31 @@ Every future sweep should add a row there with:
 - early-stop vs full-round policy
 - and DFlash acceptance / verify metrics when speculative decoding is enabled
 
+## Prepared Next Route Study
+
+Prepared but not yet launched:
+
+- `explore=32`
+- `explore_tokens=8192`
+- `route=8`
+- fixed physical `DFLASH block_size=8`
+- adaptive / FailFast continuation intentionally left off for the first pass
+
+Problem ladder:
+
+- hardest: `86e8e5`
+- harder: `dd7f5e`
+- decently hard: `a295e9`
+- medium: `9c1c5f`
+- easiest: `92ba6a`
+
+Prepared launcher:
+
+- [run_route5_explore32_route8_block8.sh](/workspace/sglang-dflash-line/scripts/playground/run_route5_explore32_route8_block8.sh)
+
+This run is meant to answer whether the current explore/route policy is already helping on
+these cases before we mix in stronger FailFast / adaptive block-size logic.
+
 ## Share-Enabled Decode-Fill Concurrency Matrix
 
 The completed long-decode matrix on this branch is now:
