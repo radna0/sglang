@@ -122,12 +122,39 @@ def test_pack_dflash_target_only_commits():
     )
     accept_len = torch.tensor([2, 0], dtype=torch.int32)
 
-    proposed_flat, commit_lens = pack_dflash_target_only_commits(
+    packed = pack_dflash_target_only_commits(
         target_predict=target_predict,
         accept_len=accept_len,
     )
-    assert commit_lens.tolist() == [3, 1]
-    assert proposed_flat.tolist() == [11, 12, 13, 21]
+    assert packed.commit_lens.tolist() == [3, 1]
+    assert packed.proposed_flat.tolist() == [11, 12, 13, 21]
+    assert packed.commit_offsets.tolist() == [0, 3, 4]
+    assert packed.default_new_verified_id.tolist() == [13, 21]
+
+
+def test_materialize_dflash_target_only_commit_metadata():
+    from sglang.srt.speculative.dflash_utils import (
+        DFlashTargetOnlyCommitResult,
+        materialize_dflash_target_only_commit_metadata,
+    )
+
+    metadata = materialize_dflash_target_only_commit_metadata(
+        commit_results=[
+            DFlashTargetOnlyCommitResult(
+                commit_len=3,
+                new_verified_token=13,
+                accepted_draft_tokens=2,
+            ),
+            DFlashTargetOnlyCommitResult(
+                commit_len=0,
+                new_verified_token=55,
+                accepted_draft_tokens=0,
+            ),
+        ],
+        device=torch.device("cpu"),
+    )
+    assert metadata.commit_lens.tolist() == [3, 0]
+    assert metadata.new_verified_id.tolist() == [13, 55]
 
 
 def test_compute_dflash_sampling_accept_len_and_bonus_honors_max_steps_and_returns_prefix(

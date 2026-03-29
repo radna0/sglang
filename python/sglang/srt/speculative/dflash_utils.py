@@ -414,6 +414,20 @@ class DFlashTargetOnlyCommitResult:
     accepted_draft_tokens: int
 
 
+@dataclass(frozen=True)
+class DFlashPackedTargetOnlyCommits:
+    proposed_flat: torch.Tensor
+    commit_lens: torch.Tensor
+    commit_offsets: torch.Tensor
+    default_new_verified_id: torch.Tensor
+
+
+@dataclass(frozen=True)
+class DFlashTargetOnlyCommitMetadata:
+    commit_lens: torch.Tensor
+    new_verified_id: torch.Tensor
+
+
 def commit_dflash_proposed_tokens_to_req(
     *,
     req: Any,
@@ -505,6 +519,28 @@ def commit_dflash_proposed_tokens_to_req(
     )
 
 
+def materialize_dflash_target_only_commit_metadata(
+    *,
+    commit_results: List[DFlashTargetOnlyCommitResult],
+    device: torch.device,
+) -> DFlashTargetOnlyCommitMetadata:
+    """Convert CPU-side target-only commit outcomes back into device tensors."""
+    commit_lens = torch.tensor(
+        [int(result.commit_len) for result in commit_results],
+        dtype=torch.int32,
+        device=device,
+    )
+    new_verified_id = torch.tensor(
+        [int(result.new_verified_token) for result in commit_results],
+        dtype=torch.int64,
+        device=device,
+    )
+    return DFlashTargetOnlyCommitMetadata(
+        commit_lens=commit_lens,
+        new_verified_id=new_verified_id,
+    )
+
+
 def can_dflash_slice_qkv_weight(qkv_proj: Any) -> Tuple[bool, str]:
     """Validate whether DFlash can slice KV weights from a fused QKV linear layer."""
     quant_method = getattr(qkv_proj, "quant_method", None)
@@ -586,7 +622,7 @@ def pack_dflash_target_only_commits(
     *,
     target_predict: torch.Tensor,
     accept_len: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> DFlashPackedTargetOnlyCommits:
     """Compact the committed target-only token prefix for CPU-side request updates.
 
     Args:
@@ -596,6 +632,8 @@ def pack_dflash_target_only_commits(
     Returns:
         proposed_flat: flattened committed token prefixes, row-major by request.
         commit_lens: [bs] committed token counts including the bonus token.
+        commit_offsets: [bs + 1] flattened-span offsets for each request.
+        default_new_verified_id: [bs] last committed token before any CPU-side truncation.
     """
     if target_predict.ndim != 2:
         raise ValueError(
@@ -616,7 +654,20 @@ def pack_dflash_target_only_commits(
         draft_token_num, device=target_predict.device, dtype=torch.int32
     )[None, :] < commit_lens.unsqueeze(1)
     proposed_flat = target_predict[keep_mask].to(torch.int64)
-    return proposed_flat, commit_lens
+    commit_offsets = torch.zeros(
+        (bs + 1,), dtype=torch.int64, device=target_predict.device
+    )
+    commit_offsets[1:].copy_(commit_lens.to(torch.int64).cumsum(0))
+    default_new_verified_id = target_predict[
+        torch.arange(bs, device=target_predict.device),
+        commit_lens.to(torch.int64) - 1,
+    ].to(torch.int64)
+    return DFlashPackedTargetOnlyCommits(
+        proposed_flat=proposed_flat,
+        commit_lens=commit_lens,
+        commit_offsets=commit_offsets,
+        default_new_verified_id=default_new_verified_id,
+    )
 
 
 def compute_dflash_sampling_accept_len_and_bonus(

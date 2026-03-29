@@ -22,6 +22,7 @@ from sglang.srt.speculative.dflash_info import DFlashDraftInput, DFlashVerifyInp
 from sglang.srt.speculative.dflash_utils import (
     can_dflash_use_fused_qkv_proj,
     commit_dflash_proposed_tokens_to_req,
+    materialize_dflash_target_only_commit_metadata,
     resolve_dflash_mask_token,
     resolve_dflash_mask_token_id,
 )
@@ -968,8 +969,7 @@ class DFlashTreeWorker:
         predict_cpu = predict.tolist()
 
         accept_length_per_req_cpu: List[int] = []
-        commit_lens_cpu: List[int] = []
-        new_verified_list: List[int] = []
+        commit_results = []
 
         for i, req in enumerate(batch.reqs):
             proposed: List[int] = []
@@ -987,12 +987,16 @@ class DFlashTreeWorker:
             if outcome.commit_len < len(proposed):
                 accept_index[i, outcome.commit_len:] = -1
 
-            commit_lens_cpu.append(outcome.commit_len)
-            new_verified_list.append(outcome.new_verified_token)
+            commit_results.append(outcome)
             accept_length_per_req_cpu.append(outcome.accepted_draft_tokens)
 
-        commit_lens = torch.tensor(commit_lens_cpu, dtype=torch.int32, device=device)
-        new_verified_id = torch.tensor(new_verified_list, dtype=torch.int64, device=device)
+        commit_lens_cpu = [result.commit_len for result in commit_results]
+        commit_metadata = materialize_dflash_target_only_commit_metadata(
+            commit_results=commit_results,
+            device=device,
+        )
+        commit_lens = commit_metadata.commit_lens
+        new_verified_id = commit_metadata.new_verified_id
 
         if self.page_size != 1:
             raise NotImplementedError("DFLASH_TREE currently requires page_size == 1.")

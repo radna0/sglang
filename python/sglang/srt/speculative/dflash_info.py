@@ -23,6 +23,7 @@ from sglang.srt.speculative.dflash_utils import (
     compute_dflash_accept_len_and_bonus,
     compute_dflash_sampling_accept_len_and_bonus,
     is_dflash_sampling_verify_available,
+    materialize_dflash_target_only_commit_metadata,
     pack_dflash_target_only_commits,
 )
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
@@ -1155,20 +1156,18 @@ class DFlashVerifyInput(SpecInput):
                 [candidates[:, 1:], accept_len.unsqueeze(1), bonus.unsqueeze(1)], dim=1
             ).cpu()
         else:
-            proposed_flat, target_commit_lens = pack_dflash_target_only_commits(
+            packed_target_only = pack_dflash_target_only_commits(
                 target_predict=target_predict,
                 accept_len=accept_len,
             )
-            packed = proposed_flat.cpu()
-            target_commit_lens_cpu = target_commit_lens.cpu()
+            packed = packed_target_only.proposed_flat.cpu()
+            target_commit_offsets_cpu = packed_target_only.commit_offsets.cpu()
         if timing_detail:
             t_after_pack = time.perf_counter()
 
         max_acc = self.draft_token_num - 1
         accept_length_per_req_cpu: List[int] = []
-        commit_lens_cpu: List[int] = []
-        new_verified_list: List[int] = []
-        packed_offset = 0
+        commit_results = []
 
         for i, req in enumerate(batch.reqs):
             if use_pq:
@@ -1179,27 +1178,28 @@ class DFlashVerifyInput(SpecInput):
                 ]
             else:
                 # Compact target_only layout: flattened committed prefixes plus per-req commit lens.
-                commit_len = int(target_commit_lens_cpu[i].item())
-                next_offset = packed_offset + commit_len
-                proposed = packed[packed_offset:next_offset].tolist()
-                packed_offset = next_offset
+                start_offset = int(target_commit_offsets_cpu[i].item())
+                end_offset = int(target_commit_offsets_cpu[i + 1].item())
+                proposed = packed[start_offset:end_offset].tolist()
 
             outcome = commit_dflash_proposed_tokens_to_req(
                 req=req,
                 proposed=proposed,
                 empty_error_prefix="DFLASH verify",
             )
-            commit_lens_cpu.append(outcome.commit_len)
-            new_verified_list.append(outcome.new_verified_token)
+            commit_results.append(outcome)
             accept_length_per_req_cpu.append(outcome.accepted_draft_tokens)
 
         if timing_detail:
             t_after_commit = time.perf_counter()
 
-        commit_lens = torch.tensor(commit_lens_cpu, dtype=torch.int32, device=device)
-        new_verified_id = torch.tensor(
-            new_verified_list, dtype=torch.int64, device=device
+        commit_lens_cpu = [result.commit_len for result in commit_results]
+        commit_metadata = materialize_dflash_target_only_commit_metadata(
+            commit_results=commit_results,
+            device=device,
         )
+        commit_lens = commit_metadata.commit_lens
+        new_verified_id = commit_metadata.new_verified_id
 
         # Free uncommitted KV cache slots and compact out_cache_loc.
         if page_size == 1:

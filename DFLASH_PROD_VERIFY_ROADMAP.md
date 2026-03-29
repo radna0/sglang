@@ -449,6 +449,12 @@ got us there and verify each dependency in reverse.
     - compact committed tokens
     - new verified ids
     - commit lengths
+    Current branch status:
+    - target-only compact commit packing now also emits:
+      - `commit_offsets`
+      - `default_new_verified_id`
+    - final `commit_lens` / `new_verified_id` are now materialized through a shared
+      helper instead of ad hoc tensor construction in each callsite
 
 13. `[partial]` Implement a fused greedy target-only postprocess path that
     eliminates the current full packed `[target_predict, accept_len].cpu()` flow.
@@ -457,6 +463,9 @@ got us there and verify each dependency in reverse.
     - CPU request mutation is still present
     - the remaining CPU request mutation semantics are now shared in one helper:
       `commit_dflash_proposed_tokens_to_req(...)`
+    - commit-offset and metadata shaping are now also centralized in helpers, so the
+      next remaining extraction is KV free / mapping / hidden assembly rather than
+      more target-only list plumbing
 
 14. `[partial]` Promote sampled target-only toward a kernel-backed helper path,
     likely starting from `compute_dflash_sampling_accept_len_and_bonus(...)`,
@@ -571,6 +580,16 @@ be:
 
 This keeps the implementation order aligned with the real bottleneck instead of
 jumping too early into overlap plumbing.
+
+Checkpoint update:
+
+- Step 1 above is now partially landed:
+  - compact target-only commit offsets are emitted at pack time
+  - final `commit_lens` / `new_verified_id` materialization is shared
+- Step 2 is the next real extraction target:
+  - `keep_mask`
+  - paged `evict_mask`
+  - clear-range metadata
 
 ## Benchmark / Validation Matrix
 
