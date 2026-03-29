@@ -157,6 +157,47 @@ def test_materialize_dflash_target_only_commit_metadata():
     assert metadata.new_verified_id.tolist() == [13, 55]
 
 
+def test_build_dflash_target_only_cache_plan_page_size_1():
+    from sglang.srt.speculative.dflash_utils import build_dflash_target_only_cache_plan
+
+    plan = build_dflash_target_only_cache_plan(
+        out_cache_loc=torch.tensor([100, 101, 102, 103, 200, 201, 202, 203], dtype=torch.int64),
+        commit_lens=torch.tensor([3, 1], dtype=torch.int32),
+        seq_lens=torch.tensor([5, 7], dtype=torch.int32),
+        draft_token_num=4,
+        page_size=1,
+    )
+    assert plan.keep_mask.tolist() == [
+        [True, True, True, False],
+        [True, False, False, False],
+    ]
+    assert plan.compact_out_cache_loc.tolist() == [100, 101, 102, 200]
+    assert plan.evicted_slots.tolist() == [103, 201, 202, 203]
+    assert plan.evicted_pages is None
+    assert plan.clear_start.tolist() == [8, 8]
+    assert plan.clear_end.tolist() == [9, 11]
+    assert plan.clear_token_count == 4
+
+
+def test_build_dflash_target_only_cache_plan_page_size_2_cpu_alignment():
+    from sglang.srt.speculative.dflash_utils import build_dflash_target_only_cache_plan
+
+    plan = build_dflash_target_only_cache_plan(
+        out_cache_loc=torch.tensor([100, 101, 102, 103], dtype=torch.int64),
+        commit_lens=torch.tensor([1], dtype=torch.int32),
+        seq_lens=torch.tensor([4], dtype=torch.int32),
+        draft_token_num=4,
+        page_size=2,
+    )
+    assert plan.keep_mask.tolist() == [[True, False, False, False]]
+    assert plan.compact_out_cache_loc.tolist() == [100]
+    assert plan.evicted_slots.tolist() == [102, 103]
+    assert plan.evicted_pages.tolist() == [51]
+    assert plan.clear_start.tolist() == [5]
+    assert plan.clear_end.tolist() == [8]
+    assert plan.clear_token_count == 3
+
+
 def test_compute_dflash_sampling_accept_len_and_bonus_honors_max_steps_and_returns_prefix(
     monkeypatch,
 ):

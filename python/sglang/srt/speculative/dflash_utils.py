@@ -428,6 +428,17 @@ class DFlashTargetOnlyCommitMetadata:
     new_verified_id: torch.Tensor
 
 
+@dataclass(frozen=True)
+class DFlashTargetOnlyCachePlan:
+    keep_mask: torch.Tensor
+    compact_out_cache_loc: torch.Tensor
+    evicted_slots: torch.Tensor
+    evicted_pages: torch.Tensor | None
+    clear_start: torch.Tensor
+    clear_end: torch.Tensor
+    clear_token_count: int
+
+
 def commit_dflash_proposed_tokens_to_req(
     *,
     req: Any,
@@ -538,6 +549,102 @@ def materialize_dflash_target_only_commit_metadata(
     return DFlashTargetOnlyCommitMetadata(
         commit_lens=commit_lens,
         new_verified_id=new_verified_id,
+    )
+
+
+def _align_dflash_evict_mask_to_page_size_fallback(
+    *,
+    seq_lens: torch.Tensor,
+    evict_mask: torch.Tensor,
+    page_size: int,
+    num_draft_tokens: int,
+) -> torch.Tensor:
+    evict_mask = evict_mask.view(-1, int(num_draft_tokens)).clone()
+    for bid in range(int(seq_lens.shape[0])):
+        seq_len = int(seq_lens[bid].item())
+        mask_row = evict_mask[bid]
+        num_trues = int(mask_row.sum().item())
+        num_false = int(num_draft_tokens) - num_trues
+        start = ((seq_len + num_false - 1) // int(page_size)) * int(page_size) - seq_len
+        for i in range(max(start, 0), min(start + int(page_size), int(num_draft_tokens))):
+            mask_row[i] = False
+    return evict_mask.reshape(-1).contiguous()
+
+
+def build_dflash_target_only_cache_plan(
+    *,
+    out_cache_loc: torch.Tensor,
+    commit_lens: torch.Tensor,
+    seq_lens: torch.Tensor,
+    draft_token_num: int,
+    page_size: int,
+) -> DFlashTargetOnlyCachePlan:
+    """Derive target-only cache free/compact/clear metadata from committed lengths."""
+    if commit_lens.ndim != 1:
+        raise ValueError(f"commit_lens must be 1D, got shape={tuple(commit_lens.shape)}")
+    bs = int(commit_lens.shape[0])
+    if out_cache_loc.ndim == 1:
+        out_cache_loc_rows = out_cache_loc.view(bs, int(draft_token_num))
+    elif out_cache_loc.ndim == 2 and tuple(out_cache_loc.shape) == (bs, int(draft_token_num)):
+        out_cache_loc_rows = out_cache_loc
+    else:
+        raise ValueError(
+            "out_cache_loc must be shaped as [bs * draft_token_num] or [bs, draft_token_num]. "
+            f"Got shape={tuple(out_cache_loc.shape)} for bs={bs}, draft_token_num={draft_token_num}."
+        )
+
+    keep_mask = torch.arange(
+        int(draft_token_num), device=commit_lens.device, dtype=torch.int32
+    )[None, :] < commit_lens.to(torch.int32).unsqueeze(1)
+    compact_out_cache_loc = out_cache_loc_rows[keep_mask]
+    clear_start = seq_lens + commit_lens.to(seq_lens.dtype)
+    clear_end = seq_lens + int(draft_token_num)
+    clear_token_count = int((clear_end - clear_start).sum().item())
+
+    if int(page_size) == 1:
+        return DFlashTargetOnlyCachePlan(
+            keep_mask=keep_mask,
+            compact_out_cache_loc=compact_out_cache_loc,
+            evicted_slots=out_cache_loc_rows[~keep_mask],
+            evicted_pages=None,
+            clear_start=clear_start,
+            clear_end=clear_end,
+            clear_token_count=clear_token_count,
+        )
+
+    evict_mask = (~keep_mask).reshape(-1).contiguous()
+    if out_cache_loc_rows.is_cuda:
+        from sglang.srt.speculative.spec_utils import align_evict_mask_to_page_size
+        from sglang.srt.utils.common import next_power_of_2
+
+        align_evict_mask_to_page_size[(bs,)](
+            seq_lens,
+            evict_mask,
+            int(page_size),
+            int(draft_token_num),
+            next_power_of_2(int(draft_token_num)),
+        )
+    else:
+        evict_mask = _align_dflash_evict_mask_to_page_size_fallback(
+            seq_lens=seq_lens,
+            evict_mask=evict_mask,
+            page_size=int(page_size),
+            num_draft_tokens=int(draft_token_num),
+        )
+
+    evicted_slots = out_cache_loc_rows.reshape(-1)[evict_mask]
+    evicted_pages = None
+    if int(evicted_slots.numel()) % int(page_size) == 0 and int(evicted_slots.numel()) > 0:
+        evicted_pages = evicted_slots.view(-1, int(page_size))[:, 0] // int(page_size)
+
+    return DFlashTargetOnlyCachePlan(
+        keep_mask=keep_mask,
+        compact_out_cache_loc=compact_out_cache_loc,
+        evicted_slots=evicted_slots,
+        evicted_pages=evicted_pages,
+        clear_start=clear_start,
+        clear_end=clear_end,
+        clear_token_count=clear_token_count,
     )
 
 

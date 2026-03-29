@@ -560,6 +560,18 @@ the shared request-mutation helper:
 
 That is the exact boundary the next implementation checkpoint should attack.
 
+What is already extracted on this branch:
+
+- `build_dflash_target_only_cache_plan(...)` now derives:
+  - `keep_mask`
+  - compacted `out_cache_loc`
+  - page-aware `evicted_slots`
+  - optional `evicted_pages`
+  - `clear_start`
+  - `clear_end`
+- the helper includes a CPU fallback for page-alignment semantics so the logic can
+  be unit-tested without CUDA
+
 ## Next Concrete Extraction Checkpoints
 
 The next low-risk implementation sequence after the current branch state should
@@ -586,10 +598,15 @@ Checkpoint update:
 - Step 1 above is now partially landed:
   - compact target-only commit offsets are emitted at pack time
   - final `commit_lens` / `new_verified_id` materialization is shared
-- Step 2 is the next real extraction target:
+- Step 2 is now partially landed:
   - `keep_mask`
-  - paged `evict_mask`
+  - paged `evicted_slots` / `evicted_pages`
   - clear-range metadata
+- The next remaining part of step 2 is to move more of the downstream consumers
+  of that plan out of ad hoc inline code:
+  - KV allocator free/commit application
+  - req-to-token mapping updates
+  - next hidden-state segment assembly
 
 ## Benchmark / Validation Matrix
 

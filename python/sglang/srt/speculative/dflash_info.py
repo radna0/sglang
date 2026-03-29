@@ -19,6 +19,7 @@ from sglang.srt.mem_cache.common import (
 )
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.speculative.dflash_utils import (
+    build_dflash_target_only_cache_plan,
     commit_dflash_proposed_tokens_to_req,
     compute_dflash_accept_len_and_bonus,
     compute_dflash_sampling_accept_len_and_bonus,
@@ -1200,16 +1201,18 @@ class DFlashVerifyInput(SpecInput):
         )
         commit_lens = commit_metadata.commit_lens
         new_verified_id = commit_metadata.new_verified_id
+        cache_plan = build_dflash_target_only_cache_plan(
+            out_cache_loc=batch.out_cache_loc,
+            commit_lens=commit_lens,
+            seq_lens=batch.seq_lens,
+            draft_token_num=self.draft_token_num,
+            page_size=page_size,
+        )
 
         # Free uncommitted KV cache slots and compact out_cache_loc.
         if page_size == 1:
-            out_cache_loc = batch.out_cache_loc.view(bs, self.draft_token_num)
-            keep_mask = (
-                torch.arange(self.draft_token_num, device=device)[None, :]
-                < commit_lens[:, None]
-            )
-            batch.token_to_kv_pool_allocator.free(out_cache_loc[~keep_mask])
-            batch.out_cache_loc = out_cache_loc[keep_mask]
+            batch.token_to_kv_pool_allocator.free(cache_plan.evicted_slots)
+            batch.out_cache_loc = cache_plan.compact_out_cache_loc
         else:
             # Page-size > 1: the allocator frees *pages* (not individual token slots),
             # so we must only evict full pages and never free a page that contains any
@@ -1219,56 +1222,35 @@ class DFlashVerifyInput(SpecInput):
             # tokens), so there is at most one "mixed" page that contains both kept
             # and evicted tokens. We keep that whole page and only free pages fully
             # beyond the committed prefix (page-aligned).
-            from sglang.srt.speculative.spec_utils import align_evict_mask_to_page_size
-            from sglang.srt.utils.common import next_power_of_2
-
-            out_cache_loc = batch.out_cache_loc.view(bs, self.draft_token_num)
-            keep_mask = (
-                torch.arange(self.draft_token_num, device=device)[None, :]
-                < commit_lens[:, None]
-            )
-
-            # Evict everything beyond the committed prefix; then align eviction to
-            # page boundaries so freeing is safe.
-            evict_mask = (~keep_mask).reshape(-1).contiguous()
-            align_evict_mask_to_page_size[(bs,)](
-                batch.seq_lens,
-                evict_mask,
-                page_size,
-                self.draft_token_num,
-                next_power_of_2(self.draft_token_num),
-            )
-            if bool(evict_mask.any()):
-                evicted_slots = batch.out_cache_loc[evict_mask]
+            if int(cache_plan.evicted_slots.numel()) > 0:
                 fast_free_used = False
                 if (
                     hasattr(batch.token_to_kv_pool_allocator, "free_page_indices")
-                    and int(evicted_slots.numel()) % int(page_size) == 0
+                    and cache_plan.evicted_pages is not None
                 ):
-                    evicted_pages = evicted_slots.view(-1, int(page_size))[:, 0] // int(
-                        page_size
-                    )
                     if bool(
                         os.environ.get("SGLANG_DFLASH_DEBUG_PAGE_FREE", "")
                         .strip()
                         .lower()
                         not in ("", "0", "false", "off", "no")
                     ):
-                        page_rows = evicted_slots.view(-1, int(page_size))
+                        page_rows = cache_plan.evicted_slots.view(-1, int(page_size))
                         same_page = (
                             page_rows // int(page_size)
-                        ) == evicted_pages[:, None]
+                        ) == cache_plan.evicted_pages[:, None]
                         if not bool(torch.all(same_page)):
                             raise RuntimeError(
                                 "DFLASH paged fast-free invariant failed: evicted slots are not page-aligned."
                             )
-                    batch.token_to_kv_pool_allocator.free_page_indices(evicted_pages)
+                    batch.token_to_kv_pool_allocator.free_page_indices(
+                        cache_plan.evicted_pages
+                    )
                     fast_free_used = True
                 if not fast_free_used:
-                    batch.token_to_kv_pool_allocator.free(evicted_slots)
+                    batch.token_to_kv_pool_allocator.free(cache_plan.evicted_slots)
 
             # Compact the committed token slots for downstream mapping updates.
-            batch.out_cache_loc = out_cache_loc[keep_mask]
+            batch.out_cache_loc = cache_plan.compact_out_cache_loc
 
         if timing_detail:
             t_after_kv_free = time.perf_counter()
@@ -1297,14 +1279,12 @@ class DFlashVerifyInput(SpecInput):
         # read them via metadata.page_table. After commit, some backends can still
         # consult page-aligned tables, so we must explicitly clear the uncommitted
         # tail mappings to a safe pad slot (0) to avoid any accidental visibility.
-        clear_start = batch.seq_lens + commit_lens.to(batch.seq_lens.dtype)
-        clear_end = batch.seq_lens + int(self.draft_token_num)
-        try:
-            total_clear = int((clear_end - clear_start).sum().item())
-        except Exception:
-            total_clear = 0
-        if total_clear > 0:
-            pad_locs = torch.zeros((total_clear,), dtype=torch.int64, device=device)
+        clear_start = cache_plan.clear_start
+        clear_end = cache_plan.clear_end
+        if cache_plan.clear_token_count > 0:
+            pad_locs = torch.zeros(
+                (cache_plan.clear_token_count,), dtype=torch.int64, device=device
+            )
             assign_req_to_token_pool_func(
                 batch.req_pool_indices,
                 batch.req_to_token_pool.req_to_token,
