@@ -1,227 +1,526 @@
 # DFlash Production Verify Roadmap
 
-This note records the current implementation state and the next development
-steps for production DFlash on this branch.
+This note is the code-anchored engineering plan for production DFlash on this
+branch.
 
 It is intentionally limited to production-relevant paths:
 
-- greedy target-only verify
-- sampled target-only verify
+- `target_only` verify
+- greedy target verify
+- sampled target verify
 - FP8 target KV cache
 - BF16 draft KV cache
 - overlap/spec-v2 scheduling
 
-`pq` verify is explicitly removed from the active roadmap. It is not the
-production path we want to optimize.
+`pq` verify is explicitly out of scope for the production plan on this branch.
 
-## Current Confirmed State
+## Scope And Non-Goals
 
-### 1. Overlap/spec-v2 is disabled for DFlash
+This roadmap is about shipping the production path that actually matters:
 
-Current DFlash runs do **not** use overlap scheduling.
+1. baseline-faithful target behavior
+2. DFlash target-only speculative decode
+3. FP8 target KV + BF16 draft KV
+4. overlap/spec-v2 support for DFlash
+
+It is **not** about:
+
+- reviving `pq`
+- treating `pq` as a production candidate
+- claiming fused draft KV append means target verify is already fused
+- pretending DFlash can reuse Eagle tree abstractions directly
+
+## Current Code-Anchored State
+
+### 1. DFlash overlap/spec-v2 is disabled today
 
 Code:
+
 - `python/sglang/srt/server_args.py`
 - `python/sglang/srt/speculative/spec_info.py`
 
-Current behavior:
+Confirmed behavior:
+
 - `server_args.py` forces `disable_overlap_schedule = True` for DFlash
-- `spec_info.py` rejects overlap for DFlash with:
-  - `"DFLASH does not support overlap scheduling (spec v2)."`
+- `spec_info.py` raises if overlap is enabled for DFlash
 
-So today:
-- no single-batch overlap
-- no two-batch overlap
-- no DFlash-specific spec-v2 future payload
+So current DFlash runs have:
 
-### 2. Current production verify mode is `target_only`
+- no overlap scheduler
+- no spec-v2 future payload
+- no DFlash participation in `FutureMap`
+- no DFlash-specific overlap replay plumbing
+
+### 2. The real production verify path is `target_only`
 
 Code:
+
 - `python/sglang/srt/speculative/dflash_info.py`
+
+Confirmed behavior:
+
+- `verify_mode` defaults to `target_only`
+- recent benchmark JSONs report `spec_dflash_verify_mode_last = "target_only"`
+
+This is the path to optimize first for both greedy and sampled target decode.
+
+### 3. Greedy target-only verify already exists and is exact
+
+Code:
+
+- `python/sglang/srt/speculative/dflash_info.py`
+- `python/sglang/srt/speculative/dflash_utils.py`
+
+Current path:
+
+1. target forward produces `logits_output.next_token_logits`
+2. greedy path computes `target_predict = argmax(logits)`
+3. it calls `compute_dflash_accept_len_and_bonus(...)`
+4. it then packs `[target_predict, accept_len]`
+5. it copies that packed tensor to CPU
+6. it performs per-request Python commit logic
+
+Important implication:
+
+- greedy verify math is already on device
+- commit/pack/free/output mutation is still partly CPU-bound
+
+### 4. Sampled target-only verify already exists, but it is not yet the optimized path
+
+Code:
+
+- `python/sglang/srt/speculative/dflash_info.py`
+- `python/sglang/srt/speculative/dflash_utils.py`
+
+Current production sampled path in `dflash_info.py`:
+
+1. scale logits by per-row temperature
+2. softmax logits to probabilities
+3. apply target-side `top_k`, `top_p`, `min_p`
+4. sample target tokens from the target distribution
+5. compute accept prefix against draft tokens
+6. pack `[target_predict, accept_len]`
+7. copy packed data to CPU
+8. run per-request Python commit logic
+
+Important detail:
+
+- `dflash_utils.py` already contains
+  `compute_dflash_sampling_accept_len_and_bonus(...)`
+- that path uses `tree_speculative_sampling_target_only`
+- but the current production flow in `dflash_info.py` is still using the inline
+  probability path plus the same CPU-side commit/packing shape as greedy
+
+So there is already reusable kernel-backed machinery for sampled target-only,
+but it is not yet the integrated production fast path.
+
+### 5. Accept/commit bookkeeping is still CPU-shaped
+
+Code:
+
+- `python/sglang/srt/speculative/dflash_info.py`
+
+Current path after accept lengths are computed:
+
+1. concatenate verify outputs into a packed tensor
+2. transfer packed tensor with a single `.cpu()`
+3. iterate requests in Python
+4. append tokens to `req.output_ids`
+5. update finish state / stop tokens / grammar
+6. update:
+   - `req.spec_verify_ct`
+   - `req.spec_accepted_tokens`
+   - acceptance histogram
+7. free uncommitted KV slots/pages
+
+This means the production hot path is currently split into:
+
+- GPU verify math
+- CPU commit / output / bookkeeping
+
+That CPU-shaped boundary is the main fusion target.
+
+### 6. Draft proposal generation already supports physical-vs-logical separation
+
+Code:
+
 - `python/sglang/srt/speculative/dflash_worker.py`
 
-Current behavior:
-- `verify_mode` defaults to `target_only`
-- recent benchmark runs record `spec_dflash_verify_mode_last = "target_only"`
+Current path in `_build_draft_proposal(...)`:
 
-This is the path to optimize first.
+- `self.block_size` is the physical max block size
+- `max_steps_per_req` is the logical cap
+- `draft_token_num = effective_step_count + 1`
 
-### 3. Greedy and sampled target-only paths already exist
+This is already the correct abstraction for:
 
-Code:
-- `python/sglang/srt/speculative/dflash_info.py`
-- `python/sglang/srt/layers/sampler.py`
+- fixed physical max block
+- adaptive logical effective length
 
-#### Greedy target-only
+So FailFast/EAFT-style control belongs on `max_steps_per_req`, not on ad hoc
+physical-width recapture first.
 
-When `sampling_info is None` or `sampling_info.is_all_greedy`:
-- target verify uses `argmax` over target logits for each verify position
-- acceptance is exact-match against those target predictions
-
-#### Sampled target-only
-
-When sampling is enabled:
-- target logits are temperature-scaled
-- target-only verify applies target-side sampling semantics using:
-  - `temperature`
-  - `top_k`
-  - `top_p`
-  - `min_p`
-- target tokens are sampled from the target distribution for each verify position
-- draft tokens are accepted only while they match sampled target tokens
-
-So sampled target-only is already a real code path. It is the correct
-production path to benchmark against baseline sampling.
-
-### 4. What is fused today is KV materialization, not verify
+### 7. What is fused today is draft KV materialization/append only
 
 Code:
+
 - `python/sglang/srt/speculative/dflash_worker.py`
 - `python/sglang/srt/speculative/triton_ops/fused_kv_materialize.py`
 
-Current fused path:
-- batched KV projection
-- RMSNorm
-- RoPE
-- draft KV pool writes
+Current fused append path:
 
-This is used when appending projected target hidden states into the draft KV
-cache.
+1. target hidden is projected into draft hidden
+2. draft K/V projection runs in the helper
+3. RMSNorm runs
+4. RoPE runs
+5. KV is written into the draft KV pool
 
-This is **not** a fused target verification kernel.
+Important constraint:
 
-### 5. FP8 target KV and BF16 draft KV are separate today
+- this is draft-side fused append
+- it does **not** fuse the target verification pass
+- it does **not** fuse target FP8 KV reads with draft BF16 KV writes
+
+### 8. There is also DFlash async shadow overlap, but it is not spec-v2
 
 Code:
+
+- `python/sglang/srt/speculative/dflash_worker.py`
+
+Current path:
+
+- `_prepare_ssd_fanout_branches_async(...)`
+- `_ssd_overlap_executor`
+- `_ssd_shadow_req_to_token_pool`
+
+What it does:
+
+- overlaps shadow draft fanout work for SSD-style branch preparation
+
+What it does **not** do:
+
+- integrate with scheduler overlap
+- use `FutureMap`
+- carry DFlash verify results as a spec-v2 payload
+- overlap target verify batches with future decode batches
+
+So this async shadow path is useful, but it is not a substitute for real
+DFlash spec-v2 support.
+
+### 9. FP8 target KV and BF16 draft KV are separate and correctly configurable
+
+Code:
+
 - `python/sglang/srt/model_executor/model_runner.py`
 - `python/sglang/srt/speculative/dflash_worker.py`
 
+Confirmed behavior:
+
+- target worker can use `kv_cache_dtype = fp8_e4m3`
+- draft worker can independently use `speculative_draft_kv_cache_dtype = bf16`
+- `configure_kv_cache_dtype()` already branches differently for draft vs target
+
+Important implication:
+
+- the mixed-precision boundary is already a real production regime
+- but it is still separated by worker/cache boundaries
+
+### 10. CUDA graph capture already has a DFlash spec input, but not an overlap payload
+
+Code:
+
+- `python/sglang/srt/model_executor/cuda_graph_runner.py`
+
 Current behavior:
-- target KV cache can be `fp8_e4m3`
-- draft KV cache can be `bfloat16`
-- they are handled in separate paths / separate pools
 
-There is no current mixed-precision fused verify kernel that directly combines:
-- target verify over FP8 target KV
-- draft append over BF16 draft KV
+- `CudaGraphRunner.get_spec_info()` creates a `DFlashVerifyInput`
+- it captures enough metadata for non-overlap DFlash verify replay
+- it does **not** carry Eagle-style overlap fields such as:
+  - `future_indices`
+  - `new_seq_lens`
+  - `verify_done`
 
-## Roadmap: What We Actually Need
+So DFlash already has a graph replay input object, but not a spec-v2 overlap
+contract.
 
-## A. DFlash-specific overlap/spec-v2 support
+## What The Next Production Design Must Look Like
 
-We need a DFlash-native spec-v2 payload instead of trying to reuse Eagle-only
-plumbing.
+## A. Fused target-only verify/postprocess, not “one giant kernel”
 
-Required design work:
+The right production breakdown is:
 
-1. Define a DFlash verify payload for overlap scheduling.
-   It needs at least:
-   - accepted lengths
-   - accepted token ids
-   - bonus token ids
-   - request-to-sequence mapping
-   - logical step count / block cap metadata
-
-2. Thread that payload through:
-   - scheduler
-   - output processor
-   - CUDA graph replay path
-   - two-batch overlap / future-index handling
-
-3. Keep DFlash flat-block semantics intact.
-   This should not pretend DFlash is an Eagle tree.
-
-Implementation target:
-- add DFlash-specific overlap glue rather than trying to coerce Eagle
-  `VerifyInput` types into DFlash.
-
-## B. Fused verify/commit for target-only
-
-The production target is **not** PQ.
-It is target-only verify for:
-- greedy target
-- sampled target
-
-The right breakdown is:
-
-1. Target verify forward
+1. target verify forward stays where it is
    - target model reads FP8 target KV
-   - target model produces verify logits
+   - target model emits verify logits and hidden states
 
-2. On-device verify/postprocess
-   - greedy target-only:
+2. on-device target-only postprocess becomes the new fusion target
+   - greedy:
      - argmax target tokens
      - exact-match accept mask
-     - accept length computation
-     - bonus token selection
-   - sampled target-only:
-     - temperature/top-k/top-p/min-p filtering
-     - target token sampling
+     - accept length
+     - bonus token
+     - compact committed token span
+   - sampled:
+     - temperature/top-k/top-p/min-p
+     - target-only sampling
      - exact-match accept mask
-     - accept length computation
-     - bonus token selection
+     - accept length
+     - bonus token
+     - compact committed token span
 
-3. Commit / append path
-   - accepted target hidden states are projected into draft-space
-   - draft KV append uses BF16 path
-   - this is where current fused KV materialization already helps
+3. draft-side append remains a separate mixed-precision handoff
+   - accepted target hidden is projected into draft space
+   - existing fused BF16 draft KV append path is reused
 
-So the next fusion target is **not** “fuse FP8 target KV and BF16 draft KV into
-one giant kernel.”
+So the practical fusion target is:
 
-The more realistic target is:
-- keep FP8 target attention/verify where it is
-- fuse target-only verify postprocessing and commit bookkeeping on device
-- then feed accepted target hidden into the existing draft BF16 fused append path
+- fuse target-only verify postprocess and compact commit metadata on device
+- then hand accepted hidden states to the existing BF16 append path
 
-That is the mixed-precision boundary that matters in practice.
+It is **not**:
 
-## C. Sampled production path to optimize first
+- one monolithic kernel that simultaneously fuses target FP8 attention and draft
+  BF16 KV writes
 
-For production benchmarking, we should split two regimes:
+## B. The mixed-precision handoff should stay explicit
 
-1. sampled target + greedy draft
-2. sampled target + sampled draft
+The production mixed-precision regime is:
 
-Order of implementation:
+- target verify forward on FP8 target KV
+- accepted hidden states in target model dtype
+- projection into draft hidden
+- fused BF16 draft KV append
 
-1. sampled target + greedy draft
-   - production-first
-   - closest to deployed speculative decoding practice
+This boundary is already natural in the code:
 
-2. sampled target + sampled draft
-   - research lane
-   - benchmark separately
+- target runner owns target KV
+- draft worker owns draft KV
+- `project_target_hidden(...)` is the handoff boundary
 
-We should not mix these into one bucket.
+So the roadmap should improve that boundary, not erase it.
 
-## D. What we are explicitly *not* doing now
+## C. DFlash needs its own spec-v2 payload contract
 
-- not optimizing `pq` verify
-- not treating PQ as the production path
-- not claiming current fused KV append means verify is fused
-- not claiming DFlash overlap/spec-v2 already works
+DFlash should not be forced into Eagle tree payload semantics.
 
-## Immediate Engineering Plan
+The DFlash overlap payload should carry at least:
 
-1. Keep benchmark lanes running and recorded as-is.
-2. Add DFlash overlap/spec-v2 design notes to the scheduler side.
-3. Map exact target-only verify hot path for:
-   - greedy
-   - sampled target
-4. Design fused verify/postprocess kernel boundaries.
-5. Reuse current fused BF16 draft KV append path after verify/commit.
-6. Benchmark:
-   - baseline sampled target
-   - DFlash sampled target + greedy draft
-   - later DFlash sampled target + sampled draft
+- request ids / req-pool mapping
+- `accept_len`
+- `commit_len`
+- `new_verified_id`
+- accepted token ids or a compact accepted-span buffer
+- logical cap / effective step count
+- next sequence lengths
+- any KV free/commit metadata needed by replay
+
+The right shape is likely:
+
+- keep `DFlashVerifyInput`
+- add a DFlash-specific v2 mixin or companion payload struct
+- thread it through scheduler, graph replay, and output processing
+
+## D. The unused sampled helper should be pulled into the production path
+
+`compute_dflash_sampling_accept_len_and_bonus(...)` already exists and wraps
+`tree_speculative_sampling_target_only`.
+
+That should be evaluated as the candidate building block for:
+
+- sampled target-only on-device accept/bonus computation
+- reducing Python-side probability manipulation in `dflash_info.py`
+
+But before promoting it, we still need:
+
+- `max_steps_per_req` support or equivalent logical-cap support
+- parity with current `temperature/top_k/top_p/min_p` semantics
+- parity in emitted metrics and debug counters
+
+## Engineering Tasks
+
+The plan below is split into:
+
+- Tasks 1-10: build/design trace
+- Tasks 11-18: implementation
+- Tasks 19-20: reverse-trace verification
+
+That final phase is deliberate. After implementation, we retrace the path that
+got us there and verify each dependency in reverse.
+
+### Build / Design Tasks
+
+1. `[done]` Audit the current roadmap against code in:
+   - `dflash_info.py`
+   - `dflash_worker.py`
+   - `model_runner.py`
+   - `server_args.py`
+   - `spec_info.py`
+
+2. `[done]` Trace greedy `target_only` verify end-to-end:
+   - target logits
+   - argmax
+   - `compute_dflash_accept_len_and_bonus(...)`
+   - CPU pack
+   - Python commit loop
+
+3. `[done]` Trace sampled `target_only` verify end-to-end:
+   - target-only sampling filters
+   - sampled target token generation
+   - accept computation
+   - CPU pack
+   - Python commit loop
+
+4. `[done]` Trace accept/commit bookkeeping and identify the CPU boundary:
+   - `packed = ... .cpu()`
+   - per-request token append
+   - finish/grammar handling
+   - KV free logic
+
+5. `[done]` Trace draft proposal generation and confirm physical-vs-logical split:
+   - `self.block_size`
+   - `max_steps_per_req`
+   - `draft_token_num`
+
+6. `[done]` Trace fused draft KV append and sequential fallback:
+   - `_append_target_hidden_fused(...)`
+   - `_append_target_hidden_sequential(...)`
+
+7. `[done]` Trace target FP8 KV and draft BF16 KV configuration:
+   - `configure_kv_cache_dtype()`
+   - draft override behavior
+
+8. `[done]` Trace the DFlash overlap-disable path and confirm spec-v2 is off:
+   - `disable_overlap_schedule`
+   - DFlash rejection in `spec_info.py`
+
+9. `[done]` Trace the existing Eagle overlap contract for reference:
+   - `future_indices`
+   - `new_seq_lens`
+   - `verify_done`
+   - scheduler `FutureMap`
+
+10. `[done]` Trace DFlash async shadow overlap and record that it is not spec-v2:
+    - SSD shadow executor
+    - shadow proposal precompute
+    - no scheduler future payload
+
+### Implementation Tasks
+
+11. `[pending]` Add a DFlash-specific v2 payload contract.
+    Target files:
+    - `dflash_info.py`
+    - new DFlash v2 helper/mixin if needed
+    - `cuda_graph_runner.py`
+    - `scheduler.py`
+
+12. `[pending]` Define the minimal device-resident verify result for greedy:
+    - accept lengths
+    - bonus tokens
+    - compact committed tokens
+    - new verified ids
+    - commit lengths
+
+13. `[pending]` Implement a fused greedy target-only postprocess path that
+    eliminates the current full packed `[target_predict, accept_len].cpu()` flow.
+
+14. `[pending]` Promote sampled target-only toward a kernel-backed helper path,
+    likely starting from `compute_dflash_sampling_accept_len_and_bonus(...)`,
+    while preserving:
+    - `temperature`
+    - `top_k`
+    - `top_p`
+    - `min_p`
+    - exact baseline-faithful target distribution
+
+15. `[pending]` Add logical-cap support to the sampled helper path so
+    `max_steps_per_req` remains first-class in both greedy and sampled target-only
+    verify.
+
+16. `[pending]` Keep the mixed-precision boundary explicit:
+    - target verify forward on FP8 target KV
+    - accepted hidden handoff
+    - existing BF16 fused draft append reused after verify
+
+17. `[pending]` Add DFlash spec-v2 scheduler integration:
+    - allocate/store/resolve DFlash future payloads
+    - plumb replay metadata through graph runner
+    - do not reuse Eagle tree semantics blindly
+
+18. `[pending]` Add DFlash-specific overlap safety checks:
+    - grammar interaction
+    - finish-state interaction
+    - page-size interaction
+    - mixed-precision cache ownership interaction
+
+### Reverse-Trace Verification Tasks
+
+19. `[pending]` Re-run the trace from the finished implementation backward:
+    - fused verify result -> scheduler payload -> graph replay -> request commit
+    and confirm every field is consumed by exactly one downstream step.
+
+20. `[pending]` Re-run the original discovery path after implementation:
+    - greedy target-only verify trace
+    - sampled target-only verify trace
+    - FP8/BF16 dtype trace
+    - overlap/spec-v2 trace
+    and confirm the new implementation actually replaced the old bottlenecks.
+
+## Low-Risk Implementation Order
+
+1. Land doc + trace first
+2. Land greedy fused postprocess first
+3. Keep sampled path functionally identical until greedy is stable
+4. Promote sampled helper only after parity checks pass
+5. Reuse existing fused BF16 draft append rather than redesigning it
+6. Add DFlash spec-v2 overlap only after non-overlap fused verify is stable
+
+This ordering keeps the risk surface small:
+
+- first shrink the CPU verify/commit boundary
+- then enable sampled parity
+- then add overlap/spec-v2
+
+## Benchmark / Validation Matrix
+
+The benchmark matrix should stay separated by regime.
+
+### Baselines
+
+1. no-DFlash greedy baseline
+2. no-DFlash sampled baseline
+
+### Production DFlash
+
+3. DFlash greedy target + greedy draft
+4. DFlash sampled target + greedy draft
+
+### Research Lane
+
+5. DFlash sampled target + sampled draft
+
+### For each lane, record
+
+- final accuracy
+- any-correct / pass@k
+- majority/final selection accuracy
+- total wall time
+- per-question wall time
+- verify count
+- accept length
+- accepted tokens
+- entropy/confidence summaries when enabled
 
 ## Success Criteria
 
-We should consider the roadmap successful only when all of the following are true:
+This roadmap is only successful when all of the following are true:
 
-1. DFlash can run with overlap/spec-v2 scheduling enabled.
-2. DFlash target-only verify uses a fused on-device postprocess/commit path.
-3. FP8 target KV + BF16 draft KV remains the standard production regime.
-4. Sampled target behavior matches baseline quality closely enough to be a real
-   serving option.
+1. DFlash has a real spec-v2 overlap payload and can run with overlap enabled.
+2. Greedy target-only verify no longer relies on the current full packed CPU
+   transfer path.
+3. Sampled target-only verify remains baseline-faithful and is materially closer
+   to the optimized greedy postprocess path.
+4. FP8 target KV + BF16 draft KV remains the standard production regime.
+5. The final production path is still benchmarked separately for:
+   - greedy target
+   - sampled target
+   - tool-calling vs no-tool
