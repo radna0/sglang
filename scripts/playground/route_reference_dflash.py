@@ -287,6 +287,10 @@ def _run_phase(
     prompt_expected_answers: list[str],
     mem_fraction_static: float,
     dflash_block_size: int,
+    temperature: float,
+    top_p: float,
+    top_k: int,
+    min_p: float,
     speculative: bool = True,
     server_env: dict[str, str] | None = None,
     disable_stream: bool = False,
@@ -314,10 +318,10 @@ def _run_phase(
             prompt_expected_answers=prompt_expected_answers,
             concurrency=concurrency,
             output_lens=output_lens,
-            temperature=0.0,
-            top_p=1.0,
-            top_k=1,
-            min_p=0.0,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            min_p=min_p,
             disable_stream=bool(disable_stream),
         )
 
@@ -356,6 +360,10 @@ def _run_chunked_exploration(
     stop_selected_margin_ge: float,
     mem_fraction_static: float,
     dflash_block_size: int,
+    temperature: float,
+    top_p: float,
+    top_k: int,
+    min_p: float,
     policy: RoutePolicy,
     disable_stream: bool = False,
 ) -> tuple[ChunkedPhaseRun, list[dict[str, Any]], list[dict[str, Any]], list[str], list[int]]:
@@ -407,10 +415,10 @@ def _run_chunked_exploration(
                 prompt_expected_answers=round_answers,
                 concurrency=min(int(concurrency), len(round_prompts)),
                 output_lens=round_output_lens,
-                temperature=0.0,
-                top_p=1.0,
-                top_k=1,
-                min_p=0.0,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                min_p=min_p,
                 disable_stream=bool(disable_stream),
             )
             total_wall_s += float(phase.summary.wall_s)
@@ -746,6 +754,12 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--buffer-tokens", type=int, default=512)
     p.add_argument("--mem-fraction-static", type=float, default=0.90)
     p.add_argument("--dflash-block-size", type=int, default=16)
+    p.add_argument("--exploration-dflash-block-size", type=int, default=None)
+    p.add_argument("--continuation-dflash-block-size", type=int, default=None)
+    p.add_argument("--temperature", type=float, default=0.0)
+    p.add_argument("--top-p", type=float, default=1.0)
+    p.add_argument("--top-k", type=int, default=1)
+    p.add_argument("--min-p", type=float, default=0.0)
     p.add_argument("--promotion-mode", choices=("strict", "throughput"), default="strict")
     p.add_argument("--promote-total-k", type=int, default=8)
     p.add_argument("--min-keep-per-qid", type=int, default=1)
@@ -793,6 +807,16 @@ def main() -> int:
         question_ids,
         int(args.exploration_num_prompts),
     )
+    exploration_dflash_block_size = int(
+        args.exploration_dflash_block_size
+        if args.exploration_dflash_block_size is not None
+        else args.dflash_block_size
+    )
+    continuation_dflash_block_size = int(
+        args.continuation_dflash_block_size
+        if args.continuation_dflash_block_size is not None
+        else args.dflash_block_size
+    )
     tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
 
     full_output_lens = _compute_output_lens(
@@ -825,7 +849,11 @@ def main() -> int:
         stop_selected_mean_accept_ge=float(args.exploration_stop_selected_mean_accept_ge),
         stop_selected_margin_ge=float(args.exploration_stop_selected_margin_ge),
         mem_fraction_static=float(args.mem_fraction_static),
-        dflash_block_size=int(args.dflash_block_size),
+        dflash_block_size=exploration_dflash_block_size,
+        temperature=float(args.temperature),
+        top_p=float(args.top_p),
+        top_k=int(args.top_k),
+        min_p=float(args.min_p),
         policy=policy,
         disable_stream=bool(args.disable_stream),
     )
@@ -848,7 +876,11 @@ def main() -> int:
         prompt_question_ids=continuation_qids,
         prompt_expected_answers=continuation_answers,
         mem_fraction_static=float(args.mem_fraction_static),
-        dflash_block_size=int(args.dflash_block_size),
+        dflash_block_size=continuation_dflash_block_size,
+        temperature=float(args.temperature),
+        top_p=float(args.top_p),
+        top_k=int(args.top_k),
+        min_p=float(args.min_p),
         speculative=True,
         server_env=continuation_server_env,
         disable_stream=bool(args.disable_stream),
@@ -887,6 +919,12 @@ def main() -> int:
             "exploration_num_prompts": int(args.exploration_num_prompts),
             "mem_fraction_static": float(args.mem_fraction_static),
             "buffer_tokens": int(args.buffer_tokens),
+            "exploration_dflash_block_size": exploration_dflash_block_size,
+            "continuation_dflash_block_size": continuation_dflash_block_size,
+            "temperature": float(args.temperature),
+            "top_p": float(args.top_p),
+            "top_k": int(args.top_k),
+            "min_p": float(args.min_p),
         },
         "exploration": {
             "summary": asdict(exploration.final_phase.summary),
