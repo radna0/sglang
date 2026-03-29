@@ -2,6 +2,62 @@ import torch
 from types import SimpleNamespace
 
 
+class _FakeGrammar:
+    def __init__(self):
+        self.accepted = []
+
+    def accept_token(self, token_id):
+        self.accepted.append(int(token_id))
+
+
+class _FakeReq:
+    def __init__(
+        self,
+        *,
+        max_new_tokens=16,
+        stop_token_ids=None,
+        ignore_eos=False,
+        grammar=None,
+        output_ids=None,
+        origin_input_ids=None,
+        eos_token_ids=None,
+        finish_after=None,
+    ):
+        self.output_ids = list(output_ids or [])
+        self.origin_input_ids = list(origin_input_ids or [1])
+        self.eos_token_ids = list(eos_token_ids or [])
+        self.tokenizer = SimpleNamespace(
+            eos_token_id=None,
+            additional_stop_token_ids=[],
+        )
+        self.vocab_size = None
+        self.grammar = grammar
+        self.sampling_params = SimpleNamespace(
+            max_new_tokens=max_new_tokens,
+            stop_strs=[],
+            stop_regex_strs=[],
+            ignore_eos=ignore_eos,
+            stop_token_ids=list(stop_token_ids or []),
+        )
+        self._finished = False
+        self._finish_after = finish_after
+        self.check_finished_calls = []
+        self.spec_verify_ct = 0
+        self.spec_accepted_tokens = 0
+        self.hist = []
+
+    def check_finished(self, new_accepted_len=None):
+        self.check_finished_calls.append(new_accepted_len)
+        if self._finish_after is not None and len(self.output_ids) >= int(self._finish_after):
+            self._finished = True
+
+    def finished(self):
+        return self._finished
+
+    def update_spec_acceptance_histogram(self, accepted_draft_tokens):
+        self.hist.append(int(accepted_draft_tokens))
+
+
 def test_build_target_layer_ids_gptoss120b_k5():
     from sglang.srt.speculative.dflash_utils import build_target_layer_ids
 
@@ -202,3 +258,59 @@ def test_compute_dflash_sampling_accept_len_and_bonus_applies_min_p_filter(
     assert probs[0] > 0
     assert probs[1].item() == 0.0
     assert probs[2].item() == 0.0
+
+
+def test_commit_dflash_proposed_tokens_to_req_fast_path_truncates_and_updates_stats():
+    from sglang.srt.speculative.dflash_utils import commit_dflash_proposed_tokens_to_req
+
+    req = _FakeReq(max_new_tokens=8, stop_token_ids=[13], origin_input_ids=[99])
+    outcome = commit_dflash_proposed_tokens_to_req(
+        req=req,
+        proposed=[11, 12, 13, 14],
+    )
+
+    assert req.output_ids == [11, 12, 13]
+    assert outcome.commit_len == 3
+    assert outcome.accepted_draft_tokens == 2
+    assert outcome.new_verified_token == 13
+    assert req.spec_verify_ct == 1
+    assert req.spec_accepted_tokens == 2
+    assert req.hist == [2]
+    assert req.check_finished_calls == [3]
+
+
+def test_commit_dflash_proposed_tokens_to_req_grammar_path_and_empty_fallback():
+    from sglang.srt.speculative.dflash_utils import commit_dflash_proposed_tokens_to_req
+
+    grammar = _FakeGrammar()
+    req = _FakeReq(
+        grammar=grammar,
+        output_ids=[],
+        origin_input_ids=[7],
+        finish_after=2,
+    )
+    outcome = commit_dflash_proposed_tokens_to_req(
+        req=req,
+        proposed=[21, 22, 23],
+        empty_error_prefix="DFLASH_TREE verify",
+    )
+
+    assert req.output_ids == [21, 22]
+    assert grammar.accepted == [21]
+    assert outcome.commit_len == 2
+    assert outcome.accepted_draft_tokens == 1
+    assert outcome.new_verified_token == 22
+    assert req.spec_verify_ct == 1
+    assert req.spec_accepted_tokens == 1
+    assert req.hist == [1]
+    assert req.check_finished_calls == [None, None]
+
+    empty_req = _FakeReq(max_new_tokens=0, output_ids=[], origin_input_ids=[55])
+    empty_outcome = commit_dflash_proposed_tokens_to_req(
+        req=empty_req,
+        proposed=[91, 92],
+    )
+    assert empty_req.output_ids == []
+    assert empty_outcome.commit_len == 0
+    assert empty_outcome.accepted_draft_tokens == 0
+    assert empty_outcome.new_verified_token == 55

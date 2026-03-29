@@ -407,6 +407,104 @@ def resolve_dflash_block_size(
     )
 
 
+@dataclass(frozen=True)
+class DFlashTargetOnlyCommitResult:
+    commit_len: int
+    new_verified_token: int
+    accepted_draft_tokens: int
+
+
+def commit_dflash_proposed_tokens_to_req(
+    *,
+    req: Any,
+    proposed: List[int],
+    empty_error_prefix: str = "DFLASH verify",
+) -> DFlashTargetOnlyCommitResult:
+    """Apply a committed speculative token prefix to a request on the CPU path.
+
+    This helper centralizes the current production CPU-side request mutation used by
+    DFlash `target_only` verify. It intentionally preserves the existing semantics:
+
+    - fast path for plain stop-token / max-new-token handling
+    - slow path for grammar / stop string / regex interaction
+    - spec-acceptance accounting
+    - fallback to the current token when no new token is appended
+    """
+    appended = 0
+    if (
+        req.grammar is None
+        and not req.sampling_params.stop_strs
+        and not req.sampling_params.stop_regex_strs
+    ):
+        remaining = int(req.sampling_params.max_new_tokens) - len(req.output_ids)
+        if remaining > 0:
+            tokens = proposed[:remaining]
+            if not req.sampling_params.ignore_eos:
+                stop_token_ids = req.sampling_params.stop_token_ids
+                eos_token_ids = req.eos_token_ids
+                tokenizer = req.tokenizer
+                tokenizer_eos = tokenizer.eos_token_id if tokenizer is not None else None
+                additional_stop = (
+                    tokenizer.additional_stop_token_ids if tokenizer is not None else None
+                )
+                vocab_size = getattr(req, "vocab_size", None)
+
+                for j, token_id in enumerate(tokens):
+                    if vocab_size is not None and (
+                        int(token_id) > int(vocab_size) or int(token_id) < 0
+                    ):
+                        tokens = tokens[: j + 1]
+                        break
+                    if stop_token_ids and token_id in stop_token_ids:
+                        tokens = tokens[: j + 1]
+                        break
+                    if eos_token_ids and token_id in eos_token_ids:
+                        tokens = tokens[: j + 1]
+                        break
+                    if tokenizer_eos is not None and int(token_id) == int(tokenizer_eos):
+                        tokens = tokens[: j + 1]
+                        break
+                    if additional_stop and token_id in additional_stop:
+                        tokens = tokens[: j + 1]
+                        break
+
+            req.output_ids.extend(int(tok) for tok in tokens)
+            appended = len(tokens)
+            if appended > 0:
+                req.check_finished(new_accepted_len=appended)
+    else:
+        for tok in proposed:
+            req.output_ids.append(int(tok))
+            appended += 1
+            req.check_finished()
+            if req.finished():
+                break
+            if req.grammar is not None:
+                req.grammar.accept_token(int(tok))
+
+    if req.output_ids:
+        new_verified_token = int(req.output_ids[-1])
+    elif req.origin_input_ids:
+        new_verified_token = int(req.origin_input_ids[-1])
+    else:
+        raise RuntimeError(
+            f"{empty_error_prefix} cannot determine current token: both output_ids and "
+            "origin_input_ids are empty."
+        )
+
+    accepted_draft_tokens = max(0, appended - 1)
+    req.spec_verify_ct += 1
+    req.spec_accepted_tokens += accepted_draft_tokens
+    if hasattr(req, "update_spec_acceptance_histogram"):
+        req.update_spec_acceptance_histogram(accepted_draft_tokens)
+
+    return DFlashTargetOnlyCommitResult(
+        commit_len=appended,
+        new_verified_token=new_verified_token,
+        accepted_draft_tokens=accepted_draft_tokens,
+    )
+
+
 def can_dflash_slice_qkv_weight(qkv_proj: Any) -> Tuple[bool, str]:
     """Validate whether DFlash can slice KV weights from a fused QKV linear layer."""
     quant_method = getattr(qkv_proj, "quant_method", None)

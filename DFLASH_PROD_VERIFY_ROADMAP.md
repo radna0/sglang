@@ -156,6 +156,17 @@ What remains:
 - finish/grammar/stop handling still lives in the Python loop
 - KV free/compaction still happens after CPU-side appended-length decisions
 
+What was improved on this branch:
+
+- the CPU-side request mutation logic is now centralized in
+  `commit_dflash_proposed_tokens_to_req(...)`
+- both `dflash_info.py` and `dflash_tree_worker.py` use that shared helper
+- this does not yet remove the CPU loop, but it gives us one stable seam for
+  later:
+  - device-generated commit metadata
+  - device-generated keep/evict decisions
+  - DFlash-specific spec-v2 payload work
+
 So the CPU-shaped boundary is smaller now, but it is still the main fusion
 target.
 
@@ -444,6 +455,8 @@ got us there and verify each dependency in reverse.
     Current branch status:
     - full-row target-only pack is already replaced by a compact committed-prefix transfer
     - CPU request mutation is still present
+    - the remaining CPU request mutation semantics are now shared in one helper:
+      `commit_dflash_proposed_tokens_to_req(...)`
 
 14. `[partial]` Promote sampled target-only toward a kernel-backed helper path,
     likely starting from `compute_dflash_sampling_accept_len_and_bonus(...)`,
@@ -462,10 +475,15 @@ got us there and verify each dependency in reverse.
     `max_steps_per_req` remains first-class in both greedy and sampled target-only
     verify.
 
-16. `[pending]` Keep the mixed-precision boundary explicit:
+16. `[partial]` Keep the mixed-precision boundary explicit:
     - target verify forward on FP8 target KV
     - accepted hidden handoff
     - existing BF16 fused draft append reused after verify
+    Current branch status:
+    - no code on this branch tries to collapse target FP8 verify and draft BF16
+      append into one monolithic mixed-precision kernel
+    - the next optimization target remains target-only postprocess, not the
+      target-to-draft ownership boundary
 
 17. `[pending]` Add DFlash spec-v2 scheduler integration:
     - allocate/store/resolve DFlash future payloads
@@ -505,6 +523,54 @@ This ordering keeps the risk surface small:
 - first shrink the CPU verify/commit boundary
 - then enable sampled parity
 - then add overlap/spec-v2
+
+## Remaining CPU-Owned Responsibilities After The Current Refactor
+
+These are the exact pieces still sitting on the CPU side after compact D2H and
+the shared request-mutation helper:
+
+1. per-request token append / truncation decisions
+   - max-new-token clipping
+   - stop token / EOS clipping
+   - grammar / regex / stop-string slow path
+2. per-request stats mutation
+   - `spec_verify_ct`
+   - `spec_accepted_tokens`
+   - acceptance histogram
+3. conversion back to device tensors for downstream updates
+   - `commit_lens`
+   - `new_verified_id`
+4. KV free / compaction policy selection
+   - `page_size == 1`
+   - paged aligned free path
+5. req-level KV accounting
+   - `kv_committed_len`
+   - `kv_allocated_len`
+6. req-to-token pool updates and tail clearing
+7. next-step hidden-state segment assembly
+
+That is the exact boundary the next implementation checkpoint should attack.
+
+## Next Concrete Extraction Checkpoints
+
+The next low-risk implementation sequence after the current branch state should
+be:
+
+1. move post-commit metadata shaping closer to the device boundary
+   - offsets into the compact committed span
+   - `new_verified_id`
+   - per-request committed lengths
+2. derive keep/evict and clear ranges from those compact lengths without
+   rebuilding more CPU-side structure than necessary
+3. only then introduce a DFlash-specific spec-v2 payload skeleton carrying:
+   - `commit_len`
+   - `new_verified_id`
+   - compact committed-span metadata
+   - next sequence lengths
+   - any replay-safe KV ownership fields
+
+This keeps the implementation order aligned with the real bottleneck instead of
+jumping too early into overlap plumbing.
 
 ## Benchmark / Validation Matrix
 

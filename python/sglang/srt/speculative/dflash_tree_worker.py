@@ -21,6 +21,7 @@ from sglang.srt.server_args import ServerArgs, get_global_server_args
 from sglang.srt.speculative.dflash_info import DFlashDraftInput, DFlashVerifyInput
 from sglang.srt.speculative.dflash_utils import (
     can_dflash_use_fused_qkv_proj,
+    commit_dflash_proposed_tokens_to_req,
     resolve_dflash_mask_token,
     resolve_dflash_mask_token_id,
 )
@@ -977,83 +978,18 @@ class DFlashTreeWorker:
                     break
                 proposed.append(int(predict_cpu[idx]))
 
-            appended = 0
-            if (
-                req.grammar is None
-                and not req.sampling_params.stop_strs
-                and not req.sampling_params.stop_regex_strs
-            ):
-                remaining = int(req.sampling_params.max_new_tokens) - len(req.output_ids)
-                if remaining > 0:
-                    tokens = proposed[:remaining]
-                    if not req.sampling_params.ignore_eos:
-                        stop_token_ids = req.sampling_params.stop_token_ids
-                        eos_token_ids = req.eos_token_ids
-                        tokenizer = req.tokenizer
-                        tokenizer_eos = (
-                            tokenizer.eos_token_id if tokenizer is not None else None
-                        )
-                        additional_stop = (
-                            tokenizer.additional_stop_token_ids
-                            if tokenizer is not None
-                            else None
-                        )
-                        vocab_size = getattr(req, "vocab_size", None)
+            outcome = commit_dflash_proposed_tokens_to_req(
+                req=req,
+                proposed=proposed,
+                empty_error_prefix="DFLASH_TREE verify",
+            )
 
-                        for j, token_id in enumerate(tokens):
-                            if vocab_size is not None and (
-                                int(token_id) > int(vocab_size) or int(token_id) < 0
-                            ):
-                                tokens = tokens[: j + 1]
-                                break
-                            if stop_token_ids and token_id in stop_token_ids:
-                                tokens = tokens[: j + 1]
-                                break
-                            if eos_token_ids and token_id in eos_token_ids:
-                                tokens = tokens[: j + 1]
-                                break
-                            if tokenizer_eos is not None and int(token_id) == int(
-                                tokenizer_eos
-                            ):
-                                tokens = tokens[: j + 1]
-                                break
-                            if additional_stop and token_id in additional_stop:
-                                tokens = tokens[: j + 1]
-                                break
+            if outcome.commit_len < len(proposed):
+                accept_index[i, outcome.commit_len:] = -1
 
-                    req.output_ids.extend(int(tok) for tok in tokens)
-                    appended = len(tokens)
-                    if appended > 0:
-                        req.check_finished(new_accepted_len=appended)
-            else:
-                for tok in proposed:
-                    req.output_ids.append(int(tok))
-                    appended += 1
-                    req.check_finished()
-                    if req.finished():
-                        break
-                    if req.grammar is not None:
-                        req.grammar.accept_token(int(tok))
-
-            if appended < len(proposed):
-                accept_index[i, appended:] = -1
-
-            if req.output_ids:
-                new_verified_token = int(req.output_ids[-1])
-            elif req.origin_input_ids:
-                new_verified_token = int(req.origin_input_ids[-1])
-            else:
-                raise RuntimeError(
-                    "DFLASH_TREE verify cannot determine current token: both output_ids and origin_input_ids are empty."
-                )
-
-            commit_lens_cpu.append(appended)
-            new_verified_list.append(new_verified_token)
-            accept_length_per_req_cpu.append(max(0, appended - 1))
-            req.spec_verify_ct += 1
-            req.spec_accepted_tokens += accept_length_per_req_cpu[-1]
-            if hasattr(req, "update_spec_acceptance_histogram"):
-                req.update_spec_acceptance_histogram(accept_length_per_req_cpu[-1])
+            commit_lens_cpu.append(outcome.commit_len)
+            new_verified_list.append(outcome.new_verified_token)
+            accept_length_per_req_cpu.append(outcome.accepted_draft_tokens)
 
         commit_lens = torch.tensor(commit_lens_cpu, dtype=torch.int32, device=device)
         new_verified_id = torch.tensor(new_verified_list, dtype=torch.int64, device=device)
