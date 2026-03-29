@@ -3613,7 +3613,6 @@ class DFlashWorker:
                 k,
                 v,
             )
-
             if validate_once:
                 try:
                     # Synchronize to ensure KV writes are visible before we read back.
@@ -3663,6 +3662,33 @@ class DFlashWorker:
                         }
                 setattr(self, "_validated_draft_kv_once", True)
                 validate_once = False
+
+    def _build_future_draft_input(
+        self,
+        draft_input: DFlashDraftInput,
+        *,
+        verify_done: torch.cuda.Event | None = None,
+    ) -> DFlashDraftInput:
+        """Build the stable post-append DFLASH draft state for future replay.
+
+        This is the DFLASH-native future payload candidate for spec-v2. It must
+        represent the post-append state only: no transient target_hidden and no
+        nonzero ctx_lens.
+        """
+        draft_seq_lens = draft_input.draft_seq_lens
+        new_seq_lens = (
+            draft_input.new_seq_lens
+            if draft_input.new_seq_lens is not None
+            else draft_seq_lens
+        )
+        return DFlashDraftInput(
+            verified_id=draft_input.verified_id,
+            target_hidden=draft_input.target_hidden,
+            ctx_lens=draft_input.ctx_lens,
+            draft_seq_lens=draft_seq_lens,
+            new_seq_lens=new_seq_lens,
+            verify_done=verify_done,
+        )
 
     def _append_target_hidden_fused(
         self,
@@ -3897,6 +3923,7 @@ class DFlashWorker:
             return GenerationBatchResult(
                 logits_output=logits_output,
                 next_token_ids=next_token_ids,
+                next_draft_input=self._build_future_draft_input(draft_input),
                 num_accepted_tokens=0,
                 spec_ssd_hit_ct=[
                     int(getattr(req, "spec_ssd_hit_ct", 0)) for req in batch.reqs
@@ -3983,6 +4010,10 @@ class DFlashWorker:
 
             dflash_debug,
         ) = verify_input.verify(batch=batch, logits_output=logits_output, page_size=self.page_size)
+        verify_done = None
+        if self.device.type != "cpu":
+            verify_done = torch.get_device_module(self.device).Event()
+            verify_done.record()
         self._update_req_dflash_debug_stats(
             batch=batch,
             verify_input=verify_input,
@@ -4162,6 +4193,9 @@ class DFlashWorker:
         return GenerationBatchResult(
             logits_output=logits_output,
             next_token_ids=new_verified_id,
+            next_draft_input=self._build_future_draft_input(
+                draft_input, verify_done=verify_done
+            ),
             num_accepted_tokens=num_accepted_tokens,
             accept_length_per_req_cpu=accept_length_per_req_cpu,
             spec_ssd_hit_ct=[

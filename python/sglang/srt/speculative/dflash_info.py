@@ -101,6 +101,30 @@ class DFlashDraftInput(SpecInput):
         # Draft state does not change token accounting.
         return (1, 1)
 
+    @classmethod
+    def create_idle_input(cls, device: torch.device):
+        return cls(
+            verified_id=torch.empty((0,), dtype=torch.int64, device=device),
+            target_hidden=torch.empty((0,), dtype=torch.float32, device=device),
+            ctx_lens=torch.empty((0,), dtype=torch.int32, device=device),
+            draft_seq_lens=torch.empty((0,), dtype=torch.int32, device=device),
+            new_seq_lens=torch.empty((0,), dtype=torch.int32, device=device),
+        )
+
+    def prepare_for_decode(self, batch: ScheduleBatch):
+        if batch.forward_mode.is_idle():
+            return
+
+        batch.maybe_evict_swa()
+        batch.maybe_wait_verify_done()
+
+        batch.input_ids = self.verified_id
+        if self.new_seq_lens is not None:
+            batch.seq_lens = self.new_seq_lens
+            batch.seq_lens_cpu = self.new_seq_lens.to(
+                dtype=torch.int32, device="cpu"
+            )
+
     def filter_batch(self, new_indices: torch.Tensor, has_been_filtered: bool = True):
         if self.future_indices is not None:
             self.future_indices.indices = self.future_indices.indices[new_indices]
@@ -229,6 +253,23 @@ class DFlashVerifyInput(SpecInput):
         super().__init__(spec_input_type=SpecInputType.DFLASH_VERIFY)
         if self.num_tokens_per_batch == -1:
             self.num_tokens_per_batch = int(self.draft_token_num)
+
+    @classmethod
+    def create_idle_input(
+        cls,
+        *,
+        device: torch.device,
+        draft_token_num: int,
+        custom_mask: torch.Tensor | None,
+        capture_hidden_mode: CaptureHiddenMode,
+    ):
+        return cls(
+            draft_token=torch.empty((0,), dtype=torch.long, device=device),
+            positions=torch.empty((0,), dtype=torch.int64, device=device),
+            draft_token_num=int(draft_token_num),
+            custom_mask=custom_mask,
+            capture_hidden_mode=capture_hidden_mode,
+        )
 
     def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
         return self.draft_token_num, self.draft_token_num

@@ -1165,9 +1165,8 @@ class CudaGraphRunner:
             _, build_custom_mask = resolve_dflash_verify_mask_policy(
                 self.model_runner.attn_backend
             )
-            spec_info = DFlashVerifyInput(
-                draft_token=None,
-                positions=None,
+            spec_info = DFlashVerifyInput.create_idle_input(
+                device=self.device,
                 draft_token_num=self.model_runner.server_args.speculative_num_draft_tokens,
                 custom_mask=(
                     None

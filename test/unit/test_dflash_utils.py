@@ -77,6 +77,22 @@ class _FakeBatch:
         self.out_cache_loc = None
 
 
+class _FakeScheduleBatchForDecode:
+    def __init__(self):
+        self.forward_mode = SimpleNamespace(is_idle=lambda: False)
+        self.evicted = False
+        self.waited = False
+        self.input_ids = None
+        self.seq_lens = torch.tensor([1, 2], dtype=torch.int32)
+        self.seq_lens_cpu = torch.tensor([1, 2], dtype=torch.int32)
+
+    def maybe_evict_swa(self):
+        self.evicted = True
+
+    def maybe_wait_verify_done(self):
+        self.waited = True
+
+
 class _FakeModelWorkerBatch:
     def __init__(self, spec_info):
         self.spec_info = spec_info
@@ -357,6 +373,41 @@ def test_future_map_dflash_rejects_pre_append_state():
     )
     with pytest.raises(ValueError, match="post-append draft state"):
         future_map.store_to_map_for_new_batch(future_indices, pre_append)
+
+
+def test_dflash_draft_input_prepare_for_decode_uses_explicit_new_seq_lens():
+    from sglang.srt.speculative.dflash_info import DFlashDraftInput
+
+    batch = _FakeScheduleBatchForDecode()
+    draft = DFlashDraftInput(
+        verified_id=torch.tensor([11, 22], dtype=torch.int64),
+        target_hidden=torch.empty((0,), dtype=torch.float32),
+        ctx_lens=torch.zeros((2,), dtype=torch.int32),
+        draft_seq_lens=torch.tensor([5, 7], dtype=torch.int32),
+        new_seq_lens=torch.tensor([6, 8], dtype=torch.int32),
+    )
+    draft.prepare_for_decode(batch)
+    assert batch.evicted is True
+    assert batch.waited is True
+    assert batch.input_ids.tolist() == [11, 22]
+    assert batch.seq_lens.tolist() == [6, 8]
+    assert batch.seq_lens_cpu.tolist() == [6, 8]
+
+
+def test_dflash_verify_input_create_idle_input():
+    from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+    from sglang.srt.speculative.dflash_info import DFlashVerifyInput
+
+    idle = DFlashVerifyInput.create_idle_input(
+        device=torch.device("cpu"),
+        draft_token_num=8,
+        custom_mask=None,
+        capture_hidden_mode=CaptureHiddenMode.FULL,
+    )
+    assert idle.draft_token.numel() == 0
+    assert idle.positions.numel() == 0
+    assert idle.draft_token_num == 8
+    assert idle.num_tokens_per_batch == 8
 
 
 def test_build_and_apply_dflash_indexed_cache_plan():

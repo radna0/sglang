@@ -290,6 +290,13 @@ Current branch status:
   - `verify_done`
 - DFlash KV append now makes `new_seq_lens` explicit after the append step
 - `FutureMap` now has a DFlash-specific storage/resolve branch
+- DFlash workers now emit `next_draft_input` as post-append draft state on both:
+  - prefill completion
+  - verify completion
+- `ScheduleBatch.prepare_for_decode()` can now consume DFlash draft state through
+  `DFlashDraftInput.prepare_for_decode(...)`
+- `CudaGraphRunner.get_spec_info()` now constructs DFlash verify replay inputs via
+  `DFlashVerifyInput.create_idle_input(...)`
 - that branch stores only the stable post-append draft state:
   - `verified_id`
   - `draft_seq_lens`
@@ -553,9 +560,13 @@ got us there and verify each dependency in reverse.
     - do not reuse Eagle tree semantics blindly
     Current branch status:
     - `FutureMap` can now allocate/store/resolve DFlash-native future state
+    - DFlash workers now emit `next_draft_input` in the same result object shape
+      the scheduler already expects
+    - `ScheduleBatch` can now re-enter decode from DFlash draft state
+    - graph-runner verify-input construction is now explicit for DFlash
     - the overlap gate is still disabled
-    - `cuda_graph_runner.py` and `scheduler.py` still need the live producer /
-      consumer wiring for DFlash-specific overlap execution
+    - `scheduler.py` still needs the live overlap producer/consumer branch for
+      DFlash-specific execution, rather than only generic result-field reuse
 
 18. `[pending]` Add DFlash-specific overlap safety checks:
     - grammar interaction

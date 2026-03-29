@@ -93,6 +93,7 @@ if TYPE_CHECKING:
 
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.managers.scheduler_metrics_mixin import PrefillStats
+    from sglang.srt.speculative.dflash_info import DFlashDraftInput
     from sglang.srt.speculative.eagle_info import EagleDraftInput
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 
@@ -1951,7 +1952,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         if self.is_spec_v2:
             # TODO(spec-v2): all spec v2 should go through this path
-            draft_input: EagleDraftInput = self.spec_info
+            draft_input: SpecInput = self.spec_info
             draft_input.prepare_for_decode(self)
 
         if not self.spec_algorithm.is_none():
@@ -2031,7 +2032,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def maybe_wait_verify_done(self):
         if self.is_spec_v2:
-            draft_input: EagleDraftInput = self.spec_info
+            draft_input: SpecInput = self.spec_info
             if draft_input.verify_done is not None:
                 draft_input.verify_done.synchronize()
 

@@ -612,6 +612,27 @@ class DFlashTreeWorker:
                 v,
             )
 
+    def _build_future_draft_input(
+        self,
+        draft_input: DFlashDraftInput,
+        *,
+        verify_done: torch.cuda.Event | None = None,
+    ) -> DFlashDraftInput:
+        draft_seq_lens = draft_input.draft_seq_lens
+        new_seq_lens = (
+            draft_input.new_seq_lens
+            if draft_input.new_seq_lens is not None
+            else draft_seq_lens
+        )
+        return DFlashDraftInput(
+            verified_id=draft_input.verified_id,
+            target_hidden=draft_input.target_hidden,
+            ctx_lens=draft_input.ctx_lens,
+            draft_seq_lens=draft_seq_lens,
+            new_seq_lens=new_seq_lens,
+            verify_done=verify_done,
+        )
+
     def _append_target_hidden_fused(
         self,
         ctx_hidden: torch.Tensor,
@@ -1098,6 +1119,7 @@ class DFlashTreeWorker:
             return GenerationBatchResult(
                 logits_output=logits_output,
                 next_token_ids=next_token_ids,
+                next_draft_input=self._build_future_draft_input(draft_input),
                 num_accepted_tokens=0,
                 can_run_cuda_graph=batch_result.can_run_cuda_graph,
             )
@@ -1135,6 +1157,10 @@ class DFlashTreeWorker:
             verify_input=verify_input,
             logits_output=logits_output,
         )
+        verify_done = None
+        if self.device.type != "cpu":
+            verify_done = torch.get_device_module(self.device).Event()
+            verify_done.record()
 
         draft_input.verified_id = new_verified_id
         draft_input.target_hidden = next_target_hidden
@@ -1154,6 +1180,9 @@ class DFlashTreeWorker:
         return GenerationBatchResult(
             logits_output=logits_output,
             next_token_ids=new_verified_id,
+            next_draft_input=self._build_future_draft_input(
+                draft_input, verify_done=verify_done
+            ),
             num_accepted_tokens=num_accepted_tokens,
             accept_length_per_req_cpu=accept_length_per_req_cpu,
             can_run_cuda_graph=can_run_cuda_graph,
