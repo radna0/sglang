@@ -1,4 +1,5 @@
 import torch
+from types import SimpleNamespace
 
 
 def test_build_target_layer_ids_gptoss120b_k5():
@@ -52,3 +53,132 @@ def test_compute_dflash_accept_len_and_bonus():
     # Bonus token is target_predict at index accept_len (2) => 13.
     assert bonus.tolist() == [13]
 
+
+def test_compute_dflash_sampling_accept_len_and_bonus_honors_max_steps_and_returns_prefix(
+    monkeypatch,
+):
+    from sglang.srt.speculative import dflash_utils as du
+
+    def fake_tree_kernel(
+        *,
+        predicts,
+        accept_index,
+        accept_token_num,
+        candidates,
+        retrive_index,
+        retrive_next_token,
+        retrive_next_sibling,
+        uniform_samples,
+        uniform_samples_for_final_sampling,
+        target_probs,
+        draft_probs,
+        threshold_single,
+        threshold_acc,
+        deterministic,
+    ):
+        predicts[:4] = torch.tensor([11, 12, 13, 14], dtype=torch.int32)
+        accept_index.fill_(-1)
+        accept_index[0, :4] = torch.tensor([0, 1, 2, 3], dtype=torch.int32)
+        accept_token_num[0] = 3
+
+    monkeypatch.setattr(du, "_DFLASH_SAMPLING_VERIFY_AVAILABLE", True)
+    monkeypatch.setattr(du, "tree_speculative_sampling_target_only", fake_tree_kernel)
+
+    sampling_info = SimpleNamespace(
+        temperatures=torch.tensor([1.0], dtype=torch.float32),
+        top_ks=torch.tensor([1], dtype=torch.int32),
+        top_ps=torch.tensor([1.0], dtype=torch.float32),
+        min_ps=torch.tensor([0.0], dtype=torch.float32),
+        need_top_k_sampling=False,
+        need_top_p_sampling=False,
+        need_min_p_sampling=False,
+    )
+    candidates = torch.tensor([[10, 11, 12, 13]], dtype=torch.int64)
+    logits = torch.zeros((4, 8), dtype=torch.float32)
+
+    accept_len, bonus, proposed = du.compute_dflash_sampling_accept_len_and_bonus(
+        candidates=candidates,
+        next_token_logits=logits,
+        sampling_info=sampling_info,
+        threshold_single=1.0,
+        threshold_acc=1.0,
+        return_proposed_tokens=True,
+    )
+    assert accept_len.tolist() == [3]
+    assert bonus.tolist() == [14]
+    assert proposed.tolist() == [[11, 12, 13, 14]]
+
+    accept_len, bonus, proposed = du.compute_dflash_sampling_accept_len_and_bonus(
+        candidates=candidates,
+        next_token_logits=logits,
+        sampling_info=sampling_info,
+        max_steps_per_req=torch.tensor([1], dtype=torch.int32),
+        threshold_single=1.0,
+        threshold_acc=1.0,
+        return_proposed_tokens=True,
+    )
+    assert accept_len.tolist() == [1]
+    assert bonus.tolist() == [12]
+    assert proposed.tolist() == [[11, 12, 0, 0]]
+
+
+def test_compute_dflash_sampling_accept_len_and_bonus_applies_min_p_filter(
+    monkeypatch,
+):
+    from sglang.srt.speculative import dflash_utils as du
+
+    captured = {}
+
+    def fake_tree_kernel(
+        *,
+        predicts,
+        accept_index,
+        accept_token_num,
+        candidates,
+        retrive_index,
+        retrive_next_token,
+        retrive_next_sibling,
+        uniform_samples,
+        uniform_samples_for_final_sampling,
+        target_probs,
+        draft_probs,
+        threshold_single,
+        threshold_acc,
+        deterministic,
+    ):
+        captured["target_probs"] = target_probs.detach().clone()
+        predicts[:2] = torch.tensor([0, 0], dtype=torch.int32)
+        accept_index.fill_(-1)
+        accept_index[0, :1] = torch.tensor([0], dtype=torch.int32)
+        accept_token_num[0] = 0
+
+    monkeypatch.setattr(du, "_DFLASH_SAMPLING_VERIFY_AVAILABLE", True)
+    monkeypatch.setattr(du, "tree_speculative_sampling_target_only", fake_tree_kernel)
+
+    sampling_info = SimpleNamespace(
+        temperatures=torch.tensor([1.0], dtype=torch.float32),
+        top_ks=torch.tensor([3], dtype=torch.int32),
+        top_ps=torch.tensor([1.0], dtype=torch.float32),
+        min_ps=torch.tensor([0.6], dtype=torch.float32),
+        need_top_k_sampling=False,
+        need_top_p_sampling=False,
+        need_min_p_sampling=True,
+    )
+    candidates = torch.tensor([[10, 11]], dtype=torch.int64)
+    logits = torch.tensor(
+        [[4.0, 1.0, 0.0], [4.0, 1.0, 0.0]],
+        dtype=torch.float32,
+    )
+
+    du.compute_dflash_sampling_accept_len_and_bonus(
+        candidates=candidates,
+        next_token_logits=logits,
+        sampling_info=sampling_info,
+        threshold_single=1.0,
+        threshold_acc=1.0,
+    )
+    probs = captured["target_probs"][0, 0]
+    assert torch.isclose(probs.sum(), torch.tensor(1.0), atol=1e-6)
+    assert probs[0] > 0
+    assert probs[1].item() == 0.0
+    assert probs[2].item() == 0.0

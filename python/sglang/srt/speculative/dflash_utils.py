@@ -489,12 +489,14 @@ def compute_dflash_sampling_accept_len_and_bonus(
     candidates: torch.Tensor,
     next_token_logits: torch.Tensor,
     sampling_info: Any,
+    max_steps_per_req: Optional[torch.Tensor] = None,
     threshold_single: Optional[float] = None,
     threshold_acc: Optional[float] = None,
     uniform_samples: Optional[torch.Tensor] = None,
     uniform_samples_for_final_sampling: Optional[torch.Tensor] = None,
     use_sparse_topk: bool = True,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    return_proposed_tokens: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor] | Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compute DFlash accept lengths and bonus tokens for non-greedy sampling.
 
     This is a chain-specialized variant of speculative target-only verification:
@@ -576,7 +578,7 @@ def compute_dflash_sampling_accept_len_and_bonus(
     expanded_temperature = torch.repeat_interleave(
         sampling_info.temperatures, draft_token_num, dim=0
     )
-    scaled_logits = next_token_logits / expanded_temperature
+    scaled_logits = next_token_logits / expanded_temperature.view(-1, 1)
     sparse_topk_applied = False
 
     if use_sparse_topk and need_top_k:
@@ -603,6 +605,22 @@ def compute_dflash_sampling_accept_len_and_bonus(
                     sampling_info.top_ps, draft_token_num, dim=0
                 )
                 topk_probs = top_p_renorm_prob(topk_probs, repeated_top_ps)
+            if bool(getattr(sampling_info, "need_min_p_sampling", False)):
+                repeated_min_ps = torch.repeat_interleave(
+                    sampling_info.min_ps, draft_token_num, dim=0
+                ).to(device=device, dtype=topk_probs.dtype)
+                base_probs = topk_probs
+                min_p_thresholds = (
+                    topk_probs.max(dim=-1, keepdim=True).values
+                    * repeated_min_ps.view(-1, 1)
+                )
+                topk_probs = topk_probs.masked_fill(topk_probs < min_p_thresholds, 0.0)
+                denom = topk_probs.sum(dim=-1, keepdim=True)
+                topk_probs = torch.where(
+                    denom > 0,
+                    topk_probs / denom.clamp_min(1e-20),
+                    base_probs,
+                )
 
             target_probs = torch.zeros_like(scaled_logits, dtype=topk_probs.dtype)
             target_probs.scatter_(1, topk_indices, topk_probs)
@@ -619,6 +637,24 @@ def compute_dflash_sampling_accept_len_and_bonus(
             target_probs = top_p_renorm_prob(
                 target_probs,
                 torch.repeat_interleave(sampling_info.top_ps, draft_token_num, dim=0),
+            )
+        if bool(getattr(sampling_info, "need_min_p_sampling", False)):
+            expanded_min_ps = torch.repeat_interleave(
+                sampling_info.min_ps, draft_token_num, dim=0
+            ).to(device=device, dtype=target_probs.dtype)
+            base_probs = target_probs
+            min_p_thresholds = (
+                target_probs.max(dim=-1, keepdim=True).values
+                * expanded_min_ps.view(-1, 1)
+            )
+            target_probs = target_probs.masked_fill(
+                target_probs < min_p_thresholds, 0.0
+            )
+            denom = target_probs.sum(dim=-1, keepdim=True)
+            target_probs = torch.where(
+                denom > 0,
+                target_probs / denom.clamp_min(1e-20),
+                base_probs,
             )
     target_probs = target_probs.view(bs, draft_token_num, -1).contiguous()
     draft_probs = torch.zeros_like(target_probs)
@@ -656,7 +692,26 @@ def compute_dflash_sampling_accept_len_and_bonus(
     )
 
     accept_len = accept_token_num
+    if max_steps_per_req is not None:
+        if max_steps_per_req.ndim != 1 or int(max_steps_per_req.shape[0]) != int(bs):
+            raise ValueError(
+                "max_steps_per_req must be a 1D tensor with shape [bs]. "
+                f"Got shape={tuple(max_steps_per_req.shape)} for bs={bs}."
+            )
+        caps = max_steps_per_req.to(device=device, dtype=torch.int32).clamp(
+            min=0, max=int(draft_token_num - 1)
+        )
+        accept_len = torch.minimum(accept_len, caps)
     row_ids = torch.arange(bs, dtype=torch.long, device=device)
     accept_pos = accept_index[row_ids, accept_len.to(torch.long)].to(torch.long)
     bonus = predicts[accept_pos].to(torch.int64)
-    return accept_len, bonus
+    if not return_proposed_tokens:
+        return accept_len, bonus
+
+    gather_index = accept_index.clamp(min=0).to(torch.long)
+    proposed_tokens = predicts[gather_index].to(torch.int64)
+    valid_prefix = torch.arange(draft_token_num, device=device, dtype=torch.int32)[
+        None, :
+    ] <= accept_len.unsqueeze(1)
+    proposed_tokens = proposed_tokens.masked_fill(~valid_prefix, 0)
+    return accept_len, bonus, proposed_tokens

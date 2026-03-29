@@ -18,7 +18,11 @@ from sglang.srt.mem_cache.common import (
     get_last_loc,
 )
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
-from sglang.srt.speculative.dflash_utils import compute_dflash_accept_len_and_bonus
+from sglang.srt.speculative.dflash_utils import (
+    compute_dflash_accept_len_and_bonus,
+    compute_dflash_sampling_accept_len_and_bonus,
+    is_dflash_sampling_verify_available,
+)
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
 from sglang.srt.utils import is_cuda
@@ -604,46 +608,85 @@ class DFlashVerifyInput(SpecInput):
                     logits_output.next_token_logits, dim=-1
                 ).view(bs, self.draft_token_num)
             else:
-                # Target-only speculative sampling: sample target tokens for each verify position
-                # and accept draft tokens only while they match the sampled target tokens.
-                #
-                # This produces the exact target distribution (same as baseline) without requiring
-                # draft probabilities q(token).
-                logits = logits_output.next_token_logits
-                expanded_temperature = torch.repeat_interleave(
-                    sampling_info.temperatures, self.draft_token_num, dim=0
+                sampled_helper_disable = (
+                    (os.environ.get("SGLANG_DFLASH_DISABLE_TARGETONLY_SAMPLED_HELPER") or "")
+                    .strip()
+                    .lower()
+                    not in ("", "0", "false", "off", "no")
                 )
-                logits.div_(expanded_temperature)
-                logits[:] = torch.softmax(logits, dim=-1)
-                probs = logits
+                sampled_helper_used = False
+                if not sampled_helper_disable and is_dflash_sampling_verify_available():
+                    try:
+                        accept_len, bonus, target_predict = (
+                            compute_dflash_sampling_accept_len_and_bonus(
+                                candidates=candidates,
+                                next_token_logits=logits_output.next_token_logits,
+                                sampling_info=sampling_info,
+                                max_steps_per_req=self.max_steps_per_req,
+                                return_proposed_tokens=True,
+                            )
+                        )
+                        sampled_helper_used = True
+                    except Exception as e:
+                        if not getattr(
+                            self, "_warned_targetonly_sampled_helper_fallback", False
+                        ):
+                            logger.warning(
+                                "DFLASH target_only sampled helper failed, falling back to inline path: %s",
+                                e,
+                            )
+                            setattr(
+                                self,
+                                "_warned_targetonly_sampled_helper_fallback",
+                                True,
+                            )
 
-                expanded_top_ks = torch.repeat_interleave(
-                    sampling_info.top_ks, self.draft_token_num, dim=0
-                )
-                expanded_top_ps = torch.repeat_interleave(
-                    sampling_info.top_ps, self.draft_token_num, dim=0
-                )
-
-                if sampling_info.need_min_p_sampling:
-                    expanded_min_ps = torch.repeat_interleave(
-                        sampling_info.min_ps, self.draft_token_num, dim=0
+                if not sampled_helper_used:
+                    # Target-only speculative sampling: sample target tokens for each verify position
+                    # and accept draft tokens only while they match the sampled target tokens.
+                    #
+                    # This produces the exact target distribution (same as baseline) without requiring
+                    # draft probabilities q(token).
+                    logits = logits_output.next_token_logits
+                    expanded_temperature = torch.repeat_interleave(
+                        sampling_info.temperatures, self.draft_token_num, dim=0
                     )
-                    probs = top_k_renorm_prob(probs, expanded_top_ks)
-                    probs = top_p_renorm_prob(probs, expanded_top_ps)
-                    sampled = min_p_sampling_from_probs(probs, expanded_min_ps)
-                else:
-                    sampled = top_k_top_p_sampling_from_probs(
-                        probs.contiguous(),
-                        expanded_top_ks,
-                        expanded_top_ps,
-                        filter_apply_order="joint",
-                        check_nan=False,
+                    probs = torch.softmax(
+                        logits / expanded_temperature.view(-1, 1), dim=-1
                     )
 
-                target_predict = sampled.view(bs, self.draft_token_num)
+                    expanded_top_ks = torch.repeat_interleave(
+                        sampling_info.top_ks, self.draft_token_num, dim=0
+                    )
+                    expanded_top_ps = torch.repeat_interleave(
+                        sampling_info.top_ps, self.draft_token_num, dim=0
+                    )
+
+                    if sampling_info.need_min_p_sampling:
+                        expanded_min_ps = torch.repeat_interleave(
+                            sampling_info.min_ps, self.draft_token_num, dim=0
+                        )
+                        probs = top_k_renorm_prob(probs, expanded_top_ks)
+                        probs = top_p_renorm_prob(probs, expanded_top_ps)
+                        sampled = min_p_sampling_from_probs(probs, expanded_min_ps)
+                    else:
+                        sampled = top_k_top_p_sampling_from_probs(
+                            probs.contiguous(),
+                            expanded_top_ks,
+                            expanded_top_ps,
+                            filter_apply_order="joint",
+                            check_nan=False,
+                        )
+
+                    target_predict = sampled.view(bs, self.draft_token_num)
             # Ensure we always return basic debug scalars so harnesses can correlate
             # accept collapse with paged-KV geometry.
             dflash_debug = dict(dbg_base)
+            dflash_debug["targetonly_sampled_helper"] = (
+                0
+                if (sampling_info is None or sampling_info.is_all_greedy)
+                else int(sampled_helper_used)
+            )
             if targetonly_scalar_stats and int(self.draft_token_num) > 1:
                 try:
                     step_count = int(self.draft_token_num - 1)
@@ -663,11 +706,12 @@ class DFlashVerifyInput(SpecInput):
                 except Exception:
                     pass
 
-            accept_len, bonus = compute_dflash_accept_len_and_bonus(
-                candidates=candidates,
-                target_predict=target_predict,
-                max_steps_per_req=self.max_steps_per_req,
-            )
+            if sampling_info is None or sampling_info.is_all_greedy or not sampled_helper_used:
+                accept_len, bonus = compute_dflash_accept_len_and_bonus(
+                    candidates=candidates,
+                    target_predict=target_predict,
+                    max_steps_per_req=self.max_steps_per_req,
+                )
             if timing_detail:
                 t_after_accept = time.perf_counter()
         else:
