@@ -54,6 +54,26 @@ def test_compute_dflash_accept_len_and_bonus():
     assert bonus.tolist() == [13]
 
 
+def test_pack_dflash_target_only_commits():
+    from sglang.srt.speculative.dflash_utils import pack_dflash_target_only_commits
+
+    target_predict = torch.tensor(
+        [
+            [11, 12, 13, 14],
+            [21, 22, 23, 24],
+        ],
+        dtype=torch.int64,
+    )
+    accept_len = torch.tensor([2, 0], dtype=torch.int32)
+
+    proposed_flat, commit_lens = pack_dflash_target_only_commits(
+        target_predict=target_predict,
+        accept_len=accept_len,
+    )
+    assert commit_lens.tolist() == [3, 1]
+    assert proposed_flat.tolist() == [11, 12, 13, 21]
+
+
 def test_compute_dflash_sampling_accept_len_and_bonus_honors_max_steps_and_returns_prefix(
     monkeypatch,
 ):
@@ -76,9 +96,9 @@ def test_compute_dflash_sampling_accept_len_and_bonus_honors_max_steps_and_retur
         threshold_acc,
         deterministic,
     ):
-        predicts[:4] = torch.tensor([11, 12, 13, 14], dtype=torch.int32)
+        predicts[:5] = torch.tensor([11, 12, 13, -99, 14], dtype=torch.int32)
         accept_index.fill_(-1)
-        accept_index[0, :4] = torch.tensor([0, 1, 2, 3], dtype=torch.int32)
+        accept_index[0, :4] = torch.tensor([0, 1, 2, 4], dtype=torch.int32)
         accept_token_num[0] = 3
 
     monkeypatch.setattr(du, "_DFLASH_SAMPLING_VERIFY_AVAILABLE", True)

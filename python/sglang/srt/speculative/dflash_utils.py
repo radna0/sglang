@@ -123,7 +123,7 @@ def _get_or_create_chain_verify_buffers(
             (new_cap, draft_token_num), -1, dtype=torch.int64, device=device
         )
         predicts = torch.empty(
-            (new_cap * draft_token_num,), dtype=torch.int32, device=device
+            (new_cap * draft_token_num + 1,), dtype=torch.int32, device=device
         )
         accept_index = torch.empty(
             (new_cap, draft_token_num), dtype=torch.int32, device=device
@@ -144,7 +144,7 @@ def _get_or_create_chain_verify_buffers(
     retrieve_index = cached["retrieve_index"][:bs]
     retrieve_next_token = cached["retrieve_next_token"][:bs]
     retrieve_next_sibling = cached["retrieve_next_sibling"][:bs]
-    predicts = cached["predicts"][: bs * draft_token_num]
+    predicts = cached["predicts"][: bs * draft_token_num + 1]
     accept_index = cached["accept_index"][:bs]
     accept_token_num = cached["accept_token_num"][:bs]
     return (
@@ -482,6 +482,43 @@ def compute_dflash_accept_len_and_bonus(
     accept_len = matches.to(torch.int32).cumprod(dim=1).sum(dim=1)
     bonus = target_predict[torch.arange(bs, device=target_predict.device), accept_len]
     return accept_len, bonus.to(torch.int64)
+
+
+def pack_dflash_target_only_commits(
+    *,
+    target_predict: torch.Tensor,
+    accept_len: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Compact the committed target-only token prefix for CPU-side request updates.
+
+    Args:
+        target_predict: [bs, draft_token_num] target-predicted tokens.
+        accept_len: [bs] accepted draft-token count, excluding the bonus token.
+
+    Returns:
+        proposed_flat: flattened committed token prefixes, row-major by request.
+        commit_lens: [bs] committed token counts including the bonus token.
+    """
+    if target_predict.ndim != 2:
+        raise ValueError(
+            f"target_predict must be 2D, got shape={tuple(target_predict.shape)}"
+        )
+    if accept_len.ndim != 1 or int(accept_len.shape[0]) != int(target_predict.shape[0]):
+        raise ValueError(
+            "accept_len must be a 1D tensor with shape [bs]. "
+            f"Got shape={tuple(accept_len.shape)} for bs={int(target_predict.shape[0])}."
+        )
+
+    bs, draft_token_num = target_predict.shape
+    commit_lens = accept_len.to(device=target_predict.device, dtype=torch.int32).clamp(
+        min=0, max=int(draft_token_num - 1)
+    )
+    commit_lens = commit_lens + 1
+    keep_mask = torch.arange(
+        draft_token_num, device=target_predict.device, dtype=torch.int32
+    )[None, :] < commit_lens.unsqueeze(1)
+    proposed_flat = target_predict[keep_mask].to(torch.int64)
+    return proposed_flat, commit_lens
 
 
 def compute_dflash_sampling_accept_len_and_bonus(

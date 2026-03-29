@@ -22,6 +22,7 @@ from sglang.srt.speculative.dflash_utils import (
     compute_dflash_accept_len_and_bonus,
     compute_dflash_sampling_accept_len_and_bonus,
     is_dflash_sampling_verify_available,
+    pack_dflash_target_only_commits,
 )
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
@@ -1143,21 +1144,22 @@ class DFlashVerifyInput(SpecInput):
         if timing_detail and t_after_accept == 0.0:
             t_after_accept = time.perf_counter()
 
-        # Single D2H transfer for CPU-side commit logic.
+        # Compact D2H transfer for CPU-side commit logic.
         #
-        # For `verify_mode=target_only`, the committed tokens must be exactly the same
-        # as baseline (target) decoding in greedy mode. Even though accepted draft
-        # tokens are definitionally equal to `target_predict` for the accepted prefix,
-        # pack the target-predicted tokens directly to make token-parity robust under
-        # paged-KV backends (avoid any accidental draft-token visibility / corruption).
+        # For `verify_mode=target_only`, commit only the accepted target prefix plus
+        # bonus token per request rather than the full verify block.
         if use_pq:
             # PQ needs candidates (draft proposals) + accept_len + bonus.
             packed = torch.cat(
                 [candidates[:, 1:], accept_len.unsqueeze(1), bonus.unsqueeze(1)], dim=1
             ).cpu()
         else:
-            # target_only: pack target_predict (length = draft_token_num) + accept_len.
-            packed = torch.cat([target_predict, accept_len.unsqueeze(1)], dim=1).cpu()
+            proposed_flat, target_commit_lens = pack_dflash_target_only_commits(
+                target_predict=target_predict,
+                accept_len=accept_len,
+            )
+            packed = proposed_flat.cpu()
+            target_commit_lens_cpu = target_commit_lens.cpu()
         if timing_detail:
             t_after_pack = time.perf_counter()
 
@@ -1165,6 +1167,7 @@ class DFlashVerifyInput(SpecInput):
         accept_length_per_req_cpu: List[int] = []
         commit_lens_cpu: List[int] = []
         new_verified_list: List[int] = []
+        packed_offset = 0
 
         for i, req in enumerate(batch.reqs):
             if use_pq:
@@ -1174,9 +1177,11 @@ class DFlashVerifyInput(SpecInput):
                     int(packed[i, max_acc + 1].item())
                 ]
             else:
-                # Layout: [target_predict (len=draft_token_num), accept_len]
-                acc_len = int(packed[i, self.draft_token_num].item())
-                proposed = packed[i, : acc_len + 1].tolist()
+                # Compact target_only layout: flattened committed prefixes plus per-req commit lens.
+                commit_len = int(target_commit_lens_cpu[i].item())
+                next_offset = packed_offset + commit_len
+                proposed = packed[packed_offset:next_offset].tolist()
+                packed_offset = next_offset
 
             appended = 0
             if (
