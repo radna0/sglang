@@ -4011,7 +4011,7 @@ class DFlashWorker:
             dflash_debug,
         ) = verify_input.verify(batch=batch, logits_output=logits_output, page_size=self.page_size)
         verify_done = None
-        if self.device.type != "cpu":
+        if torch.device(self.device).type != "cpu":
             verify_done = torch.get_device_module(self.device).Event()
             verify_done.record()
         self._update_req_dflash_debug_stats(

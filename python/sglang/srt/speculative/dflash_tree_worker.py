@@ -1158,7 +1158,7 @@ class DFlashTreeWorker:
             logits_output=logits_output,
         )
         verify_done = None
-        if self.device.type != "cpu":
+        if torch.device(self.device).type != "cpu":
             verify_done = torch.get_device_module(self.device).Event()
             verify_done.record()
 
