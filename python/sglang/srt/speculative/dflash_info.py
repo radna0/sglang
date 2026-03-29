@@ -19,10 +19,14 @@ from sglang.srt.mem_cache.common import (
 )
 from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.speculative.dflash_utils import (
+    apply_dflash_target_only_cache_plan,
+    apply_dflash_target_only_mapping_updates,
+    apply_dflash_target_only_req_kv_accounting,
     build_dflash_target_only_cache_plan,
     commit_dflash_proposed_tokens_to_req,
     compute_dflash_accept_len_and_bonus,
     compute_dflash_sampling_accept_len_and_bonus,
+    gather_dflash_committed_hidden,
     is_dflash_sampling_verify_available,
     materialize_dflash_target_only_commit_metadata,
     pack_dflash_target_only_commits,
@@ -1209,111 +1213,39 @@ class DFlashVerifyInput(SpecInput):
             page_size=page_size,
         )
 
-        # Free uncommitted KV cache slots and compact out_cache_loc.
-        if page_size == 1:
-            batch.token_to_kv_pool_allocator.free(cache_plan.evicted_slots)
-            batch.out_cache_loc = cache_plan.compact_out_cache_loc
-        else:
-            # Page-size > 1: the allocator frees *pages* (not individual token slots),
-            # so we must only evict full pages and never free a page that contains any
-            # committed token (or any prefix token).
-            #
-            # DFlash always commits a prefix of the verify block (first `commit_len`
-            # tokens), so there is at most one "mixed" page that contains both kept
-            # and evicted tokens. We keep that whole page and only free pages fully
-            # beyond the committed prefix (page-aligned).
-            if int(cache_plan.evicted_slots.numel()) > 0:
-                fast_free_used = False
-                if (
-                    hasattr(batch.token_to_kv_pool_allocator, "free_page_indices")
-                    and cache_plan.evicted_pages is not None
-                ):
-                    if bool(
-                        os.environ.get("SGLANG_DFLASH_DEBUG_PAGE_FREE", "")
-                        .strip()
-                        .lower()
-                        not in ("", "0", "false", "off", "no")
-                    ):
-                        page_rows = cache_plan.evicted_slots.view(-1, int(page_size))
-                        same_page = (
-                            page_rows // int(page_size)
-                        ) == cache_plan.evicted_pages[:, None]
-                        if not bool(torch.all(same_page)):
-                            raise RuntimeError(
-                                "DFLASH paged fast-free invariant failed: evicted slots are not page-aligned."
-                            )
-                    batch.token_to_kv_pool_allocator.free_page_indices(
-                        cache_plan.evicted_pages
-                    )
-                    fast_free_used = True
-                if not fast_free_used:
-                    batch.token_to_kv_pool_allocator.free(cache_plan.evicted_slots)
-
-            # Compact the committed token slots for downstream mapping updates.
-            batch.out_cache_loc = cache_plan.compact_out_cache_loc
+        apply_dflash_target_only_cache_plan(
+            batch=batch,
+            cache_plan=cache_plan,
+            page_size=page_size,
+            debug_page_free=bool(
+                os.environ.get("SGLANG_DFLASH_DEBUG_PAGE_FREE", "")
+                .strip()
+                .lower()
+                not in ("", "0", "false", "off", "no")
+            ),
+        )
 
         if timing_detail:
             t_after_kv_free = time.perf_counter()
 
-        # Update req-level KV cache accounting.
-        for req, commit_len in zip(batch.reqs, commit_lens_cpu, strict=True):
-            req.decode_batch_idx += commit_len
-            req.kv_committed_len += commit_len
-            req.kv_allocated_len = req.kv_committed_len
-
-        # Update req_to_token pool mapping for newly committed tokens.
-        end_offset = batch.seq_lens + commit_lens.to(batch.seq_lens.dtype)
-        assign_req_to_token_pool_func(
-            batch.req_pool_indices,
-            batch.req_to_token_pool.req_to_token,
-            batch.seq_lens,
-            end_offset,
-            batch.out_cache_loc,
-            bs,
+        apply_dflash_target_only_req_kv_accounting(
+            reqs=batch.reqs,
+            commit_lens_cpu=commit_lens_cpu,
+        )
+        apply_dflash_target_only_mapping_updates(
+            batch=batch,
+            commit_lens=commit_lens,
+            commit_lens_cpu=commit_lens_cpu,
+            cache_plan=cache_plan,
         )
         if timing_detail:
             t_after_mapping = time.perf_counter()
 
-        # Paged-KV safety: we temporarily wrote req_to_token mappings for the *entire*
-        # verify block (including uncommitted speculative slots) so TARGET_VERIFY can
-        # read them via metadata.page_table. After commit, some backends can still
-        # consult page-aligned tables, so we must explicitly clear the uncommitted
-        # tail mappings to a safe pad slot (0) to avoid any accidental visibility.
-        clear_start = cache_plan.clear_start
-        clear_end = cache_plan.clear_end
-        if cache_plan.clear_token_count > 0:
-            pad_locs = torch.zeros(
-                (cache_plan.clear_token_count,), dtype=torch.int64, device=device
-            )
-            assign_req_to_token_pool_func(
-                batch.req_pool_indices,
-                batch.req_to_token_pool.req_to_token,
-                clear_start,
-                clear_end,
-                pad_locs,
-                bs,
-            )
-
-        # Update batch seq lens.
-        batch.seq_lens.add_(commit_lens.to(batch.seq_lens.dtype))
-        batch.seq_lens_cpu.add_(
-            torch.tensor(commit_lens_cpu, dtype=batch.seq_lens_cpu.dtype)
+        next_target_hidden = gather_dflash_committed_hidden(
+            hidden_states=logits_output.hidden_states,
+            keep_mask=cache_plan.keep_mask,
+            draft_token_num=self.draft_token_num,
         )
-        # Keep seq_lens_sum in sync; flashinfer indices updaters rely on this for buffer sizing.
-        batch.seq_lens_sum += sum(commit_lens_cpu)
-
-        # Build next-step context features from the committed verify-input tokens.
-        hidden = logits_output.hidden_states
-        if hidden is None:
-            raise RuntimeError(
-                "DFLASH verify requires target hidden states, but got None."
-            )
-        hidden = hidden.view(bs, self.draft_token_num, -1)
-        segments: List[torch.Tensor] = []
-        for i, ln in enumerate(commit_lens_cpu):
-            if ln > 0:
-                segments.append(hidden[i, :ln, :])
-        next_target_hidden = torch.cat(segments, dim=0) if segments else hidden[:0]
         if timing_detail:
             t_after_hidden = time.perf_counter()
 

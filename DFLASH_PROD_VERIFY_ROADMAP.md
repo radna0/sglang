@@ -571,6 +571,11 @@ What is already extracted on this branch:
   - `clear_end`
 - the helper includes a CPU fallback for page-alignment semantics so the logic can
   be unit-tested without CUDA
+- `apply_dflash_target_only_cache_plan(...)` now owns allocator free/compact application
+- `apply_dflash_target_only_mapping_updates(...)` now owns req-to-token mapping and
+  clear-range updates
+- `gather_dflash_committed_hidden(...)` now owns committed hidden assembly using the
+  same `keep_mask`
 
 ## Next Concrete Extraction Checkpoints
 
@@ -602,11 +607,11 @@ Checkpoint update:
   - `keep_mask`
   - paged `evicted_slots` / `evicted_pages`
   - clear-range metadata
-- The next remaining part of step 2 is to move more of the downstream consumers
-  of that plan out of ad hoc inline code:
-  - KV allocator free/commit application
-  - req-to-token mapping updates
-  - next hidden-state segment assembly
+- The next remaining part of step 2 is no longer the basic target-only path in
+  `dflash_info.py`; it is:
+  - parity extraction for the remaining `dflash_tree_worker.py` path
+  - any remaining inline req-level KV/accounting consumers
+  - then spec-v2 payload design on top of the cleaner target-only path
 
 ## Benchmark / Validation Matrix
 

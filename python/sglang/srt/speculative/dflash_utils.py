@@ -648,6 +648,113 @@ def build_dflash_target_only_cache_plan(
     )
 
 
+def apply_dflash_target_only_cache_plan(
+    *,
+    batch: Any,
+    cache_plan: DFlashTargetOnlyCachePlan,
+    page_size: int,
+    debug_page_free: bool = False,
+) -> None:
+    """Apply the target-only cache free/compact plan to the batch allocator state."""
+    if int(page_size) == 1:
+        batch.token_to_kv_pool_allocator.free(cache_plan.evicted_slots)
+        batch.out_cache_loc = cache_plan.compact_out_cache_loc
+        return
+
+    if int(cache_plan.evicted_slots.numel()) > 0:
+        fast_free_used = False
+        if (
+            hasattr(batch.token_to_kv_pool_allocator, "free_page_indices")
+            and cache_plan.evicted_pages is not None
+        ):
+            if debug_page_free:
+                page_rows = cache_plan.evicted_slots.view(-1, int(page_size))
+                same_page = (page_rows // int(page_size)) == cache_plan.evicted_pages[:, None]
+                if not bool(torch.all(same_page)):
+                    raise RuntimeError(
+                        "DFLASH paged fast-free invariant failed: evicted slots are not page-aligned."
+                    )
+            batch.token_to_kv_pool_allocator.free_page_indices(cache_plan.evicted_pages)
+            fast_free_used = True
+        if not fast_free_used:
+            batch.token_to_kv_pool_allocator.free(cache_plan.evicted_slots)
+
+    batch.out_cache_loc = cache_plan.compact_out_cache_loc
+
+
+def apply_dflash_target_only_req_kv_accounting(
+    *,
+    reqs: List[Any],
+    commit_lens_cpu: List[int],
+) -> None:
+    for req, commit_len in zip(reqs, commit_lens_cpu, strict=True):
+        req.decode_batch_idx += int(commit_len)
+        req.kv_committed_len += int(commit_len)
+        req.kv_allocated_len = req.kv_committed_len
+
+
+def apply_dflash_target_only_mapping_updates(
+    *,
+    batch: Any,
+    commit_lens: torch.Tensor,
+    commit_lens_cpu: List[int],
+    cache_plan: DFlashTargetOnlyCachePlan,
+) -> None:
+    from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
+
+    bs = int(commit_lens.shape[0])
+    end_offset = batch.seq_lens + commit_lens.to(batch.seq_lens.dtype)
+    assign_req_to_token_pool_func(
+        batch.req_pool_indices,
+        batch.req_to_token_pool.req_to_token,
+        batch.seq_lens,
+        end_offset,
+        batch.out_cache_loc,
+        bs,
+    )
+    if cache_plan.clear_token_count > 0:
+        pad_locs = torch.zeros(
+            (cache_plan.clear_token_count,),
+            dtype=torch.int64,
+            device=commit_lens.device,
+        )
+        assign_req_to_token_pool_func(
+            batch.req_pool_indices,
+            batch.req_to_token_pool.req_to_token,
+            cache_plan.clear_start,
+            cache_plan.clear_end,
+            pad_locs,
+            bs,
+        )
+
+    batch.seq_lens.add_(commit_lens.to(batch.seq_lens.dtype))
+    batch.seq_lens_cpu.add_(
+        torch.tensor(commit_lens_cpu, dtype=batch.seq_lens_cpu.dtype)
+    )
+    batch.seq_lens_sum += sum(commit_lens_cpu)
+
+
+def gather_dflash_committed_hidden(
+    *,
+    hidden_states: torch.Tensor,
+    keep_mask: torch.Tensor,
+    draft_token_num: int,
+) -> torch.Tensor:
+    """Gather committed verify hidden states using the same compact keep mask."""
+    if hidden_states is None:
+        raise RuntimeError("DFLASH verify requires target hidden states, but got None.")
+    if hidden_states.ndim == 2:
+        bs = int(keep_mask.shape[0])
+        hidden = hidden_states.view(bs, int(draft_token_num), -1)
+    elif hidden_states.ndim == 3:
+        hidden = hidden_states
+    else:
+        raise ValueError(
+            f"hidden_states must be 2D or 3D, got shape={tuple(hidden_states.shape)}"
+        )
+    return hidden[keep_mask]
+
+
 def can_dflash_slice_qkv_weight(qkv_proj: Any) -> Tuple[bool, str]:
     """Validate whether DFlash can slice KV weights from a fused QKV linear layer."""
     quant_method = getattr(qkv_proj, "quant_method", None)

@@ -58,6 +58,24 @@ class _FakeReq:
         self.hist.append(int(accepted_draft_tokens))
 
 
+class _FakeAllocator:
+    def __init__(self):
+        self.freed = []
+        self.freed_pages = []
+
+    def free(self, free_index):
+        self.freed.append(free_index.clone())
+
+    def free_page_indices(self, free_page_indices):
+        self.freed_pages.append(free_page_indices.clone())
+
+
+class _FakeBatch:
+    def __init__(self):
+        self.token_to_kv_pool_allocator = _FakeAllocator()
+        self.out_cache_loc = None
+
+
 def test_build_target_layer_ids_gptoss120b_k5():
     from sglang.srt.speculative.dflash_utils import build_target_layer_ids
 
@@ -196,6 +214,77 @@ def test_build_dflash_target_only_cache_plan_page_size_2_cpu_alignment():
     assert plan.clear_start.tolist() == [5]
     assert plan.clear_end.tolist() == [8]
     assert plan.clear_token_count == 3
+
+
+def test_apply_dflash_target_only_cache_plan_page_size_1():
+    from sglang.srt.speculative.dflash_utils import (
+        apply_dflash_target_only_cache_plan,
+        build_dflash_target_only_cache_plan,
+    )
+
+    batch = _FakeBatch()
+    batch.out_cache_loc = torch.tensor(
+        [100, 101, 102, 103, 200, 201, 202, 203], dtype=torch.int64
+    )
+    plan = build_dflash_target_only_cache_plan(
+        out_cache_loc=batch.out_cache_loc,
+        commit_lens=torch.tensor([3, 1], dtype=torch.int32),
+        seq_lens=torch.tensor([5, 7], dtype=torch.int32),
+        draft_token_num=4,
+        page_size=1,
+    )
+    apply_dflash_target_only_cache_plan(batch=batch, cache_plan=plan, page_size=1)
+    assert len(batch.token_to_kv_pool_allocator.freed) == 1
+    assert batch.token_to_kv_pool_allocator.freed[0].tolist() == [103, 201, 202, 203]
+    assert batch.out_cache_loc.tolist() == [100, 101, 102, 200]
+
+
+def test_apply_dflash_target_only_cache_plan_page_size_2_uses_page_free():
+    from sglang.srt.speculative.dflash_utils import (
+        apply_dflash_target_only_cache_plan,
+        build_dflash_target_only_cache_plan,
+    )
+
+    batch = _FakeBatch()
+    batch.out_cache_loc = torch.tensor([100, 101, 102, 103], dtype=torch.int64)
+    plan = build_dflash_target_only_cache_plan(
+        out_cache_loc=batch.out_cache_loc,
+        commit_lens=torch.tensor([1], dtype=torch.int32),
+        seq_lens=torch.tensor([4], dtype=torch.int32),
+        draft_token_num=4,
+        page_size=2,
+    )
+    apply_dflash_target_only_cache_plan(batch=batch, cache_plan=plan, page_size=2)
+    assert len(batch.token_to_kv_pool_allocator.freed_pages) == 1
+    assert batch.token_to_kv_pool_allocator.freed_pages[0].tolist() == [51]
+    assert batch.out_cache_loc.tolist() == [100]
+
+
+def test_gather_dflash_committed_hidden_uses_keep_mask():
+    from sglang.srt.speculative.dflash_utils import gather_dflash_committed_hidden
+
+    hidden = torch.tensor(
+        [
+            [1.0, 10.0],
+            [2.0, 20.0],
+            [3.0, 30.0],
+            [4.0, 40.0],
+            [5.0, 50.0],
+            [6.0, 60.0],
+        ]
+    )
+    keep_mask = torch.tensor(
+        [
+            [True, True, False],
+            [True, False, False],
+        ]
+    )
+    gathered = gather_dflash_committed_hidden(
+        hidden_states=hidden,
+        keep_mask=keep_mask,
+        draft_token_num=3,
+    )
+    assert gathered.tolist() == [[1.0, 10.0], [2.0, 20.0], [4.0, 40.0]]
 
 
 def test_compute_dflash_sampling_accept_len_and_bonus_honors_max_steps_and_returns_prefix(
