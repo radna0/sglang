@@ -60,6 +60,21 @@ Documented benchmark JSON outputs are mirrored into:
 
 - [benchmark_artifacts/README.md](/workspace/sglang-dflash-line/benchmark_artifacts/README.md)
 
+## Production Verify Roadmap
+
+The current implementation roadmap for production DFlash verify is tracked in:
+
+- [DFLASH_PROD_VERIFY_ROADMAP.md](/workspace/sglang-dflash-line/DFLASH_PROD_VERIFY_ROADMAP.md)
+
+This is the active design note for:
+
+- target-only greedy verify
+- target-only sampled verify
+- FP8 target KV + BF16 draft KV boundaries
+- DFlash overlap/spec-v2 support
+
+`pq` verify is explicitly out of the active production plan.
+
 ## Prepared Next Route Study
 
 Prepared but not yet launched:
