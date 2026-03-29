@@ -85,7 +85,7 @@ Important implication:
 - greedy verify math is already on device
 - commit/pack/free/output mutation is still partly CPU-bound
 
-### 4. Sampled target-only verify already exists, but it is not yet the optimized path
+### 4. Sampled target-only verify now has a production helper path, with fallback
 
 Code:
 
@@ -94,27 +94,33 @@ Code:
 
 Current production sampled path in `dflash_info.py`:
 
-1. scale logits by per-row temperature
-2. softmax logits to probabilities
-3. apply target-side `top_k`, `top_p`, `min_p`
-4. sample target tokens from the target distribution
-5. compute accept prefix against draft tokens
-6. pack `[target_predict, accept_len]`
-7. copy packed data to CPU
-8. run per-request Python commit logic
+1. prefer `compute_dflash_sampling_accept_len_and_bonus(...)` when available
+2. preserve a strict inline fallback if the helper is unavailable or fails
+3. preserve target-side:
+   - `temperature`
+   - `top_k`
+   - `top_p`
+   - `min_p`
+4. preserve logical-cap behavior through `max_steps_per_req`
+5. return the committed target-only prefix for CPU-side request mutation
 
 Important detail:
 
 - `dflash_utils.py` already contains
   `compute_dflash_sampling_accept_len_and_bonus(...)`
 - that path uses `tree_speculative_sampling_target_only`
-- but the current production flow in `dflash_info.py` is still using the inline
-  probability path plus the same CPU-side commit/packing shape as greedy
+- it now supports:
+  - logical cap
+  - committed-prefix reconstruction
+  - `min_p`
+- `dflash_info.py` now records whether the helper path was used through:
+  - `targetonly_sampled_helper`
 
-So there is already reusable kernel-backed machinery for sampled target-only,
-but it is not yet the integrated production fast path.
+So sampled target-only is no longer purely the old inline path. It now has a
+production helper fast path, but still does not have a fully fused on-device
+commit/update stage.
 
-### 5. Accept/commit bookkeeping is still CPU-shaped
+### 5. Accept/commit bookkeeping is still CPU-shaped, but the D2H boundary is smaller
 
 Code:
 
@@ -122,8 +128,8 @@ Code:
 
 Current path after accept lengths are computed:
 
-1. concatenate verify outputs into a packed tensor
-2. transfer packed tensor with a single `.cpu()`
+1. build compact committed target-only prefixes on device
+2. transfer compact committed prefixes plus per-request commit lengths to CPU
 3. iterate requests in Python
 4. append tokens to `req.output_ids`
 5. update finish state / stop tokens / grammar
@@ -138,7 +144,20 @@ This means the production hot path is currently split into:
 - GPU verify math
 - CPU commit / output / bookkeeping
 
-That CPU-shaped boundary is the main fusion target.
+What changed already:
+
+- target-only no longer has to copy the full `draft_token_num` token row for each
+  request
+- it now copies only the committed prefix plus lengths
+
+What remains:
+
+- CPU request mutation still exists
+- finish/grammar/stop handling still lives in the Python loop
+- KV free/compaction still happens after CPU-side appended-length decisions
+
+So the CPU-shaped boundary is smaller now, but it is still the main fusion
+target.
 
 ### 6. Draft proposal generation already supports physical-vs-logical separation
 
@@ -420,10 +439,13 @@ got us there and verify each dependency in reverse.
     - new verified ids
     - commit lengths
 
-13. `[pending]` Implement a fused greedy target-only postprocess path that
+13. `[partial]` Implement a fused greedy target-only postprocess path that
     eliminates the current full packed `[target_predict, accept_len].cpu()` flow.
+    Current branch status:
+    - full-row target-only pack is already replaced by a compact committed-prefix transfer
+    - CPU request mutation is still present
 
-14. `[pending]` Promote sampled target-only toward a kernel-backed helper path,
+14. `[partial]` Promote sampled target-only toward a kernel-backed helper path,
     likely starting from `compute_dflash_sampling_accept_len_and_bonus(...)`,
     while preserving:
     - `temperature`
@@ -431,8 +453,12 @@ got us there and verify each dependency in reverse.
     - `top_p`
     - `min_p`
     - exact baseline-faithful target distribution
+    Current branch status:
+    - helper path is integrated
+    - strict fallback remains
+    - full commit/update fusion is still pending
 
-15. `[pending]` Add logical-cap support to the sampled helper path so
+15. `[done]` Add logical-cap support to the sampled helper path so
     `max_steps_per_req` remains first-class in both greedy and sampled target-only
     verify.
 
