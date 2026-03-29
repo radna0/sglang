@@ -514,6 +514,7 @@ class DFlashTreeWorker:
 
         total_ctx = int(draft_input.target_hidden.shape[0])
         if total_ctx <= 0:
+            draft_input.new_seq_lens = draft_input.draft_seq_lens.clone()
             return
 
         req_to_token = self.draft_model_runner.req_to_token_pool.req_to_token
@@ -587,6 +588,7 @@ class DFlashTreeWorker:
                 )
 
         draft_input.draft_seq_lens = draft_seq_lens + ctx_lens
+        draft_input.new_seq_lens = draft_input.draft_seq_lens.clone()
         draft_input.ctx_lens = torch.zeros_like(ctx_lens)
         draft_input.target_hidden = draft_input.target_hidden[:0]
 

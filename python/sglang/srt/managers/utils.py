@@ -15,7 +15,9 @@ from sglang.srt.server_args import ServerArgs
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import GenerationBatchResult
+    from sglang.srt.speculative.dflash_info import DFlashDraftInput
     from sglang.srt.speculative.eagle_info import EagleDraftInput
+    from sglang.srt.speculative.spec_info import SpecInput
 
 
 logger = logging.getLogger(__name__)
@@ -44,7 +46,7 @@ class GenerationBatchResult:
     accept_lens: Optional[torch.Tensor] = None
 
     # relay path: forward stream -> next step forward
-    next_draft_input: Optional[EagleDraftInput] = None
+    next_draft_input: Optional["SpecInput"] = None
 
     # metrics
     expert_distribution_metrics: Optional[ExpertDistributionMetrics] = None

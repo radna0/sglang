@@ -3383,6 +3383,7 @@ class DFlashWorker:
 
         total_ctx = int(draft_input.target_hidden.shape[0])
         if total_ctx <= 0:
+            draft_input.new_seq_lens = draft_input.draft_seq_lens.clone()
             if validate_kv and self.tp_rank == 0 and not getattr(self, "_logged_validate_kv_skip", False):
                 logger.warning(
                     "DFLASH validate_draft_kv: KV append skipped (total_ctx<=0). page_size=%s bs=%s",
@@ -3567,6 +3568,7 @@ class DFlashWorker:
                     )
 
         draft_input.draft_seq_lens = draft_seq_lens + ctx_lens
+        draft_input.new_seq_lens = draft_input.draft_seq_lens.clone()
         draft_input.ctx_lens = torch.zeros_like(ctx_lens)
         draft_input.target_hidden = draft_input.target_hidden[:0]
 

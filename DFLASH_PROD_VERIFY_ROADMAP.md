@@ -273,6 +273,42 @@ Current behavior:
 So DFlash already has a graph replay input object, but not a spec-v2 overlap
 contract.
 
+### 11. DFlash now has a native post-append future-state contract, but it is inert
+
+Code:
+
+- `python/sglang/srt/speculative/dflash_info.py`
+- `python/sglang/srt/speculative/dflash_worker.py`
+- `python/sglang/srt/speculative/dflash_tree_worker.py`
+- `python/sglang/srt/managers/overlap_utils.py`
+
+Current branch status:
+
+- `DFlashDraftInput` now carries DFlash-native future fields:
+  - `future_indices`
+  - `new_seq_lens`
+  - `verify_done`
+- DFlash KV append now makes `new_seq_lens` explicit after the append step
+- `FutureMap` now has a DFlash-specific storage/resolve branch
+- that branch stores only the stable post-append draft state:
+  - `verified_id`
+  - `draft_seq_lens`
+  - `new_seq_lens`
+
+Important design choice:
+
+- the DFlash future payload does **not** carry transient `target_hidden`
+  buffers
+- it also rejects nonzero `ctx_lens` on store
+- this is intentional: the overlap payload should represent the state *after*
+  target hidden has already been appended into the draft KV cache
+
+So the branch now has the correct DFlash-native payload seam, but:
+
+- DFlash still reports `supports_spec_v2() == False`
+- scheduler overlap is still disabled
+- no live overlap execution path uses the new payload yet
+
 ## What The Next Production Design Must Look Like
 
 ## A. Fused target-only verify/postprocess, not “one giant kernel”
@@ -333,22 +369,30 @@ So the roadmap should improve that boundary, not erase it.
 
 DFlash should not be forced into Eagle tree payload semantics.
 
-The DFlash overlap payload should carry at least:
+The correct DFlash overlap payload is the **post-append** draft state, not the
+pre-append verify bundle.
 
-- request ids / req-pool mapping
-- `accept_len`
-- `commit_len`
-- `new_verified_id`
-- accepted token ids or a compact accepted-span buffer
-- logical cap / effective step count
-- next sequence lengths
-- any KV free/commit metadata needed by replay
+That means the payload should carry at least:
 
-The right shape is likely:
+- `future_indices`
+- `verified_id`
+- `draft_seq_lens`
+- `new_seq_lens`
+- request/batch routing metadata needed by scheduler replay
 
-- keep `DFlashVerifyInput`
-- add a DFlash-specific v2 mixin or companion payload struct
-- thread it through scheduler, graph replay, and output processing
+And it should **not** carry:
+
+- transient `target_hidden`
+- nonzero `ctx_lens`
+- Eagle tree `topk_p/topk_index` semantics
+
+The right shape is:
+
+- keep `DFlashVerifyInput` for verify replay
+- keep `DFlashDraftInput` as the DFlash-native future payload carrier
+- store only post-append state in `FutureMap`
+- thread that payload through scheduler and graph replay without reusing Eagle
+  tree buffers
 
 ## D. The unused sampled helper should be pulled into the production path
 
@@ -436,12 +480,21 @@ got us there and verify each dependency in reverse.
 
 ### Implementation Tasks
 
-11. `[pending]` Add a DFlash-specific v2 payload contract.
+11. `[partial]` Add a DFlash-specific v2 payload contract.
     Target files:
     - `dflash_info.py`
     - new DFlash v2 helper/mixin if needed
     - `cuda_graph_runner.py`
     - `scheduler.py`
+    Current branch status:
+    - `DFlashDraftInput` now carries:
+      - `future_indices`
+      - `new_seq_lens`
+      - `verify_done`
+    - DFlash append paths now make `new_seq_lens` explicit
+    - `FutureMap` now has a DFlash-native post-append storage/resolve branch
+    - scheduler and graph-runner still do not produce or consume this payload in
+      a live overlap path
 
 12. `[pending]` Define the minimal device-resident verify result for greedy:
     - accept lengths
@@ -494,10 +547,15 @@ got us there and verify each dependency in reverse.
     - the next optimization target remains target-only postprocess, not the
       target-to-draft ownership boundary
 
-17. `[pending]` Add DFlash spec-v2 scheduler integration:
+17. `[partial]` Add DFlash spec-v2 scheduler integration:
     - allocate/store/resolve DFlash future payloads
     - plumb replay metadata through graph runner
     - do not reuse Eagle tree semantics blindly
+    Current branch status:
+    - `FutureMap` can now allocate/store/resolve DFlash-native future state
+    - the overlap gate is still disabled
+    - `cuda_graph_runner.py` and `scheduler.py` still need the live producer /
+      consumer wiring for DFlash-specific overlap execution
 
 18. `[pending]` Add DFlash-specific overlap safety checks:
     - grammar interaction

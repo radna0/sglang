@@ -1,4 +1,5 @@
 import torch
+import pytest
 from types import SimpleNamespace
 
 
@@ -74,6 +75,12 @@ class _FakeBatch:
     def __init__(self):
         self.token_to_kv_pool_allocator = _FakeAllocator()
         self.out_cache_loc = None
+
+
+class _FakeModelWorkerBatch:
+    def __init__(self, spec_info):
+        self.spec_info = spec_info
+        self.input_ids = torch.empty((0,), dtype=torch.int64)
 
 
 def test_build_target_layer_ids_gptoss120b_k5():
@@ -258,6 +265,98 @@ def test_apply_dflash_target_only_cache_plan_page_size_2_uses_page_free():
     assert len(batch.token_to_kv_pool_allocator.freed_pages) == 1
     assert batch.token_to_kv_pool_allocator.freed_pages[0].tolist() == [51]
     assert batch.out_cache_loc.tolist() == [100]
+
+
+def test_dflash_draft_input_future_filter_and_merge():
+    from sglang.srt.managers.overlap_utils import FutureIndices
+    from sglang.srt.speculative.dflash_info import DFlashDraftInput
+
+    draft = DFlashDraftInput(
+        verified_id=torch.tensor([11, 22], dtype=torch.int64),
+        target_hidden=torch.empty((0,), dtype=torch.float32),
+        ctx_lens=torch.zeros((2,), dtype=torch.int32),
+        draft_seq_lens=torch.tensor([5, 7], dtype=torch.int32),
+        future_indices=FutureIndices(indices=torch.tensor([101, 102], dtype=torch.int64)),
+        new_seq_lens=torch.tensor([5, 7], dtype=torch.int32),
+    )
+    draft.filter_batch(torch.tensor([1], dtype=torch.int64))
+    assert draft.future_indices.indices.tolist() == [102]
+    assert draft.new_seq_lens.tolist() == [7]
+
+    other = DFlashDraftInput(
+        verified_id=torch.tensor([33], dtype=torch.int64),
+        target_hidden=torch.empty((0,), dtype=torch.float32),
+        ctx_lens=torch.zeros((1,), dtype=torch.int32),
+        draft_seq_lens=torch.tensor([9], dtype=torch.int32),
+        future_indices=FutureIndices(indices=torch.tensor([103], dtype=torch.int64)),
+        new_seq_lens=torch.tensor([9], dtype=torch.int32),
+    )
+    draft.merge_batch(other)
+    assert draft.future_indices.indices.tolist() == [102, 103]
+    assert draft.new_seq_lens.tolist() == [7, 9]
+
+
+def test_future_map_dflash_roundtrip_uses_post_append_state():
+    from sglang.srt.managers.overlap_utils import FutureMap
+    from sglang.srt.speculative.dflash_info import DFlashDraftInput
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+    future_map = FutureMap(
+        max_running_requests=4,
+        chunked_prefill_size=0,
+        context_len=16,
+        device=torch.device("cpu"),
+        spec_algo=SpeculativeAlgorithm.DFLASH,
+    )
+    future_indices = future_map.alloc_future_indices(2)
+    stored = DFlashDraftInput(
+        verified_id=torch.tensor([11, 22], dtype=torch.int64),
+        target_hidden=torch.empty((0,), dtype=torch.float32),
+        ctx_lens=torch.zeros((2,), dtype=torch.int32),
+        draft_seq_lens=torch.tensor([5, 7], dtype=torch.int32),
+        new_seq_lens=torch.tensor([5, 7], dtype=torch.int32),
+    )
+    future_map.store_to_map_for_new_batch(future_indices, stored)
+
+    unresolved = DFlashDraftInput(
+        verified_id=torch.empty((0,), dtype=torch.int64),
+        target_hidden=torch.empty((0,), dtype=torch.float32),
+        ctx_lens=torch.empty((0,), dtype=torch.int32),
+        draft_seq_lens=torch.empty((0,), dtype=torch.int32),
+        future_indices=future_indices,
+        new_seq_lens=torch.empty((0,), dtype=torch.int32),
+    )
+    future_map.resolve_future(_FakeModelWorkerBatch(unresolved))
+
+    assert unresolved.verified_id.tolist() == [11, 22]
+    assert unresolved.draft_seq_lens.tolist() == [5, 7]
+    assert unresolved.new_seq_lens.tolist() == [5, 7]
+    assert unresolved.ctx_lens.tolist() == [0, 0]
+    assert unresolved.target_hidden.numel() == 0
+
+
+def test_future_map_dflash_rejects_pre_append_state():
+    from sglang.srt.managers.overlap_utils import FutureMap
+    from sglang.srt.speculative.dflash_info import DFlashDraftInput
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+    future_map = FutureMap(
+        max_running_requests=4,
+        chunked_prefill_size=0,
+        context_len=16,
+        device=torch.device("cpu"),
+        spec_algo=SpeculativeAlgorithm.DFLASH,
+    )
+    future_indices = future_map.alloc_future_indices(1)
+    pre_append = DFlashDraftInput(
+        verified_id=torch.tensor([11], dtype=torch.int64),
+        target_hidden=torch.randn((1, 4), dtype=torch.float32),
+        ctx_lens=torch.tensor([1], dtype=torch.int32),
+        draft_seq_lens=torch.tensor([5], dtype=torch.int32),
+        new_seq_lens=torch.tensor([6], dtype=torch.int32),
+    )
+    with pytest.raises(ValueError, match="post-append draft state"):
+        future_map.store_to_map_for_new_batch(future_indices, pre_append)
 
 
 def test_build_and_apply_dflash_indexed_cache_plan():

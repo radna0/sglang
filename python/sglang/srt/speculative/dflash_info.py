@@ -11,6 +11,7 @@ import torch
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import apply_custom_logit_processor
+from sglang.srt.managers.overlap_utils import FutureIndices
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
@@ -79,20 +80,42 @@ class DFlashDraftInput(SpecInput):
     # The next draft step appends ctx_lens[i] tokens starting at draft_seq_lens[i].
     draft_seq_lens: torch.Tensor
 
+    # Inputs for a future DFLASH-specific spec-v2 overlap payload.
+    # This stores the post-append draft state, not the transient pre-append
+    # target_hidden bundle.
+    future_indices: Optional[FutureIndices] = None
+    new_seq_lens: torch.Tensor | None = None
+    verify_done: Optional[torch.cuda.Event] = None
+
     def __post_init__(self):
         super().__init__(spec_input_type=SpecInputType.DFLASH_DRAFT)
+        if (
+            self.new_seq_lens is None
+            and self.draft_seq_lens is not None
+            and self.ctx_lens is not None
+            and self.draft_seq_lens.numel() == self.ctx_lens.numel()
+        ):
+            self.new_seq_lens = self.draft_seq_lens + self.ctx_lens
 
     def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
         # Draft state does not change token accounting.
         return (1, 1)
 
     def filter_batch(self, new_indices: torch.Tensor, has_been_filtered: bool = True):
+        if self.future_indices is not None:
+            self.future_indices.indices = self.future_indices.indices[new_indices]
+            if self.new_seq_lens is not None:
+                self.new_seq_lens = self.new_seq_lens[new_indices]
+            return
+
         old_ctx_lens = self.ctx_lens
         old_target_hidden = self.target_hidden
 
         self.verified_id = self.verified_id[new_indices]
         self.ctx_lens = old_ctx_lens[new_indices]
         self.draft_seq_lens = self.draft_seq_lens[new_indices]
+        if self.new_seq_lens is not None:
+            self.new_seq_lens = self.new_seq_lens[new_indices]
 
         if old_target_hidden is None or old_target_hidden.numel() == 0:
             self.target_hidden = old_target_hidden
@@ -127,11 +150,33 @@ class DFlashDraftInput(SpecInput):
         )
 
     def merge_batch(self, spec_info: "DFlashDraftInput"):
+        if self.future_indices is not None:
+            assert spec_info.future_indices is not None
+            self.future_indices = FutureIndices(
+                indices=torch.cat(
+                    [self.future_indices.indices, spec_info.future_indices.indices],
+                    dim=0,
+                )
+            )
+            if self.new_seq_lens is None:
+                self.new_seq_lens = spec_info.new_seq_lens
+            elif spec_info.new_seq_lens is not None:
+                self.new_seq_lens = torch.cat(
+                    [self.new_seq_lens, spec_info.new_seq_lens], dim=0
+                )
+            return
+
         self.verified_id = torch.cat([self.verified_id, spec_info.verified_id], dim=0)
         self.ctx_lens = torch.cat([self.ctx_lens, spec_info.ctx_lens], dim=0)
         self.draft_seq_lens = torch.cat(
             [self.draft_seq_lens, spec_info.draft_seq_lens], dim=0
         )
+        if self.new_seq_lens is None:
+            self.new_seq_lens = spec_info.new_seq_lens
+        elif spec_info.new_seq_lens is not None:
+            self.new_seq_lens = torch.cat(
+                [self.new_seq_lens, spec_info.new_seq_lens], dim=0
+            )
         if self.target_hidden is None or self.target_hidden.numel() == 0:
             self.target_hidden = spec_info.target_hidden
         elif (
