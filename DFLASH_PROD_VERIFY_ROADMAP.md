@@ -576,6 +576,11 @@ What is already extracted on this branch:
   clear-range updates
 - `gather_dflash_committed_hidden(...)` now owns committed hidden assembly using the
   same `keep_mask`
+- the same downstream helper surface is now reused by `dflash_tree_worker.py` for:
+  - indexed cache compaction
+  - req-level KV accounting
+  - mapping updates
+  - hidden gather by accepted flat indices
 
 ## Next Concrete Extraction Checkpoints
 
@@ -609,9 +614,14 @@ Checkpoint update:
   - clear-range metadata
 - The next remaining part of step 2 is no longer the basic target-only path in
   `dflash_info.py`; it is:
-  - parity extraction for the remaining `dflash_tree_worker.py` path
   - any remaining inline req-level KV/accounting consumers
   - then spec-v2 payload design on top of the cleaner target-only path
+
+Checkpoint update:
+
+- parity extraction for the remaining `dflash_tree_worker.py` path is now landed
+- the next major implementation frontier is no longer post-verify helperization;
+  it is the DFlash-specific spec-v2 payload and overlap contract
 
 ## Benchmark / Validation Matrix
 

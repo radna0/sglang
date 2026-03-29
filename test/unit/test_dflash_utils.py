@@ -260,6 +260,26 @@ def test_apply_dflash_target_only_cache_plan_page_size_2_uses_page_free():
     assert batch.out_cache_loc.tolist() == [100]
 
 
+def test_build_and_apply_dflash_indexed_cache_plan():
+    from sglang.srt.speculative.dflash_utils import (
+        apply_dflash_indexed_cache_plan,
+        build_dflash_indexed_cache_plan,
+    )
+
+    batch = _FakeBatch()
+    batch.out_cache_loc = torch.tensor([100, 101, 102, 103, 104], dtype=torch.int64)
+    plan = build_dflash_indexed_cache_plan(
+        out_cache_loc=batch.out_cache_loc,
+        accepted_indices=torch.tensor([1, 3], dtype=torch.int64),
+    )
+    assert plan.compact_out_cache_loc.tolist() == [101, 103]
+    assert plan.evicted_slots.tolist() == [100, 102, 104]
+    apply_dflash_indexed_cache_plan(batch=batch, cache_plan=plan)
+    assert len(batch.token_to_kv_pool_allocator.freed) == 1
+    assert batch.token_to_kv_pool_allocator.freed[0].tolist() == [100, 102, 104]
+    assert batch.out_cache_loc.tolist() == [101, 103]
+
+
 def test_gather_dflash_committed_hidden_uses_keep_mask():
     from sglang.srt.speculative.dflash_utils import gather_dflash_committed_hidden
 
@@ -285,6 +305,24 @@ def test_gather_dflash_committed_hidden_uses_keep_mask():
         draft_token_num=3,
     )
     assert gathered.tolist() == [[1.0, 10.0], [2.0, 20.0], [4.0, 40.0]]
+
+
+def test_gather_dflash_hidden_by_flat_indices():
+    from sglang.srt.speculative.dflash_utils import gather_dflash_hidden_by_flat_indices
+
+    hidden = torch.tensor(
+        [
+            [1.0, 10.0],
+            [2.0, 20.0],
+            [3.0, 30.0],
+            [4.0, 40.0],
+        ]
+    )
+    gathered = gather_dflash_hidden_by_flat_indices(
+        hidden_states=hidden,
+        accepted_indices=torch.tensor([2, 0], dtype=torch.int64),
+    )
+    assert gathered.tolist() == [[3.0, 30.0], [1.0, 10.0]]
 
 
 def test_compute_dflash_sampling_accept_len_and_bonus_honors_max_steps_and_returns_prefix(

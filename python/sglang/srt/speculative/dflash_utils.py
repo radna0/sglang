@@ -439,6 +439,13 @@ class DFlashTargetOnlyCachePlan:
     clear_token_count: int
 
 
+@dataclass(frozen=True)
+class DFlashIndexedCachePlan:
+    accepted_indices: torch.Tensor
+    compact_out_cache_loc: torch.Tensor
+    evicted_slots: torch.Tensor
+
+
 def commit_dflash_proposed_tokens_to_req(
     *,
     req: Any,
@@ -693,12 +700,14 @@ def apply_dflash_target_only_req_kv_accounting(
         req.kv_allocated_len = req.kv_committed_len
 
 
-def apply_dflash_target_only_mapping_updates(
+def apply_dflash_commit_mapping_updates(
     *,
     batch: Any,
     commit_lens: torch.Tensor,
     commit_lens_cpu: List[int],
-    cache_plan: DFlashTargetOnlyCachePlan,
+    clear_start: torch.Tensor | None = None,
+    clear_end: torch.Tensor | None = None,
+    clear_token_count: int = 0,
 ) -> None:
     from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
 
@@ -712,17 +721,21 @@ def apply_dflash_target_only_mapping_updates(
         batch.out_cache_loc,
         bs,
     )
-    if cache_plan.clear_token_count > 0:
+    if int(clear_token_count) > 0:
+        if clear_start is None or clear_end is None:
+            raise ValueError(
+                "clear_start and clear_end must be provided when clear_token_count > 0."
+            )
         pad_locs = torch.zeros(
-            (cache_plan.clear_token_count,),
+            (int(clear_token_count),),
             dtype=torch.int64,
             device=commit_lens.device,
         )
         assign_req_to_token_pool_func(
             batch.req_pool_indices,
             batch.req_to_token_pool.req_to_token,
-            cache_plan.clear_start,
-            cache_plan.clear_end,
+            clear_start,
+            clear_end,
             pad_locs,
             bs,
         )
@@ -732,6 +745,48 @@ def apply_dflash_target_only_mapping_updates(
         torch.tensor(commit_lens_cpu, dtype=batch.seq_lens_cpu.dtype)
     )
     batch.seq_lens_sum += sum(commit_lens_cpu)
+
+
+def apply_dflash_target_only_mapping_updates(
+    *,
+    batch: Any,
+    commit_lens: torch.Tensor,
+    commit_lens_cpu: List[int],
+    cache_plan: DFlashTargetOnlyCachePlan,
+) -> None:
+    apply_dflash_commit_mapping_updates(
+        batch=batch,
+        commit_lens=commit_lens,
+        commit_lens_cpu=commit_lens_cpu,
+        clear_start=cache_plan.clear_start,
+        clear_end=cache_plan.clear_end,
+        clear_token_count=cache_plan.clear_token_count,
+    )
+
+
+def build_dflash_indexed_cache_plan(
+    *,
+    out_cache_loc: torch.Tensor,
+    accepted_indices: torch.Tensor,
+) -> DFlashIndexedCachePlan:
+    accepted_indices = accepted_indices.to(dtype=torch.int64, device=out_cache_loc.device)
+    evict_mask = torch.ones_like(out_cache_loc, dtype=torch.bool)
+    if accepted_indices.numel() > 0:
+        evict_mask[accepted_indices] = False
+    return DFlashIndexedCachePlan(
+        accepted_indices=accepted_indices,
+        compact_out_cache_loc=out_cache_loc[accepted_indices],
+        evicted_slots=out_cache_loc[evict_mask],
+    )
+
+
+def apply_dflash_indexed_cache_plan(
+    *,
+    batch: Any,
+    cache_plan: DFlashIndexedCachePlan,
+) -> None:
+    batch.token_to_kv_pool_allocator.free(cache_plan.evicted_slots)
+    batch.out_cache_loc = cache_plan.compact_out_cache_loc
 
 
 def gather_dflash_committed_hidden(
@@ -753,6 +808,21 @@ def gather_dflash_committed_hidden(
             f"hidden_states must be 2D or 3D, got shape={tuple(hidden_states.shape)}"
         )
     return hidden[keep_mask]
+
+
+def gather_dflash_hidden_by_flat_indices(
+    *,
+    hidden_states: torch.Tensor,
+    accepted_indices: torch.Tensor,
+) -> torch.Tensor:
+    if hidden_states is None:
+        raise RuntimeError("DFLASH verify requires target hidden states, but got None.")
+    accepted_indices = accepted_indices.to(dtype=torch.int64, device=hidden_states.device)
+    return (
+        hidden_states.index_select(0, accepted_indices)
+        if accepted_indices.numel() > 0
+        else hidden_states[:0]
+    )
 
 
 def can_dflash_slice_qkv_weight(qkv_proj: Any) -> Tuple[bool, str]:

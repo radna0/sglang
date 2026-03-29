@@ -20,8 +20,13 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.server_args import ServerArgs, get_global_server_args
 from sglang.srt.speculative.dflash_info import DFlashDraftInput, DFlashVerifyInput
 from sglang.srt.speculative.dflash_utils import (
+    apply_dflash_commit_mapping_updates,
+    apply_dflash_indexed_cache_plan,
+    apply_dflash_target_only_req_kv_accounting,
+    build_dflash_indexed_cache_plan,
     can_dflash_use_fused_qkv_proj,
     commit_dflash_proposed_tokens_to_req,
+    gather_dflash_hidden_by_flat_indices,
     materialize_dflash_target_only_commit_metadata,
     resolve_dflash_mask_token,
     resolve_dflash_mask_token_id,
@@ -1002,39 +1007,28 @@ class DFlashTreeWorker:
             raise NotImplementedError("DFLASH_TREE currently requires page_size == 1.")
 
         accept_index_flat = accept_index[accept_index != -1].to(torch.int64)
-        evict_mask = torch.ones_like(verify_input.draft_token, dtype=torch.bool)
-        if accept_index_flat.numel() > 0:
-            evict_mask[accept_index_flat] = False
-        batch.token_to_kv_pool_allocator.free(batch.out_cache_loc[evict_mask])
-        batch.out_cache_loc = batch.out_cache_loc[accept_index_flat]
-
-        for req, commit_len in zip(batch.reqs, commit_lens_cpu, strict=True):
-            req.kv_committed_len += int(commit_len)
-            req.kv_allocated_len = req.kv_committed_len
-
-        end_offset = batch.seq_lens + commit_lens.to(batch.seq_lens.dtype)
-        assign_req_to_token_pool_func(
-            batch.req_pool_indices,
-            batch.req_to_token_pool.req_to_token,
-            batch.seq_lens,
-            end_offset,
-            batch.out_cache_loc,
-            bs,
+        cache_plan = build_dflash_indexed_cache_plan(
+            out_cache_loc=batch.out_cache_loc,
+            accepted_indices=accept_index_flat,
+        )
+        apply_dflash_indexed_cache_plan(
+            batch=batch,
+            cache_plan=cache_plan,
         )
 
-        batch.seq_lens.add_(commit_lens.to(batch.seq_lens.dtype))
-        batch.seq_lens_cpu.add_(
-            torch.tensor(commit_lens_cpu, dtype=batch.seq_lens_cpu.dtype)
+        apply_dflash_target_only_req_kv_accounting(
+            reqs=batch.reqs,
+            commit_lens_cpu=commit_lens_cpu,
         )
-        batch.seq_lens_sum += sum(commit_lens_cpu)
+        apply_dflash_commit_mapping_updates(
+            batch=batch,
+            commit_lens=commit_lens,
+            commit_lens_cpu=commit_lens_cpu,
+        )
 
-        hidden = logits_output.hidden_states
-        if hidden is None:
-            raise RuntimeError("DFLASH_TREE verify requires target hidden states, but got None.")
-        next_target_hidden = (
-            hidden.index_select(0, accept_index_flat)
-            if accept_index_flat.numel() > 0
-            else hidden[:0]
+        next_target_hidden = gather_dflash_hidden_by_flat_indices(
+            hidden_states=logits_output.hidden_states,
+            accepted_indices=accept_index_flat,
         )
         logits_output.hidden_states = None
 
