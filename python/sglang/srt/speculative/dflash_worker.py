@@ -2947,7 +2947,7 @@ class DFlashWorker:
 
     def _apply_draft_proposal_to_batch(
         self,
-        batch: ScheduleBatch,
+        batch: Union[ScheduleBatch, ModelWorkerBatch],
         proposal: _DFlashDraftProposal,
     ) -> None:
         bs = batch.batch_size()
@@ -3013,7 +3013,7 @@ class DFlashWorker:
         batch.return_hidden_states = False
 
     def _prepare_for_speculative_decoding(
-        self, batch: ScheduleBatch, draft_input: DFlashDraftInput
+        self, batch: Union[ScheduleBatch, ModelWorkerBatch], draft_input: DFlashDraftInput
     ):
         if batch.forward_mode.is_extend() or batch.forward_mode.is_idle():
             return
@@ -3027,7 +3027,8 @@ class DFlashWorker:
                 "DFLASH does not support grammar-constrained decoding yet."
             )
 
-        batch.maybe_evict_swa()
+        if hasattr(batch, "maybe_evict_swa"):
+            batch.maybe_evict_swa()
 
         bs = batch.batch_size()
 
@@ -3348,7 +3349,7 @@ class DFlashWorker:
 
     def _append_target_hidden_to_draft_kv(
         self,
-        batch: ScheduleBatch,
+        batch: Union[ScheduleBatch, ModelWorkerBatch],
         draft_input: DFlashDraftInput,
     ) -> None:
         """Materialize the target hidden-state features into the draft KV cache.
@@ -3846,12 +3847,12 @@ class DFlashWorker:
                 "Invariant broken: DFLASH batch requested return_logprob, but scheduler should have rejected this request."
             )
 
-        if isinstance(batch, ModelWorkerBatch):
-            # Should not happen for spec-v1 (non-overlap) scheduling, but keep a sane fallback.
-            return self.target_worker.forward_batch_generation(batch, **kwargs)
-
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
-            model_worker_batch = batch.get_model_worker_batch()
+            model_worker_batch = (
+                batch.get_model_worker_batch()
+                if isinstance(batch, ScheduleBatch)
+                else batch
+            )
             model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
 
             batch_result = self.target_worker.forward_batch_generation(
@@ -3974,7 +3975,11 @@ class DFlashWorker:
 
         self._prepare_for_speculative_decoding(batch, draft_input)
 
-        model_worker_batch = batch.get_model_worker_batch()
+        model_worker_batch = (
+            batch.get_model_worker_batch()
+            if isinstance(batch, ScheduleBatch)
+            else batch
+        )
         assert model_worker_batch.forward_mode.is_target_verify()
         verify_input = model_worker_batch.spec_info
         assert isinstance(verify_input, DFlashVerifyInput)
@@ -4190,14 +4195,29 @@ class DFlashWorker:
             )
             setattr(self, "_logged_ssd_stats", True)
 
+        next_token_ids = new_verified_id
+        accept_lens = None
+        if isinstance(batch, ModelWorkerBatch):
+            overlap_tokens = getattr(verify_input, "target_only_overlap_tokens", None)
+            overlap_accept_lens = getattr(
+                verify_input, "target_only_overlap_accept_lens", None
+            )
+            if overlap_tokens is None or overlap_accept_lens is None:
+                raise RuntimeError(
+                    "DFLASH spec-v2 verify currently requires target_only compact overlap payloads."
+                )
+            next_token_ids = overlap_tokens
+            accept_lens = overlap_accept_lens
+
         return GenerationBatchResult(
             logits_output=logits_output,
-            next_token_ids=new_verified_id,
+            next_token_ids=next_token_ids,
             next_draft_input=self._build_future_draft_input(
                 draft_input, verify_done=verify_done
             ),
             num_accepted_tokens=num_accepted_tokens,
             accept_length_per_req_cpu=accept_length_per_req_cpu,
+            accept_lens=accept_lens,
             spec_ssd_hit_ct=[
                 int(getattr(req, "spec_ssd_hit_ct", 0)) for req in batch.reqs
             ],

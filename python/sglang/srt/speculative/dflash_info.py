@@ -533,6 +533,10 @@ class DFlashVerifyInput(SpecInput):
             next_target_hidden: tensor [sum(commit_lens), feature_dim]
             accept_length_per_req_cpu: list[int] (accepted draft tokens per request)
         """
+        setattr(self, "target_only_overlap_tokens", None)
+        setattr(self, "target_only_overlap_offsets", None)
+        setattr(self, "target_only_overlap_accept_lens", None)
+
         if batch.forward_mode.is_idle():
             empty = torch.empty((0,), dtype=torch.int64, device=batch.device)
             return empty, empty.to(torch.int32), empty, [], None
@@ -1251,6 +1255,9 @@ class DFlashVerifyInput(SpecInput):
                 target_predict=target_predict,
                 accept_len=accept_len,
             )
+            self.target_only_overlap_tokens = packed_target_only.proposed_flat
+            self.target_only_overlap_offsets = packed_target_only.commit_offsets
+            self.target_only_overlap_accept_lens = packed_target_only.commit_lens
             packed = packed_target_only.proposed_flat.cpu()
             target_commit_offsets_cpu = packed_target_only.commit_offsets.cpu()
         if timing_detail:

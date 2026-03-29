@@ -954,6 +954,38 @@ def pack_dflash_target_only_commits(
     )
 
 
+def resolve_dflash_overlap_token_ids(
+    *,
+    flat_token_ids: torch.Tensor,
+    accept_lens: torch.Tensor,
+) -> list[list[int]]:
+    """Slice compact DFLASH overlap outputs into per-request accepted-token lists."""
+    if flat_token_ids.ndim != 1:
+        raise ValueError(
+            f"flat_token_ids must be 1D, got shape={tuple(flat_token_ids.shape)}"
+        )
+    if accept_lens.ndim != 1:
+        raise ValueError(
+            f"accept_lens must be 1D, got shape={tuple(accept_lens.shape)}"
+        )
+
+    flat_cpu = flat_token_ids.to(torch.int64).tolist()
+    lens_cpu = accept_lens.to(torch.int64).tolist()
+    out: list[list[int]] = []
+    offset = 0
+    for commit_len in lens_cpu:
+        next_offset = offset + int(commit_len)
+        out.append(flat_cpu[offset:next_offset])
+        offset = next_offset
+
+    if offset != len(flat_cpu):
+        raise ValueError(
+            "DFLASH overlap compact token layout mismatch: "
+            f"consumed={offset} total={len(flat_cpu)} lens={lens_cpu}"
+        )
+    return out
+
+
 def compute_dflash_sampling_accept_len_and_bonus(
     *,
     candidates: torch.Tensor,

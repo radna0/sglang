@@ -564,9 +564,18 @@ got us there and verify each dependency in reverse.
       the scheduler already expects
     - `ScheduleBatch` can now re-enter decode from DFlash draft state
     - graph-runner verify-input construction is now explicit for DFlash
+    - `ModelWorkerBatch` now carries the DFlash-owned cache references needed by
+      verify/commit (`req_to_token_pool`, allocator, tree cache) and exposes the
+      minimal batch/device helpers DFlash needs on the overlap path
+    - scheduler output processing now has a DFlash-specific compact-overlap
+      consumer, instead of assuming Eagle's fixed-stride accepted-token layout
+    - target-only verify now records a compact overlap payload
+      (`proposed_flat`, `commit_lens`) for future spec-v2 replay/output handling
+    - `python/sglang/srt/speculative/dflash_worker_v2.py` now exists as the
+      DFlash-native worker-v2 entry point, even though it is not selected yet
     - the overlap gate is still disabled
-    - `scheduler.py` still needs the live overlap producer/consumer branch for
-      DFlash-specific execution, rather than only generic result-field reuse
+    - `scheduler.py` / `spec_info.py` still keep DFlash overlap disabled, so this
+      is infrastructure only, not a live enabled path yet
 
 18. `[pending]` Add DFlash-specific overlap safety checks:
     - grammar interaction

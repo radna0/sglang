@@ -2238,6 +2238,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mamba_track_indices=self.mamba_track_indices,
             mamba_track_mask=self.mamba_track_mask,
             mamba_track_seqlens=self.mamba_track_seqlens,
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            tree_cache=self.tree_cache,
+            enable_overlap=self.enable_overlap,
         )
 
     def copy(self):
@@ -2418,6 +2422,13 @@ class ModelWorkerBatch:
     reqs: Optional[List[Req]] = None
     has_grammar: bool = False
 
+    # DFlash overlap bring-up still needs access to scheduler-owned cache state
+    # during verify/commit.
+    req_to_token_pool: Optional[ReqToTokenPool] = None
+    token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator] = None
+    tree_cache: Optional[BasePrefixCache] = None
+    enable_overlap: bool = False
+
     # For hidden states before normal
     return_hidden_states_before_norm: bool = False
 
@@ -2425,3 +2436,19 @@ class ModelWorkerBatch:
     mamba_track_indices: Optional[torch.Tensor] = None  # shape: [b], int64
     mamba_track_mask: Optional[torch.Tensor] = None  # shape: [b], bool
     mamba_track_seqlens: Optional[torch.Tensor] = None  # shape: [b], int64
+
+    @property
+    def device(self) -> torch.device:
+        return self.input_ids.device
+
+    def batch_size(self) -> int:
+        return int(self.seq_lens.shape[0])
+
+    def maybe_evict_swa(self):
+        return
+
+    def maybe_wait_verify_done(self):
+        spec_info = self.spec_info
+        verify_done = getattr(spec_info, "verify_done", None)
+        if verify_done is not None:
+            verify_done.synchronize()

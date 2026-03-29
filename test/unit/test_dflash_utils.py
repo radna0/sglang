@@ -173,6 +173,16 @@ def test_pack_dflash_target_only_commits():
     assert packed.default_new_verified_id.tolist() == [13, 21]
 
 
+def test_resolve_dflash_overlap_token_ids():
+    from sglang.srt.speculative.dflash_utils import resolve_dflash_overlap_token_ids
+
+    got = resolve_dflash_overlap_token_ids(
+        flat_token_ids=torch.tensor([11, 12, 13, 21], dtype=torch.int64),
+        accept_lens=torch.tensor([3, 1], dtype=torch.int32),
+    )
+    assert got == [[11, 12, 13], [21]]
+
+
 def test_materialize_dflash_target_only_commit_metadata():
     from sglang.srt.speculative.dflash_utils import (
         DFlashTargetOnlyCommitResult,

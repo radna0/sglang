@@ -23,6 +23,7 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.speculative.dflash_utils import resolve_dflash_overlap_token_ids
 from sglang.srt.tracing.trace import trace_slice, trace_slice_batch, trace_slice_end
 
 if TYPE_CHECKING:
@@ -350,19 +351,26 @@ class SchedulerOutputProcessorMixin:
         assert result.next_token_ids.is_cpu
         assert result.accept_lens.is_cpu
 
-        next_token_ids = result.next_token_ids.tolist()
         accept_lens = result.accept_lens.tolist()
         result.num_accepted_tokens = sum(accept_lens) - len(batch.reqs)
-        result.accept_length_per_req_cpu = [x - 1 for x in accept_lens]
+        if result.accept_length_per_req_cpu is None:
+            result.accept_length_per_req_cpu = [x - 1 for x in accept_lens]
 
-        predict_tokens = []
-        stride = self.draft_worker.speculative_num_draft_tokens
+        if batch.spec_algorithm.is_dflash():
+            predict_tokens = resolve_dflash_overlap_token_ids(
+                flat_token_ids=result.next_token_ids,
+                accept_lens=result.accept_lens,
+            )
+        else:
+            next_token_ids = result.next_token_ids.tolist()
+            stride = self.draft_worker.speculative_num_draft_tokens
+            predict_tokens = [
+                next_token_ids[i * stride : i * stride + accept_lens[i]]
+                for i, _req in enumerate(batch.reqs)
+            ]
 
         for i, req in enumerate(batch.reqs):
             req.kv_committed_len += accept_lens[i]
-            predict_tokens.append(
-                next_token_ids[i * stride : i * stride + accept_lens[i]]
-            )
             req.spec_verify_ct += 1
 
             accepted_draft_tokens = result.accept_length_per_req_cpu[i]
