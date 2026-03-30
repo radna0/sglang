@@ -1,5 +1,5 @@
 {
-  "converted_config": "/workspace/sglang_gpt_oss_care_runs/gptoss120b_care_u_convert_only_sweep_20260315_0622/care_u_r1024/conversion/converted_checkpoint/config.json",
+  "converted_config": "{{MLA_ROOT}}/data/hf_runs/gptoss120b_care_u_convert_only_sweep_20260315_0622/care_u_r1024/conversion/converted_checkpoint/config.json",
   "interpretation": {
     "current_split_mismatch": "Original GPT-OSS applies RoPE to the full head_dim. Any nonzero qk_nope_head_dim forces some originally-RoPE channels into a non-RoPE path.",
     "r1024_note": "If r=1024 is already enough to represent the unique noPE+V rows exactly, then remaining error is dominated by attention-geometry mismatch rather than latent-rank shortage.",
@@ -300,7 +300,7 @@
     "qk_nope_head_dim": 32,
     "qk_rope_head_dim": 32
   },
-  "model_path": "/workspace/offload_root/gpt-oss-120b",
+  "model_path": "{{MLA_ROOT}}/repos/MLA_TRANSFER/workspace/offload_root/gpt-oss-120b",
   "original_geometry": {
     "gpt_oss_original_rope_mode": "full_head_rope",
     "head_dim": 64,

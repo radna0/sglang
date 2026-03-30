@@ -94,8 +94,8 @@
     }
   },
   "prompt": "Question: What is 2 + 2?\\nAnswer:",
-  "student_model": "/workspace/sglang_gpt_oss_care_runs/gptoss120b_gptoss_native_mla_r1024_gqarope_exp1",
-  "teacher_model": "/workspace/offload_root/gpt-oss-120b",
+  "student_model": "{{MLA_ROOT}}/data/hf_runs/gptoss120b_gptoss_native_mla_r1024_gqarope_exp1",
+  "teacher_model": "{{MLA_ROOT}}/repos/MLA_TRANSFER/workspace/offload_root/gpt-oss-120b",
   "trace_layers": [
     0,
     1,
