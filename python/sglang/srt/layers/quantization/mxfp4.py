@@ -76,10 +76,21 @@ def _get_flashinfer_mxfp4_device_permute_indices(
     epilogue_tile_m: int,
     num_elts_per_sf: Optional[int] = None,
 ) -> torch.Tensor:
+    x_for_perm = x
+    # FlashInfer's row-index helper requires K to be 4-aligned for scale tensors.
+    # GPT-OSS MXFP4 scale matrices use hidden_size // 32 columns, which is 90 for
+    # the 2880-wide GPT-OSS family and therefore not 4-aligned. We only need the
+    # permutation row ordering here, so pad columns for the helper call and keep the
+    # original storage/layout unchanged for the actual checkpoint tensors.
+    if x_for_perm.dim() == 2 and x_for_perm.shape[1] % 4 != 0:
+        x_for_perm = torch.nn.functional.pad(
+            x_for_perm, (0, 4 - (x_for_perm.shape[1] % 4)), value=0
+        )
+
     extra_args = {} if num_elts_per_sf is None else {"num_elts_per_sf": num_elts_per_sf}
     permute_indices = get_w2_permute_indices_with_cache(
         _flashinfer_mxfp4_permute_indices_cache,
-        x,
+        x_for_perm,
         epilogue_tile_m,
         **extra_args,
     )
@@ -87,10 +98,10 @@ def _get_flashinfer_mxfp4_device_permute_indices(
     device_index = -1 if x.device.index is None else x.device.index
     num_elts_per_sf_key = -1 if num_elts_per_sf is None else num_elts_per_sf
     cache_key = (
-        tuple(x.shape),
+        tuple(x_for_perm.shape),
         epilogue_tile_m,
         num_elts_per_sf_key,
-        x.device.type,
+        x_for_perm.device.type,
         device_index,
     )
     cached_device_indices = _flashinfer_mxfp4_permute_indices_device_cache.get(
@@ -137,8 +148,60 @@ def _swizzle_mxfp4(quant_tensor, scale, num_warps):
     """weight swizzle for mxfp4 moe, used for OAI mxfp4 kernel"""
     import triton_kernels.matmul_ogs_details.opt_flags as opt_flags
     from triton_kernels.numerics import InFlexData
-    from triton_kernels.tensor import FP4, convert_layout, wrap_torch_tensor
+    from triton_kernels.tensor import (
+        FP4,
+        Storage,
+        Tensor,
+        convert_layout,
+        wrap_torch_tensor,
+    )
     from triton_kernels.tensor_details import layout
+
+    def _convert_layout_chunked(
+        tensor: torch.Tensor,
+        layout_obj,
+        layout_opts: dict,
+        *,
+        chunk_dim: int,
+        chunk_size: int,
+        dtype,
+    ):
+        if tensor.shape[chunk_dim] <= chunk_size:
+            return convert_layout(
+                wrap_torch_tensor(tensor, dtype=dtype), layout_obj, **layout_opts
+            )
+
+        chunks = []
+        template_shape = None
+        output_dtype = None
+        for start in range(0, tensor.shape[chunk_dim], chunk_size):
+            stop = min(start + chunk_size, tensor.shape[chunk_dim])
+            chunk = tensor.narrow(chunk_dim, start, stop - start).contiguous()
+            converted = convert_layout(
+                wrap_torch_tensor(chunk, dtype=dtype), layout_obj, **layout_opts
+            )
+            if template_shape is None:
+                template_shape = list(converted.shape)
+                output_dtype = converted.dtype
+            else:
+                assert (
+                    len(converted.shape) == len(template_shape)
+                    and converted.shape[1:] == template_shape[1:]
+                ), "Chunked swizzle produced inconsistent logical shapes"
+            chunks.append(converted.data)
+            del converted, chunk
+            torch.cuda.empty_cache()
+
+        assert template_shape is not None and output_dtype is not None
+        template_shape[chunk_dim] = tensor.shape[chunk_dim]
+        return Tensor(
+            Storage(
+                torch.cat(chunks, dim=chunk_dim),
+                layout_obj(template_shape, **layout_opts),
+            ),
+            dtype=output_dtype,
+            shape=template_shape,
+        )
 
     if is_sm120_supported():
         # SM120 desktop Blackwell does not support the persistent/TMA MXFP4 path.
@@ -179,10 +242,29 @@ def _swizzle_mxfp4(quant_tensor, scale, num_warps):
     # transpose the tensor so that the quantization axis is on dim1
     quant_tensor = quant_tensor.transpose(-2, -1)
     scale = scale.transpose(-2, -1)
-    quant_tensor = convert_layout(
-        wrap_torch_tensor(quant_tensor, dtype=FP4), value_layout, **value_layout_opts
+    # The Hopper MXFP4 swizzle can briefly allocate about another GiB of scratch
+    # memory on top of the already-loaded expert shard. Chunk the batch dimension
+    # so 1xH100 startup stays below the peak-memory cliff without changing the
+    # resulting layout.
+    chunk_dim = 0
+    quant_chunk_size = 1 if quant_tensor.shape[chunk_dim] > 1 else 1
+    scale_chunk_size = 1 if scale.shape[chunk_dim] > 1 else 1
+    quant_tensor = _convert_layout_chunked(
+        quant_tensor,
+        value_layout,
+        value_layout_opts,
+        chunk_dim=chunk_dim,
+        chunk_size=quant_chunk_size,
+        dtype=FP4,
     )
-    scale = convert_layout(wrap_torch_tensor(scale), scale_layout, **scale_layout_opts)
+    scale = _convert_layout_chunked(
+        scale,
+        scale_layout,
+        scale_layout_opts,
+        chunk_dim=chunk_dim,
+        chunk_size=scale_chunk_size,
+        dtype=None,
+    )
     return quant_tensor, InFlexData(), scale
 
 
@@ -707,7 +789,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             layer.w13_weight_bias = Parameter(w13_weight_bias, requires_grad=False)
             layer.w2_weight_bias = Parameter(w2_weight_bias, requires_grad=False)
 
-            num_warps = 8
+            # Keep the Hopper MXFP4 scale layout on 4 warps so triton_kernels
+            # selects the 128-wide safe matmul specialization instead of the
+            # 256-wide variant that currently fails codegen on this stack.
+            num_warps = 4
 
             w13_weight, w13_flex, w13_scale = _swizzle_mxfp4(
                 layer.w13_weight, layer.w13_weight_scale, num_warps
@@ -716,31 +801,106 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 layer.w2_weight, layer.w2_weight_scale, num_warps
             )
 
+            # triton_kernels.matmul_ogs infers W_TRANSPOSE from the *physical*
+            # storage stride, not from the logical shape metadata. Keep the
+            # logical GPT-OSS shape, but materialize the Hopper MXFP4 expert
+            # shards as transposed storage views so the kernel sees the
+            # expected column-major layout.
+            w13_weight.storage.data = w13_weight.storage.data.transpose(-2, -1)
+            w2_weight.storage.data = w2_weight.storage.data.transpose(-2, -1)
+
             self.w13_precision_config = PrecisionConfig(
                 weight_scale=w13_scale, flex_ctx=FlexCtx(rhs_data=w13_flex)
             )
             self.w2_precision_config = PrecisionConfig(
                 weight_scale=w2_scale, flex_ctx=FlexCtx(rhs_data=w2_flex)
             )
+            logger.info(
+                "GPT-OSS triton_kernels MXFP4 scale layouts: w13=%s num_warps=%s shape=%s stride=%s w13_weight_stride=%s w2=%s num_warps=%s shape=%s stride=%s w2_weight_stride=%s",
+                type(w13_scale.storage.layout).__name__,
+                getattr(w13_scale.storage.layout, "num_warps", None),
+                tuple(w13_scale.shape),
+                tuple(w13_scale.storage.data.stride()),
+                tuple(w13_weight.storage.data.stride()),
+                type(w2_scale.storage.layout).__name__,
+                getattr(w2_scale.storage.layout, "num_warps", None),
+                tuple(w2_scale.shape),
+                tuple(w2_scale.storage.data.stride()),
+                tuple(w2_weight.storage.data.stride()),
+            )
 
             self.w13_weight_triton_tensor = w13_weight
             self.w2_weight_triton_tensor = w2_weight
+            # The packed MXFP4 storage keeps a swizzled 4D backing tensor, but
+            # the external MoE runner expects the logical 3D matrix shape.
+            # Match the GPT-OSS/Transformers MXFP4 contract here so the
+            # triton_kernels runner sees the real hidden / intermediate widths
+            # instead of the packed block dimensions.
+            logical_w13_shape = [
+                layer.num_local_experts,
+                layer.hidden_size,
+                2 * self.intermediate_size_per_partition,
+            ]
+            logical_w2_shape = [
+                layer.num_local_experts,
+                self.intermediate_size_per_partition,
+                layer.hidden_size,
+            ]
+            self.w13_weight_triton_tensor.shape = logical_w13_shape
+            self.w2_weight_triton_tensor.shape = logical_w2_shape
             del layer.w13_weight
             del layer.w2_weight
         else:
             from triton_kernels.numerics_details.mxfp import upcast_from_mxfp
 
-            w13_weight = upcast_from_mxfp(
+            def _upcast_from_mxfp_chunked(
+                tensor: torch.Tensor,
+                scale: torch.Tensor,
+                target_dtype: torch.dtype,
+                *,
+                chunk_dim: int,
+                chunk_size: int,
+            ) -> torch.Tensor:
+                if tensor.shape[chunk_dim] <= chunk_size:
+                    return upcast_from_mxfp(
+                        tensor, scale, target_dtype=target_dtype, axis=-1
+                    )
+
+                chunks = []
+                for start in range(0, tensor.shape[chunk_dim], chunk_size):
+                    stop = min(start + chunk_size, tensor.shape[chunk_dim])
+                    tensor_chunk = tensor.narrow(
+                        chunk_dim, start, stop - start
+                    ).contiguous()
+                    scale_chunk = scale.narrow(chunk_dim, start, stop - start).contiguous()
+                    chunks.append(
+                        upcast_from_mxfp(
+                            tensor_chunk,
+                            scale_chunk,
+                            target_dtype=target_dtype,
+                            axis=-1,
+                        )
+                    )
+                    del tensor_chunk, scale_chunk
+                    torch.cuda.empty_cache()
+
+                return torch.cat(chunks, dim=chunk_dim)
+
+            chunk_dim = 0
+            chunk_size = 1
+            w13_weight = _upcast_from_mxfp_chunked(
                 layer.w13_weight,
                 layer.w13_weight_scale,
                 target_dtype=torch.bfloat16,
-                axis=-1,
+                chunk_dim=chunk_dim,
+                chunk_size=chunk_size,
             )
-            w2_weight = upcast_from_mxfp(
+            w2_weight = _upcast_from_mxfp_chunked(
                 layer.w2_weight,
                 layer.w2_weight_scale,
                 target_dtype=torch.bfloat16,
-                axis=-1,
+                chunk_dim=chunk_dim,
+                chunk_size=chunk_size,
             )
             del layer.w13_weight
             del layer.w2_weight

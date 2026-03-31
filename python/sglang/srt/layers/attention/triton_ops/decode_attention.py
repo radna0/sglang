@@ -25,8 +25,9 @@ import logging
 import triton
 import triton.language as tl
 
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_cuda, is_hip
 
+_is_cuda = is_cuda()
 _is_hip = is_hip()
 
 logger = logging.getLogger(__name__)
@@ -445,8 +446,15 @@ def _decode_grouped_att_m_fwd(
     if _is_hip and Lk >= 576:
         BLOCK = 16
 
-    if Lk == 576:
+    if Lk >= 1024:
+        # Absorbed GPT-OSS MLA checkpoints can expose a wider decode-side query
+        # layout. Use a smaller tile to keep the kernel compilable on Hopper.
         BLOCK_DMODEL = 512
+        BLOCK_DPE = 0
+    elif Lk == 576:
+        # Keep the Triton decode kernel within Hopper shared-memory limits on the
+        # larger GPT-OSS MLA head shape.
+        BLOCK_DMODEL = 256
         BLOCK_DPE = 64
     elif Lk == 288:
         BLOCK_DMODEL = 256
@@ -473,6 +481,11 @@ def _decode_grouped_att_m_fwd(
         # https://rocm.docs.amd.com/en/docs-6.2.0/how-to/llm-fine-tuning-optimization/optimizing-triton-kernel.html
         # https://github.com/triton-lang/triton/blob/main/third_party/amd/backend/compiler.py
         extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 2}
+        num_stages = 1
+    elif _is_cuda and Lk >= 576:
+        # Large-k decode on Hopper can exceed the per-kernel shared-memory budget with
+        # the default 2-stage launch configuration. Use a single stage here to keep the
+        # kernel compilable while preserving correctness.
         num_stages = 1
 
     _fwd_grouped_kernel_stage1[grid](

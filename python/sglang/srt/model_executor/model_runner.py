@@ -2141,6 +2141,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             batch_size=batch_size,
             input_ids=buffers.input_ids,
             req_pool_indices=buffers.req_pool_indices,
+            req_pool_indices_cpu=buffers.req_pool_indices.cpu(),
             seq_lens=buffers.seq_lens,
             seq_lens_cpu=buffers.seq_lens_cpu,
             next_token_logits_buffer=buffers.next_token_logits_buffer,

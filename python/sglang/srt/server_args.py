@@ -487,6 +487,7 @@ class ServerArgs:
     speculative_moe_runner_backend: Optional[str] = None
     speculative_moe_a2a_backend: Optional[str] = None
     speculative_draft_model_quantization: Optional[str] = None
+    speculative_draft_kv_cache_dtype: Optional[str] = None
 
     # Speculative decoding (ngram)
     speculative_ngram_min_match_window_size: int = 1
@@ -4531,6 +4532,12 @@ class ServerArgs:
             choices=SPECULATIVE_DRAFT_MODEL_QUANTIZATION_CHOICES,
             default=ServerArgs.speculative_draft_model_quantization,
             help="The quantization method for speculative model.",
+        )
+        parser.add_argument(
+            "--speculative-draft-kv-cache-dtype",
+            type=str,
+            default=ServerArgs.speculative_draft_kv_cache_dtype,
+            help="KV cache dtype for the speculative draft model. Defaults to bf16 for DFlash.",
         )
 
         # Speculative decoding (ngram)

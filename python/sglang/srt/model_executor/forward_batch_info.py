@@ -304,6 +304,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # Optional seq_lens on cpu
     seq_lens_cpu: Optional[torch.Tensor] = None
+    # Optional req_pool_indices on cpu. Needed by graph-captured backends that
+    # must not touch CUDA tensors with .tolist() during capture.
+    req_pool_indices_cpu: Optional[torch.Tensor] = None
 
     # For logprob
     return_logprob: bool = False
@@ -433,6 +436,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             batch_size=len(batch.seq_lens),
             input_ids=batch.input_ids,
             req_pool_indices=batch.req_pool_indices,
+            req_pool_indices_cpu=batch.req_pool_indices.cpu(),
             seq_lens=batch.seq_lens,
             out_cache_loc=batch.out_cache_loc,
             mamba_track_indices=batch.mamba_track_indices,
@@ -916,6 +920,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             self.seq_lens_cpu = self._pad_tensor_to_size(
                 self.seq_lens_cpu, bs, value=seq_len_fill_value
             )
+        if self.req_pool_indices_cpu is not None:
+            self.req_pool_indices_cpu = self._pad_tensor_to_size(
+                self.req_pool_indices_cpu, bs, value=0
+            )
 
         self.out_cache_loc = self._pad_tensor_to_size(self.out_cache_loc, num_tokens)
         if self.encoder_lens is not None:
@@ -991,6 +999,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 self.positions = self.positions[:num_tokens]
                 self.seq_lens = self.seq_lens[:bs]
                 self.req_pool_indices = self.req_pool_indices[:bs]
+                if self.req_pool_indices_cpu is not None:
+                    self.req_pool_indices_cpu = self.req_pool_indices_cpu[:bs]
                 if self.seq_lens_cpu is not None:
                     self.seq_lens_cpu = self.seq_lens_cpu[:bs]
                 logits_output.next_token_logits = logits_output.next_token_logits[

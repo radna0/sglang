@@ -27,6 +27,7 @@ from sglang.srt.mem_cache.memory_pool import (
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool, SWATokenToKVPoolAllocator
 from sglang.srt.speculative.dflash_utils import scale_kv_cell_size_per_token_for_dflash
+from sglang.srt.model_executor.mla_utils import get_flashmla_mla_kv_cache_dim
 from sglang.srt.utils.common import (
     get_available_gpu_memory,
     is_float4_e2m1fn_x2,
@@ -57,40 +58,41 @@ class ModelRunnerKVCacheMixin:
     def get_cell_size_per_token(self: ModelRunner, num_layers: int) -> int:
         kv_size = torch._utils._element_size(self.kv_cache_dtype)
         if self.use_mla_backend:
-            qk_rope_head_dim = int(self.model_config.qk_rope_head_dim)
+            kv_cache_dim = self.calculate_mla_kv_cache_dim()
             kv_rank_schedule = getattr(
                 self.model_config, "kv_lora_rank_per_layer", None
             )
             if self.model_config.is_hybrid_swa and kv_rank_schedule is not None:
+                mla_rope_num_kv_heads = int(
+                    getattr(self.model_config, "mla_rope_num_kv_heads", 1) or 1
+                )
                 cell_size = (
                     sum(
-                        int(kv_rank_schedule[layer_id]) + qk_rope_head_dim
+                        get_flashmla_mla_kv_cache_dim(
+                            int(kv_rank_schedule[layer_id]),
+                            int(self.model_config.qk_rope_head_dim),
+                            mla_rope_num_kv_heads,
+                            getattr(self.server_args, "attention_backend", None),
+                        )
                         for layer_id in self.model_config.full_attention_layer_ids
                     )
                     + sum(
-                        int(kv_rank_schedule[layer_id]) + qk_rope_head_dim
+                        get_flashmla_mla_kv_cache_dim(
+                            int(kv_rank_schedule[layer_id]),
+                            int(self.model_config.qk_rope_head_dim),
+                            mla_rope_num_kv_heads,
+                            getattr(self.server_args, "attention_backend", None),
+                        )
                         for layer_id in self.model_config.swa_attention_layer_ids
                     )
                 ) * kv_size
             else:
-                cell_size = (
-                    (self.model_config.kv_lora_rank + qk_rope_head_dim)
-                    * num_layers
-                    * kv_size
-                )
+                cell_size = kv_cache_dim * num_layers * kv_size
             if is_float4_e2m1fn_x2(self.kv_cache_dtype):
                 # kv_scale_buffer
                 scale_block_size = 16
                 cell_size = (cell_size // 2) + (
-                    (
-                        (
-                            self.model_config.kv_lora_rank
-                            + self.model_config.qk_rope_head_dim
-                        )
-                        // scale_block_size
-                    )
-                    * num_layers
-                    * kv_size
+                    (kv_cache_dim // scale_block_size) * num_layers * kv_size
                 )
 
             # Add indexer KV cache overhead for NSA models (DeepSeek V3.2)
@@ -270,7 +272,30 @@ class ModelRunnerKVCacheMixin:
         kv_cache_dtype = self.kv_cache_dtype
         kv_lora_rank = self.model_config.kv_lora_rank
         qk_rope_head_dim = self.model_config.qk_rope_head_dim
-        kv_cache_dim = kv_lora_rank + qk_rope_head_dim  # default mla kv cache dim
+        mla_rope_num_kv_heads = int(
+            getattr(self.model_config, "mla_rope_num_kv_heads", 1) or 1
+        )
+        kv_cache_dim = kv_lora_rank + qk_rope_head_dim * mla_rope_num_kv_heads
+
+        is_gpt_oss_mla = any(
+            arch in self.model_config.hf_config.architectures
+            for arch in ("GptOssMlaForCausalLM", "GptOssForCausalLM")
+        )
+        if is_gpt_oss_mla:
+            flashmla_kv_cache_dim = get_flashmla_mla_kv_cache_dim(
+                kv_lora_rank,
+                qk_rope_head_dim,
+                mla_rope_num_kv_heads,
+                getattr(self.server_args, "attention_backend", None),
+            )
+            if flashmla_kv_cache_dim == kv_cache_dim and kv_cache_dim > 576:
+                logger.warning(
+                    "GPT-OSS MLA cache width %d exceeds the legacy 576-wide floor; "
+                    "this rank uses the native rope-head geometry and may require a "
+                    "FlashMLA/kernel update if the backend cannot handle it.",
+                    kv_cache_dim,
+                )
+            return flashmla_kv_cache_dim
 
         # For non-NSA models, MLA kv cache dim is simply kv_lora_rank + qk_rope_head_dim
         if not is_nsa_model:
@@ -350,19 +375,28 @@ class ModelRunnerKVCacheMixin:
 
         kv_size = torch._utils._element_size(self.kv_cache_dtype)
 
-        # Full layer per-token memory
-        full_per_token = (
-            self.model_config.get_num_kv_heads(get_attention_tp_size())
-            * (self.model_config.head_dim + self.model_config.v_head_dim)
-            * kv_size
-        )
+        if self.use_mla_backend:
+            # GPT-OSS / MLA layers store a shared latent vector plus the RoPE tail.
+            # Full and SWA layers consume the same latent cache width, so using the
+            # GQA-style head geometry here overestimates memory and can produce a
+            # negative token budget even when the checkpoint is otherwise loadable.
+            mla_cache_dim = self.calculate_mla_kv_cache_dim()
+            full_per_token = mla_cache_dim * kv_size
+            swa_per_token = mla_cache_dim * kv_size
+        else:
+            # Full layer per-token memory
+            full_per_token = (
+                self.model_config.get_num_kv_heads(get_attention_tp_size())
+                * (self.model_config.head_dim + self.model_config.v_head_dim)
+                * kv_size
+            )
 
-        # SWA layer per-token memory
-        swa_per_token = (
-            self.model_config.get_swa_num_kv_heads(get_attention_tp_size())
-            * (self.model_config.swa_head_dim + self.model_config.swa_v_head_dim)
-            * kv_size
-        )
+            # SWA layer per-token memory
+            swa_per_token = (
+                self.model_config.get_swa_num_kv_heads(get_attention_tp_size())
+                * (self.model_config.swa_head_dim + self.model_config.swa_v_head_dim)
+                * kv_size
+            )
 
         # Total memory available from profile
         total_memory = self.max_total_num_tokens * (

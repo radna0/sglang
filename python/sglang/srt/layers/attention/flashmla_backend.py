@@ -5,6 +5,7 @@ Support attention backend for FlashMLA.
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Optional, Tuple, Union
 
@@ -27,6 +28,16 @@ if TYPE_CHECKING:
 
 PAGE_SIZE = 64
 FLASHMLA_SPARSE_TOPK_ALIGNMENT = 128
+
+
+def _maybe_sync_debug_flashmla(stage: str) -> None:
+    if not bool(int(os.getenv("SGLANG_GPTOSS_DEBUG_FLASHMLA_SYNC", "0"))):
+        return
+    if not torch.cuda.is_available():
+        return
+    if torch.cuda.is_current_stream_capturing():
+        return
+    torch.cuda.synchronize()
 
 
 @dataclass
@@ -81,10 +92,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         self.scaling = model_runner.model_config.scaling
         self.data_type = model_runner.kv_cache_dtype
         self.q_data_type = model_runner.dtype
-        self.kv_cache_dim = self.kv_lora_rank + self.qk_rope_head_dim
-        # Align to 64 for FlashMLA kernels (which often require 576)
-        if self.kv_cache_dim % 64 != 0:
-            self.kv_cache_dim = (self.kv_cache_dim + 63) // 64 * 64
+        self.kv_cache_dim = model_runner.calculate_mla_kv_cache_dim()
 
         self.is_fp8_kvcache = self.data_type in {
             torch.float8_e4m3fn,
@@ -151,6 +159,19 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             FLASHMLA_SPARSE_TOPK_ALIGNMENT
         )
 
+    def _maybe_translate_swa_indices(
+        self,
+        token_locs: torch.Tensor,
+        token_to_kv_pool,
+        use_sliding: bool,
+    ) -> torch.Tensor:
+        if (
+            use_sliding
+            and hasattr(token_to_kv_pool, "translate_loc_from_full_to_swa")
+        ):
+            token_locs = token_to_kv_pool.translate_loc_from_full_to_swa(token_locs)
+        return token_locs.to(torch.long)
+
     def _build_decode_sliding_indices(
         self,
         seq_lens_cpu: torch.Tensor,
@@ -180,7 +201,11 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        req_pool_indices = [int(x) for x in forward_batch.req_pool_indices.tolist()]
+        token_to_kv_pool = forward_batch.token_to_kv_pool
+        req_pool_indices_cpu = getattr(forward_batch, "req_pool_indices_cpu", None)
+        if req_pool_indices_cpu is None:
+            req_pool_indices_cpu = forward_batch.req_pool_indices.detach().cpu()
+        req_pool_indices = [int(x) for x in req_pool_indices_cpu.tolist()]
         seq_lens_cpu = [int(x) for x in forward_batch.seq_lens_cpu.tolist()]
         extend_prefix_lens_cpu = [int(x) for x in forward_batch.extend_prefix_lens_cpu]
         extend_seq_lens_cpu = [int(x) for x in forward_batch.extend_seq_lens_cpu]
@@ -192,6 +217,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         use_sliding = (
             layer.sliding_window_size is not None and layer.sliding_window_size > -1
         )
+        sliding_window = int(layer.sliding_window_size) if use_sliding else -1
 
         for req_idx, seq_len, prefix_len, extend_len in zip(
             req_pool_indices,
@@ -199,25 +225,48 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             extend_prefix_lens_cpu,
             extend_seq_lens_cpu,
         ):
-            token_locs = self.req_to_token[req_idx, :seq_len].to(torch.long)
+            if use_sliding:
+                visible_start = max(0, prefix_len - sliding_window)
+            else:
+                visible_start = 0
+            token_locs = self.req_to_token[req_idx, visible_start:seq_len].detach().to(
+                torch.long
+            )
+            token_locs = self._maybe_translate_swa_indices(
+                token_locs, token_to_kv_pool, use_sliding
+            )
+            if not torch.cuda.is_current_stream_capturing():
+                token_locs_cpu = token_locs.cpu()
+                if token_locs_cpu.numel() > 0:
+                    min_token_loc = int(token_locs_cpu.min().item())
+                    max_token_loc = int(token_locs_cpu.max().item())
+                    if min_token_loc < 0 or max_token_loc >= k_cache.shape[0]:
+                        raise ValueError(
+                            "FlashMLA sparse extend saw out-of-range req_to_token indices: "
+                            f"req_idx={req_idx}, seq_len={seq_len}, "
+                            f"token_loc_min={min_token_loc}, token_loc_max={max_token_loc}, "
+                            f"kv_cache_len={k_cache.shape[0]}"
+                        )
             kv_segments.append(k_cache[token_locs])
 
             for rel in range(extend_len):
                 q_pos = prefix_len + rel
                 start = (
-                    max(0, q_pos - int(layer.sliding_window_size))
+                    max(0, q_pos - sliding_window)
                     if use_sliding
                     else 0
                 )
+                row_start = start - visible_start
+                row_end = q_pos - visible_start + 1
                 row = torch.arange(
-                    start + kv_base,
-                    q_pos + kv_base + 1,
+                    row_start + kv_base,
+                    row_end + kv_base,
                     dtype=torch.int32,
-                    device=k_cache.device,
+                    device="cpu",
                 )
                 sparse_rows.append(row)
                 raw_topk = max(raw_topk, int(row.numel()))
-            kv_base += seq_len
+            kv_base += int(token_locs.numel())
 
         if not kv_segments:
             raise ValueError(
@@ -233,7 +282,15 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             device=k_cache.device,
         )
         for row_idx, row in enumerate(sparse_rows):
-            indices[row_idx, 0, : row.numel()] = row
+            row_numel = int(row.numel())
+            if row_numel > topk:
+                raise ValueError(
+                    "FlashMLA sparse extend row exceeded aligned topk: "
+                    f"row_idx={row_idx}, row_numel={row_numel}, topk={topk}"
+                )
+            indices[row_idx, 0, :row_numel] = row.to(
+                device=k_cache.device, non_blocking=True
+            )
 
         return kv_dense, indices
 
@@ -243,31 +300,60 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        req_pool_indices = [int(x) for x in forward_batch.req_pool_indices.tolist()]
+        token_to_kv_pool = forward_batch.token_to_kv_pool
+        req_pool_indices_cpu = getattr(forward_batch, "req_pool_indices_cpu", None)
+        if req_pool_indices_cpu is None:
+            req_pool_indices_cpu = forward_batch.req_pool_indices.detach().cpu()
+        req_pool_indices = [int(x) for x in req_pool_indices_cpu.tolist()]
         seq_lens_cpu = [int(x) for x in forward_batch.seq_lens_cpu.tolist()]
 
         kv_segments = []
         sparse_rows = []
         kv_base = 0
         raw_topk = 0
+        use_sliding = (
+            layer.sliding_window_size is not None and layer.sliding_window_size > -1
+        )
+        sliding_window = int(layer.sliding_window_size) if use_sliding else -1
 
         for req_idx, seq_len in zip(req_pool_indices, seq_lens_cpu):
-            token_locs = self.req_to_token[req_idx, :seq_len].to(torch.long)
+            if use_sliding:
+                visible_start = max(0, seq_len - (sliding_window + 1))
+            else:
+                visible_start = 0
+            token_locs = self.req_to_token[req_idx, visible_start:seq_len].detach().to(
+                torch.long
+            )
+            token_locs = self._maybe_translate_swa_indices(
+                token_locs, token_to_kv_pool, use_sliding
+            )
+            if not torch.cuda.is_current_stream_capturing():
+                token_locs_cpu = token_locs.cpu()
+                if token_locs_cpu.numel() > 0:
+                    min_token_loc = int(token_locs_cpu.min().item())
+                    max_token_loc = int(token_locs_cpu.max().item())
+                    if min_token_loc < 0 or max_token_loc >= k_cache.shape[0]:
+                        raise ValueError(
+                            "FlashMLA sparse decode saw out-of-range req_to_token indices: "
+                            f"req_idx={req_idx}, seq_len={seq_len}, "
+                            f"token_loc_min={min_token_loc}, token_loc_max={max_token_loc}, "
+                            f"kv_cache_len={k_cache.shape[0]}"
+                        )
             kv_segments.append(k_cache[token_locs])
 
-            if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
-                start = max(0, seq_len - (int(layer.sliding_window_size) + 1))
+            if use_sliding:
+                start = max(0, seq_len - (sliding_window + 1)) - visible_start
             else:
                 start = 0
             row = torch.arange(
                 start + kv_base,
-                seq_len + kv_base,
+                (seq_len - visible_start) + kv_base,
                 dtype=torch.int32,
                 device=k_cache.device,
             )
             sparse_rows.append(row)
             raw_topk = max(raw_topk, int(row.numel()))
-            kv_base += seq_len
+            kv_base += int(token_locs.numel())
 
         if not kv_segments:
             raise ValueError(
@@ -283,7 +369,15 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             device=k_cache.device,
         )
         for row_idx, row in enumerate(sparse_rows):
-            indices[row_idx, 0, : row.numel()] = row
+            row_numel = int(row.numel())
+            if row_numel > topk:
+                raise ValueError(
+                    "FlashMLA sparse decode row exceeded aligned topk: "
+                    f"row_idx={row_idx}, row_numel={row_numel}, topk={topk}"
+                )
+            indices[row_idx, 0, :row_numel] = row.to(
+                device=k_cache.device, non_blocking=True
+            )
 
         return kv_dense, indices
 
@@ -442,7 +536,12 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                 block_kv_indices,
             )
         else:
-            super().init_forward_metadata(forward_batch)
+            # FlashMLA handles extend/prefill through its own sparse path in
+            # forward_extend(), so we must not fall back to FlashInfer's MLA
+            # planner here. That planner instantiates a generated batch MLA
+            # kernel and currently rejects some large-rank GPT-OSS checkpoints
+            # such as kv_lora_rank=1024 at compile time.
+            self.forward_metadata = FlashMLADecodeMetadata()
 
     def init_cuda_graph_state(
         self,
@@ -733,7 +832,10 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
         use_sliding = (
             layer.sliding_window_size is not None and layer.sliding_window_size > -1
         )
-        use_sparse_decode = use_sliding or self.kv_cache_dim != (512 + 64)
+        # Only true sliding-window decode needs the custom sparse gather path.
+        # Full-attention GPT-OSS MLA ranks should stay on the native FlashMLA
+        # decode kernel, even when kv_lora_rank != 512.
+        use_sparse_decode = use_sliding
         if use_sparse_decode:
             kv_dense, indices = self._build_decode_dense_kv_and_indices(
                 k_cache, layer, forward_batch
@@ -853,6 +955,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
                         )
 
             k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+            _maybe_sync_debug_flashmla("forward_extend/pre_reshape")
             q_all = self._reshape_q_all(q, layer, q_rope)
             kv_dense, indices = self._build_extend_dense_kv_and_indices(
                 k_cache, layer, forward_batch
@@ -877,6 +980,7 @@ class FlashMLABackend(FlashInferMLAAttnBackend):
             bs = forward_batch.batch_size
             k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
 
+            _maybe_sync_debug_flashmla("forward_decode/pre_reshape")
             q_all = self._reshape_q_all(q, layer, q_rope)
             q_width = q_all.shape[-1]
             reshape_q = q_all.view(

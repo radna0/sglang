@@ -26,6 +26,12 @@ smoke_mod = SourceFileLoader(
 from sglang.srt.configs.model_config import AttentionArch, ModelConfig  # noqa: E402
 from sglang.srt.layers.radix_attention import RadixAttention  # noqa: E402
 from sglang.srt.layers.utils.multi_platform import MultiPlatformOp  # noqa: E402
+from sglang.srt.model_executor.mla_utils import (  # noqa: E402
+    get_flashmla_mla_kv_cache_dim,
+)
+from sglang.srt.model_executor.model_runner_kv_cache_mixin import (  # noqa: E402
+    ModelRunnerKVCacheMixin,
+)
 
 
 class _FakeBackend:
@@ -230,6 +236,49 @@ class TestGptOssCareCpuChecks(unittest.TestCase):
             source,
         )
 
+    def test_flashmla_graph_capture_uses_cpu_req_pool_indices(self):
+        flashmla_source = (
+            REPO_ROOT
+            / "python"
+            / "sglang"
+            / "srt"
+            / "layers"
+            / "attention"
+            / "flashmla_backend.py"
+        ).read_text(encoding="utf-8")
+        forward_batch_source = (
+            REPO_ROOT
+            / "python"
+            / "sglang"
+            / "srt"
+            / "model_executor"
+            / "forward_batch_info.py"
+        ).read_text(encoding="utf-8")
+        model_runner_source = (
+            REPO_ROOT
+            / "python"
+            / "sglang"
+            / "srt"
+            / "model_executor"
+            / "model_runner.py"
+        ).read_text(encoding="utf-8")
+        cuda_graph_runner_source = (
+            REPO_ROOT
+            / "python"
+            / "sglang"
+            / "srt"
+            / "model_executor"
+            / "cuda_graph_runner.py"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn('req_pool_indices_cpu: Optional[torch.Tensor] = None', forward_batch_source)
+        self.assertIn('req_pool_indices_cpu=batch.req_pool_indices.cpu()', forward_batch_source)
+        self.assertIn('req_pool_indices_cpu=buffers.req_pool_indices.cpu()', model_runner_source)
+        self.assertIn('req_pool_indices_cpu = req_pool_indices.cpu()', cuda_graph_runner_source)
+        self.assertIn('req_pool_indices_cpu=req_pool_indices_cpu', cuda_graph_runner_source)
+        self.assertIn('req_pool_indices_cpu = getattr(forward_batch, "req_pool_indices_cpu", None)', flashmla_source)
+        self.assertIn('forward_batch.req_pool_indices.detach().cpu()', flashmla_source)
+
     def test_server_args_prefers_triton_kernel_for_gptoss_mxfp4_on_cuda(self):
         source = (REPO_ROOT / "python" / "sglang" / "srt" / "server_args.py").read_text(
             encoding="utf-8"
@@ -265,6 +314,33 @@ class TestGptOssCareCpuChecks(unittest.TestCase):
             / "model_runner_kv_cache_mixin.py"
         ).read_text(encoding="utf-8")
         self.assertIn("self.max_running_requests = max_num_reqs", source)
+
+    def test_hybrid_swa_allocator_uses_mla_latent_width(self):
+        class DummyRunner(ModelRunnerKVCacheMixin):
+            pass
+
+        runner = DummyRunner()
+        runner.use_mla_backend = True
+        runner.kv_cache_dtype = torch.bfloat16
+        runner.sliding_window_size = 4096
+        runner.max_total_num_tokens = 8192
+        runner.server_args = SimpleNamespace(page_size=64, swa_full_tokens_ratio=0.8)
+        runner.model_config = SimpleNamespace(
+            full_attention_layer_ids=[0, 1],
+            swa_attention_layer_ids=[2, 3],
+        )
+        runner.calculate_mla_kv_cache_dim = lambda: 576
+
+        runner.set_num_tokens_hybrid_swa()
+
+        self.assertGreater(runner.full_max_total_num_tokens, 0)
+        self.assertGreater(runner.swa_max_total_num_tokens, 0)
+        self.assertEqual(runner.max_total_num_tokens, runner.full_max_total_num_tokens)
+
+    def test_flashmla_mla_cache_width_helper_preserves_shared_and_native_geometries(self):
+        self.assertEqual(get_flashmla_mla_kv_cache_dim(512, 32, 1, "flashmla"), 576)
+        self.assertEqual(get_flashmla_mla_kv_cache_dim(256, 32, 1, "triton"), 576)
+        self.assertEqual(get_flashmla_mla_kv_cache_dim(512, 32, 8, "flashmla"), 768)
 
     def test_scheduler_prefers_triton_kernel_for_gptoss_mxfp4_on_hopper(self):
         source = (

@@ -1,4 +1,7 @@
 import copy
+import os
+import sys
+import warnings
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -24,11 +27,42 @@ from transformers.models.gpt_oss.modeling_gpt_oss import (
 from transformers.cache_utils import Cache, DynamicCache
 
 
+_UNSLOTH_FLEX_ATTENTION_ERROR = None
+
+
+def _load_unsloth_flex_attention_with_sink():
+    global _UNSLOTH_FLEX_ATTENTION_ERROR
+
+    local_unsloth_zoo = os.environ.get("UNSLOTH_ZOO_LOCAL_PATH", "/workspace/unsloth_zoo_repo")
+    local_unsloth = os.environ.get("UNSLOTH_LOCAL_PATH", "/workspace/unsloth_repo")
+    if os.path.isdir(local_unsloth) and local_unsloth not in sys.path:
+        sys.path.insert(0, local_unsloth)
+    if os.path.isdir(local_unsloth_zoo) and local_unsloth_zoo not in sys.path:
+        sys.path.insert(0, local_unsloth_zoo)
+
+    try:
+        if os.environ.get("UNSLOTH_IS_PRESENT") != "1":
+            import unsloth  # noqa: F401
+        from unsloth_zoo.flex_attention import flex_attention_with_sink
+
+        return flex_attention_with_sink
+    except Exception as exc:  # pragma: no cover - optional acceleration path
+        _UNSLOTH_FLEX_ATTENTION_ERROR = repr(exc)
+        return None
+
+
 class GptOssMlaAttention(nn.Module):
     """HF-native MLA attention for converted GPT-OSS checkpoints.
 
     This follows the DeepSeek MLA decomposition pattern while preserving GPT-OSS
     sinks and alternating sliding/full attention behavior.
+
+    GPT-OSS-specific contract:
+
+    - q_proj is assumed to already live in the exported decoupled {NoPE, RoPE}
+      basis.
+    - kv_b_proj is interpreted as [all K_nope rows][all V rows], not per-head
+      [K,V] interleaving.
     """
 
     def __init__(self, config: GptOssConfig, layer_idx: int):
@@ -48,11 +82,29 @@ class GptOssMlaAttention(nn.Module):
         self.head_dim = self.qk_head_dim
         self.v_head_dim = int(getattr(config, "v_head_dim", getattr(config, "head_dim")))
         self.mla_rope_num_kv_heads = int(getattr(config, "mla_rope_num_kv_heads", 1))
+        self.gpt_oss_mla_contract = getattr(config, "gpt_oss_mla_contract", None)
         if self.num_heads % self.mla_rope_num_kv_heads != 0:
             raise ValueError(
                 f"num_attention_heads={self.num_heads} is not divisible by "
                 f"mla_rope_num_kv_heads={self.mla_rope_num_kv_heads}"
             )
+        if config.model_type == "gpt_oss" and self.gpt_oss_mla_contract is not None:
+            status = self.gpt_oss_mla_contract.get("status")
+            query_basis_status = self.gpt_oss_mla_contract.get("query_basis_status")
+            if status == "bridge_per_kv_head_rope":
+                warnings.warn(
+                    "GPT-OSS MLA checkpoint is in bridge mode with per-KV-head rope. "
+                    "This is useful for debugging but is not the final shared-k_R "
+                    "target contract.",
+                    stacklevel=2,
+                )
+            if query_basis_status != "rewritten_decoupled":
+                warnings.warn(
+                    "GPT-OSS MLA checkpoint does not declare a rewritten decoupled "
+                    "query basis. Quality-sensitive evaluation should treat this as "
+                    "an experimental artifact, not the final target contract.",
+                    stacklevel=2,
+                )
 
         per_layer_rank = getattr(config, "kv_lora_rank_per_layer", None)
         if per_layer_rank is not None:
@@ -79,6 +131,11 @@ class GptOssMlaAttention(nn.Module):
             self.num_heads * self.v_head_dim,
             config.hidden_size,
             bias=config.attention_bias,
+        )
+        self.mla_train_attention_backend = getattr(
+            config,
+            "mla_train_attention_backend",
+            "eager",
         )
 
         self.sliding_window = (
@@ -115,12 +172,14 @@ class GptOssMlaAttention(nn.Module):
             [self.kv_lora_rank, self.mla_rope_num_kv_heads * self.qk_rope_head_dim],
             dim=-1,
         )
-        kv_expanded = self.kv_b_proj(kv_latent).view(key_shape).transpose(1, 2)
-        k_nope, value_states = torch.split(
+        kv_expanded = self.kv_b_proj(kv_latent)
+        k_flat, v_flat = torch.split(
             kv_expanded,
-            [self.qk_nope_head_dim, self.v_head_dim],
+            [self.num_heads * self.qk_nope_head_dim, self.num_heads * self.v_head_dim],
             dim=-1,
         )
+        k_nope = k_flat.view(batch_size, seq_length, self.num_heads, self.qk_nope_head_dim).transpose(1, 2)
+        value_states = v_flat.view(batch_size, seq_length, self.num_heads, self.v_head_dim).transpose(1, 2)
 
         if self.qk_rope_head_dim > 0:
             k_rope = k_rope.reshape(
@@ -151,22 +210,59 @@ class GptOssMlaAttention(nn.Module):
         if self.config._attn_implementation == "flash_attention_2" and self.qk_head_dim != self.v_head_dim:
             value_states = F.pad(value_states, [0, self.qk_head_dim - self.v_head_dim])
 
-        attention_interface = eager_attention_forward
-        if self.config._attn_implementation != "eager":
-            attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
-
-        attn_output, attn_weights = attention_interface(
-            self,
-            query_states,
-            key_states,
-            value_states,
-            attention_mask,
-            dropout=0.0 if not self.training else self.attention_dropout,
-            scaling=self.scaling,
-            sliding_window=self.sliding_window,
-            s_aux=self.sinks,
-            **kwargs,
+        use_unsloth_flex_attention = (
+            self.training
+            and past_key_values is None
+            and self.config._attn_implementation == "eager"
+            and (
+                self.mla_train_attention_backend == "unsloth_flex_attention"
+                or os.environ.get("GPT_OSS_MLA_USE_UNSLOTH_FLEX_ATTENTION", "0") == "1"
+            )
         )
+
+        if use_unsloth_flex_attention:
+            flex_attention_with_sink = _load_unsloth_flex_attention_with_sink()
+            if flex_attention_with_sink is None:
+                raise RuntimeError(
+                    "GPT-OSS MLA training requested Unsloth Flex Attention, but "
+                    f"unsloth_zoo.flex_attention.flex_attention_with_sink could not be loaded: "
+                    f"{_UNSLOTH_FLEX_ATTENTION_ERROR}"
+                )
+            kernel_dtype = query_states.dtype
+            if kernel_dtype not in (torch.float16, torch.bfloat16):
+                kernel_dtype = torch.bfloat16 if query_states.is_cuda else torch.float32
+            if query_states.dtype != kernel_dtype:
+                query_states = query_states.to(kernel_dtype)
+            if key_states.dtype != kernel_dtype:
+                key_states = key_states.to(kernel_dtype)
+            if value_states.dtype != kernel_dtype:
+                value_states = value_states.to(kernel_dtype)
+            attn_output = flex_attention_with_sink(
+                self,
+                query_states,
+                key_states,
+                value_states,
+            )
+            if attn_output.dtype != self.o_proj.weight.dtype:
+                attn_output = attn_output.to(self.o_proj.weight.dtype)
+            attn_weights = None
+        else:
+            attention_interface = eager_attention_forward
+            if self.config._attn_implementation != "eager":
+                attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+
+            attn_output, attn_weights = attention_interface(
+                self,
+                query_states,
+                key_states,
+                value_states,
+                attention_mask,
+                dropout=0.0 if not self.training else self.attention_dropout,
+                scaling=self.scaling,
+                sliding_window=self.sliding_window,
+                s_aux=self.sinks,
+                **kwargs,
+            )
 
         if self.config._attn_implementation == "flash_attention_2" and self.qk_head_dim != self.v_head_dim:
             attn_output = attn_output[:, :, :, : self.v_head_dim]
@@ -195,7 +291,9 @@ class GptOssMlaModel(GptOssPreTrainedModel):
         )
         self.norm = GptOssRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         rotary_config = copy.deepcopy(config)
-        rotary_config.head_dim = int(getattr(config, "qk_rope_head_dim"))
+        rotary_config.head_dim = int(
+            getattr(config, "qk_rope_head_dim", getattr(config, "head_dim"))
+        )
         self.rotary_emb = GptOssRotaryEmbedding(config=rotary_config)
         self.gradient_checkpointing = False
         self.post_init()

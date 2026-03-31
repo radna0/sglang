@@ -873,6 +873,7 @@ class CudaGraphRunner:
         # Graph inputs
         input_ids = buffers.input_ids[:num_tokens]
         req_pool_indices = buffers.req_pool_indices[:bs]
+        req_pool_indices_cpu = req_pool_indices.cpu()
         seq_lens = buffers.seq_lens[:bs]
         seq_lens_cpu = buffers.seq_lens_cpu[:bs]
         out_cache_loc = buffers.out_cache_loc[:num_tokens]
@@ -962,6 +963,7 @@ class CudaGraphRunner:
             batch_size=bs,
             input_ids=input_ids,
             req_pool_indices=req_pool_indices,
+            req_pool_indices_cpu=req_pool_indices_cpu,
             seq_lens=seq_lens,
             seq_lens_cpu=seq_lens_cpu,
             next_token_logits_buffer=next_token_logits_buffer,

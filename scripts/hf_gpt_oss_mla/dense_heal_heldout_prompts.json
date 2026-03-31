@@ -1,0 +1,18 @@
+[
+  {"id": "planets", "category": "list", "prompt": "Name four planets in our solar system."},
+  {"id": "photosynthesis", "category": "prose", "prompt": "Explain photosynthesis in simple language."},
+  {"id": "haiku", "category": "creative", "prompt": "Write a short haiku about rain."},
+  {"id": "fibonacci", "category": "math", "prompt": "What are the first six Fibonacci numbers?"},
+  {"id": "json_example", "category": "code", "prompt": "Give a tiny JSON example with a name and age."},
+  {"id": "mountain", "category": "factual", "prompt": "Mount Everest is"},
+  {"id": "healthy_habits", "category": "list", "prompt": "List three healthy daily habits."},
+  {"id": "moon", "category": "prose", "prompt": "Describe the moon in two sentences."},
+  {"id": "capital_japan", "category": "factual", "prompt": "The capital of Japan is"},
+  {"id": "for_loop", "category": "code", "prompt": "Write a Python for-loop that prints numbers 1 to 3."},
+  {"id": "triangle", "category": "math", "prompt": "How many sides does a triangle have?"},
+  {"id": "water_cycle", "category": "prose", "prompt": "Explain the water cycle briefly."},
+  {"id": "fruit_list", "category": "list", "prompt": "List five fruits."},
+  {"id": "penguin", "category": "factual", "prompt": "Write one sentence about penguins."},
+  {"id": "greeting", "category": "dialogue", "prompt": "Write a polite greeting email opening."},
+  {"id": "binary", "category": "math", "prompt": "Convert decimal 5 to binary."}
+]

@@ -211,6 +211,26 @@ def resolve_dflash_target_layer_ids(
     )
 
 
+def resolve_dflash_block_size(
+    *,
+    draft_hf_config: Any | None = None,
+    draft_config_json: Any | None = None,
+    default: Optional[int] = None,
+) -> Optional[int]:
+    """Resolve the DFlash block size from either an HF config or raw JSON config.
+
+    Older call sites pass `draft_config_json=...` while newer ones pass
+    `draft_hf_config=...`. Keep both for compatibility so the draft model can
+    register and load regardless of which path constructs the config object.
+    """
+    cfg_src = draft_hf_config if draft_hf_config is not None else draft_config_json
+    if cfg_src is None:
+        return default
+    return parse_dflash_draft_config(draft_hf_config=cfg_src).resolve_block_size(
+        default=default
+    )
+
+
 def _cfg_get(config: Any, key: str, default: Any = None) -> Any:
     if isinstance(config, dict):
         return config.get(key, default)

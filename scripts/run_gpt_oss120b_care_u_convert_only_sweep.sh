@@ -12,6 +12,15 @@ QK_ROPE_HEAD_DIM="${QK_ROPE_HEAD_DIM:-32}"
 QK_NOPE_HEAD_DIM="${QK_NOPE_HEAD_DIM:-32}"
 DTYPE="${DTYPE:-bfloat16}"
 CONVERSION_DEVICE_MAP="${CONVERSION_DEVICE_MAP:-cuda:0}"
+NUM_KV_HEADS="$(
+  /venv/main/bin/python - <<PY
+import json
+from pathlib import Path
+cfg = json.loads(Path("${MODEL_PATH}/config.json").read_text())
+print(int(cfg.get("num_key_value_heads", 1) or 1))
+PY
+)"
+MLA_ROPE_NUM_KV_HEADS="${MLA_ROPE_NUM_KV_HEADS:-${NUM_KV_HEADS}}"
 
 BASE_CONV_ROOT="${BASE_RUN_ROOT}/conversion"
 COVARIANCE_DIR="${BASE_CONV_ROOT}/covariance"
@@ -40,6 +49,7 @@ echo "[covariance-dir] ${COVARIANCE_DIR}"
 echo "[dataset-spec-json] ${DATASET_SPEC_JSON}"
 echo "[out-root] ${OUT_ROOT}"
 echo "[ranks] ${RANKS}"
+echo "[mla-rope-num-kv-heads] ${MLA_ROPE_NUM_KV_HEADS}"
 
 IFS=',' read -r -a rank_list <<< "${RANKS}"
 for rank in "${rank_list[@]}"; do
@@ -65,6 +75,7 @@ for rank in "${rank_list[@]}"; do
   "uniform_rank": true,
   "qk_rope_head_dim": ${QK_ROPE_HEAD_DIM},
   "qk_nope_head_dim": ${QK_NOPE_HEAD_DIM},
+  "mla_rope_num_kv_heads": ${MLA_ROPE_NUM_KV_HEADS},
   "decoupled_rope_dim": 0,
   "decoupled_rope_init": "mean",
   "rank_source_fusion": false
@@ -78,6 +89,7 @@ JSON
     --kv-lora-rank "${rank}" \
     --qk-rope-head-dim "${QK_ROPE_HEAD_DIM}" \
     --qk-nope-head-dim "${QK_NOPE_HEAD_DIM}" \
+    --mla-rope-num-kv-heads "${MLA_ROPE_NUM_KV_HEADS}" \
     --decoupled-rope-dim 0 \
     --decoupled-rope-init mean \
     --covariance-dir "${COVARIANCE_DIR}" \

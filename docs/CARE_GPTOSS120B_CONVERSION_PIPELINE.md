@@ -70,6 +70,23 @@ Current CARE-E support in code:
 - explicit absorbed export in `scripts/export_gpt_oss_care_absorbed.py`
 - benchmark-suite automation in `scripts/run_gpt_oss_care_benchmark_suite.py`
 
+GPT-OSS CARE geometry note:
+
+- GPT-OSS checkpoints now support two distinct CARE-family export geometries:
+  - `mla_rope_num_kv_heads=1` with `mla_attention_mode="shared_latent"` is the
+    true CARE-native shared-latent MLA path.
+  - `mla_rope_num_kv_heads=num_key_value_heads` with `mla_attention_mode="mha_explicit"`
+    is the explicit-anchor compatibility bridge that reconstructs per-head keys/values
+    for runtime parity checks.
+- The older absorbed checkpoints that omitted `mla_rope_num_kv_heads` are now treated as
+  legacy compatibility artifacts, not the target geometry.
+- The fresh shared-latent checkpoints written under
+  `gptoss120b_care_sharedlatent_r512_20260326` and
+  `gptoss120b_care_sharedlatent_r1024_20260326` are the current CARE-family baselines for
+  GPT-OSS.
+- The older `gptoss120b_care_nativeanchor_*` checkpoints remain available only as
+  compatibility bridges for runtime debugging and comparison.
+
 ## Converter contract
 
 Input:
@@ -415,7 +432,8 @@ python scripts/convert_gpt_oss_to_care_mla.py \
   --output-dir /root/out/gpt-oss-120b-care-mla-r512 \
   --device cuda \
   --kv-lora-rank 512 \
-  --qk-rope-head-dim 32
+  --qk-rope-head-dim 32 \
+  --mla-rope-num-kv-heads 1
 ```
 
 For a dynamic schedule:
@@ -426,5 +444,6 @@ python scripts/convert_gpt_oss_to_care_mla.py \
   --output-dir /root/out/gpt-oss-120b-care-mla-caree \
   --device cuda \
   --rank-schedule-json /path/to/kv_lora_rank_schedule.json \
-  --qk-rope-head-dim 32
+  --qk-rope-head-dim 32 \
+  --mla-rope-num-kv-heads 1
 ```

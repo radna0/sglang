@@ -60,16 +60,24 @@ class TestFlashMLABackendMetadata(unittest.TestCase):
 class TestFlashMLABackendSparseIndexing(unittest.TestCase):
     def _make_backend(self):
         backend = object.__new__(FlashMLABackend)
-        backend.req_to_token = torch.arange(6, dtype=torch.int64).view(2, 3)
+        backend.req_to_token = torch.tensor(
+            [
+                [100, 101, 102, 103],
+                [102, 103, 104, 105],
+            ],
+            dtype=torch.int64,
+        )
         return backend
 
     def test_decode_sparse_indices_are_request_local_offsets(self):
         backend = self._make_backend()
-        k_cache = torch.randn(6, 1, 4, dtype=torch.float32)
+        k_cache = torch.arange(0, 200, dtype=torch.float32).view(200, 1, 1)
         layer = _LayerStub(sliding_window_size=-1, tp_q_head_num=1, head_dim=4)
         forward_batch = SimpleNamespace(
             req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
+            req_pool_indices_cpu=torch.tensor([0, 1], dtype=torch.int64),
             seq_lens_cpu=torch.tensor([2, 1], dtype=torch.int64),
+            token_to_kv_pool=SimpleNamespace(),
         )
 
         kv_dense, indices = backend._build_decode_dense_kv_and_indices(
@@ -78,25 +86,67 @@ class TestFlashMLABackendSparseIndexing(unittest.TestCase):
             forward_batch,
         )
 
-        self.assertEqual(tuple(kv_dense.shape), (3, 1, 4))
+        self.assertEqual(tuple(kv_dense.shape), (3, 1, 1))
         self.assertEqual(tuple(indices.shape), (2, 1, 128))
         self.assertTrue(
             torch.equal(indices[0, 0, :2], torch.tensor([0, 1], dtype=torch.int32))
         )
         self.assertTrue(torch.equal(indices[1, 0, :1], torch.tensor([2], dtype=torch.int32)))
+        self.assertTrue(
+            torch.equal(
+                kv_dense[:, 0, 0],
+                torch.tensor([100.0, 101.0, 102.0]),
+            )
+        )
 
     def test_decode_sparse_sliding_window_offset(self):
         backend = self._make_backend()
-        k_cache = torch.randn(6, 1, 4, dtype=torch.float32)
+        k_cache = torch.arange(0, 20, dtype=torch.float32).view(20, 1, 1)
         layer = _LayerStub(sliding_window_size=0, tp_q_head_num=1, head_dim=4)
         forward_batch = SimpleNamespace(
             req_pool_indices=torch.tensor([0], dtype=torch.int64),
+            req_pool_indices_cpu=torch.tensor([0], dtype=torch.int64),
             seq_lens_cpu=torch.tensor([3], dtype=torch.int64),
+            token_to_kv_pool=SimpleNamespace(
+                translate_loc_from_full_to_swa=lambda idx: idx - 99
+            ),
         )
 
         _, indices = backend._build_decode_dense_kv_and_indices(k_cache, layer, forward_batch)
         self.assertTrue(
             torch.equal(indices[0, 0, :1], torch.tensor([2], dtype=torch.int32))
+        )
+
+    def test_extend_sparse_sliding_window_rebases_visible_suffix(self):
+        backend = self._make_backend()
+        k_cache = torch.arange(0, 40, dtype=torch.float32).view(40, 1, 1)
+        layer = _LayerStub(sliding_window_size=1, tp_q_head_num=1, head_dim=4)
+        forward_batch = SimpleNamespace(
+            req_pool_indices=torch.tensor([0], dtype=torch.int64),
+            req_pool_indices_cpu=torch.tensor([0], dtype=torch.int64),
+            seq_lens_cpu=torch.tensor([4], dtype=torch.int64),
+            extend_prefix_lens_cpu=[3],
+            extend_seq_lens_cpu=[1],
+            token_to_kv_pool=SimpleNamespace(
+                translate_loc_from_full_to_swa=lambda idx: idx - 99
+            ),
+        )
+
+        kv_dense, indices = backend._build_extend_dense_kv_and_indices(
+            k_cache,
+            layer,
+            forward_batch,
+        )
+
+        self.assertEqual(tuple(kv_dense.shape), (2, 1, 1))
+        self.assertTrue(
+            torch.equal(
+                kv_dense[:, 0, 0],
+                torch.tensor([3.0, 4.0]),
+            )
+        )
+        self.assertTrue(
+            torch.equal(indices[0, 0, :2], torch.tensor([0, 1], dtype=torch.int32))
         )
 
 

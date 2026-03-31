@@ -1,0 +1,12 @@
+[
+  {"id": "prime", "category": "prose", "prompt": "Write a short paragraph about prime numbers."},
+  {"id": "france", "category": "factual", "prompt": "The capital of France is"},
+  {"id": "colors", "category": "list", "prompt": "List three colors:"},
+  {"id": "gravity", "category": "prose", "prompt": "Explain what gravity is in two sentences."},
+  {"id": "python_add", "category": "code", "prompt": "Write a short Python function that adds two integers."},
+  {"id": "ocean", "category": "prose", "prompt": "Write one sentence about the ocean."},
+  {"id": "mammals", "category": "list", "prompt": "Name three mammals and one short fact about each."},
+  {"id": "story", "category": "creative", "prompt": "Continue in one short paragraph: Once upon a time"},
+  {"id": "arithmetic", "category": "math", "prompt": "Solve briefly: 17 + 28 ="},
+  {"id": "trees", "category": "prose", "prompt": "Summarize why trees matter in one sentence."}
+]

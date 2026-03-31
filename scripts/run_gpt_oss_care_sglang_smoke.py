@@ -38,7 +38,9 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--dtype", default="bfloat16")
     parser.add_argument("--kv-cache-dtype", default="bfloat16")
     parser.add_argument("--mem-fraction-static", type=float, default=0.95)
+    parser.add_argument("--cpu-offload-gb", type=int, default=0)
     parser.add_argument("--attention-backend", default="auto")
+    parser.add_argument("--moe-runner-backend", default=None)
     parser.add_argument("--disable-piecewise-cuda-graph", action="store_true")
     parser.add_argument("--server-timeout-s", type=int, default=900)
     parser.add_argument("--server-log", default=None)
@@ -178,6 +180,14 @@ def _wait_for_server(base_url: str, timeout_s: int) -> dict[str, Any]:
 
 def _launch_server(args: argparse.Namespace) -> subprocess.Popen[str]:
     env = os.environ.copy()
+    alloc_conf = env.get("PYTORCH_CUDA_ALLOC_CONF")
+    if alloc_conf:
+        if "expandable_segments:True" not in alloc_conf:
+            env["PYTORCH_CUDA_ALLOC_CONF"] = (
+                alloc_conf + ",expandable_segments:True"
+            )
+    else:
+        env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
     repo_root = Path(__file__).resolve().parent.parent
     python_path = str(repo_root / "python")
     existing_python_path = env.get("PYTHONPATH", "")
@@ -205,10 +215,14 @@ def _launch_server(args: argparse.Namespace) -> subprocess.Popen[str]:
         str(args.kv_cache_dtype),
         "--mem-fraction-static",
         str(args.mem_fraction_static),
+        "--cpu-offload-gb",
+        str(args.cpu_offload_gb),
         "--attention-backend",
         args.attention_backend,
         "--trust-remote-code",
     ]
+    if args.moe_runner_backend:
+        cmd.extend(["--moe-runner-backend", args.moe_runner_backend])
     if args.tokenizer_path:
         cmd.extend(["--tokenizer-path", args.tokenizer_path])
     if args.tokenizer_mode:
@@ -261,6 +275,20 @@ def _run_completion(args: argparse.Namespace, base_url: str, model_id: str) -> d
 def main() -> None:
     args = _parse_args()
     checkpoint_config = _load_checkpoint_config(args.model_path)
+    architectures = checkpoint_config.get("architectures") or []
+    is_gpt_oss_mla = "GptOssMlaForCausalLM" in architectures
+    quant_cfg = checkpoint_config.get("quantization_config") or {}
+    quant_method = str(quant_cfg.get("quant_method", "") or "")
+    if (
+        args.moe_runner_backend is None
+        and is_gpt_oss_mla
+        and quant_method == "mxfp4"
+    ):
+        # GPT-OSS shared-latent MXFP4 checkpoints currently load most reliably
+        # through the BF16 Triton MoE path. The packed `triton_kernel` path
+        # expects a half-width expert input contract that this checkpoint family
+        # does not satisfy yet.
+        args.moe_runner_backend = "triton"
     args.attention_backend = _select_attention_backend(
         args.attention_backend, checkpoint_config
     )

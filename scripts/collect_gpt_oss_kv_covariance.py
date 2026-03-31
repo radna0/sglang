@@ -109,10 +109,16 @@ def _iter_jsonl_files(files: list[str]) -> Iterator[dict[str, Any]]:
 def _iter_packed_torch_filelist(
     source: dict[str, Any], start_file_index: int = 0, start_row_index: int = 0
 ) -> Iterator[tuple[int, int, torch.Tensor]]:
-    with Path(source["filelist"]).open("r", encoding="utf-8") as f:
+    filelist_path = Path(source["filelist"]).resolve()
+    with filelist_path.open("r", encoding="utf-8") as f:
         files = [line.strip() for line in f if line.strip()]
     for file_index, file_path in enumerate(files[start_file_index:], start=start_file_index):
-        payload = torch.load(Path(file_path), map_location="cpu")
+        resolved_file_path = Path(file_path)
+        if not resolved_file_path.exists():
+            candidate = filelist_path.parent / resolved_file_path.name
+            if candidate.exists():
+                resolved_file_path = candidate
+        payload = torch.load(resolved_file_path, map_location="cpu")
         input_ids = payload["input_ids"] if isinstance(payload, dict) else payload
         if not isinstance(input_ids, torch.Tensor):
             input_ids = torch.tensor(input_ids, dtype=torch.int32)

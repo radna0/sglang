@@ -19,6 +19,7 @@ It supports page size = 1 and prefill with KV cache (i.e. extend).
 import torch
 import triton
 import triton.language as tl
+import logging
 
 from sglang.srt.layers.attention.triton_ops.prefill_attention import (
     context_attention_fwd,
@@ -30,6 +31,8 @@ if _is_cuda:
     CUDA_CAPABILITY = torch.cuda.get_device_capability()
 
 _is_hip = is_hip()
+
+logger = logging.getLogger(__name__)
 
 
 def _get_block_sizes_for_extend_attention(Lq: int, Lv: int):
@@ -44,8 +47,16 @@ def _get_block_sizes_for_extend_attention(Lq: int, Lv: int):
         tuple: (BLOCK_DMODEL, BLOCK_DPE, BLOCK_DV, BLOCK_M, BLOCK_N, num_warps)
     """
     # Determine BLOCK_DMODEL and BLOCK_DPE based on head dimension
-    if Lq == 576:
+    if Lq >= 1024:
+        # GPT-OSS-120B absorbed checkpoints can present a very wide extend-side
+        # query layout. A smaller tile keeps the Triton kernel under Hopper's
+        # shared-memory limit while preserving correctness.
         BLOCK_DMODEL = 512
+        BLOCK_DPE = 0
+    elif Lq == 576:
+        # Hopper shared-memory limits are tighter for the large-K decode/extend
+        # path. Use a smaller tile here so the kernel remains compilable on H100.
+        BLOCK_DMODEL = 256
         BLOCK_DPE = 64
     elif Lq == 288:
         BLOCK_DMODEL = 256
@@ -601,6 +612,19 @@ def extend_attention_fwd(
 
     grid = (batch_size, head_num, triton.cdiv(max_len_extend, BLOCK_M))
     num_stages = 1
+
+    logger.info(
+        "Triton extend launch: Lq=%s Lk=%s Lv=%s BLOCK_DMODEL=%s BLOCK_DPE=%s BLOCK_DV=%s BLOCK_M=%s BLOCK_N=%s num_warps=%s",
+        Lq,
+        Lk,
+        Lv,
+        BLOCK_DMODEL,
+        BLOCK_DPE,
+        BLOCK_DV,
+        BLOCK_M,
+        BLOCK_N,
+        num_warps,
+    )
 
     extra_kargs = {}
     if _is_hip:

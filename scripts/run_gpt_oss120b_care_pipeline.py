@@ -35,6 +35,15 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--qk-rope-head-dim", type=int, default=32)
     parser.add_argument("--qk-nope-head-dim", type=int, default=None)
+    parser.add_argument(
+        "--mla-rope-num-kv-heads",
+        type=int,
+        default=None,
+        help=(
+            "Number of KV heads used by the GPT-OSS MLA rope path. If unset, GPT-OSS "
+            "defaults to its native MHA-anchor geometry (original num_key_value_heads)."
+        ),
+    )
     parser.add_argument("--decoupled-rope-dim", type=int, default=0)
     parser.add_argument(
         "--decoupled-rope-init",
@@ -140,6 +149,15 @@ def main() -> None:
     out_root = Path(args.out_root).resolve()
     out_root.mkdir(parents=True, exist_ok=True)
 
+    model_config = json.loads((model_path / "config.json").read_text(encoding="utf-8"))
+    model_type = str(model_config.get("model_type", ""))
+    num_kv_heads = int(model_config.get("num_key_value_heads", 1) or 1)
+    mla_rope_num_kv_heads = (
+        int(args.mla_rope_num_kv_heads)
+        if args.mla_rope_num_kv_heads is not None
+        else (num_kv_heads if model_type == "gpt_oss" else 1)
+    )
+
     covariance_dir = out_root / "covariance"
     rank_schedule_json = out_root / "kv_lora_rank_schedule.json"
     converted_dir = out_root / "converted_checkpoint"
@@ -167,6 +185,7 @@ def main() -> None:
         "qk_nope_head_dim": int(args.qk_nope_head_dim)
         if args.qk_nope_head_dim is not None
         else None,
+        "mla_rope_num_kv_heads": int(mla_rope_num_kv_heads),
         "decoupled_rope_dim": int(args.decoupled_rope_dim),
         "decoupled_rope_init": args.decoupled_rope_init,
         "rank_source_fusion": bool(args.rank_source_fusion),
@@ -281,6 +300,8 @@ def main() -> None:
             str(args.target_rank),
             "--qk-rope-head-dim",
             str(args.qk_rope_head_dim),
+            "--mla-rope-num-kv-heads",
+            str(mla_rope_num_kv_heads),
             "--decoupled-rope-dim",
             str(args.decoupled_rope_dim),
             "--decoupled-rope-init",

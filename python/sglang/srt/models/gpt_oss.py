@@ -184,6 +184,36 @@ def _bool_env(name: str) -> bool:
     return v in {"1", "true", "yes", "y", "on"}
 
 
+def _maybe_log_router_logits(router_logits: torch.Tensor, layer_id: int, stage: str) -> None:
+    if not _bool_env("SGLANG_GPTOSS_DEBUG_ROUTER"):
+        return
+    if str(os.environ.get("RANK", "0")) != "0":
+        return
+    # CUDA graph capture cannot tolerate extra CUDA queries here. Treat debug
+    # logging as a post-capture-only side channel.
+    if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+        return
+    finite = bool(torch.isfinite(router_logits).all().item())
+    if finite:
+        stats = (
+            float(router_logits.min().item()),
+            float(router_logits.max().item()),
+            float(router_logits.float().mean().item()),
+        )
+        print(
+            f"[GPTOSS_ROUTER_DEBUG] stage={stage} layer={layer_id} shape={tuple(router_logits.shape)} "
+            f"dtype={router_logits.dtype} finite=1 min={stats[0]:.6f} max={stats[1]:.6f} mean={stats[2]:.6f}",
+            flush=True,
+        )
+    else:
+        bad = int((~torch.isfinite(router_logits)).sum().item())
+        print(
+            f"[GPTOSS_ROUTER_DEBUG] stage={stage} layer={layer_id} shape={tuple(router_logits.shape)} "
+            f"dtype={router_logits.dtype} finite=0 bad={bad}",
+            flush=True,
+        )
+
+
 def _infer_deepseek_latent_kv_rank_from_ckpt_index(idx_path: str) -> int:
     idx = _load_deepseek_latent_kv_ckpt_index(idx_path)
     if not idx:
@@ -438,6 +468,7 @@ class GptOssSparseMoeBlock(nn.Module):
             final_hidden_states = moe_impl(self.layer_id, hidden_states)
         else:
             router_logits, _ = self.router(hidden_states)
+            _maybe_log_router_logits(router_logits, self.layer_id, "forward_normal")
             topk_output = self.topk(hidden_states, router_logits)
             final_hidden_states = self.experts(hidden_states, topk_output)
 
@@ -453,6 +484,7 @@ def moe_impl(layer_id: int, hidden_states: torch.Tensor) -> torch.Tensor:
     forward_context = get_forward_context()
     moe_fusion = forward_context.moe_fusions[layer_id]
     router_logits, _ = moe_fusion.router(hidden_states)
+    _maybe_log_router_logits(router_logits, layer_id, "moe_impl")
     topk_output = moe_fusion.topk(hidden_states, router_logits)
     final_hidden_states = moe_fusion.experts(hidden_states, topk_output)
     return final_hidden_states
@@ -2700,7 +2732,20 @@ class GptOssMlaForCausalLM(GptOssForCausalLM):
                 continue
 
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
-            weight_loader(param, loaded_weight)
+            try:
+                weight_loader(param, loaded_weight)
+            except Exception as exc:
+                logger.error(
+                    "GPT-OSS MLA weight load failed for name=%s target=%s "
+                    "loaded_shape=%s param_shape=%s param_type=%s output_dim=%s",
+                    name,
+                    target_name,
+                    tuple(loaded_weight.shape),
+                    tuple(param.data.shape) if hasattr(param, "data") else None,
+                    type(param).__name__,
+                    getattr(param, "output_dim", None),
+                )
+                raise
 
     def post_load_weights(self):
         for layer_id in range(self.config.num_hidden_layers):
