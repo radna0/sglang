@@ -118,6 +118,21 @@ def remove_prefix(text: str, prefix: str) -> str:
     return text[len(prefix) :] if text.startswith(prefix) else text
 
 
+def _merge_request_extra_body(
+    extra_request_body: Dict[str, Any], per_request_extra_body: Dict[str, Any]
+) -> Dict[str, Any]:
+    merged_extra_body = {**extra_request_body, **per_request_extra_body}
+    if (
+        "sampling_params" in extra_request_body
+        or "sampling_params" in per_request_extra_body
+    ):
+        merged_extra_body["sampling_params"] = {
+            **extra_request_body.get("sampling_params", {}),
+            **per_request_extra_body.get("sampling_params", {}),
+        }
+    return merged_extra_body
+
+
 def remove_suffix(text: str, suffix: str) -> str:
     return text[: -len(suffix)] if text.endswith(suffix) else text
 
@@ -639,43 +654,57 @@ async def async_request_sglang_generate(
                 url=api_url, json=payload, headers=headers
             ) as response:
                 if response.status == 200:
-                    async for chunk_bytes in response.content:
-                        chunk_bytes = chunk_bytes.strip()
-                        if not chunk_bytes:
-                            continue
-
-                        chunk = remove_prefix(chunk_bytes.decode("utf-8"), "data: ")
+                    if args.disable_stream:
+                        data = await response.json()
                         latency = time.perf_counter() - st
-                        if chunk == "[DONE]":
-                            pass
-                        else:
-                            data = json.loads(chunk)
+                        generated_text = data.get("text") or ""
+                        output.meta_info = data.get("meta_info") or {}
+                        output_len = int(
+                            output.meta_info.get(
+                                "completion_tokens", request_func_input.output_len
+                            )
+                        )
+                        output.ttft = latency
+                    else:
+                        async for chunk_bytes in response.content:
+                            chunk_bytes = chunk_bytes.strip()
+                            if not chunk_bytes:
+                                continue
 
-                            # NOTE: Some completion API might have a last
-                            # usage summary response without a token so we
-                            # want to check a token was generated
-                            if "text" in data and data["text"]:
-                                timestamp = time.perf_counter()
-                                generated_text = data["text"]
-                                output.meta_info = data.get("meta_info") or {}
-                                output_len = output.meta_info["completion_tokens"]
+                            chunk = remove_prefix(chunk_bytes.decode("utf-8"), "data: ")
+                            latency = time.perf_counter() - st
+                            if chunk == "[DONE]":
+                                pass
+                            else:
+                                data = json.loads(chunk)
 
-                                # First token
-                                if ttft == 0.0:
-                                    ttft = time.perf_counter() - st
-                                    output.ttft = ttft
+                                # NOTE: Some completion API might have a last
+                                # usage summary response without a token so we
+                                # want to check a token was generated
+                                if "text" in data and data["text"]:
+                                    timestamp = time.perf_counter()
+                                    generated_text = data["text"]
+                                    output.meta_info = data.get("meta_info") or {}
+                                    output_len = output.meta_info["completion_tokens"]
 
-                                # Decoding phase
-                                else:
-                                    num_new_tokens = output_len - last_output_len
-                                    if num_new_tokens == 0:
-                                        continue
-                                    chunk_gap = timestamp - most_recent_timestamp
-                                    adjust_itl = chunk_gap / num_new_tokens
-                                    output.itl.extend([adjust_itl] * num_new_tokens)
+                                    # First token
+                                    if ttft == 0.0:
+                                        ttft = time.perf_counter() - st
+                                        output.ttft = ttft
 
-                                most_recent_timestamp = timestamp
-                                last_output_len = output_len
+                                    # Decoding phase
+                                    else:
+                                        num_new_tokens = output_len - last_output_len
+                                        if num_new_tokens == 0:
+                                            continue
+                                        chunk_gap = timestamp - most_recent_timestamp
+                                        adjust_itl = chunk_gap / num_new_tokens
+                                        output.itl.extend(
+                                            [adjust_itl] * num_new_tokens
+                                        )
+
+                                    most_recent_timestamp = timestamp
+                                    last_output_len = output_len
 
                     output.generated_text = generated_text
                     output.success = True
@@ -2496,9 +2525,9 @@ async def benchmark(
         else:
             lora_name = None
 
-        # Merge global extra_request_body with per-request extras
-        # Per-request parameters take precedence over global ones
-        merged_extra_body = {**extra_request_body, **request.extra_request_body}
+        merged_extra_body = _merge_request_extra_body(
+            extra_request_body, request.extra_request_body
+        )
 
         request_func_input = RequestFuncInput(
             model=model_id,

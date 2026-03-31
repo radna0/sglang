@@ -93,6 +93,10 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 
+def _model_requires_input_embeds(model_runner: "ModelRunner") -> bool:
+    return bool(getattr(model_runner.model, "requires_input_embeds", False))
+
+
 @dataclass
 class DecodeInputBuffers(ForwardInputBuffers):
 
@@ -476,13 +480,13 @@ class CudaGraphRunner:
             model_runner.spec_algorithm.is_eagle()
             or model_runner.spec_algorithm.is_standalone()
             or model_runner.spec_algorithm.is_ngram()
-            or model_runner.spec_algorithm.is_dflash()
+            or model_runner.spec_algorithm.is_dflash_family()
         ):
             if self.model_runner.is_draft_worker:
                 # EAGLE/standalone/ngram draft workers use separate cuda-graph runners; do not
                 # capture TARGET_VERIFY graphs here. DFLASH draft uses a fixed-size block and
                 # reuses TARGET_VERIFY graphs for performance.
-                if not self.model_runner.spec_algorithm.is_dflash():
+                if not self.model_runner.spec_algorithm.is_dflash_family():
                     raise RuntimeError("This should not happen")
             self.capture_forward_mode = ForwardMode.TARGET_VERIFY
             self.num_tokens_per_bs = (
@@ -565,7 +569,7 @@ class CudaGraphRunner:
         ):
             self.model_runner.model.set_eagle3_layers_to_capture()
         if (
-            model_runner.spec_algorithm.is_dflash()
+            model_runner.spec_algorithm.is_dflash_family()
             and model_runner.dflash_use_aux_hidden_state
         ):
             if not hasattr(self.model_runner.model, "set_dflash_layers_to_capture"):
@@ -601,7 +605,7 @@ class CudaGraphRunner:
                 max(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs
                 if self.model_runner.spec_algorithm.is_eagle()
                 or self.model_runner.spec_algorithm.is_standalone()
-                or self.model_runner.spec_algorithm.is_dflash()
+                or self.model_runner.spec_algorithm.is_dflash_family()
                 else max(forward_batch.global_num_tokens_cpu)
             )
         else:
@@ -930,8 +934,9 @@ class CudaGraphRunner:
                     {k: v.clone() for k, v in pp_proxy_tensors.tensors.items()}
                 )
             if (
-                self.model_runner.spec_algorithm.is_dflash()
+                self.model_runner.spec_algorithm.is_dflash_family()
                 and self.model_runner.is_draft_worker
+                and _model_requires_input_embeds(self.model_runner)
                 and "input_embeds" in inspect.signature(forward).parameters
             ):
                 kwargs["input_embeds"] = buffers.input_embeds[:num_tokens]
@@ -1003,7 +1008,7 @@ class CudaGraphRunner:
 
         raw_bs = forward_batch.batch_size
         raw_num_token = raw_bs * self.num_tokens_per_bs
-        if self.model_runner.spec_algorithm.is_dflash():
+        if self.model_runner.spec_algorithm.is_dflash_family():
             raw_num_token = len(forward_batch.input_ids)
 
         # Pad
@@ -1013,7 +1018,7 @@ class CudaGraphRunner:
                 max_num_tokens / self.num_tokens_per_bs
                 if self.model_runner.spec_algorithm.is_eagle()
                 or self.model_runner.spec_algorithm.is_standalone()
-                or self.model_runner.spec_algorithm.is_dflash()
+                or self.model_runner.spec_algorithm.is_dflash_family()
                 else max_num_tokens
             )
             index = bisect.bisect_left(self.capture_bs, max_batch_size)
@@ -1036,8 +1041,9 @@ class CudaGraphRunner:
             pp_proxy_tensors=pp_proxy_tensors,
         )
         if (
-            self.model_runner.spec_algorithm.is_dflash()
+            self.model_runner.spec_algorithm.is_dflash_family()
             and self.model_runner.is_draft_worker
+            and _model_requires_input_embeds(self.model_runner)
             and forward_batch.input_embeds is not None
         ):
             buffers.input_embeds[:raw_num_token].copy_(forward_batch.input_embeds)
@@ -1050,7 +1056,12 @@ class CudaGraphRunner:
                 spec_info=forward_batch.spec_info,
             )
         if forward_batch.forward_mode.is_idle() and forward_batch.spec_info is not None:
-            forward_batch.spec_info.custom_mask = buffers.custom_mask
+            custom_mask = getattr(forward_batch.spec_info, "custom_mask", None)
+            # Preserve runtime-built full tree masks when they are larger than the
+            # generic cuda-graph scratch buffer. Rebinding those large masks to the
+            # tiny shared buffer corrupts tree verify replay metadata on overlap-v2.
+            if custom_mask is None or custom_mask.numel() <= buffers.custom_mask.numel():
+                forward_batch.spec_info.custom_mask = buffers.custom_mask
         # Attention backend
         if self.enable_pdmux:
             stream_idx = get_current_stream_idx()
@@ -1088,8 +1099,9 @@ class CudaGraphRunner:
             self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
             self.buffers.positions[: self.raw_num_token].copy_(forward_batch.positions)
             if (
-                self.model_runner.spec_algorithm.is_dflash()
+                self.model_runner.spec_algorithm.is_dflash_family()
                 and self.model_runner.is_draft_worker
+                and _model_requires_input_embeds(self.model_runner)
                 and forward_batch.input_embeds is not None
             ):
                 self.buffers.input_embeds[: self.raw_num_token].copy_(
@@ -1114,7 +1126,7 @@ class CudaGraphRunner:
                 full_logits = None
                 next_token_logits = output.next_token_logits[: self.raw_num_token]
 
-            return LogitsProcessorOutput(
+            ret = LogitsProcessorOutput(
                 next_token_logits=next_token_logits,
                 full_logits=full_logits,
                 hidden_states=(
@@ -1124,6 +1136,11 @@ class CudaGraphRunner:
                 ),
                 customized_info=output.customized_info,
             )
+            if getattr(output, "_dflash_final_hidden_states", None) is not None:
+                ret._dflash_final_hidden_states = output._dflash_final_hidden_states[
+                    : self.raw_num_token
+                ]
+            return ret
         else:
             assert isinstance(output, PPProxyTensors)
             return PPProxyTensors({k: v[: self.bs] for k, v in output.tensors.items()})
@@ -1154,7 +1171,25 @@ class CudaGraphRunner:
                     seq_lens_sum=None,
                     seq_lens_cpu=None,
                 )
-        elif self.model_runner.spec_algorithm.is_dflash():
+        elif self.model_runner.spec_algorithm.is_dflash_tree():
+            from sglang.srt.speculative.eagle_info import EagleVerifyInput
+
+            spec_info = EagleVerifyInput(
+                draft_token=None,
+                custom_mask=self.buffers.custom_mask,
+                positions=None,
+                retrive_index=None,
+                retrive_next_token=None,
+                retrive_next_sibling=None,
+                retrive_cum_len=None,
+                spec_steps=self.model_runner.server_args.speculative_num_steps,
+                topk=self.model_runner.server_args.speculative_eagle_topk,
+                draft_token_num=self.model_runner.server_args.speculative_num_draft_tokens,
+                capture_hidden_mode=CaptureHiddenMode.FULL,
+                seq_lens_sum=None,
+                seq_lens_cpu=None,
+            )
+        elif self.model_runner.spec_algorithm.is_dflash_family():
             from sglang.srt.speculative.dflash_info import DFlashVerifyInput
             from sglang.srt.speculative.dflash_utils import (
                 resolve_dflash_verify_mask_policy,

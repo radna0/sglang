@@ -75,17 +75,11 @@ This is the active design note for:
 
 `pq` verify is explicitly out of the active production plan.
 
-## Prepared Next Route Study
+## Focused Route Study
 
-Prepared but not yet launched:
+The focused mixed-pool route study is now complete enough for the current branch checkpoint.
 
-- `explore=32`
-- `explore_tokens=8192`
-- `route=8`
-- fixed physical `DFLASH block_size=8`
-- adaptive / FailFast continuation intentionally left off for the first pass
-
-Problem ladder:
+Problem ladder used for the route-focused runs:
 
 - hardest: `86e8e5`
 - harder: `dd7f5e`
@@ -93,30 +87,163 @@ Problem ladder:
 - medium: `9c1c5f`
 - easiest: `92ba6a`
 
-Prepared launcher:
+Original launcher:
 
 - [run_route5_explore32_route8_block8.sh](/workspace/sglang-dflash-line/scripts/playground/run_route5_explore32_route8_block8.sh)
 
-This run is meant to answer whether the current explore/route policy is already helping on
-these cases before we mix in stronger FailFast / adaptive block-size logic.
+Mixed-pool follow-up results:
 
-## Prepared Sampled Baseline
+- old mixed-pool greedy, `8 -> 8` cap:
+  - [result.json](/workspace/route5_explore32_route8_block8_20260328/result.json)
+  - exploration `3146.926 tok/s`, accept `2.928`
+  - continuation `791.732 tok/s`, accept `3.974`
+  - routed boxed-correct rate `0.75`
+- mixed-pool greedy, `4 -> 8` cap:
+  - [result.json](/workspace/route5_explore32_route8_block4to8_greedy_20260329/result.json)
+  - exploration `3439.704 tok/s`, accept `2.474`
+  - continuation `803.360 tok/s`, accept `4.208`
+  - routed boxed-correct rate `0.75`
+- mixed-pool sampled, `4 -> 8` cap:
+  - [result.json](/workspace/route5_explore32_route8_block4to8_sampled_20260329/result.json)
+  - exploration `2275.360 tok/s`, accept `2.225`
+  - continuation `557.241 tok/s`, accept `3.002`
+  - routed boxed-correct rate `0.75`
 
-Prepared but not yet launched:
+What these three runs mean:
 
-- no DFLASH
-- no PaCoRe
-- `attempts=8`
-- `early_stop=4`
-- sampled decode:
-  - `temperature=1.0`
-  - `top_p=1.0`
-  - `top_k=50`
-  - `min_p=0.02`
+- lowering the exploration cap from `8` to `4` improved exploration throughput
+- the greedy `4 -> 8` rerun slightly improved continuation throughput and accept length
+- the sampled `4 -> 8` rerun was materially slower and did not improve routed quality
+- all promoted branches in both `4 -> 8` runs were still labeled `hard_tail`
+- current mixed-pool routing is therefore not producing a real green-zone route set yet
+
+So the route study is complete enough for now. Work should return to:
+
+- overlap-v2
+- fused / CUDA-graph / mixed-precision verify
+- linear + tree-verify path completion
+- FailFast
+- SSD
+- and only after that PaCoRe
+
+## Tree Config Sweep
+
+The next prepared benchmark, before we promote tree overlap further, is a single-request
+tree-config sweep:
+
+- linear DFlash baseline per block size
+- tree configs over `block_size = 4 / 8 / 16`
+- compact tree grids over `spec_steps` and `topk`
+- rank by `wall tok/s` while requiring correct boxed output
 
 Prepared launcher:
 
-- [run_showtime_baseline10_earlystop_nodflash_sampled.sh](/workspace/sglang-dflash-line/scripts/playground/run_showtime_baseline10_earlystop_nodflash_sampled.sh)
+- [run_dflash_tree_config_sweep.sh](/workspace/sglang-dflash-line/scripts/playground/run_dflash_tree_config_sweep.sh)
+- [run_dflash_tree_overlap_single_request_best.sh](/workspace/sglang-dflash-line/scripts/playground/run_dflash_tree_overlap_single_request_best.sh)
+- [run_dflash_tree_overlap_config_sweep.sh](/workspace/sglang-dflash-line/scripts/playground/run_dflash_tree_overlap_config_sweep.sh)
+
+Default sweep intent:
+
+- single request first
+- overlap disabled
+- graph-backed tree verify still on
+- compare tree configs against the matching linear DFlash baseline for the same block size
+
+Initial sweep signal:
+
+- `block_size=4` best so far: `spec_steps=3`, `topk=4`, `num_verify_tokens=4`
+  - tree tok/s: `271.792`
+  - linear tok/s: `255.166`
+  - speedup: `1.065x`
+  - correct boxed rate: `1.0`
+- `block_size=8` best so far: `spec_steps=4`, `topk=2`, `num_verify_tokens=6`
+  - tree tok/s: `299.849`
+  - linear tok/s: `279.095`
+  - speedup: `1.074x`
+  - correct boxed rate: `1.0`
+- `block_size=16` best so far: `spec_steps=8`, `topk=1`, `num_verify_tokens=9`
+  - tree tok/s: `332.333`
+  - linear tok/s: `294.920`
+  - speedup: `1.127x`
+  - correct boxed rate: `1.0`
+
+Interpretation:
+
+- single-request tree verify is already clean
+- the best tree settings beat the matched linear baseline on throughput
+- the overlap follow-up should use the best tree settings first
+- overlap-enabled tree sweep across the same config grid is now prepared
+
+## Locked Single-Request Tree vs Linear
+
+The earlier single-request mismatch is now resolved. Two benchmark issues were fixed first:
+
+- non-stream benchmark JSON handling / nested sampling-param merge in
+  [bench_serving.py](/workspace/sglang-dflash-line/python/sglang/bench_serving.py)
+- local benchmark scripts now import `DatasetRow` from the local benchmark module, not
+  another checkout on `PYTHONPATH`
+
+After those fixes, the clean non-overlap, graph-backed, single-request comparisons for
+`92ba6a` are:
+
+| Block | Linear tok/s | Tree tok/s | Speedup | Tree config | Correct |
+|---|---:|---:|---:|---|---:|
+| `4` | `274.047` | `304.201` | `1.110x` | `steps=3, topk=4, vt=4` | `1.0` |
+| `8` | `301.705` | `343.534` | `1.139x` | `steps=4, topk=2, vt=6` | `1.0` |
+| `16` | `315.758` | `385.327` | `1.221x` | `steps=8, topk=1, vt=9` | `1.0` |
+
+Artifacts:
+
+- block `4` linear: [block4_linear_current_postfix.json](/workspace/tree_vs_linear_apples_20260330/block4_linear_current_postfix.json)
+- block `4` tree: [block4_tree_current_postfix.json](/workspace/tree_vs_linear_apples_20260330/block4_tree_current_postfix.json)
+- block `8` linear: [block8_linear_current_postfix.json](/workspace/tree_vs_linear_apples_20260330/block8_linear_current_postfix.json)
+- block `8` tree: [block8_tree_current_postfix.json](/workspace/tree_vs_linear_apples_20260330/block8_tree_current_postfix.json)
+- block `16` linear: [block16_linear_current_postfix.json](/workspace/tree_vs_linear_apples_20260330/block16_linear_current_postfix.json)
+- block `16` tree: [block16_tree_current_postfix.json](/workspace/tree_vs_linear_apples_20260330/block16_tree_current_postfix.json)
+
+Interpretation now:
+
+- single-request `DFLASH_TREE` is clean
+- tree is faster than matched linear at `block=4/8/16`
+- the best current win is `block=16`, about `1.22x`
+- the next correct benchmark is batched non-overlap tree-vs-linear using these locked configs
+
+## Batched Non-Overlap Tree vs Linear
+
+The next step after the locked single-request comparison is the matched batched
+non-overlap sweep on the same best-per-block tree configs.
+
+Completed rows so far on the current tree code:
+
+| Block | Concurrency | Linear tok/s | Tree tok/s | Speedup | Tree accept len | Correct |
+|---|---:|---:|---:|---:|---:|---:|
+| `4` | `1` | `274.120` | `306.603` | `1.1185x` | `3.208` | `1.0` |
+| `4` | `4` | `1179.283` | `1194.003` | `1.0125x` | `3.282` | `1.0` |
+
+Artifacts:
+
+- `block=4, c=1` linear: [linear_report.json](/workspace/dflash_tree_batch_sweep_20260330_postfix/linear/block_4/c_1/linear_report.json)
+- `block=4, c=1` tree: [tree_report.json](/workspace/dflash_tree_batch_sweep_20260330_postfix/tree/block_4/c_1/tree_report.json)
+- `block=4, c=4` linear: [linear_report.json](/workspace/dflash_tree_batch_sweep_20260330_postfix/linear/block_4/c_4/linear_report.json)
+- `block=4, c=4` tree: [tree_report.json](/workspace/dflash_tree_batch_sweep_20260330_postfix/tree/block_4/c_4/tree_report.json)
+- manifest: [manifest.jsonl](/workspace/dflash_tree_batch_sweep_20260330_postfix/manifest.jsonl)
+
+Important interpretation:
+
+- batched `DFLASH_TREE` is still genuinely faster than matched linear on the first two
+  completed rows, but the gain is much smaller at higher concurrency than in the
+  single-request case
+- this tree path is **not optimized enough yet**
+- current `DFLASH_TREE` batching is still leaving substantial speed on the table
+- higher-concurrency tree runs are still unstable on the current worktree, so the batch
+  sweep is not finished yet
+
+So the current state is:
+
+- correctness on the completed batched rows is good
+- some speedup is real
+- but `DFLASH_TREE` is definitely **not** “blazingly fast” or fully optimized yet
+- more tree-specific development is still required before we should judge the ceiling
 
 ## Important Baseline Finding
 
@@ -152,6 +279,39 @@ Important future speculative-design split:
 - sampled target with sampled draft
 
 Those are different speculative regimes and must be benchmarked separately.
+
+## Current Headline Matrix
+
+This is the current branch-level benchmark checkpoint that should be treated as the
+reference before more overlap-v2 / fused-verify work lands.
+
+| Family | Regime | Quality | Speed / accept | Artifact |
+|---|---|---|---|---|
+| baseline | no DFlash, greedy, `early_stop=4` | `7/10` final, `8/10` any-correct | `5227s` total | [summary.json](/workspace/showtime_baseline10_20260328_earlystop_nodflash/summary.json) |
+| baseline | no DFlash, sampled, `early_stop=4` | `10/10` final, `10/10` any-correct | `5627s` total | [summary.json](/workspace/showtime_baseline10_20260328_earlystop_nodflash_sampled/summary.json) |
+| baseline | no DFlash, sampled, full-round `8/8` | `9/10` final, `10/10` any-correct | full-round worse than sampled early-stop on `86e8e5` | [summary.json](/workspace/showtime_baseline10_20260328_fullround_nodflash_sampled/summary.json) |
+| route | mixed-pool greedy, `8 -> 8` cap | continuation boxed-correct `0.75` | explore `3146.926 tok/s`, accept `2.928`; continue `791.732 tok/s`, accept `3.974` | [result.json](/workspace/route5_explore32_route8_block8_20260328/result.json) |
+| route | mixed-pool greedy, `4 -> 8` cap | continuation boxed-correct `0.75` | explore `3439.704 tok/s`, accept `2.474`; continue `803.360 tok/s`, accept `4.208` | [result.json](/workspace/route5_explore32_route8_block4to8_greedy_20260329/result.json) |
+| route | mixed-pool sampled, `4 -> 8` cap | continuation boxed-correct `0.75` | explore `2275.360 tok/s`, accept `2.225`; continue `557.241 tok/s`, accept `3.002` | [result.json](/workspace/route5_explore32_route8_block4to8_sampled_20260329/result.json) |
+| overlap microbench | sampled easy `92ba6a`, non-overlap | microbench only | `561.643 tok/s`, accept `2.923` | [json](/workspace/dflash_overlap_compare_sampled_short_20260329/non_overlap_fused_current.json) |
+| overlap microbench | sampled easy `92ba6a`, overlap | microbench only | `581.786 tok/s`, accept `3.042` | [json](/workspace/dflash_overlap_compare_sampled_short_20260329/overlap_fused_current.json) |
+| overlap microbench | sampled hard `86e8e5`, non-overlap | microbench only | `472.817 tok/s`, accept `2.364` | [json](/workspace/dflash_overlap_compare_sampled_short_20260329/hard_non_overlap_fused_current.json) |
+| overlap microbench | sampled hard `86e8e5`, overlap | microbench only | `473.963 tok/s`, accept `2.448` | [json](/workspace/dflash_overlap_compare_sampled_short_20260329/hard_overlap_fused_current.json) |
+
+What this matrix currently says:
+
+- the strongest confirmed quality lane is still the no-DFlash sampled baseline
+- sampled `early_stop=4` beat sampled full-round `8/8` on the unstable hard case
+- mixed-pool `explore32 -> route8` is not yet finding a real green-zone subset
+- reducing exploration cap from `8` to `4` helped exploration overhead
+- sampled mixed-pool routing did not improve routed quality and was slower
+- overlap-v2 is helping, but only modestly so far on the sampled short A/B
+
+The branch should therefore treat the route study as paused and put engineering focus back on:
+
+- overlap-v2
+- fused / CUDA-graph / mixed-precision verify
+- linear + tree-verify path completion
 
 ## Share-Enabled Decode-Fill Concurrency Matrix
 

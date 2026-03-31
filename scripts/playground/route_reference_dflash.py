@@ -29,8 +29,7 @@ import numpy as np
 import requests
 from transformers import AutoTokenizer
 
-from sglang.bench_serving import benchmark, set_global_args
-from sglang.benchmark.datasets import DatasetRow
+from sglang.bench_serving import DatasetRow, benchmark, set_global_args
 from sglang.test.test_utils import kill_process_tree
 
 from bench_reference_dflash import (
@@ -90,7 +89,10 @@ def _bench_one_with_texts(
     min_p: float,
     disable_stream: bool = False,
 ) -> PhaseRun:
-    reqs = [DatasetRow(p, 0, int(out)) for p, out in zip(prompts, output_lens)]
+    reqs = [
+        DatasetRow(prompt=p, prompt_len=0, output_len=int(out))
+        for p, out in zip(prompts, output_lens)
+    ]
     args = argparse.Namespace(
         disable_ignore_eos=False,
         disable_stream=bool(disable_stream),
@@ -258,6 +260,7 @@ def _server_session(
             piecewise_cuda_graph_max_tokens=8192,
             disable_cuda_graph=False,
             speculative=speculative,
+            speculative_algorithm="DFLASH",
             draft_model_path=draft_model_path,
             draft_attention_backend="fa3",
             draft_kv_cache_dtype="bfloat16",
@@ -265,6 +268,7 @@ def _server_session(
             speculative_moe_runner_backend="triton_kernel",
             speculative_dflash_block_size=int(dflash_block_size),
             mem_fraction_static=mem_fraction_static,
+            disable_overlap_schedule=True,
         )
     base_url = f"http://127.0.0.1:{int(port)}"
     try:

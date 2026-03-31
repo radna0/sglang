@@ -13,10 +13,15 @@
 # ==============================================================================
 """Fused Triton kernel for DFlash KV materialization.
 
-Combines: KV projection (cuBLAS) + RMSNorm + RoPE (Triton), then pool-managed KV writes.
+Combines:
+- accepted-row target-hidden selection
+- target->draft projection
+- draft-layer KV projection (cuBLAS)
+- RMSNorm + RoPE (Triton)
+- pool-managed KV writes
 """
 
-from typing import Callable, List
+from typing import Callable, List, Optional
 
 import torch
 import triton
@@ -191,12 +196,18 @@ class FusedKVMaterializeHelper:
         num_kv_heads: int,
         head_dim: int,
         device: torch.device,
+        target_fc_weight: Optional[torch.Tensor] = None,
+        target_hidden_norm_weight: Optional[torch.Tensor] = None,
+        target_hidden_norm_eps: Optional[float] = None,
     ):
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
         self.rotary_emb = rotary_emb
         self.n_layers = len(layers)
         self.device = device
+        self.target_fc_weight = target_fc_weight
+        self.target_hidden_norm_weight = target_hidden_norm_weight
+        self.target_hidden_norm_eps = target_hidden_norm_eps
 
         self.rotary_dim = int(getattr(rotary_emb, "rotary_dim", head_dim))
         self.is_neox_style = bool(getattr(rotary_emb, "is_neox_style", True))
@@ -265,6 +276,51 @@ class FusedKVMaterializeHelper:
         else:
             self.batched_kv_bias = None
 
+    def project_target_hidden_selected(
+        self,
+        target_hidden: torch.Tensor,
+        accepted_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.target_fc_weight is None or self.target_hidden_norm_weight is None:
+            raise RuntimeError(
+                "FusedKVMaterializeHelper is missing DFlash target projection weights."
+            )
+        if self.target_hidden_norm_eps is None:
+            raise RuntimeError(
+                "FusedKVMaterializeHelper is missing DFlash target hidden norm epsilon."
+            )
+
+        if target_hidden.ndim == 3:
+            flat_target_hidden = target_hidden.reshape(-1, target_hidden.shape[-1])
+        elif target_hidden.ndim == 2:
+            flat_target_hidden = target_hidden
+        else:
+            raise ValueError(
+                f"target_hidden must be 2D or 3D, got shape={tuple(target_hidden.shape)}"
+            )
+
+        accepted_indices = accepted_indices.to(
+            dtype=torch.int64, device=flat_target_hidden.device
+        )
+        selected_hidden = (
+            flat_target_hidden.index_select(0, accepted_indices)
+            if accepted_indices.numel() > 0
+            else flat_target_hidden[:0]
+        )
+        ctx_hidden = torch.nn.functional.linear(selected_hidden, self.target_fc_weight)
+        if ctx_hidden.numel() == 0:
+            return ctx_hidden
+
+        ctx_hidden_fp32 = ctx_hidden.to(torch.float32)
+        variance = ctx_hidden_fp32.pow(2).mean(dim=-1, keepdim=True)
+        ctx_hidden_fp32 = ctx_hidden_fp32 * torch.rsqrt(
+            variance + float(self.target_hidden_norm_eps)
+        )
+        ctx_hidden_fp32 = ctx_hidden_fp32 * self.target_hidden_norm_weight.to(
+            dtype=torch.float32, device=ctx_hidden_fp32.device
+        )
+        return ctx_hidden_fp32.to(dtype=ctx_hidden.dtype)
+
     def materialize(
         self,
         ctx_hidden: torch.Tensor,
@@ -318,3 +374,20 @@ class FusedKVMaterializeHelper:
                 self.eps_values[layer_id],
             )
             write_layer_kv(layer_id, cache_k, cache_v)
+
+    def materialize_from_target_hidden_selected(
+        self,
+        target_hidden: torch.Tensor,
+        accepted_indices: torch.Tensor,
+        positions: torch.Tensor,
+        write_layer_kv: Callable[[int, torch.Tensor, torch.Tensor], None],
+    ) -> None:
+        ctx_hidden = self.project_target_hidden_selected(
+            target_hidden=target_hidden,
+            accepted_indices=accepted_indices,
+        )
+        self.materialize(
+            ctx_hidden=ctx_hidden,
+            positions=positions,
+            write_layer_kv=write_layer_kv,
+        )

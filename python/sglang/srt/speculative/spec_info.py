@@ -16,6 +16,7 @@ class SpeculativeAlgorithm(Enum):
     """Enumeration of speculative decoding algorithms."""
 
     DFLASH = auto()
+    DFLASH_TREE = auto()
     EAGLE = auto()
     EAGLE3 = auto()
     STANDALONE = auto()
@@ -44,6 +45,12 @@ class SpeculativeAlgorithm(Enum):
     def is_dflash(self) -> bool:
         return self == SpeculativeAlgorithm.DFLASH
 
+    def is_dflash_tree(self) -> bool:
+        return self == SpeculativeAlgorithm.DFLASH_TREE
+
+    def is_dflash_family(self) -> bool:
+        return self.is_dflash() or self.is_dflash_tree()
+
     def is_standalone(self) -> bool:
         return self == SpeculativeAlgorithm.STANDALONE
 
@@ -51,7 +58,7 @@ class SpeculativeAlgorithm(Enum):
         return self == SpeculativeAlgorithm.NGRAM
 
     def supports_spec_v2(self) -> bool:
-        return self.is_eagle() or self.is_standalone()
+        return self.is_eagle() or self.is_standalone() or self.is_dflash_family()
 
     def create_worker(
         self, server_args: ServerArgs
@@ -64,12 +71,25 @@ class SpeculativeAlgorithm(Enum):
 
         if self.is_dflash():
             if enable_overlap:
-                raise ValueError(
-                    "DFLASH does not support overlap scheduling (spec v2)."
-                )
+                from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
+
+                return DFlashWorkerV2
+
             from sglang.srt.speculative.dflash_worker import DFlashWorker
 
             return DFlashWorker
+
+        if self.is_dflash_tree():
+            if enable_overlap:
+                from sglang.srt.speculative.dflash_tree_worker_v2 import (
+                    DFlashTreeWorkerV2,
+                )
+
+                return DFlashTreeWorkerV2
+
+            from sglang.srt.speculative.dflash_tree_worker import DFlashTreeWorker
+
+            return DFlashTreeWorker
 
         if self.is_eagle() and server_args.enable_multi_layer_eagle:
             # FIXME: migrate to EagleWorker

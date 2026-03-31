@@ -1,16 +1,11 @@
 from __future__ import annotations
 
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch
-from sglang.srt.speculative.dflash_worker import DFlashWorker
+from sglang.srt.speculative.dflash_tree_worker import DFlashTreeWorker
 
 
-class DFlashWorkerV2(DFlashWorker):
-    """DFlash-native worker for the future spec-v2 / overlap path.
-
-    The overlap gate remains disabled until the DFlash-specific scheduler contract
-    is fully validated end to end. This class exists so the v2 path can evolve
-    without depending on Eagle worker semantics.
-    """
+class DFlashTreeWorkerV2(DFlashTreeWorker):
+    """DFLASH_TREE-native worker for the overlap/spec-v2 path."""
 
     def _forward_prefill_v2(
         self,
@@ -37,7 +32,7 @@ class DFlashWorkerV2(DFlashWorker):
     ):
         if not isinstance(model_worker_batch, ModelWorkerBatch):
             raise TypeError(
-                "DFLASH overlap-v2 worker expects ModelWorkerBatch at entry."
+                "DFLASH_TREE overlap-v2 worker expects ModelWorkerBatch at entry."
             )
         if (
             model_worker_batch.forward_mode.is_extend()

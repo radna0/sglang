@@ -754,6 +754,7 @@ class GptOssForCausalLM(nn.Module):
             hidden_states, aux_hidden_states = hidden_states
 
         if self.pp_group.is_last_rank:
+            final_hidden_states = hidden_states
             if fa4_trace_model_tail:
                 logger.info(
                     "[FA4ModelTail] before_logits shape=%s dtype=%s contiguous=%s",
@@ -772,6 +773,15 @@ class GptOssForCausalLM(nn.Module):
                 forward_batch,
                 aux_hidden_states,
             )
+            if (
+                self.capture_aux_hidden_states
+                and forward_batch.forward_mode.is_target_verify()
+                and hasattr(logits, "__dict__")
+            ):
+                # DFLASH keeps aux hidden features in `logits_output.hidden_states` for
+                # draft-KV append. Preserve the final LM-head-ready hidden states on a
+                # private attribute so tree verify can bypass `next_token_logits` safely.
+                logits._dflash_final_hidden_states = final_hidden_states
             if fa4_trace_model_tail:
                 if isinstance(logits, torch.Tensor):
                     logger.info(

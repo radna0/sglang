@@ -109,7 +109,9 @@ These are the current branch-level conclusions we already trust.
 | DFlash long-decode throughput depends heavily on local continuation predictability | confirmed |
 | High acceptance is useful but not a correctness oracle by itself | confirmed |
 | Tool-calling vs no-tool and greedy vs sampled must be separated | confirmed |
-| Baseline no-DFlash showtime 10-problem early-stop run | running |
+| Baseline no-DFlash showtime 10-problem early-stop run | finished |
+| Baseline no-DFlash showtime 10-problem sampled full-round run | finished |
+| Mixed-pool `explore32 -> route8` route study is complete enough for now | confirmed |
 | DFlash + PaCoRe 10-problem showtime run | running / partial |
 
 ## Run Table
@@ -120,10 +122,17 @@ Append new rows here. Keep failed and superseded runs; do not erase them.
 |---|---|---|---|---|---|---|---|---|---|---|
 | `showtime_baseline10_nodflash_greedy_earlystop4` | finished | `baseline` | `showtime-harmony-tool` | `off` | `4` | `off` | `final_accuracy + pass@8` | `wall_s_total` | `/workspace/showtime_baseline10_20260328_earlystop_nodflash` | greedy baseline over all 10 |
 | `showtime_baseline10_nodflash_sampled_earlystop4` | finished | `baseline` | `showtime-harmony-tool` | `off` | `4` | `off` | `final_accuracy + majority_vote + pass@8` | `wall_s_total` | `/workspace/showtime_baseline10_20260328_earlystop_nodflash_sampled` | sampled baseline: `temperature=1.0`, `top_p=1.0`, `top_k=50`, `min_p=0.02` |
-| `showtime_baseline10_nodflash_sampled_fullround8` | prepared | `baseline` | `showtime-harmony-tool` | `off` | `off/full-round` | `off` | `final_accuracy + majority_vote + pass@8` | `wall_s_total + wall_s_per_question` | `/workspace/showtime_baseline10_20260328_fullround_nodflash_sampled` | same sampled baseline, but force all 8 attempts per question |
+| `showtime_baseline10_nodflash_sampled_fullround8` | finished | `baseline` | `showtime-harmony-tool` | `off` | `off/full-round` | `off` | `final_accuracy + majority_vote + pass@8` | `wall_s_total + wall_s_per_question` | `/workspace/showtime_baseline10_20260328_fullround_nodflash_sampled` | finished: `9/10` final correct, `10/10` any-correct |
 | `showtime_route10_pacore8` | running/partial | `DFLASH` | `showtime-harmony-tool` | `8->1` | `4` | `DFLASH` | `final_accuracy` | `wall_s_total + DFlash metrics` | `/workspace/showtime_harmony_route10_20260328` | current optimized PaCoRe lane |
 | `showtime_smoke_92_dflash` | finished | `DFLASH` | `showtime-harmony-tool` | `off` | `4` | `DFLASH` | `final_accuracy` | `wall_s_total + DFlash metrics` | `/workspace/showtime_harmony_smoke_20260328` | `92ba6a` correct, Python tools exercised |
-| `route5_explore32_route8_block8` | prepared | `explore32->route8` | `no-tool` | `off` | `router early-promotion` | `DFLASH` | `route selection quality + final routed quality` | `wall_s_total + route/explore/continue split` | `/workspace/route5_explore32_route8_block8_20260328` | focused 5-problem difficulty ladder with fixed physical block `8`, adaptive cap off |
+| `route5_explore32_route8_block8` | finished | `explore32->route8` | `no-tool` | `off` | `router early-promotion` | `DFLASH` | `route selection quality + final routed quality` | `wall_s_total + route/explore/continue split` | `/workspace/route5_explore32_route8_block8_20260328` | finished: explore `3146.926 tok/s`, continue `791.732 tok/s`, boxed-correct `0.75` |
+| `route5_explore32_route8_block4to8_greedy` | finished | `explore32->route8` | `no-tool` | `off` | `router early-promotion` | `DFLASH` | `route selection quality + final routed quality` | `wall_s_total + route/explore/continue split` | `/workspace/route5_explore32_route8_block4to8_greedy_20260329` | finished: exploration `3439.704 tok/s`, continuation `803.360 tok/s`, boxed-correct `0.75` |
+| `route5_explore32_route8_block4to8_sampled` | finished | `explore32->route8` | `no-tool` | `off` | `router early-promotion` | `DFLASH` | `route selection quality + final routed quality` | `wall_s_total + route/explore/continue split` | `/workspace/route5_explore32_route8_block4to8_sampled_20260329` | finished: exploration `2275.360 tok/s`, continuation `557.241 tok/s`, boxed-correct `0.75` |
+| `dflash_tree_config_sweep_single_req` | finished | `DFLASH_TREE` | `no-tool` | `off` | `off/full-round` | `DFLASH_TREE` | `tree verify correctness + wall tok/s` | `wall_s_total + accept_length + correct_boxed_rate` | `/workspace/dflash_tree_config_sweep_20260330` | sweep finished: block `4` best is `steps=3 topk=4 vt=4` (`271.792 tok/s`, `1.065x`), block `8` best is `steps=4 topk=2 vt=6` (`299.849 tok/s`, `1.074x`), block `16` best is `steps=8 topk=1 vt=9` (`332.333 tok/s`, `1.127x`) |
+| `tree_vs_linear_single_req_locked_postfix` | finished | `DFLASH_TREE` | `no-tool` | `off` | `off/full-round` | `DFLASH/DFLASH_TREE` | `single-request apples-to-apples tree vs linear` | `wall_tok_s + accept_length + correct_boxed_rate` | `/workspace/tree_vs_linear_apples_20260330` | locked after benchmark-driver fixes: block `4` `304.201/274.047=1.110x`, block `8` `343.534/301.705=1.139x`, block `16` `385.327/315.758=1.221x`, all boxed-correct |
+| `dflash_tree_batch_sweep_postfix` | running/partial | `DFLASH_TREE` | `no-tool` | `off` | `off/full-round` | `DFLASH/DFLASH_TREE` | `batched non-overlap tree vs linear using locked best configs` | `wall_tok_s + accept_length + correct_boxed_rate + batch speedup` | `/workspace/dflash_tree_batch_sweep_20260330_postfix` | partial results locked: block `4` `c=1` `306.603/274.120=1.1185x`, block `4` `c=4` `1194.003/1179.283=1.0125x`, both boxed-correct; `c=8` currently unstable on tree verify and under active debug; overlap forced off |
+| `dflash_tree_overlap_single_request_best` | prepared | `DFLASH_TREE` | `no-tool` | `off` | `off/full-round` | `DFLASH_TREE` | `tree overlap correctness + wall tok/s` | `wall_s_total + accept_length + correct_boxed_rate + overlap speedup` | `/workspace/dflash_tree_overlap_single_request_best_20260330` | prepared follow-up: single-request overlap compare using the best tree configs first (`block=4` and `block=8`) |
+| `dflash_tree_overlap_config_sweep_single_req` | prepared | `DFLASH_TREE` | `no-tool` | `off` | `off/full-round` | `DFLASH_TREE` | `tree overlap speedup across config grid` | `wall_s_total + accept_length + correct_boxed_rate + overlap speedup` | `/workspace/dflash_tree_overlap_config_sweep_20260330` | overlap sweep reuses the linear baselines from `dflash_tree_config_sweep_20260330` and scans the same compact tree grid |
 
 ## Important Baseline Finding
 
@@ -244,18 +253,32 @@ Prepared launcher:
 
 - [run_route5_explore32_route8_block8.sh](/workspace/sglang-dflash-line/scripts/playground/run_route5_explore32_route8_block8.sh)
 
-Another prepared baseline lane, separate from the greedy baseline:
+Finished mixed-pool follow-up:
 
-- no DFLASH
-- no PaCoRe
-- `attempts=8`
-- `early_stop=4`
-- sampled decode:
-  - `temperature=1.0`
-  - `top_p=1.0`
-  - `top_k=50`
-  - `min_p=0.02`
+1. greedy mixed-pool rerun with exploration cap `4` and continuation cap `8`
+   - [run_route5_explore32_route8_block4to8_greedy.sh](/workspace/sglang-dflash-line/scripts/playground/run_route5_explore32_route8_block4to8_greedy.sh)
+   - result: [result.json](/workspace/route5_explore32_route8_block4to8_greedy_20260329/result.json)
+2. sampled mixed-pool rerun with the same `4 -> 8` block-cap split
+   - sampled target settings: `temperature=1.0`, `top_p=1.0`, `top_k=50`, `min_p=0.02`
+   - [run_route5_explore32_route8_block4to8_sampled.sh](/workspace/sglang-dflash-line/scripts/playground/run_route5_explore32_route8_block4to8_sampled.sh)
+   - result: [result.json](/workspace/route5_explore32_route8_block4to8_sampled_20260329/result.json)
 
-Prepared launcher:
+Current conclusion from these route runs:
 
-- [run_showtime_baseline10_earlystop_nodflash_sampled.sh](/workspace/sglang-dflash-line/scripts/playground/run_showtime_baseline10_earlystop_nodflash_sampled.sh)
+- greedy `4 -> 8` was better than sampled `4 -> 8` on throughput
+- sampled `4 -> 8` did not improve routed quality
+- all promoted branches were still `hard_tail`
+- so the route study is complete enough for now, and the next work item is again:
+  - overlap-v2
+  - fused / CUDA-graph / mixed-precision verify
+  - linear + tree-verify completion
+
+Current checkpoint:
+
+- no-DFlash sampled baseline is still the strongest confirmed quality regime
+- sampled full-round did not beat sampled early-stop
+- mixed-pool route study is complete enough for now
+- next engineering focus is:
+  - overlap-v2
+  - fused / CUDA-graph / mixed-precision verify
+  - linear + tree-verify completion

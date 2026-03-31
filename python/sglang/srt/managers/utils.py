@@ -47,6 +47,13 @@ class GenerationBatchResult:
 
     # relay path: forward stream -> next step forward
     next_draft_input: Optional["SpecInput"] = None
+    next_out_cache_loc: Optional[torch.Tensor] = None
+
+    # DFLASH overlap currently commits request/output state inside verify. In that
+    # mode, the scheduler only needs the copied logits/customized info, not the
+    # compact token payload again.
+    dflash_overlap_preprocessed: bool = False
+    requires_output_processing_barrier: bool = False
 
     # metrics
     expert_distribution_metrics: Optional[ExpertDistributionMetrics] = None
@@ -81,10 +88,11 @@ class GenerationBatchResult:
             self.logits_output.hidden_states = self.logits_output.hidden_states.to(
                 "cpu", non_blocking=True
             )
-        self.next_token_ids = self.next_token_ids.to("cpu", non_blocking=True)
+        if not self.dflash_overlap_preprocessed and self.next_token_ids is not None:
+            self.next_token_ids = self.next_token_ids.to("cpu", non_blocking=True)
 
-        if self.accept_lens is not None:
-            self.accept_lens = self.accept_lens.to("cpu", non_blocking=True)
+            if self.accept_lens is not None:
+                self.accept_lens = self.accept_lens.to("cpu", non_blocking=True)
 
         if (x := self.expert_distribution_metrics) is not None:
             x.copy_to_cpu()

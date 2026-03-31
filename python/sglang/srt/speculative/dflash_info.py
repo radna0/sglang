@@ -24,6 +24,7 @@ from sglang.srt.speculative.dflash_utils import (
     apply_dflash_target_only_mapping_updates,
     apply_dflash_target_only_req_kv_accounting,
     build_dflash_target_only_cache_plan,
+    commit_dflash_target_only_batch,
     commit_dflash_proposed_tokens_to_req,
     compute_dflash_accept_len_and_bonus,
     compute_dflash_sampling_accept_len_and_bonus,
@@ -124,12 +125,18 @@ class DFlashDraftInput(SpecInput):
             batch.seq_lens_cpu = self.new_seq_lens.to(
                 dtype=torch.int32, device="cpu"
             )
+            batch.seq_lens_sum = int(self.new_seq_lens.sum().item())
 
     def filter_batch(self, new_indices: torch.Tensor, has_been_filtered: bool = True):
         if self.future_indices is not None:
             self.future_indices.indices = self.future_indices.indices[new_indices]
+            self.verified_id = self.verified_id[new_indices]
+            self.draft_seq_lens = self.draft_seq_lens[new_indices]
+            self.ctx_lens = self.ctx_lens[new_indices]
             if self.new_seq_lens is not None:
                 self.new_seq_lens = self.new_seq_lens[new_indices]
+            if self.target_hidden is not None and self.target_hidden.numel() > 0:
+                self.target_hidden = self.target_hidden[:0]
             return
 
         old_ctx_lens = self.ctx_lens
@@ -182,11 +189,27 @@ class DFlashDraftInput(SpecInput):
                     dim=0,
                 )
             )
+            self.verified_id = torch.cat(
+                [self.verified_id, spec_info.verified_id], dim=0
+            )
+            self.draft_seq_lens = torch.cat(
+                [self.draft_seq_lens, spec_info.draft_seq_lens], dim=0
+            )
+            self.ctx_lens = torch.cat([self.ctx_lens, spec_info.ctx_lens], dim=0)
             if self.new_seq_lens is None:
                 self.new_seq_lens = spec_info.new_seq_lens
             elif spec_info.new_seq_lens is not None:
                 self.new_seq_lens = torch.cat(
                     [self.new_seq_lens, spec_info.new_seq_lens], dim=0
+                )
+            if self.target_hidden is None or self.target_hidden.numel() == 0:
+                self.target_hidden = spec_info.target_hidden
+            elif (
+                spec_info.target_hidden is not None
+                and spec_info.target_hidden.numel() > 0
+            ):
+                self.target_hidden = torch.cat(
+                    [self.target_hidden, spec_info.target_hidden], dim=0
                 )
             return
 
@@ -209,6 +232,16 @@ class DFlashDraftInput(SpecInput):
             self.target_hidden = torch.cat(
                 [self.target_hidden, spec_info.target_hidden], dim=0
             )
+
+
+@dataclass
+class DFlashVerifyResult:
+    new_verified_id: torch.Tensor
+    commit_lens: torch.Tensor
+    next_target_hidden: torch.Tensor | None
+    accept_length_per_req_cpu: List[int]
+    dflash_debug: Optional[Dict[str, Any]]
+    cache_plan: Any
 
 
 @dataclass
@@ -524,22 +557,27 @@ class DFlashVerifyInput(SpecInput):
         batch: ScheduleBatch,
         logits_output: LogitsProcessorOutput,
         page_size: int,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[int], Optional[Dict[str, Any]]]:
+        need_target_hidden: bool = True,
+    ) -> DFlashVerifyResult:
         """DFlash verification (greedy or sampling).
 
         Returns:
             new_verified_id: int64 tensor [bs] (the new current token per request)
             commit_lens: int32 tensor [bs] (how many verify-input tokens are committed)
-            next_target_hidden: tensor [sum(commit_lens), feature_dim]
+            next_target_hidden: tensor [sum(commit_lens), feature_dim] when requested
             accept_length_per_req_cpu: list[int] (accepted draft tokens per request)
         """
-        setattr(self, "target_only_overlap_tokens", None)
-        setattr(self, "target_only_overlap_offsets", None)
-        setattr(self, "target_only_overlap_accept_lens", None)
-
         if batch.forward_mode.is_idle():
-            empty = torch.empty((0,), dtype=torch.int64, device=batch.device)
-            return empty, empty.to(torch.int32), empty, [], None
+            empty_i64 = torch.empty((0,), dtype=torch.int64, device=batch.device)
+            empty_i32 = torch.empty((0,), dtype=torch.int32, device=batch.device)
+            return DFlashVerifyResult(
+                new_verified_id=empty_i64,
+                commit_lens=empty_i32,
+                next_target_hidden=None,
+                accept_length_per_req_cpu=[],
+                dflash_debug=None,
+                cache_plan=None,
+            )
 
         bs = batch.batch_size()
         device = logits_output.next_token_logits.device
@@ -1241,31 +1279,27 @@ class DFlashVerifyInput(SpecInput):
         if timing_detail and t_after_accept == 0.0:
             t_after_accept = time.perf_counter()
 
-        # Compact D2H transfer for CPU-side commit logic.
+        # Single D2H transfer for CPU-side commit logic.
         #
-        # For `verify_mode=target_only`, commit only the accepted target prefix plus
-        # bonus token per request rather than the full verify block.
+        # For `verify_mode=target_only`, the committed tokens must be exactly the same
+        # as baseline (target) decoding in greedy mode. Even though accepted draft
+        # tokens are definitionally equal to `target_predict` for the accepted prefix,
+        # pack the target-predicted tokens directly to make token-parity robust under
+        # paged-KV backends.
         if use_pq:
             # PQ needs candidates (draft proposals) + accept_len + bonus.
             packed = torch.cat(
                 [candidates[:, 1:], accept_len.unsqueeze(1), bonus.unsqueeze(1)], dim=1
             ).cpu()
         else:
-            packed_target_only = pack_dflash_target_only_commits(
-                target_predict=target_predict,
-                accept_len=accept_len,
-            )
-            self.target_only_overlap_tokens = packed_target_only.proposed_flat
-            self.target_only_overlap_offsets = packed_target_only.commit_offsets
-            self.target_only_overlap_accept_lens = packed_target_only.commit_lens
-            packed = packed_target_only.proposed_flat.cpu()
-            target_commit_offsets_cpu = packed_target_only.commit_offsets.cpu()
+            packed = torch.cat([target_predict, accept_len.unsqueeze(1)], dim=1).cpu()
         if timing_detail:
             t_after_pack = time.perf_counter()
 
         max_acc = self.draft_token_num - 1
         accept_length_per_req_cpu: List[int] = []
-        commit_results = []
+        commit_lens_cpu: List[int] = []
+        new_verified_list: List[int] = []
 
         for i, req in enumerate(batch.reqs):
             if use_pq:
@@ -1275,29 +1309,93 @@ class DFlashVerifyInput(SpecInput):
                     int(packed[i, max_acc + 1].item())
                 ]
             else:
-                # Compact target_only layout: flattened committed prefixes plus per-req commit lens.
-                start_offset = int(target_commit_offsets_cpu[i].item())
-                end_offset = int(target_commit_offsets_cpu[i + 1].item())
-                proposed = packed[start_offset:end_offset].tolist()
+                # Layout: [target_predict (len=draft_token_num), accept_len]
+                acc_len = int(packed[i, self.draft_token_num].item())
+                proposed = packed[i, : acc_len + 1].tolist()
 
-            outcome = commit_dflash_proposed_tokens_to_req(
-                req=req,
-                proposed=proposed,
-                empty_error_prefix="DFLASH verify",
-            )
-            commit_results.append(outcome)
-            accept_length_per_req_cpu.append(outcome.accepted_draft_tokens)
+            appended = 0
+            if (
+                req.grammar is None
+                and not req.sampling_params.stop_strs
+                and not req.sampling_params.stop_regex_strs
+            ):
+                remaining = int(req.sampling_params.max_new_tokens) - len(req.output_ids)
+                if remaining > 0:
+                    tokens = proposed[:remaining]
+                    if not req.sampling_params.ignore_eos:
+                        stop_token_ids = req.sampling_params.stop_token_ids
+                        eos_token_ids = req.eos_token_ids
+                        tokenizer = req.tokenizer
+                        tokenizer_eos = (
+                            tokenizer.eos_token_id if tokenizer is not None else None
+                        )
+                        additional_stop = (
+                            tokenizer.additional_stop_token_ids
+                            if tokenizer is not None
+                            else None
+                        )
+                        vocab_size = getattr(req, "vocab_size", None)
+
+                        for j, token_id in enumerate(tokens):
+                            if vocab_size is not None and (
+                                int(token_id) > int(vocab_size) or int(token_id) < 0
+                            ):
+                                tokens = tokens[: j + 1]
+                                break
+                            if stop_token_ids and token_id in stop_token_ids:
+                                tokens = tokens[: j + 1]
+                                break
+                            if eos_token_ids and token_id in eos_token_ids:
+                                tokens = tokens[: j + 1]
+                                break
+                            if tokenizer_eos is not None and int(token_id) == int(
+                                tokenizer_eos
+                            ):
+                                tokens = tokens[: j + 1]
+                                break
+                            if additional_stop and token_id in additional_stop:
+                                tokens = tokens[: j + 1]
+                                break
+
+                    req.output_ids.extend(int(tok) for tok in tokens)
+                    appended = len(tokens)
+                    if appended > 0:
+                        req.check_finished(new_accepted_len=appended)
+            else:
+                for tok in proposed:
+                    req.output_ids.append(int(tok))
+                    appended += 1
+                    req.check_finished()
+                    if req.finished():
+                        break
+                    if req.grammar is not None:
+                        req.grammar.accept_token(int(tok))
+
+            if req.output_ids:
+                new_verified_token = int(req.output_ids[-1])
+            elif req.origin_input_ids:
+                new_verified_token = int(req.origin_input_ids[-1])
+            else:
+                raise RuntimeError(
+                    "DFLASH verify cannot determine current token: both output_ids and "
+                    "origin_input_ids are empty."
+                )
+
+            commit_lens_cpu.append(appended)
+            new_verified_list.append(new_verified_token)
+            accept_length_per_req_cpu.append(max(0, appended - 1))
+            req.spec_verify_ct += 1
+            req.spec_accepted_tokens += accept_length_per_req_cpu[-1]
+            if hasattr(req, "update_spec_acceptance_histogram"):
+                req.update_spec_acceptance_histogram(accept_length_per_req_cpu[-1])
 
         if timing_detail:
             t_after_commit = time.perf_counter()
 
-        commit_lens_cpu = [result.commit_len for result in commit_results]
-        commit_metadata = materialize_dflash_target_only_commit_metadata(
-            commit_results=commit_results,
-            device=device,
+        commit_lens = torch.tensor(commit_lens_cpu, dtype=torch.int32, device=device)
+        new_verified_id = torch.tensor(
+            new_verified_list, dtype=torch.int64, device=device
         )
-        commit_lens = commit_metadata.commit_lens
-        new_verified_id = commit_metadata.new_verified_id
         cache_plan = build_dflash_target_only_cache_plan(
             out_cache_loc=batch.out_cache_loc,
             commit_lens=commit_lens,
@@ -1334,15 +1432,22 @@ class DFlashVerifyInput(SpecInput):
         if timing_detail:
             t_after_mapping = time.perf_counter()
 
-        next_target_hidden = gather_dflash_committed_hidden(
-            hidden_states=logits_output.hidden_states,
-            keep_mask=cache_plan.keep_mask,
-            draft_token_num=self.draft_token_num,
-        )
+        next_target_hidden = None
+        if need_target_hidden:
+            hidden = logits_output.hidden_states
+            if hidden is None:
+                raise RuntimeError(
+                    "DFLASH verify requires target hidden states, but got None."
+                )
+            hidden = hidden.view(bs, self.draft_token_num, -1)
+            segments: List[torch.Tensor] = []
+            for i, ln in enumerate(commit_lens_cpu):
+                if ln > 0:
+                    segments.append(hidden[i, :ln, :])
+            next_target_hidden = torch.cat(segments, dim=0) if segments else hidden[:0]
         if timing_detail:
             t_after_hidden = time.perf_counter()
 
-        # Avoid confusing downstream consumers (spec-v1 decode doesn't use this).
         logits_output.hidden_states = None
 
         if timing_detail:
@@ -1367,10 +1472,11 @@ class DFlashVerifyInput(SpecInput):
                     float(t_after_hidden - t0),
                 )
 
-        return (
-            new_verified_id,
-            commit_lens,
-            next_target_hidden,
-            accept_length_per_req_cpu,
-            dflash_debug,
+        return DFlashVerifyResult(
+            new_verified_id=new_verified_id,
+            commit_lens=commit_lens,
+            next_target_hidden=next_target_hidden,
+            accept_length_per_req_cpu=accept_length_per_req_cpu,
+            dflash_debug=dflash_debug,
+            cache_plan=cache_plan,
         )

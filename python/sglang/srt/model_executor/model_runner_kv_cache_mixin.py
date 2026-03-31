@@ -147,7 +147,7 @@ class ModelRunnerKVCacheMixin:
             num_layers = self.num_effective_layers
 
         cell_size = self.get_cell_size_per_token(num_layers)
-        if self.spec_algorithm.is_dflash() and not self.is_draft_worker:
+        if self.spec_algorithm.is_dflash_family() and not self.is_draft_worker:
             draft_num_layers = getattr(self, "dflash_draft_num_layers", None)
             if (
                 draft_num_layers is not None

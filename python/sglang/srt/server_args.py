@@ -2825,10 +2825,10 @@ class ServerArgs:
                     "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
                 )
 
-            self.disable_overlap_schedule = True
-            logger.warning(
-                "Overlap scheduler is disabled when using DFLASH speculative decoding (spec v2 is not supported yet)."
-            )
+            if not self.disable_overlap_schedule:
+                logger.warning(
+                    "DFLASH overlap scheduler (spec v2) is enabled. This path is experimental and should be validated on the target workload."
+                )
 
             if self.enable_mixed_chunk:
                 self.enable_mixed_chunk = False
@@ -2892,12 +2892,6 @@ class ServerArgs:
             if self.pp_size != 1:
                 raise ValueError(
                     "Currently DFLASH_TREE speculative decoding only supports pp_size == 1."
-                )
-
-            if self.page_size != 1:
-                raise ValueError(
-                    "Currently DFLASH_TREE speculative decoding requires page_size == 1. "
-                    f"Got page_size={self.page_size}."
                 )
 
             if self.speculative_draft_model_path is None:
@@ -3035,10 +3029,23 @@ class ServerArgs:
                     "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
                 )
 
-            self.disable_overlap_schedule = True
-            logger.warning(
-                "Overlap scheduler is disabled when using DFLASH_TREE speculative decoding (spec v2 is not supported yet)."
+            tree_overlap_experimental = (
+                (os.environ.get("SGLANG_ENABLE_DFLASH_TREE_OVERLAP_EXPERIMENTAL") or "")
+                .strip()
+                .lower()
+                not in ("", "0", "false", "off", "no")
             )
+            if tree_overlap_experimental:
+                logger.warning(
+                    "DFLASH_TREE overlap scheduler is enabled in experimental mode. "
+                    "This path is not production-ready yet and must be validated under CUDA graph replay."
+                )
+            else:
+                self.disable_overlap_schedule = True
+                logger.warning(
+                    "Overlap scheduler is disabled when using DFLASH_TREE speculative decoding. "
+                    "Set SGLANG_ENABLE_DFLASH_TREE_OVERLAP_EXPERIMENTAL=1 to enable the experimental spec-v2 path."
+                )
 
             if self.enable_mixed_chunk:
                 self.enable_mixed_chunk = False
@@ -4677,7 +4684,15 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-algorithm",
             type=str,
-            choices=["DFLASH", "EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "NGRAM"],
+            choices=[
+                "DFLASH",
+                "DFLASH_TREE",
+                "EAGLE",
+                "EAGLE3",
+                "NEXTN",
+                "STANDALONE",
+                "NGRAM",
+            ],
             help="Speculative algorithm.",
         )
         parser.add_argument(

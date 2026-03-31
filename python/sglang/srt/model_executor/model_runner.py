@@ -383,7 +383,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 # if there is no aux layer, set to None
                 self.eagle_aux_hidden_state_layer_ids = None
 
-        if self.spec_algorithm.is_dflash() and not self.is_draft_worker:
+        if self.spec_algorithm.is_dflash_family() and not self.is_draft_worker:
             # Select target layers to capture for building DFlash context features.
             draft_model_config = ModelConfig.from_server_args(
                 server_args,
@@ -1989,7 +1989,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # DFlash draft model forward requires `input_embeds` from the target embedding.
         # The draft worker does not have that embedding during warmup, and draft workers
         # do not use CUDA graphs for DFlash anyway (see can_use_cuda_graphs()).
-        if self.is_draft_worker and self.spec_algorithm.is_dflash():
+        if self.is_draft_worker and self.spec_algorithm.is_dflash_family():
             logger.info(
                 "FlexFlash4 pre-capture warmup: skipping for DFlash draft worker (requires input_embeds)."
             )
@@ -2061,7 +2061,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.spec_algorithm.is_eagle()
             or self.spec_algorithm.is_standalone()
             or self.spec_algorithm.is_ngram()
-            or self.spec_algorithm.is_dflash()
+            or self.spec_algorithm.is_dflash_family()
         ):
             return not self.is_draft_worker
 
@@ -2096,7 +2096,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.spec_algorithm.is_eagle()
             or self.spec_algorithm.is_standalone()
             or self.spec_algorithm.is_ngram()
-            or self.spec_algorithm.is_dflash()
+            or self.spec_algorithm.is_dflash_family()
         ):
             # Speculative algorithms use a dedicated draft worker. That worker still
             # needs a normal warmup pass, so do not special-case it into TARGET_VERIFY.
@@ -2454,8 +2454,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
             return
 
-        # Disable piecewise CUDA graph for non-language models
-        if not hasattr(self.model, "model"):
+        model_root = getattr(self.model, "language_model", self.model)
+        model_container = getattr(model_root, "model", None)
+        requires_input_embeds = bool(getattr(self.model, "requires_input_embeds", False))
+
+        # Disable piecewise CUDA graph for models that neither expose a language-model
+        # container nor explicitly opt into input-embed-driven piecewise capture.
+        if model_container is None and not requires_input_embeds:
             logger.warning(
                 "Disable piecewise CUDA graph because the model is not a language model"
             )
@@ -2469,12 +2474,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             return
 
         # Collect attention layers and moe layers from the model
-        self.model.model = resolve_language_model(self.model)
-        language_model = getattr(self.model, "language_model", self.model)
+        if model_container is None:
+            model_container = model_root
+        else:
+            self.model.model = resolve_language_model(self.model)
+        language_model = model_root
         self.attention_layers = []
         self.moe_layers = []
         self.moe_fusions = []
-        for layer in language_model.model.layers:
+        for layer in model_container.layers:
             if hasattr(layer, "self_attn"):
                 if hasattr(layer.self_attn, "attn"):
                     self.attention_layers.append(layer.self_attn.attn)

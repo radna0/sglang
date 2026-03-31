@@ -135,7 +135,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
 )
 from sglang.srt.managers.mm_utils import init_mm_embedding_cache, unwrap_shm_features
-from sglang.srt.managers.overlap_utils import FutureMap
+from sglang.srt.managers.overlap_utils import FutureIndices, FutureMap
 from sglang.srt.managers.prefill_delayer import (
     PrefillDelayer,
     PrefillDelayerSinglePassExecutor,
@@ -862,7 +862,9 @@ class Scheduler(
         if self.draft_worker is None or self.spec_algorithm.is_ngram():
             draft_token_to_kv_pool = None
         elif self.spec_algorithm.supports_spec_v2() and self.enable_overlap:
-            if self.server_args.enable_multi_layer_eagle:
+            if self.spec_algorithm.is_dflash_family():
+                draft_runner = self.draft_worker.draft_model_runner
+            elif self.server_args.enable_multi_layer_eagle:
                 draft_runner = self.draft_worker.draft_worker.draft_runner_list[0]
             else:
                 draft_runner = self.draft_worker.draft_worker.draft_runner
@@ -1149,6 +1151,20 @@ class Scheduler(
             if self._engine_paused:
                 continue
 
+            # Some speculative workers, notably DFlash-family overlap-preprocessed
+            # decode, already commit request/KV state inside verify. Those results
+            # must be output-processed before the next scheduling step reuses the
+            # live running batch; otherwise the overlap loop can schedule against
+            # stale ownership and corrupt allocator state.
+            if self.result_queue and bool(
+                getattr(
+                    self.result_queue[0][1],
+                    "requires_output_processing_barrier",
+                    False,
+                )
+            ):
+                pop_and_process()
+
             # Get the next batch to run
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
@@ -1167,7 +1183,7 @@ class Scheduler(
                 batch_result = None
 
             # Process the last batch
-            if self.last_batch:
+            if self.last_batch and self.result_queue:
                 if not disable_overlap_for_batch:
                     pop_and_process()
             elif batch is None:
@@ -1562,14 +1578,14 @@ class Scheduler(
                 self._add_request_to_queue(req)
                 return
 
-        if self.spec_algorithm.is_dflash() and req.return_logprob:
+        if self.spec_algorithm.is_dflash_family() and req.return_logprob:
             req.set_finish_with_abort(
                 "DFLASH speculative decoding does not support return_logprob yet."
             )
             self.init_req_max_new_tokens(req)
             self._add_request_to_queue(req)
             return
-        if self.spec_algorithm.is_dflash() and (
+        if self.spec_algorithm.is_dflash_family() and (
             req.sampling_params.json_schema is not None
             or req.sampling_params.regex is not None
             or req.sampling_params.ebnf is not None
@@ -2294,6 +2310,54 @@ class Scheduler(
         self.batch_record_ct = (self.batch_record_ct + 1) % 2
         self.batch_record_buf[self.batch_record_ct] = model_worker_batch
 
+    def _prepare_spec_v2_overlap_state(
+        self,
+        batch: ScheduleBatch,
+        batch_result: GenerationBatchResult,
+        future_indices: FutureIndices,
+    ) -> None:
+        """Move DFlash/Eagle next-draft state into the overlap scheduler contract.
+
+        This keeps the spec-v2 producer side explicit instead of leaving ad hoc
+        DFlash/Eagle behavior in the middle of `run_batch`.
+        """
+        next_draft_input = batch_result.next_draft_input
+        if next_draft_input is None:
+            raise RuntimeError(
+                "spec-v2 overlap requires next_draft_input from the speculative worker."
+            )
+
+        batch.spec_info = next_draft_input
+        batch.spec_info.future_indices = future_indices
+
+        new_seq_lens = getattr(next_draft_input, "new_seq_lens", None)
+        if new_seq_lens is None:
+            raise RuntimeError(
+                "spec-v2 overlap requires next_draft_input.new_seq_lens."
+            )
+
+        # The future value, usually for next batch preparation.
+        # Current implementation strictly synchronizes seq_lens at this boundary.
+        batch.seq_lens = new_seq_lens
+        batch.seq_lens_sum = int(new_seq_lens.sum().item())
+
+        if batch.spec_algorithm.is_dflash_family():
+            # Keep CPU-side scheduling state aligned with the DFlash-native future
+            # payload. This mirrors DFlashDraftInput.prepare_for_decode() but is
+            # done here so overlap scheduling can safely inspect the updated batch
+            # before the next round starts.
+            batch.seq_lens_cpu = new_seq_lens.to(dtype=torch.int32, device="cpu")
+
+            next_out_cache_loc = getattr(batch_result, "next_out_cache_loc", None)
+            if next_out_cache_loc is not None:
+                batch.out_cache_loc = next_out_cache_loc
+
+        # Keep req ownership intact until output processing runs. DFlash-family
+        # overlap may commit finish state inside verify, but KV release still
+        # happens in the decode output processor. Filtering here can drop the req
+        # before `_handle_dflash_overlap_preprocessed_req()` sees it, which leaks
+        # the verify-owned KV slots for that req.
+
     def run_batch(
         self,
         batch: ScheduleBatch,
@@ -2360,20 +2424,9 @@ class Scheduler(
                 future_indices_or_next_token_ids = -future_indices.indices
 
                 if batch.is_spec_v2:
-                    # FIXME(lsyin): tmp code for spec v2
-                    # We only keep future indices for next draft input
-
-                    batch.spec_info = batch_result.next_draft_input
-                    batch.spec_info.future_indices = future_indices
-
-                    # batch.spec_info = EagleDraftInput(
-                    #     future_indices=future_indices,
-                    #     verify_done=batch_result.next_draft_input.verify_done,
-                    # )
-
-                    # The future value, usually for next batch preparation
-                    # Current implementation strictly synchronizes the seq_lens
-                    batch.seq_lens = batch_result.next_draft_input.new_seq_lens
+                    self._prepare_spec_v2_overlap_state(
+                        batch, batch_result, future_indices
+                    )
             elif self.enable_pdmux and batch.forward_mode.is_split_prefill():
                 batch_result = self.tp_worker.forward_batch_split_prefill(batch)
                 future_indices_or_next_token_ids = batch_result.next_token_ids

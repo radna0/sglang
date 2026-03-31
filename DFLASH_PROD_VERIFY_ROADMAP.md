@@ -32,24 +32,90 @@ It is **not** about:
 
 ## Current Code-Anchored State
 
-### 1. DFlash overlap/spec-v2 is disabled today
+### 0. Current benchmark checkpoint before more overlap work
+
+The branch-level benchmark state now supports a narrow engineering conclusion:
+
+- no-DFlash sampled baseline is still the strongest confirmed quality regime
+- mixed-pool `explore32 -> route8` is not yet producing a true green-zone route set
+- overlap-v2 is helping on short sampled A/B, but only modestly so far
+
+That means the right immediate engineering target is not more routing work. It is:
+
+1. overlap-v2 completion
+2. fused / CUDA-graph / mixed-precision verify on the DFlash family path
+3. linear + tree parity under that contract
+
+The route study is therefore treated as documented and paused for now.
+
+### 1. DFlash overlap/spec-v2 was hard-disabled, but the local worktree now has the gate wiring
 
 Code:
 
 - `python/sglang/srt/server_args.py`
 - `python/sglang/srt/speculative/spec_info.py`
+- `python/sglang/srt/managers/scheduler.py`
 
-Confirmed behavior:
+Old behavior:
 
 - `server_args.py` forces `disable_overlap_schedule = True` for DFlash
 - `spec_info.py` raises if overlap is enabled for DFlash
 
-So current DFlash runs have:
+Local worktree state now:
 
-- no overlap scheduler
-- no spec-v2 future payload
-- no DFlash participation in `FutureMap`
-- no DFlash-specific overlap replay plumbing
+- `SpeculativeAlgorithm.supports_spec_v2()` includes DFlash
+- `create_worker(...)` selects `DFlashWorkerV2` when overlap is enabled
+- `server_args.py` no longer force-disables overlap for DFlash
+- `scheduler.init_disaggregation()` no longer assumes Eagle-only nested draft runners for the DFlash overlap path
+- `DFlashWorkerV2` now owns an explicit:
+  - overlap prefill entrypoint
+  - overlap decode/verify entrypoint
+  instead of relying on the base worker's mixed v1/v2 public method
+
+What still must be proven by benchmark before commit:
+
+- live overlap-v2 scheduler replay works end to end on the actual DFlash serving path
+- the overlap path is stable under CUDA graph replay
+- the overlap path improves throughput enough to justify the gate flip
+- DFLASH_TREE overlap-v2 now has internal worker/future/scheduler scaffolding in the
+  local worktree, and `server_args.py` now exposes it behind the explicit
+  experimental env gate:
+  - `SGLANG_ENABLE_DFLASH_TREE_OVERLAP_EXPERIMENTAL=1`
+  It is still not production-ready until benchmarked and validated under CUDA graph replay.
+
+### 1a. DFLASH_TREE is no longer structurally blocked in the local worktree
+
+Code:
+
+- `python/sglang/srt/speculative/spec_info.py`
+- `python/sglang/srt/speculative/dflash_tree_worker.py`
+- `python/sglang/srt/speculative/dflash_tree_worker_v2.py`
+- `python/sglang/srt/managers/overlap_utils.py`
+- `python/sglang/srt/managers/scheduler.py`
+- `python/sglang/srt/managers/scheduler_output_processor_mixin.py`
+
+Current local worktree state:
+
+- `DFLASH_TREE` is a real `SpeculativeAlgorithm` enum member
+- `supports_spec_v2()` now includes the DFlash family
+- `create_worker(...)` can now select:
+  - `DFlashTreeWorker` when overlap is disabled
+  - `DFlashTreeWorkerV2` when overlap is enabled
+- `FutureMap`, scheduler overlap state prep, and overlap output processing now key on
+  the DFlash family rather than only `DFLASH`
+- `DFlashTreeWorker` now has an internal overlap-v2-shaped execution path and emits:
+  - `next_draft_input`
+  - `verify_done`
+  - `dflash_overlap_preprocessed`
+
+What remains before we can claim tree overlap is really working:
+
+- live scheduler replay on the tree path
+- CUDA-graph validation
+- real throughput validation vs tree non-overlap
+- the new indexed cache plan no longer hard-requires `page_size == 1`
+  - tree verify now computes page-aware evicted-page frees through the shared
+    indexed cache-plan helpers instead of bailing out early
 
 ### 2. The real production verify path is `target_only`
 
@@ -120,6 +186,50 @@ So sampled target-only is no longer purely the old inline path. It now has a
 production helper fast path, but still does not have a fully fused on-device
 commit/update stage.
 
+Local worktree hardening that is not committed yet:
+
+- the sampled helper now clamps the kernel-reported accepted count into the legal
+  DFlash range before compact target-only packing
+- this is intended to stop the live sampled helper crash that previously surfaced
+  as a device-side assert during `pack_dflash_target_only_commits(...)`
+- the sampled helper no longer reconstructs the committed prefix from the wider
+  kernel-side accept-index table
+  - it now reconstructs the target-only committed proposal directly as:
+    - accepted candidate prefix
+    - plus the target-sampled bonus token
+  - this is the correct target-only contract and removes a class of invalid-index
+    failures that were not semantically necessary in the first place
+
+### 4a. DFLASH_TREE now uses compact packed commits like the linear path
+
+Code:
+
+- `python/sglang/srt/speculative/dflash_tree_worker.py`
+- `python/sglang/srt/speculative/dflash_utils.py`
+
+Local worktree state now:
+
+- tree verify no longer reconstructs proposals per request in a Python loop
+- tree verify now packs accepted verify outputs into:
+  - compact flat committed tokens
+  - commit lengths
+  - commit offsets
+  - default `new_verified_id`
+- CPU-side commit on the tree path now uses the same batched helper shape as the
+  linear target-only path
+- final accepted flat verify indices are now derived from:
+  - original `accept_index`
+  - final `commit_lens`
+  instead of mutating `accept_index` row-by-row on CPU
+
+Why this matters:
+
+- this removes one of the biggest remaining structural differences between the
+  linear path and the tree path
+- it gives tree verify the same no-truncation fast-path metadata seam the linear
+  path already had
+- it is the correct staging point for later deeper fusion work
+
 ### 5. Accept/commit bookkeeping is still CPU-shaped, but the D2H boundary is smaller
 
 Code:
@@ -149,6 +259,25 @@ What changed already:
 - target-only no longer has to copy the full `draft_token_num` token row for each
   request
 - it now copies only the committed prefix plus lengths
+- the common plain-request `target_only` path now batches CPU finish-policy handling
+  for:
+  - `max_new_tokens`
+  - EOS / stop-token detection
+  - invalid-vocab handling
+  while preserving strict fallback for:
+  - grammar
+  - stop strings
+  - stop regex
+- shared-pool `target_only` verify no longer eagerly materializes committed target
+  hidden by default
+  - `verify()` now returns structured commit metadata
+  - the worker only gathers committed hidden on the staged-append fallback path
+  - the direct shared-pool append path uses:
+    - target verify hidden states
+    - compact flat accepted indices
+    - flat accepted positions from `verify_input.positions`
+    - compact cache plan
+    without pre-staging an accepted-hidden tensor on the verify side
 
 What remains:
 
@@ -161,6 +290,11 @@ What was improved on this branch:
 - the CPU-side request mutation logic is now centralized in
   `commit_dflash_proposed_tokens_to_req(...)`
 - both `dflash_info.py` and `dflash_tree_worker.py` use that shared helper
+- target-only commit metadata now has a no-truncation fast path:
+  - if the CPU commit loop did not shorten the proposed prefix for a request,
+    we reuse the device-side `commit_lens` and `default_new_verified_id`
+  - only requests that actually diverge from the device defaults are patched back
+    from CPU outcomes
 - this does not yet remove the CPU loop, but it gives us one stable seam for
   later:
   - device-generated commit metadata
@@ -169,6 +303,77 @@ What was improved on this branch:
 
 So the CPU-shaped boundary is smaller now, but it is still the main fusion
 target.
+
+### 5a. What this means concretely for "fused verify"
+
+The current fused-verify story on this branch is:
+
+1. target verify math runs on device
+2. committed target-only prefixes are compacted on device
+3. the common no-truncation case now reuses device-side commit metadata
+4. shared-pool regimes can append verified hidden directly into the draft KV path
+5. overlap replay no longer re-copies / re-resolves accepted token payloads on CPU
+6. shared-pool verify no longer stages committed hidden unless the direct append
+   path falls back
+
+What is still **not** fused:
+
+- the Python request mutation loop itself
+- finish / stop-string / grammar decisions
+- any mixed FP8-target/BF16-draft single verify kernel
+
+So the next production boundary is still host-side request semantics, not draft KV math.
+
+### 5b. The next fused-verify seam is now explicit
+
+After the current local changes, the remaining mixed-precision production seam is:
+
+1. target verify produces target hidden on device
+2. commit metadata and keep/evict plan are produced on device
+3. the fused shared-pool lane now owns:
+   - accepted-row selection
+   - target->draft projection
+   - target hidden norm
+   - BF16 draft KV materialization
+4. the remaining separation is that this is still a DFlash helper path, not yet a
+   single dedicated selected-hidden append kernel
+
+So the next undeniably best technical target is no longer vague. It is one of:
+
+- a deeper DFlash-owned fused selected-hidden -> draft-KV append kernel
+  - input:
+    - target hidden buffer
+    - compact accepted indices
+    - accepted positions from the flat verify layout
+    - compact cache locations
+  - output:
+    - BF16 draft KV written directly
+- or a combined target+verify+draft CUDA graph on the DFlash overlap-v2 path that
+  makes that boundary stable enough that the remaining gather cost is fully hidden
+
+The current branch should pursue both in that order:
+
+1. keep the shared-pool no-staging fast path as the baseline seam
+2. replace the current DFlash-owned fused-helper path with a dedicated selected-hidden append kernel
+3. then fold target verify + accepted-hidden append + next draft proposal into the
+   DFlash-owned overlap-v2 graph path
+
+Current local seam:
+
+- `DFlashDraftModel.project_target_hidden_selected(...)`
+- `DFlashWorker._project_and_write_verified_hidden_selected_to_draft_kv(...)`
+- `FusedKVMaterializeHelper.materialize_from_target_hidden_selected(...)`
+
+Parity note:
+
+- the same selected-hidden fused-helper ownership now exists on:
+  - `DFlashWorker`
+  - `DFlashTreeWorker`
+
+So the next kernel/graph step no longer needs separate main-vs-tree boundary work first.
+
+This is now the one explicit replacement point for the deeper mixed-precision
+fused append path.
 
 ### 6. Draft proposal generation already supports physical-vs-logical separation
 
@@ -237,12 +442,151 @@ What it does **not** do:
 So this async shadow path is useful, but it is not a substitute for real
 DFlash spec-v2 support.
 
+### 8a. DFlash already has partial SSD scaffolding, but it is not yet the primary architecture
+
+Code:
+
+- `python/sglang/srt/speculative/dflash_worker.py`
+- `python/sglang/srt/managers/utils.py`
+
+Current branch status:
+
+- there is already a DFlash-specific SSD control surface behind env flags:
+  - `SGLANG_DFLASH_SSD_ENABLE`
+  - `SGLANG_DFLASH_SSD_PREPARE_NEXT`
+  - `SGLANG_DFLASH_SSD_FANOUT`
+  - `SGLANG_DFLASH_SSD_BRANCH_MODE`
+  - `SGLANG_DFLASH_SSD_ASYNC_OVERLAP`
+  - difficulty / miss-streak / alt-mass gates
+- there is already a branch-candidate collection path:
+  - `_collect_ssd_branch_candidates(...)`
+- there is already an eager-next SSD cache path:
+  - `_prepare_ssd_fanout_branches(...)`
+- there is already an async SSD shadow-overlap path:
+  - `_schedule_ssd_fanout_overlap(...)`
+  - shadow req-to-token pool
+  - shadow KV scratch
+  - overlap executor / future
+- request metrics already include SSD counters:
+  - `spec_ssd_hit_ct`
+  - `spec_ssd_prepare_ct`
+  - `spec_ssd_prepare_failure_ct`
+  - `spec_ssd_cache_pending`
+  - `spec_ssd_overlap_launch_ct`
+  - `spec_ssd_overlap_wait_ct`
+- the current cached-proposal lookup is still keyed narrowly by:
+  - `(expected_seq_len, expected_verified_id)`
+  rather than a richer explicit verification-outcome object
+
+What this means:
+
+- we do **not** need to invent an SSD mode from scratch
+- we already have a prototype of:
+  - verification-outcome branch prediction
+  - eager-next preparation
+  - async overlap preparation
+- but it is still attached to the current linear DFlash worker lifecycle
+  rather than treated as a first-class overlap-v2 scheduler contract
+
+So the real task is:
+
+1. harden the existing SSD prototype
+2. align it with the DFlash-native spec-v2 payload
+3. strengthen the cache key / future payload so it represents the verification
+   outcome explicitly, not just the current minimal key
+4. then measure it against ordinary DFlash overlap, instead of building a
+   separate unrelated system
+
+### 8b. SSD is not the same thing as EAGLE tree verify
+
+Reference material inspected:
+
+- `https://arxiv.org/pdf/2603.03251`
+- `/workspace/ssd_paper/ssd_2603.03251.txt`
+- `/workspace/ssd_repo/README.md`
+- `/workspace/ssd_repo/ssd/utils/verify.py`
+- `/workspace/ssd_repo/ssd/engine/speculator_async.py`
+- `/workspace/ssd_repo/ssd/engine/draft_runner.py`
+- `/workspace/ssd_repo/ssd/engine/verifier.py`
+
+Important distinction:
+
+- EAGLE-style tree speculation increases verifier-side structure:
+  - multiple branches are verified by the target in one tree-masked verify pass
+  - verifier compute grows with the tree
+- SSD-style async speculation does **not** add verifier compute:
+  - the verifier still verifies one ordinary speculative rollout
+  - the draft predicts likely future verification outcomes in parallel on
+    separate hardware and caches them
+
+This matters for DFlash:
+
+- the current main DFlash worker is still fundamentally a linear block-speculation
+  path
+- DFlash tree behavior exists separately in `dflash_tree_worker.py`
+- SSD belongs more naturally on top of:
+  - DFlash overlap-v2 future payloads
+  - outcome-cache / branch-preparation logic
+  - draft-side overlap scheduling
+- SSD does **not** imply reusing Eagle tree masks or Eagle tree payload semantics
+
+So the right mental model is:
+
+- EAGLE tree: more verifier structure
+- SSD: more draft-side future-outcome preparation
+- DFlash can and should eventually support both ideas, but they solve different
+  bottlenecks
+
 ### 9. FP8 target KV and BF16 draft KV are separate and correctly configurable
 
 Code:
 
 - `python/sglang/srt/model_executor/model_runner.py`
 - `python/sglang/srt/speculative/dflash_worker.py`
+
+## Current Dirty-Tree Benchmark State
+
+Short sampled A/B, `92ba6a`, `ctx=65536`, `decode=2048`, `concurrency=4`,
+`block_size=8`, target `fp8_e4m3`, draft `bfloat16`, CUDA graph on:
+
+- current non-overlap:
+  - `/workspace/dflash_overlap_compare_sampled_short_20260329/non_overlap_fused_current.json`
+  - `561.643 tok/s`
+  - `accept=2.923`
+- current overlap:
+  - `/workspace/dflash_overlap_compare_sampled_short_20260329/overlap_fused_current.json`
+  - `581.786 tok/s`
+  - `accept=3.042`
+- current paired speedup:
+  - about `1.036x`
+
+Earlier hard sampled A/B, `86e8e5`, same short regime:
+
+- current non-overlap:
+  - `/workspace/dflash_overlap_compare_sampled_short_20260329/hard_non_overlap_fused_current.json`
+  - `472.817 tok/s`
+  - `accept=2.364`
+- current overlap:
+  - `/workspace/dflash_overlap_compare_sampled_short_20260329/hard_overlap_fused_current.json`
+  - `473.963 tok/s`
+  - `accept=2.448`
+- current paired speedup:
+  - about `1.002x`
+
+There is still an older hard pair on disk with a larger overlap advantage:
+
+- `/workspace/dflash_overlap_compare_sampled_short_20260329/hard_non_overlap_fused.json`
+- `/workspace/dflash_overlap_compare_sampled_short_20260329/hard_overlap_fused.json`
+- about `1.052x`
+
+So the stable conclusion is:
+
+- overlap-v2 + current fused-verify work is no longer losing on the hard case
+- but the hard-case gain is still variance-sensitive and much smaller than on the easy case
+
+This is enough to say the overlap-v2 + current fused-verify path is no longer
+just an architectural bring-up. It is now a real throughput win on both the
+easy and the harder sampled short workloads already measured on this branch.
 
 Confirmed behavior:
 
@@ -290,11 +634,15 @@ Current branch status:
   - `verify_done`
 - DFlash KV append now makes `new_seq_lens` explicit after the append step
 - `FutureMap` now has a DFlash-specific storage/resolve branch
+- `FutureMap` now also preserves `verify_done` across DFlash future store/resolve,
+  so the replayed draft state keeps the same verify-completion synchronization signal
 - DFlash workers now emit `next_draft_input` as post-append draft state on both:
   - prefill completion
   - verify completion
 - `ScheduleBatch.prepare_for_decode()` can now consume DFlash draft state through
   `DFlashDraftInput.prepare_for_decode(...)`
+- scheduler overlap handoff now has an explicit DFlash/spec-v2 state-preparation
+  helper instead of leaving DFlash-specific future-state mutation inline in `run_batch`
 - `CudaGraphRunner.get_spec_info()` now constructs DFlash verify replay inputs via
   `DFlashVerifyInput.create_idle_input(...)`
 - that branch stores only the stable post-append draft state:
@@ -310,11 +658,62 @@ Important design choice:
 - this is intentional: the overlap payload should represent the state *after*
   target hidden has already been appended into the draft KV cache
 
-So the branch now has the correct DFlash-native payload seam, but:
+So the branch now has the correct DFlash-native payload seam, and the local
+worktree has gone further than the original roadmap state:
 
-- DFlash still reports `supports_spec_v2() == False`
-- scheduler overlap is still disabled
-- no live overlap execution path uses the new payload yet
+- DFlash now reports `supports_spec_v2() == True`
+- overlap scheduling is no longer force-disabled for DFlash on this branch
+- the live overlap path now runs end to end with:
+  - `FutureMap` DFlash payload storage/resolve
+  - `DFlashWorkerV2` selection
+  - DFlash-specific overlap token slicing in the scheduler output processor
+
+What still remains true:
+
+- the overlap path is still treated as experimental until it shows a repeatable
+  throughput win, not just correctness/stability
+- most of the remaining overhead is now at the host-side verify/commit boundary,
+  not in missing payload plumbing
+
+### 12. Current overlap/fused-verify benchmark state
+
+Reference workload so far:
+
+- sampled target decode
+- target KV: `fp8_e4m3`
+- draft KV: `bfloat16`
+- `block_size=8`
+- `page_size=1`
+- shared pools
+- `question_id=92ba6a`
+- `num_prompts=4`
+- `concurrency=4`
+- `decode_len=2048`
+
+Observed results on this branch:
+
+- old non-overlap baseline:
+  - `604.432 tok/s`
+- old overlap before the new overlap/fused work:
+  - `535.158 tok/s`
+- overlap after direct shared-pool verify->draft append:
+  - `601.787 tok/s`
+- latest paired rerun after skipping redundant DFlash overlap token D2H:
+  - non-overlap: `557.643 tok/s`
+  - overlap: `563.073 tok/s`
+
+Interpretation:
+
+- overlap-v2 is now stable on the sampled DFlash short benchmark
+- the overlap path is no longer clearly slower
+- the direct shared-pool verify->draft append helped overlap much more than it
+  helped non-overlap
+- the latest DFlash-specific overlap CPU/D2H cut moved the paired rerun to a
+  small overlap win (`~1.01x`)
+
+This is enough to say the overlap path is real, but not enough yet to claim a
+broad production win. The next validation step is a harder sampled workload, not
+another easy-only claim.
 
 ## What The Next Production Design Must Look Like
 
@@ -355,6 +754,22 @@ It is **not**:
 - one monolithic kernel that simultaneously fuses target FP8 attention and draft
   BF16 KV writes
 
+What is already landed locally:
+
+- compact target-only commit packing on device
+- compact cache-plan derivation for free/clear/keep
+- direct shared-pool verify hidden -> draft append
+- batched plain-request `target_only` CPU commit path for the common no-grammar,
+  no-string-stop regime
+
+So the remaining fused-verify gap is narrower now:
+
+- reduce or batch the remaining host-side request/output mutation that still has
+  to stay on CPU
+- reduce overlap-specific D2H / CPU rematerialization for the cases that still
+  diverge from device defaults
+- only after that consider deeper kernel fusion
+
 ## B. The mixed-precision handoff should stay explicit
 
 The production mixed-precision regime is:
@@ -369,6 +784,41 @@ This boundary is already natural in the code:
 - target runner owns target KV
 - draft worker owns draft KV
 - `project_target_hidden(...)` is the handoff boundary
+
+## FluentLLM Takeaways
+
+Reference repo inspected:
+
+- `/workspace/SGLang-FluentLLM`
+- commit `a9db4a83d2522e1bd1392cd54054a1965d5461f4`
+
+Useful reference points:
+
+- `python/sglang/srt/speculative/spec_decoding_cuda_graph_runner.py`
+  really does capture a single speculative CUDA graph around the target verify +
+  draft proposal path for their Eagle/PLD flow
+- `python/sglang/srt/speculative/eagle_worker_overlap.py` uses device-resident
+  future-token placeholders plus async D2D copies to feed overlap launches
+- `python/sglang/srt/managers/scheduler_post_process_mixin.py` still performs a
+  host-side per-request decode postprocess loop
+
+What this means for DFlash:
+
+- FluentLLM is a good reference for overlap producer/consumer ownership and
+  graph-capture boundaries
+- it is **not** evidence that the remaining DFlash host-side request commit
+  boundary should be ignored or can be solved just by copying their overlap code
+- their fork still keeps a scheduler-side request/output postprocess loop, so
+  the remaining DFlash CPU commit/finish work is still a legitimate optimization
+  target on this branch
+
+So the current DFlash direction remains correct:
+
+1. keep the DFlash-native overlap-v2 path
+2. keep the explicit FP8-target -> BF16-draft handoff
+3. batch the common plain-request `target_only` CPU commit path
+4. only after that reassess whether any deeper mixed-precision fused-verify
+   kernel is still worth the implementation cost
 
 So the roadmap should improve that boundary, not erase it.
 
@@ -416,6 +866,35 @@ But before promoting it, we still need:
 - `max_steps_per_req` support or equivalent logical-cap support
 - parity with current `temperature/top_k/top_p/min_p` semantics
 - parity in emitted metrics and debug counters
+
+## E. The current DFlash branch geometry is still split: linear main path, tree side path
+
+Code:
+
+- `python/sglang/srt/speculative/dflash_worker.py`
+- `python/sglang/srt/speculative/dflash_tree_worker.py`
+
+Current state:
+
+- `DFlashWorker` is still the primary linear block-speculation worker
+- `DFlashTreeWorker` contains the tree / indexed verify behavior
+- overlap-v2 and the new fused selected-hidden append work have been landing
+  primarily on the main DFlash path first, with parity being added afterward
+
+Implication:
+
+- if we want "EAGLE-style branches" in the strong sense, that is a tree-verify
+  question and belongs with the tree path
+- if we want "SSD-style many likely future outcomes", that is an async branch
+  preparation question and belongs with the main overlap-v2 draft scheduler path
+
+So the best architecture is not to force them into one abstraction too early.
+It is:
+
+1. finish the linear DFlash overlap-v2 + fused verify path
+2. finish the SSD-style future-outcome preparation path on top of that
+3. only then decide how much tree-verify branching should be merged back into
+   the same control plane
 
 ## Engineering Tasks
 
@@ -560,9 +1039,13 @@ got us there and verify each dependency in reverse.
     - do not reuse Eagle tree semantics blindly
     Current branch status:
     - `FutureMap` can now allocate/store/resolve DFlash-native future state
+    - `FutureMap` now preserves `verify_done` as part of that DFlash-native
+      future state
     - DFlash workers now emit `next_draft_input` in the same result object shape
       the scheduler already expects
     - `ScheduleBatch` can now re-enter decode from DFlash draft state
+    - `scheduler.py` now has an explicit spec-v2 overlap handoff helper for
+      DFlash instead of mutating DFlash future state inline in the generic path
     - graph-runner verify-input construction is now explicit for DFlash
     - `ModelWorkerBatch` now carries the DFlash-owned cache references needed by
       verify/commit (`req_to_token_pool`, allocator, tree cache) and exposes the
@@ -583,17 +1066,64 @@ got us there and verify each dependency in reverse.
     - page-size interaction
     - mixed-precision cache ownership interaction
 
+19. `[pending]` Reframe the current SSD prototype as a first-class DFlash overlap mode.
+    Target files:
+    - `dflash_worker.py`
+    - `dflash_worker_v2.py`
+    - `scheduler.py`
+    - `overlap_utils.py`
+    - `scheduler_output_processor_mixin.py`
+    Goal:
+    - stop treating SSD branch preparation as an auxiliary thread-side feature
+    - make branch-prepared future outcomes visible to the overlap-v2 producer /
+      consumer contract
+    - keep verifier compute unchanged
+
+20. `[pending]` Define the DFlash SSD future payload explicitly.
+    It should carry, for each prepared outcome:
+    - accepted-length hypothesis
+    - bonus/recovery token hypothesis
+    - prepared draft proposal identity
+    - prepared draft KV ownership / validity metadata
+    It should not reuse Eagle tree payload fields.
+
+21. `[pending]` Decide the authoritative branch-selection signal for SSD mode.
+    Candidate signals already present on this branch:
+    - `accept_len_last`
+    - `accept_len_ema`
+    - `verify_ct_last`
+    - `q_entropy_mean_last`
+    - `q_max_mean_last`
+    - miss streak
+    - alt probability mass
+    The implementation should choose one coherent policy rather than stacking
+    ad hoc gates forever.
+
+22. `[pending]` Benchmark the existing SSD prototype against the new overlap-v2 baseline.
+    Compare:
+    - overlap-v2 only
+    - overlap-v2 + eager-next SSD cache
+    - overlap-v2 + async shadow SSD overlap
+    - later, overlap-v2 + hardened first-class SSD payload
+    The benchmark must record:
+    - cache hit rate
+    - accepted suffix length on hit
+    - accepted suffix length on miss
+    - total throughput
+    - draft-side overlap launch/wait counts
+
 ### Reverse-Trace Verification Tasks
 
-19. `[pending]` Re-run the trace from the finished implementation backward:
+23. `[pending]` Re-run the trace from the finished implementation backward:
     - fused verify result -> scheduler payload -> graph replay -> request commit
     and confirm every field is consumed by exactly one downstream step.
 
-20. `[pending]` Re-run the original discovery path after implementation:
+24. `[pending]` Re-run the original discovery path after implementation:
     - greedy target-only verify trace
     - sampled target-only verify trace
     - FP8/BF16 dtype trace
     - overlap/spec-v2 trace
+    - SSD branch-preparation trace
     and confirm the new implementation actually replaced the old bottlenecks.
 
 ## Low-Risk Implementation Order
@@ -604,6 +1134,38 @@ got us there and verify each dependency in reverse.
 4. Promote sampled helper only after parity checks pass
 5. Reuse existing fused BF16 draft append rather than redesigning it
 6. Add DFlash spec-v2 overlap only after non-overlap fused verify is stable
+
+## Best Next Implementation Point
+
+Given the current branch state, the next undeniably best implementation target is:
+
+1. finish the DFlash-owned fused selected-hidden append path on the overlap-v2
+   serving route
+2. make that path measurable under CUDA graph replay
+3. only then promote SSD from a worker-side prototype into a first-class
+   overlap-v2 future-outcome mode
+
+Why this order is correct:
+
+- SSD helps by eliminating draft wait time on predicted future outcomes
+- but if the verify->append->next-draft boundary is still too expensive, SSD
+  will be fighting the wrong bottleneck
+- the current branch already has the right seam for this:
+  - flat accepted indices
+  - flat accepted positions
+  - compact cache locations
+  - DFlash-owned fused selected-hidden helper
+- once that seam is stable under overlap-v2 graph replay, SSD can be layered on
+  top of it without changing verifier semantics
+
+So the architecture should be:
+
+- step 1: stabilize fused verify/append on the overlap-v2 path
+- step 2: expose SSD future-outcome preparation through the same payload system
+- step 3: benchmark:
+  - overlap-v2 only
+  - overlap-v2 + SSD eager-next
+  - overlap-v2 + SSD async overlap
 
 This ordering keeps the risk surface small:
 

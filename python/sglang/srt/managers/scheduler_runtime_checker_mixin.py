@@ -6,6 +6,8 @@ import time
 import warnings
 from typing import TYPE_CHECKING
 
+import torch
+
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -141,10 +143,53 @@ class SchedulerRuntimeCheckerMixin:
         full_ok = int(full_leaked) in (0, int(reserved_tokens))
         swa_ok = int(swa_leaked) in (0, int(reserved_tokens))
         memory_leak = not (full_ok and swa_ok)
+        leak_detail = ""
+        if memory_leak:
+            try:
+                full_alloc = self.token_to_kv_pool_allocator.full_attn_allocator
+                swa_alloc = self.token_to_kv_pool_allocator.swa_attn_allocator
+                free_full = set(
+                    torch.cat(
+                        [full_alloc.free_pages, full_alloc.release_pages]
+                    ).tolist()
+                )
+                free_swa = set(
+                    torch.cat(
+                        [swa_alloc.free_pages, swa_alloc.release_pages]
+                    ).tolist()
+                )
+                cached_full_t = (
+                    self.tree_cache.all_values_flatten()
+                    if self.tree_cache.full_evictable_size() > 0
+                    else torch.empty((0,), dtype=torch.int64)
+                )
+                cached_full = set(cached_full_t.tolist())
+                mapping = self.token_to_kv_pool_allocator.full_to_swa_index_mapping
+                cached_swa_t = mapping[cached_full_t] if cached_full_t.numel() > 0 else cached_full_t
+                cached_swa = set(cached_swa_t[cached_swa_t > 0].tolist())
+                expected_full = set(range(1, int(self.full_tokens_per_layer) + 1))
+                expected_swa = set(range(1, int(self.swa_tokens_per_layer) + 1))
+                leaked_full_slots = sorted(
+                    expected_full - free_full - cached_full
+                )[:16]
+                leaked_swa_slots = sorted(
+                    expected_swa - free_swa - cached_swa
+                )[:16]
+                cached_and_free_full_slots = sorted(cached_full & free_full)[:16]
+                cached_and_free_swa_slots = sorted(cached_swa & free_swa)[:16]
+                leak_detail = (
+                    f"leaked_full_slots={leaked_full_slots if leaked_full_slots else None}, "
+                    f"leaked_swa_slots={leaked_swa_slots if leaked_swa_slots else None}, "
+                    f"cached_and_free_full_slots={cached_and_free_full_slots if cached_and_free_full_slots else None}, "
+                    f"cached_and_free_swa_slots={cached_and_free_swa_slots if cached_and_free_swa_slots else None}\n"
+                )
+            except Exception as e:
+                leak_detail = f"leak_detail_error={e}\n"
         token_msg = (
             f"{full_leaked=}, {swa_leaked=}\n"
             f"{self.full_tokens_per_layer=}, {full_available_size=}, {full_evictable_size=}, {full_protected=}, {session_held_full=}, {reserved_tokens=}\n"
             f"{self.swa_tokens_per_layer=}, {swa_available_size=}, {swa_evictable_size=}, {swa_protected=}, {session_held_swa=}, {reserved_tokens=}\n"
+            f"{leak_detail}"
         )
         return memory_leak, token_msg
 

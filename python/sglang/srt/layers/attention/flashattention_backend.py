@@ -2701,31 +2701,59 @@ class FlashAttentionBackend(AttentionBackend):
 
                 # metadata_expand.max_seq_len_q = 1, already set in capture
                 # metadata_expand.cu_seqlens_q already set in capture
-                offsets = torch.arange(
-                    self.speculative_num_draft_tokens, device=device
-                ).unsqueeze(
-                    0
-                )  # shape: (1, self.speculative_num_draft_tokens)
-
-                cols = offsets.expand(seq_lens.numel(), -1) + seq_lens.unsqueeze(1)
-                cum_len = torch.nn.functional.pad(
+                offsets_cpu = torch.arange(
+                    self.speculative_num_draft_tokens,
+                    device="cpu",
+                    dtype=torch.int64,
+                ).unsqueeze(0)
+                seq_lens_cpu_i64 = seq_lens_cpu.to(dtype=torch.int64, device="cpu")
+                cols_cpu = offsets_cpu.expand(seq_lens_cpu_i64.numel(), -1) + seq_lens_cpu_i64.unsqueeze(1)
+                cols_max_index = int(cols_cpu.max().item()) if cols_cpu.numel() > 0 else -1
+                if cols_max_index >= int(self.req_to_token.shape[1]):
+                    raise RuntimeError(
+                        "Speculative replay produced out-of-range req_to_token column indices: "
+                        f"max_col={cols_max_index} req_to_token_width={int(self.req_to_token.shape[1])} "
+                        f"bs={int(bs)} seq_lens_cpu={seq_lens_cpu_i64.tolist()} "
+                        f"draft_token_num={int(self.speculative_num_draft_tokens)}"
+                    )
+                cols = cols_cpu.to(device=device, non_blocking=True)
+                offsets = offsets_cpu.to(device=device, non_blocking=True)
+                cum_len_cpu = torch.nn.functional.pad(
                     torch.cumsum(
                         (
-                            seq_lens + self.speculative_num_draft_tokens
+                            seq_lens_cpu_i64 + self.speculative_num_draft_tokens
                         ).repeat_interleave(self.speculative_num_draft_tokens),
                         dim=0,
                     ),
                     (1, 0),
                 )[:-1]
-                mask_extraction_indices = (
-                    cols.repeat_interleave(self.speculative_num_draft_tokens, dim=0)
-                    + cum_len[:, None]
+                mask_extraction_indices_cpu = (
+                    cols_cpu.repeat_interleave(self.speculative_num_draft_tokens, dim=0)
+                    + cum_len_cpu[:, None]
                 ).view(1, -1)
                 # avoid extracting padded seq indices which will be out of boundary
-                mask_extraction_indices[
+                mask_extraction_indices_cpu[
                     :,
                     spec_info.positions.numel() * self.speculative_num_draft_tokens :,
                 ].fill_(0)
+                mask_max_index = (
+                    int(mask_extraction_indices_cpu.max().item())
+                    if mask_extraction_indices_cpu.numel() > 0
+                    else -1
+                )
+                custom_mask_numel = int(spec_info.custom_mask.numel())
+                if mask_max_index >= custom_mask_numel:
+                    raise RuntimeError(
+                        "DFLASH_TREE overlap replay produced out-of-range custom_mask indices: "
+                        f"max_index={mask_max_index} custom_mask_numel={custom_mask_numel} "
+                        f"bs={int(bs)} seq_lens={seq_lens.detach().to('cpu', non_blocking=False).tolist()} "
+                        f"seq_lens_sum={int(seq_lens.sum().item())} "
+                        f"positions_numel={int(spec_info.positions.numel())} "
+                        f"draft_token_num={int(self.speculative_num_draft_tokens)}"
+                    )
+                mask_extraction_indices = mask_extraction_indices_cpu.to(
+                    device=device, non_blocking=True
+                )
                 mask = spec_info.custom_mask[mask_extraction_indices].view(
                     -1, self.speculative_num_draft_tokens
                 )  # (bsz * draft_num, draft_num)

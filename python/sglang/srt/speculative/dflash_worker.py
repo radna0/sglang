@@ -38,10 +38,14 @@ from sglang.srt.speculative.dflash_controller import (
     survival_should_force_target_only,
 )
 from sglang.srt.speculative.dflash_utils import (
+    apply_dflash_shared_pool_verify_append,
     can_dflash_use_fused_qkv_proj,
+    gather_dflash_committed_hidden,
     is_dflash_sampling_verify_available,
     parse_dflash_draft_config,
+    resolve_dflash_verify_append_path,
     resolve_dflash_verify_mask_policy,
+    update_dflash_req_verify_bookkeeping,
 )
 from sglang.srt.speculative.pq_filter import filter_topk_probs_like_sglang_sampler
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -612,6 +616,14 @@ class DFlashWorker:
         )
         self.draft_model_runner = self.draft_worker.model_runner
         self.draft_model = self.draft_model_runner.model
+        if hasattr(self.draft_model, "set_embed"):
+            self.draft_model.set_embed(
+                self.target_worker.model_runner.model.get_input_embeddings()
+            )
+            # Keep linear DFLASH on the original explicit-input-embed path.
+            # This matches the stable production behavior and avoids relying on
+            # the newer self-embedding draft path while we validate regressions.
+            self.draft_model.requires_input_embeds = True
         draft_config = parse_dflash_draft_config(
             draft_hf_config=self.draft_model_runner.model_config.hf_config
         )
@@ -888,6 +900,9 @@ class DFlashWorker:
                 num_kv_heads=first_attn.num_kv_heads,
                 head_dim=first_attn.head_dim,
                 device=self.device,
+                target_fc_weight=self.draft_model.fc.weight,
+                target_hidden_norm_weight=self.draft_model.hidden_norm.weight,
+                target_hidden_norm_eps=self.draft_model.hidden_norm.variance_epsilon,
             )
             if self.tp_rank == 0:
                 logger.info(
@@ -1782,10 +1797,10 @@ class DFlashWorker:
         verify_input: DFlashVerifyInput,
         accept_length_per_req_cpu: list[int],
         dflash_debug: dict | None,
+        append_path: str | None = None,
     ) -> None:
         verify_mode = str(getattr(verify_input, "verify_mode", "target_only") or "target_only")
         draft_conf_debug = getattr(verify_input, "draft_conf_debug", None)
-        sig = None
         pq_ctrl_debug = None
         if dflash_debug is not None:
             try:
@@ -1796,6 +1811,8 @@ class DFlashWorker:
                 )
             except Exception:
                 sig = None
+        else:
+            sig = None
         if verify_mode == "pq" and sig is not None:
             try:
                 _, pq_ctrl_debug = self._adaptive_pq.on_verify_end(sig)
@@ -1812,145 +1829,24 @@ class DFlashWorker:
                     .tolist()
                 )
 
-        debug_scalar_keys = (
-            "accept_ratio_mean",
-            "tv_mean",
-            "p_entropy_mean",
-            "q_entropy_mean",
-            "p_max_mean",
-            "q_max_mean",
+        effective_draft_token_num = int(
+            getattr(verify_input, "draft_token_num", self.block_size)
         )
-        draft_scalar_keys = (
-            "q_max_mean_first",
-            "q_max_min_first",
-            "q_ent_mean_first",
+        update_dflash_req_verify_bookkeeping(
+            reqs=list(batch.reqs),
+            accept_length_per_req_cpu=accept_length_per_req_cpu,
+            verify_mode=verify_mode,
+            append_path=append_path,
+            dflash_debug=dflash_debug,
+            draft_conf_debug=draft_conf_debug,
+            max_steps_per_req_cpu=max_steps_cpu,
+            default_max_steps=int(self.block_size - 1),
+            default_effective_draft_token_num=effective_draft_token_num,
+            default_effective_step_count=max(0, effective_draft_token_num - 1),
         )
 
-        for i, req in enumerate(batch.reqs):
-            req.spec_dflash_debug_stat_ct = int(
-                getattr(req, "spec_dflash_debug_stat_ct", 0)
-            ) + (1 if dflash_debug is not None else 0)
-            req.spec_dflash_verify_mode_last = verify_mode
-
-            st = getattr(req, "dflash_difficulty_state", None)
-            if st is None:
-                st = DFlashReqDifficultyState()
-                setattr(req, "dflash_difficulty_state", st)
-
-            accept_len_i = int(accept_length_per_req_cpu[i])
-            st.update(accept_len=accept_len_i, verify_ct=int(getattr(req, "spec_verify_ct", 0)))
-            if sig is not None:
-                st.update_verify_debug(sig)
-
-            req.spec_accept_length_step_last = accept_len_i
-            prev_min = getattr(req, "spec_accept_length_step_min", None)
-            prev_max = getattr(req, "spec_accept_length_step_max", None)
-            req.spec_accept_length_step_min = (
-                accept_len_i if prev_min is None else min(int(prev_min), accept_len_i)
-            )
-            req.spec_accept_length_step_max = (
-                accept_len_i if prev_max is None else max(int(prev_max), accept_len_i)
-            )
-
-            max_steps_i = (
-                int(max_steps_cpu[i])
-                if max_steps_cpu is not None and i < len(max_steps_cpu)
-                else int(self.block_size - 1)
-            )
-            effective_draft_token_num_i = int(
-                getattr(verify_input, "draft_token_num", self.block_size)
-            )
-            effective_step_count_i = max(0, effective_draft_token_num_i - 1)
-            req.spec_dflash_max_steps_last = max_steps_i
-            prev_min_steps = getattr(req, "spec_dflash_max_steps_min", None)
-            prev_max_steps = getattr(req, "spec_dflash_max_steps_max", None)
-            req.spec_dflash_max_steps_min = (
-                max_steps_i
-                if prev_min_steps is None
-                else min(int(prev_min_steps), max_steps_i)
-            )
-            req.spec_dflash_max_steps_max = (
-                max_steps_i
-                if prev_max_steps is None
-                else max(int(prev_max_steps), max_steps_i)
-            )
-            self._update_req_running_mean(req, "spec_dflash_max_steps_mean", max_steps_i)
-            req.spec_dflash_effective_draft_token_num_last = effective_draft_token_num_i
-            prev_min_token_num = getattr(
-                req, "spec_dflash_effective_draft_token_num_min", None
-            )
-            prev_max_token_num = getattr(
-                req, "spec_dflash_effective_draft_token_num_max", None
-            )
-            req.spec_dflash_effective_draft_token_num_min = (
-                effective_draft_token_num_i
-                if prev_min_token_num is None
-                else min(int(prev_min_token_num), effective_draft_token_num_i)
-            )
-            req.spec_dflash_effective_draft_token_num_max = (
-                effective_draft_token_num_i
-                if prev_max_token_num is None
-                else max(int(prev_max_token_num), effective_draft_token_num_i)
-            )
-            self._update_req_running_mean(
-                req,
-                "spec_dflash_effective_draft_token_num_mean",
-                effective_draft_token_num_i,
-            )
-            req.spec_dflash_effective_step_count_last = effective_step_count_i
-            prev_min_eff_steps = getattr(
-                req, "spec_dflash_effective_step_count_min", None
-            )
-            prev_max_eff_steps = getattr(
-                req, "spec_dflash_effective_step_count_max", None
-            )
-            req.spec_dflash_effective_step_count_min = (
-                effective_step_count_i
-                if prev_min_eff_steps is None
-                else min(int(prev_min_eff_steps), effective_step_count_i)
-            )
-            req.spec_dflash_effective_step_count_max = (
-                effective_step_count_i
-                if prev_max_eff_steps is None
-                else max(int(prev_max_eff_steps), effective_step_count_i)
-            )
-            self._update_req_running_mean(
-                req,
-                "spec_dflash_effective_step_count_mean",
-                effective_step_count_i,
-            )
-            req.spec_dflash_total_draft_token_num = int(
-                getattr(req, "spec_dflash_total_draft_token_num", 0)
-            ) + int(effective_step_count_i)
-
-            if dflash_debug is not None:
-                for key in debug_scalar_keys:
-                    self._update_req_running_mean(
-                        req, f"spec_dflash_{key}", dflash_debug.get(key)
-                    )
-            if sig is not None:
-                self._update_req_running_mean(
-                    req, "spec_dflash_accept_ratio_mean", sig.accept_mean
-                )
-                self._update_req_running_mean(req, "spec_dflash_tv_mean", sig.tv_mean)
-                self._update_req_running_mean(
-                    req, "spec_dflash_p_entropy_mean", sig.p_entropy_mean
-                )
-                self._update_req_running_mean(
-                    req, "spec_dflash_q_entropy_mean", sig.q_entropy_mean
-                )
-                self._update_req_running_mean(
-                    req, "spec_dflash_p_max_mean", sig.p_max_mean
-                )
-                self._update_req_running_mean(
-                    req, "spec_dflash_q_max_mean", sig.q_max_mean
-                )
-            if draft_conf_debug is not None:
-                for key in draft_scalar_keys:
-                    self._update_req_running_mean(
-                        req, f"spec_dflash_{key}", draft_conf_debug.get(key)
-                    )
-            if pq_ctrl_debug is not None:
+        if pq_ctrl_debug is not None:
+            for req in batch.reqs:
                 self._update_req_running_mean(
                     req,
                     "spec_dflash_adaptive_temp_mul",
@@ -2544,7 +2440,6 @@ class DFlashWorker:
         block_ids = buffers.block_ids[:, :draft_token_num]
         block_ids.fill_(int(self._mask_token_id))
         block_ids[:, 0].copy_(draft_input.verified_id.to(torch.long))
-
         noise_embedding = embed_module(block_ids)
         input_embeds = noise_embedding.view(-1, noise_embedding.shape[-1])
 
@@ -3347,6 +3242,139 @@ class DFlashWorker:
 
         return out_token_ids, None
 
+    def _project_and_write_target_hidden_to_draft_kv(
+        self,
+        *,
+        target_hidden: torch.Tensor,
+        ctx_positions: torch.Tensor,
+        ctx_cache_loc: torch.Tensor,
+    ) -> None:
+        with torch.inference_mode():
+            ctx_hidden = self.draft_model.project_target_hidden(target_hidden)
+            if ctx_hidden.shape[0] != ctx_cache_loc.numel():
+                raise RuntimeError(
+                    f"DFLASH ctx_hidden/cache_loc mismatch: {ctx_hidden.shape[0]} vs {ctx_cache_loc.numel()}."
+                )
+
+            if self._use_fused_kv_materialize and self._fused_kv_helper is not None:
+                try:
+                    self._append_target_hidden_fused(
+                        ctx_hidden, ctx_positions, ctx_cache_loc
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "DFLASH fused KV append failed; falling back to sequential path: %s",
+                        e,
+                    )
+                    self._use_fused_kv_materialize = False
+                    self._fused_kv_helper = None
+                    self._append_target_hidden_sequential(
+                        ctx_hidden, ctx_positions, ctx_cache_loc
+                    )
+            else:
+                self._append_target_hidden_sequential(
+                    ctx_hidden, ctx_positions, ctx_cache_loc
+                )
+
+    def _append_verified_hidden_from_cache_plan(
+        self,
+        *,
+        batch: Union[ScheduleBatch, ModelWorkerBatch],
+        draft_input: DFlashDraftInput,
+        verify_positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        cache_plan,
+        commit_lens: torch.Tensor,
+        draft_token_num: int,
+    ) -> bool:
+        if not bool(getattr(self, "_dflash_draft_share_pools", True)):
+            return False
+        apply_dflash_shared_pool_verify_append(
+            draft_input=draft_input,
+            verify_positions=verify_positions,
+            hidden_states=hidden_states,
+            cache_plan=cache_plan,
+            commit_lens=commit_lens,
+            write_selected_hidden=self._project_and_write_verified_hidden_selected_to_draft_kv,
+        )
+        return True
+
+    def _project_and_write_verified_hidden_selected_to_draft_kv(
+        self,
+        *,
+        hidden_states: torch.Tensor,
+        accepted_indices: torch.Tensor,
+        ctx_positions: torch.Tensor,
+        ctx_cache_loc: torch.Tensor,
+    ) -> None:
+        """Shared-pool fast path seam for accepted verify tokens.
+
+        This is the current replacement point for a future DFlash-owned mixed-precision
+        fused verify append path: selected target hidden -> draft projection -> BF16 KV write.
+        """
+        with torch.inference_mode():
+            if self._use_fused_kv_materialize and self._fused_kv_helper is not None:
+                try:
+                    self._append_verified_hidden_selected_fused(
+                        hidden_states=hidden_states,
+                        accepted_indices=accepted_indices,
+                        ctx_positions=ctx_positions,
+                        ctx_cache_loc=ctx_cache_loc,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "DFLASH fused selected verify append failed; falling back to sequential path: %s",
+                        e,
+                    )
+                    self._use_fused_kv_materialize = False
+                    self._fused_kv_helper = None
+                if self._use_fused_kv_materialize:
+                    return
+
+            ctx_hidden = self.draft_model.project_target_hidden_selected(
+                hidden_states, accepted_indices
+            )
+            if ctx_hidden.shape[0] != ctx_cache_loc.numel():
+                raise RuntimeError(
+                    "DFLASH selected verify hidden/cache_loc mismatch: "
+                    f"{ctx_hidden.shape[0]} vs {ctx_cache_loc.numel()}."
+                )
+            self._append_target_hidden_sequential(
+                ctx_hidden, ctx_positions, ctx_cache_loc
+            )
+
+    def _append_verified_hidden_selected_fused(
+        self,
+        *,
+        hidden_states: torch.Tensor,
+        accepted_indices: torch.Tensor,
+        ctx_positions: torch.Tensor,
+        ctx_cache_loc: torch.Tensor,
+    ) -> None:
+        if self._fused_kv_helper is None:
+            raise RuntimeError("DFLASH fused selected verify append requires fused helper.")
+
+        token_to_kv_pool = self.draft_model_runner.token_to_kv_pool
+        layers = self.draft_model.layers
+
+        def _write_layer_kv(
+            layer_idx: int, cache_k: torch.Tensor, cache_v: torch.Tensor
+        ) -> None:
+            attn = layers[layer_idx].self_attn.attn
+            token_to_kv_pool.set_kv_buffer(
+                attn,
+                ctx_cache_loc,
+                cache_k,
+                cache_v,
+            )
+
+        self._fused_kv_helper.materialize_from_target_hidden_selected(
+            target_hidden=hidden_states,
+            accepted_indices=accepted_indices,
+            positions=ctx_positions,
+            write_layer_kv=_write_layer_kv,
+        )
+
     def _append_target_hidden_to_draft_kv(
         self,
         batch: Union[ScheduleBatch, ModelWorkerBatch],
@@ -3539,34 +3567,11 @@ class DFlashWorker:
                     )
                     req_to_token[row_ids, ctx_positions] = ctx_cache_loc.to(torch.int32)
 
-            with torch.inference_mode():
-                ctx_hidden = self.draft_model.project_target_hidden(
-                    draft_input.target_hidden
-                )  # [sum(ctx), hidden]
-                if ctx_hidden.shape[0] != ctx_cache_loc.numel():
-                    raise RuntimeError(
-                        f"DFLASH ctx_hidden/cache_loc mismatch: {ctx_hidden.shape[0]} vs {ctx_cache_loc.numel()}."
-                    )
-
-                if self._use_fused_kv_materialize and self._fused_kv_helper is not None:
-                    try:
-                        self._append_target_hidden_fused(
-                            ctx_hidden, ctx_positions, ctx_cache_loc
-                        )
-                    except Exception as e:
-                        logger.warning(
-                            "DFLASH fused KV append failed; falling back to sequential path: %s",
-                            e,
-                        )
-                        self._use_fused_kv_materialize = False
-                        self._fused_kv_helper = None
-                        self._append_target_hidden_sequential(
-                            ctx_hidden, ctx_positions, ctx_cache_loc
-                        )
-                else:
-                    self._append_target_hidden_sequential(
-                        ctx_hidden, ctx_positions, ctx_cache_loc
-                    )
+            self._project_and_write_target_hidden_to_draft_kv(
+                target_hidden=draft_input.target_hidden,
+                ctx_positions=ctx_positions,
+                ctx_cache_loc=ctx_cache_loc,
+            )
 
         draft_input.draft_seq_lens = draft_seq_lens + ctx_lens
         draft_input.new_seq_lens = draft_input.draft_seq_lens.clone()
@@ -3836,9 +3841,30 @@ class DFlashWorker:
             model=self.target_worker.model_runner.model,
         )
 
-    def forward_batch_generation(
+    def _coerce_model_worker_batch(
         self,
         batch: Union[ScheduleBatch, ModelWorkerBatch],
+        *,
+        overlap_v2: bool,
+    ) -> ModelWorkerBatch:
+        if overlap_v2:
+            if not isinstance(batch, ModelWorkerBatch):
+                raise TypeError(
+                    "DFLASH overlap-v2 expects ModelWorkerBatch at worker entry."
+                )
+            return batch
+
+        return (
+            batch.get_model_worker_batch()
+            if isinstance(batch, ScheduleBatch)
+            else batch
+        )
+
+    def _forward_batch_generation_impl(
+        self,
+        batch: Union[ScheduleBatch, ModelWorkerBatch],
+        *,
+        overlap_v2: bool,
         **kwargs,
     ) -> GenerationBatchResult:
         self._maybe_finalize_ssd_overlap(block=False)
@@ -3848,10 +3874,8 @@ class DFlashWorker:
             )
 
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
-            model_worker_batch = (
-                batch.get_model_worker_batch()
-                if isinstance(batch, ScheduleBatch)
-                else batch
+            model_worker_batch = self._coerce_model_worker_batch(
+                batch, overlap_v2=overlap_v2
             )
             model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
 
@@ -3975,10 +3999,8 @@ class DFlashWorker:
 
         self._prepare_for_speculative_decoding(batch, draft_input)
 
-        model_worker_batch = (
-            batch.get_model_worker_batch()
-            if isinstance(batch, ScheduleBatch)
-            else batch
+        model_worker_batch = self._coerce_model_worker_batch(
+            batch, overlap_v2=overlap_v2
         )
         assert model_worker_batch.forward_mode.is_target_verify()
         verify_input = model_worker_batch.spec_info
@@ -4007,24 +4029,35 @@ class DFlashWorker:
             batch_result.can_run_cuda_graph,
         )
 
-        (
-            new_verified_id,
-            commit_lens,
-            next_target_hidden,
-            accept_length_per_req_cpu,
+        direct_verify_append_enabled = bool(
+            getattr(self, "_dflash_draft_share_pools", True)
+        ) and (os.environ.get("SGLANG_DFLASH_ENABLE_DIRECT_VERIFY_APPEND") or "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
 
-            dflash_debug,
-        ) = verify_input.verify(batch=batch, logits_output=logits_output, page_size=self.page_size)
+        verify_result = verify_input.verify(
+            batch=batch,
+            logits_output=logits_output,
+            page_size=self.page_size,
+            # Keep plain linear DFLASH on the stable staged verify-append path by
+            # default. The newer direct cache-plan append is still available behind
+            # an explicit env gate for targeted experiments.
+            need_target_hidden=not direct_verify_append_enabled,
+        )
+        new_verified_id = verify_result.new_verified_id
+        commit_lens = verify_result.commit_lens
+        next_target_hidden = verify_result.next_target_hidden
+        accept_length_per_req_cpu = verify_result.accept_length_per_req_cpu
+        dflash_debug = verify_result.dflash_debug
+        cache_plan = verify_result.cache_plan
         verify_done = None
         if torch.device(self.device).type != "cpu":
             verify_done = torch.get_device_module(self.device).Event()
             verify_done.record()
-        self._update_req_dflash_debug_stats(
-            batch=batch,
-            verify_input=verify_input,
-            accept_length_per_req_cpu=accept_length_per_req_cpu,
-            dflash_debug=dflash_debug,
-        )
+        append_path = "staged"
         if timing_flag and self.tp_rank == 0 and not getattr(self, "_logged_verify_wall", False):
             dt = time.perf_counter() - t0
             logger.info(
@@ -4039,17 +4072,59 @@ class DFlashWorker:
         # Update draft state for the next iteration. Also materialize the committed verify tokens
         # into the draft KV cache immediately so radix cache entries are safe to reuse.
         draft_input.verified_id = new_verified_id
-        draft_input.target_hidden = next_target_hidden
-        draft_input.ctx_lens = commit_lens
         t1 = time.perf_counter() if timing_flag else 0.0
-        self._append_target_hidden_to_draft_kv(batch, draft_input)
+        appended_from_verify = False
+        if direct_verify_append_enabled:
+            try:
+                appended_from_verify = self._append_verified_hidden_from_cache_plan(
+                    batch=batch,
+                    draft_input=draft_input,
+                    verify_positions=verify_input.positions,
+                    hidden_states=logits_output.hidden_states,
+                    cache_plan=cache_plan,
+                    commit_lens=commit_lens,
+                    draft_token_num=int(verify_input.draft_token_num),
+                )
+            except Exception as e:
+                logger.warning(
+                    "DFLASH direct verify append failed; falling back to staged path: %s",
+                    e,
+                )
+
+        if not appended_from_verify:
+            if next_target_hidden is None:
+                next_target_hidden = gather_dflash_committed_hidden(
+                    hidden_states=logits_output.hidden_states,
+                    keep_mask=cache_plan.keep_mask,
+                    draft_token_num=int(verify_input.draft_token_num),
+                    accepted_indices=cache_plan.accepted_indices,
+                )
+            draft_input.target_hidden = next_target_hidden
+            draft_input.ctx_lens = commit_lens
+            self._append_target_hidden_to_draft_kv(batch, draft_input)
+        append_path = resolve_dflash_verify_append_path(
+            appended_from_verify=appended_from_verify,
+            fused_helper_active=bool(
+                self._use_fused_kv_materialize and self._fused_kv_helper is not None
+            ),
+        )
+
+        self._update_req_dflash_debug_stats(
+            batch=batch,
+            verify_input=verify_input,
+            accept_length_per_req_cpu=accept_length_per_req_cpu,
+            dflash_debug=dflash_debug,
+            append_path=append_path,
+        )
+
+        logits_output.hidden_states = None
         if timing_flag and self.tp_rank == 0 and not getattr(self, "_logged_append_wall", False):
             dt_append = time.perf_counter() - t1
             logger.info(
                 "DFLASH draft_kv_append wall timing (one-shot): %.6fs bs=%d ctx_tokens=%d",
                 float(dt_append),
                 int(batch.batch_size()),
-                int(next_target_hidden.shape[0]) if next_target_hidden is not None else 0,
+                int(commit_lens.sum().item()) if int(commit_lens.numel()) > 0 else 0,
             )
             setattr(self, "_logged_append_wall", True)
         batch.spec_info = draft_input
@@ -4195,29 +4270,21 @@ class DFlashWorker:
             )
             setattr(self, "_logged_ssd_stats", True)
 
-        next_token_ids = new_verified_id
-        accept_lens = None
-        if isinstance(batch, ModelWorkerBatch):
-            overlap_tokens = getattr(verify_input, "target_only_overlap_tokens", None)
-            overlap_accept_lens = getattr(
-                verify_input, "target_only_overlap_accept_lens", None
-            )
-            if overlap_tokens is None or overlap_accept_lens is None:
-                raise RuntimeError(
-                    "DFLASH spec-v2 verify currently requires target_only compact overlap payloads."
-                )
-            next_token_ids = overlap_tokens
-            accept_lens = overlap_accept_lens
-
         return GenerationBatchResult(
             logits_output=logits_output,
-            next_token_ids=next_token_ids,
+            # On the overlap-preprocessed decode path, verify already committed
+            # request/output state and the scheduler consumes only the copied logits
+            # + customized info. The compact verified-token payload is not read again.
+            next_token_ids=None if overlap_v2 else new_verified_id,
             next_draft_input=self._build_future_draft_input(
                 draft_input, verify_done=verify_done
             ),
+            next_out_cache_loc=batch.out_cache_loc if overlap_v2 else None,
             num_accepted_tokens=num_accepted_tokens,
             accept_length_per_req_cpu=accept_length_per_req_cpu,
-            accept_lens=accept_lens,
+            accept_lens=None,
+            dflash_overlap_preprocessed=overlap_v2,
+            requires_output_processing_barrier=overlap_v2,
             spec_ssd_hit_ct=[
                 int(getattr(req, "spec_ssd_hit_ct", 0)) for req in batch.reqs
             ],
@@ -4254,4 +4321,15 @@ class DFlashWorker:
                 for req in batch.reqs
             ],
             can_run_cuda_graph=can_run_cuda_graph,
+        )
+
+    def forward_batch_generation(
+        self,
+        batch: Union[ScheduleBatch, ModelWorkerBatch],
+        **kwargs,
+    ) -> GenerationBatchResult:
+        return self._forward_batch_generation_impl(
+            batch,
+            overlap_v2=isinstance(batch, ModelWorkerBatch),
+            **kwargs,
         )

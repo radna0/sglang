@@ -54,7 +54,7 @@ import requests
 from transformers import AutoTokenizer
 
 from sglang.bench_serving import benchmark, set_global_args
-from sglang.benchmark.datasets import DatasetRow
+from sglang.bench_serving import DatasetRow
 from sglang.srt.server_args import ServerArgs
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -90,7 +90,10 @@ def _bench_one(
     min_p: float,
 ) -> BenchResult:
     padded = (PROMPTS * ((num_prompts + len(PROMPTS) - 1) // len(PROMPTS)))[:num_prompts]
-    reqs: List[DatasetRow] = [DatasetRow(p, 0, int(decode_len)) for p in padded]
+    reqs: List[DatasetRow] = [
+        DatasetRow(prompt=p, prompt_len=0, output_len=int(decode_len))
+        for p in padded
+    ]
 
     args = SimpleNamespace(
         disable_ignore_eos=False,

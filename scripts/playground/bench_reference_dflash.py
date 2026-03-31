@@ -21,8 +21,7 @@ import numpy as np
 import requests
 from transformers import AutoTokenizer
 
-from sglang.bench_serving import benchmark, set_global_args
-from sglang.benchmark.datasets import DatasetRow
+from sglang.bench_serving import DatasetRow, benchmark, set_global_args
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     _launch_server_process,
@@ -218,13 +217,18 @@ def _launch_server(
     piecewise_cuda_graph_max_tokens: int | None,
     disable_cuda_graph: bool,
     speculative: bool,
+    speculative_algorithm: str,
     draft_model_path: str | None,
     draft_attention_backend: str | None,
     draft_kv_cache_dtype: str | None,
     draft_page_size: int | None,
     speculative_moe_runner_backend: str | None,
     speculative_dflash_block_size: int | None,
+    speculative_num_steps: int | None,
+    speculative_eagle_topk: int | None,
+    speculative_num_draft_tokens: int | None,
     mem_fraction_static: float | None,
+    disable_overlap_schedule: bool,
     tool_server: str | None = None,
 ) -> object:
     base_url = f"http://127.0.0.1:{int(port)}"
@@ -267,6 +271,8 @@ def _launch_server(
         cmd += ["--tool-server", str(tool_server)]
     if disable_cuda_graph:
         cmd.append("--disable-cuda-graph")
+    if disable_overlap_schedule:
+        cmd.append("--disable-overlap-schedule")
     if enable_piecewise_cuda_graph:
         cmd.append("--enable-piecewise-cuda-graph")
     if piecewise_cuda_graph_max_tokens is not None:
@@ -279,7 +285,7 @@ def _launch_server(
             raise ValueError("draft_model_path is required for speculative launch")
         cmd += [
             "--speculative-algorithm",
-            "DFLASH",
+            str(speculative_algorithm),
             "--speculative-draft-model-path",
             str(draft_model_path),
         ]
@@ -301,6 +307,21 @@ def _launch_server(
             cmd += [
                 "--speculative-dflash-block-size",
                 str(int(speculative_dflash_block_size)),
+            ]
+        if speculative_num_steps is not None:
+            cmd += [
+                "--speculative-num-steps",
+                str(int(speculative_num_steps)),
+            ]
+        if speculative_eagle_topk is not None:
+            cmd += [
+                "--speculative-eagle-topk",
+                str(int(speculative_eagle_topk)),
+            ]
+        if speculative_num_draft_tokens is not None:
+            cmd += [
+                "--speculative-num-draft-tokens",
+                str(int(speculative_num_draft_tokens)),
             ]
 
     repo_python = str((Path(__file__).resolve().parents[2] / "python"))
@@ -553,7 +574,10 @@ def _bench_one(
 ) -> BenchRun:
     if len(prompts) != len(output_lens):
         raise ValueError("prompts and output_lens must have the same length")
-    reqs = [DatasetRow(p, 0, int(out)) for p, out in zip(prompts, output_lens)]
+    reqs = [
+        DatasetRow(prompt=p, prompt_len=0, output_len=int(out))
+        for p, out in zip(prompts, output_lens)
+    ]
 
     args = argparse.Namespace(
         disable_ignore_eos=False,
@@ -607,6 +631,25 @@ def _bench_one(
     )
     wall_s = time.perf_counter() - t0
 
+    raw_generated_texts = list(results.get("generated_texts") or [])
+    raw_meta_infos = list(results.get("meta_infos") or [])
+    if len(raw_generated_texts) != len(reqs):
+        raise RuntimeError(
+            "Benchmark returned an unexpected number of generated texts: "
+            f"{len(raw_generated_texts)} vs expected {len(reqs)}"
+        )
+    if disable_stream and (
+        len(raw_meta_infos) != len(reqs)
+        or any(
+            not isinstance(meta, dict) or meta.get("completion_tokens") is None
+            for meta in raw_meta_infos
+        )
+    ):
+        raise RuntimeError(
+            "Non-stream benchmark returned malformed meta_info payloads; "
+            "refusing to emit a bogus artifact."
+        )
+
     if int(results.get("completed", 0)) != len(reqs):
         raise RuntimeError(
             f"Benchmark incomplete: completed={results.get('completed')} expected={len(reqs)}"
@@ -626,7 +669,6 @@ def _bench_one(
     completed = int(results["completed"])
     total_output_tokens = float(results["total_output_tokens"])
     accept_length = float(results.get("accept_length") or 1.0)
-    raw_meta_infos = results.get("meta_infos") or []
     spec_meta = _summarize_spec_meta(raw_meta_infos)
     request_metrics = _extract_request_metrics(
         meta_infos=raw_meta_infos,
@@ -638,9 +680,11 @@ def _bench_one(
 
     summary = BenchResult(
         completed=completed,
-        wall_s=round(wall_s, 6),
-        req_s=round(completed / wall_s, 3),
-        wall_tok_s=round(total_output_tokens / wall_s, 3),
+        # Use the benchmark phase duration from bench_serving so warmup/setup does
+        # not contaminate the reported serving throughput.
+        wall_s=round(float(results.get("duration") or wall_s), 6),
+        req_s=round(completed / float(results.get("duration") or wall_s), 3),
+        wall_tok_s=round(total_output_tokens / float(results.get("duration") or wall_s), 3),
         accept_length=round(accept_length, 3),
         accept_length_min_step=spec_meta["accept_length_min_step"],
         accept_length_max_step=spec_meta["accept_length_max_step"],
@@ -685,13 +729,18 @@ def _run_single(
     piecewise_cuda_graph_max_tokens: int | None,
     disable_cuda_graph: bool,
     speculative: bool,
+    speculative_algorithm: str,
     draft_model_path: str | None,
     draft_attention_backend: str | None,
     draft_kv_cache_dtype: str | None,
     draft_page_size: int | None,
     speculative_moe_runner_backend: str | None,
     speculative_dflash_block_size: int | None,
+    speculative_num_steps: int | None,
+    speculative_eagle_topk: int | None,
+    speculative_num_draft_tokens: int | None,
     mem_fraction_static: float | None,
+    disable_overlap_schedule: bool,
     prompts: list[str],
     prompt_question_ids: list[str],
     prompt_expected_answers: list[str],
@@ -717,13 +766,18 @@ def _run_single(
         piecewise_cuda_graph_max_tokens=piecewise_cuda_graph_max_tokens,
         disable_cuda_graph=disable_cuda_graph,
         speculative=speculative,
+        speculative_algorithm=speculative_algorithm,
         draft_model_path=draft_model_path,
         draft_attention_backend=draft_attention_backend,
         draft_kv_cache_dtype=draft_kv_cache_dtype,
         draft_page_size=draft_page_size,
         speculative_moe_runner_backend=speculative_moe_runner_backend,
         speculative_dflash_block_size=speculative_dflash_block_size,
+        speculative_num_steps=speculative_num_steps,
+        speculative_eagle_topk=speculative_eagle_topk,
+        speculative_num_draft_tokens=speculative_num_draft_tokens,
         mem_fraction_static=mem_fraction_static,
+        disable_overlap_schedule=disable_overlap_schedule,
     )
     base_url = f"http://127.0.0.1:{int(port)}"
     try:
@@ -777,12 +831,22 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--draft-attention-backend", default="fa3")
     p.add_argument("--speculative-moe-runner-backend", default="triton_kernel")
     p.add_argument("--speculative-dflash-block-size", type=int, default=8)
+    p.add_argument("--speculative-num-steps", type=int, default=None)
+    p.add_argument("--speculative-eagle-topk", type=int, default=None)
+    p.add_argument("--speculative-num-draft-tokens", type=int, default=None)
     p.add_argument("--mem-fraction-static", type=float, default=None)
     p.add_argument("--temperature", type=float, default=0.0)
     p.add_argument("--top-p", type=float, default=1.0)
     p.add_argument("--top-k", type=int, default=1)
     p.add_argument("--min-p", type=float, default=0.0)
     p.add_argument("--disable-cuda-graph", action="store_true")
+    p.add_argument("--disable-overlap-schedule", action="store_true")
+    p.add_argument(
+        "--speculative-algorithm",
+        type=str,
+        choices=["DFLASH", "DFLASH_TREE"],
+        default="DFLASH",
+    )
     p.add_argument("--disable-stream", action="store_true")
     return p.parse_args()
 
@@ -835,13 +899,18 @@ def main() -> int:
             piecewise_cuda_graph_max_tokens=args.piecewise_cuda_graph_max_tokens,
             disable_cuda_graph=bool(args.disable_cuda_graph),
             speculative=False,
+            speculative_algorithm="DFLASH",
             draft_model_path=None,
             draft_attention_backend=None,
             draft_kv_cache_dtype=None,
             draft_page_size=None,
             speculative_moe_runner_backend=None,
             speculative_dflash_block_size=None,
+            speculative_num_steps=None,
+            speculative_eagle_topk=None,
+            speculative_num_draft_tokens=None,
             mem_fraction_static=args.mem_fraction_static,
+            disable_overlap_schedule=bool(args.disable_overlap_schedule),
             prompts=prompts,
             prompt_question_ids=prompt_question_ids,
             prompt_expected_answers=prompt_expected_answers,
@@ -868,13 +937,18 @@ def main() -> int:
         piecewise_cuda_graph_max_tokens=args.piecewise_cuda_graph_max_tokens,
         disable_cuda_graph=bool(args.disable_cuda_graph),
         speculative=True,
+        speculative_algorithm=args.speculative_algorithm,
         draft_model_path=args.draft_model_path,
         draft_attention_backend=args.draft_attention_backend,
         draft_kv_cache_dtype=args.draft_kv_cache_dtype,
         draft_page_size=args.draft_page_size,
         speculative_moe_runner_backend=args.speculative_moe_runner_backend,
         speculative_dflash_block_size=args.speculative_dflash_block_size,
+        speculative_num_steps=args.speculative_num_steps,
+        speculative_eagle_topk=args.speculative_eagle_topk,
+        speculative_num_draft_tokens=args.speculative_num_draft_tokens,
         mem_fraction_static=args.mem_fraction_static,
+        disable_overlap_schedule=bool(args.disable_overlap_schedule),
         prompts=prompts,
         prompt_question_ids=prompt_question_ids,
         prompt_expected_answers=prompt_expected_answers,
@@ -917,12 +991,18 @@ def main() -> int:
             "moe_runner_backend": args.moe_runner_backend,
             "draft_attention_backend": args.draft_attention_backend,
             "speculative_moe_runner_backend": args.speculative_moe_runner_backend,
+            "speculative_algorithm": args.speculative_algorithm,
             "speculative_dflash_block_size": args.speculative_dflash_block_size,
+            "speculative_num_steps": args.speculative_num_steps,
+            "speculative_eagle_topk": args.speculative_eagle_topk,
+            "speculative_num_draft_tokens": args.speculative_num_draft_tokens,
             "cuda_graph": not args.disable_cuda_graph,
+            "piecewise_cuda_graph": not args.disable_cuda_graph,
             "cuda_graph_max_bs": args.cuda_graph_max_bs,
             "max_running_requests": args.max_running_requests,
             "piecewise_cuda_graph_max_tokens": args.piecewise_cuda_graph_max_tokens,
             "mem_fraction_static": args.mem_fraction_static,
+            "disable_overlap_schedule": bool(args.disable_overlap_schedule),
             "temperature": args.temperature,
             "top_p": args.top_p,
             "top_k": args.top_k,
