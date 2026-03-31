@@ -235,6 +235,12 @@ def _parse_args() -> argparse.Namespace:
         default="dense_logits",
         choices=["dense_logits", "top1_local"],
     )
+    parser.add_argument(
+        "--expert-partition-mode",
+        default="contiguous",
+        choices=["contiguous", "strided"],
+    )
+    parser.add_argument("--expert-parallel-profile-occupancy", action="store_true")
     parser.add_argument("--gradient-checkpointing", action="store_true")
     parser.add_argument(
         "--gradient-checkpointing-mode",
@@ -1168,6 +1174,8 @@ class ExpertParallelGptOssExperts(nn.Module):
         world_size: int,
         overlap_mode: str = "none",
         local_mxfp4_routing_mode: str = "dense_logits",
+        partition_mode: str = "contiguous",
+        profile_occupancy: bool = False,
     ) -> None:
         super().__init__()
         self.intermediate_size = int(full_experts.intermediate_size)
@@ -1177,14 +1185,32 @@ class ExpertParallelGptOssExperts(nn.Module):
         self.world_size = int(world_size)
         self.overlap_mode = str(overlap_mode)
         self.local_mxfp4_routing_mode = str(local_mxfp4_routing_mode)
+        self.partition_mode = str(partition_mode)
+        self.profile_occupancy = bool(profile_occupancy)
         if self.num_experts % self.world_size != 0:
             raise ValueError(
                 f"Expert-parallel requires num_experts divisible by world_size; "
                 f"got num_experts={self.num_experts} world_size={self.world_size}"
             )
         self.local_num_experts = self.num_experts // self.world_size
-        self.expert_start = self.rank * self.local_num_experts
-        self.expert_stop = self.expert_start + self.local_num_experts
+        if self.partition_mode == "contiguous":
+            local_global_expert_indices = torch.arange(
+                self.rank * self.local_num_experts,
+                (self.rank + 1) * self.local_num_experts,
+                dtype=torch.long,
+            )
+        elif self.partition_mode == "strided":
+            local_global_expert_indices = torch.arange(
+                self.rank,
+                self.num_experts,
+                self.world_size,
+                dtype=torch.long,
+            )
+        else:
+            raise ValueError(f"Unsupported expert partition mode: {self.partition_mode!r}")
+        self.local_global_expert_indices_cpu = local_global_expert_indices.clone()
+        self.expert_start = int(local_global_expert_indices[0].item())
+        self.expert_stop = int(local_global_expert_indices[-1].item()) + 1
         self.alpha = float(getattr(full_experts, "alpha", 1.702))
         self.limit = float(getattr(full_experts, "limit", 7.0))
         self.local_mxfp4_experts: Optional[nn.Module] = None
@@ -1196,38 +1222,50 @@ class ExpertParallelGptOssExperts(nn.Module):
             "return_exchange": 0.0,
             "merge": 0.0,
         }
+        self._occupancy_stats: dict[str, float] = {
+            "sample_count": 0.0,
+            "routed_tokens": 0.0,
+            "local_tokens": 0.0,
+            "rank_load_imbalance": 0.0,
+            "rank_load_std": 0.0,
+            "local_active_experts": 0.0,
+            "local_max_tokens_per_expert": 0.0,
+            "global_active_experts": 0.0,
+            "global_max_tokens_per_expert": 0.0,
+            "global_mean_tokens_per_active_expert": 0.0,
+            "global_top4_expert_share": 0.0,
+            "global_expert_imbalance": 0.0,
+        }
+        self._pending_rank_loads: Optional[torch.Tensor] = None
+        self._pending_routed_tokens: int = 0
+        self._pending_local_tokens: int = 0
 
         gate_up_precision = getattr(full_experts, "gate_up_proj_precision_config", None)
         down_precision = getattr(full_experts, "down_proj_precision_config", None)
         if gate_up_precision is not None and down_precision is not None:
             self.local_mxfp4_experts = self._build_local_mxfp4_experts(
                 full_experts,
-                start=self.expert_start,
-                length=self.local_num_experts,
+                expert_indices=self.local_global_expert_indices_cpu,
             )
             return
 
-        gate_up_proj = self._slice_expert_tensor_like(
+        gate_up_proj = self._select_expert_tensor_like(
             full_experts,
-            start=self.expert_start,
-            length=self.local_num_experts,
+            expert_indices=self.local_global_expert_indices_cpu,
             attr_name="gate_up_proj",
         )
-        gate_up_proj_bias = self._slice_expert_tensor_like(
+        gate_up_proj_bias = self._select_expert_tensor_like(
             full_experts.gate_up_proj_bias,
-            start=self.expert_start,
-            length=self.local_num_experts,
+            expert_indices=self.local_global_expert_indices_cpu,
         )
-        down_proj = self._slice_expert_tensor_like(
+        down_proj = self._select_expert_tensor_like(
             full_experts,
-            start=self.expert_start,
-            length=self.local_num_experts,
+            expert_indices=self.local_global_expert_indices_cpu,
             attr_name="down_proj",
         )
-        down_proj_bias = self._slice_expert_tensor_like(
+        down_proj_bias = self._select_expert_tensor_like(
             full_experts.down_proj_bias,
-            start=self.expert_start,
-            length=self.local_num_experts,
+            expert_indices=self.local_global_expert_indices_cpu,
         )
 
         self.gate_up_proj = nn.Parameter(gate_up_proj, requires_grad=False)
@@ -1253,69 +1291,82 @@ class ExpertParallelGptOssExperts(nn.Module):
         return new_layout
 
     @staticmethod
-    def _slice_custom_tensor_wrapper(value: Any, *, start: int, length: int) -> Any:
+    def _select_custom_tensor_wrapper(value: Any, *, expert_indices: torch.Tensor) -> Any:
         storage = getattr(value, "storage", None)
         if storage is None or not isinstance(getattr(storage, "data", None), torch.Tensor):
             raise TypeError(f"Unsupported custom expert tensor wrapper type for slicing: {type(value)!r}")
         tensor_cls = type(value)
         storage_cls = type(storage)
-        sliced_view = storage.data.narrow(0, int(start), int(length))
+        source_data = storage.data
+        expert_indices = expert_indices.to(device=source_data.device, dtype=torch.long)
+        sliced_view = source_data.index_select(0, expert_indices)
+        source_shape = tuple(source_data.shape)
+        source_stride = tuple(source_data.stride())
+        sliced_shape = (int(expert_indices.numel()), *source_shape[1:])
+        sliced_stride = (source_stride[0], *source_stride[1:])
         sliced_data = torch.empty_strided(
-            tuple(sliced_view.shape),
-            tuple(sliced_view.stride()),
+            sliced_shape,
+            sliced_stride,
             dtype=sliced_view.dtype,
             device=sliced_view.device,
         )
         sliced_data.copy_(sliced_view)
-        sliced_layout = ExpertParallelGptOssExperts._slice_layout_for_experts(storage.layout, length=length)
+        sliced_layout = ExpertParallelGptOssExperts._slice_layout_for_experts(
+            storage.layout,
+            length=int(expert_indices.numel()),
+        )
         sliced_storage = storage_cls(sliced_data, layout=sliced_layout)
         shape = getattr(value, "shape", None)
         if shape is not None:
-            shape = torch.Size((int(length), *tuple(shape)[1:]))
+            shape = torch.Size((int(expert_indices.numel()), *tuple(shape)[1:]))
         shape_max = getattr(value, "shape_max", None)
         if shape_max is not None:
-            shape_max = torch.Size((int(length), *tuple(shape_max)[1:]))
+            shape_max = torch.Size((int(expert_indices.numel()), *tuple(shape_max)[1:]))
         return tensor_cls(sliced_storage, value.dtype, shape=shape, shape_max=shape_max)
 
     @staticmethod
-    def _slice_expert_tensor_like(value: Any, *, start: int, length: int, attr_name: Optional[str] = None) -> torch.Tensor:
+    def _select_expert_tensor_like(
+        value: Any,
+        *,
+        expert_indices: torch.Tensor,
+        attr_name: Optional[str] = None,
+    ) -> torch.Tensor:
         if attr_name is not None:
             value = getattr(value, attr_name)
+        expert_indices = expert_indices.to(dtype=torch.long)
         if isinstance(value, nn.Parameter):
-            return value.detach().narrow(0, start, length).clone().contiguous()
+            return value.detach().index_select(0, expert_indices.to(device=value.device)).clone().contiguous()
         if isinstance(value, torch.Tensor):
-            return value.detach().narrow(0, start, length).clone().contiguous()
+            return value.detach().index_select(0, expert_indices.to(device=value.device)).clone().contiguous()
         data = getattr(value, "data", None)
         if isinstance(data, torch.Tensor):
-            return data.narrow(0, int(start), int(length)).clone().contiguous()
+            return data.index_select(0, expert_indices.to(device=data.device)).clone().contiguous()
         raise TypeError(f"Unsupported expert tensor wrapper type for expert-parallel slicing: {type(value)!r}")
 
     @staticmethod
-    def _slice_precision_config_weight_scale(
+    def _select_precision_config_weight_scale(
         precision_config: Any,
-        full_experts: nn.Module,
-        start: int,
-        length: int,
+        expert_indices: torch.Tensor,
     ) -> Any:
         import copy
 
         new_precision_config = copy.copy(precision_config)
-        new_precision_config.weight_scale = ExpertParallelGptOssExperts._slice_custom_tensor_wrapper(
+        new_precision_config.weight_scale = ExpertParallelGptOssExperts._select_custom_tensor_wrapper(
             precision_config.weight_scale,
-            start=start,
-            length=length,
+            expert_indices=expert_indices,
         )
         return new_precision_config
 
     @staticmethod
-    def _build_local_mxfp4_experts(full_experts: nn.Module, *, start: int, length: int) -> nn.Module:
+    def _build_local_mxfp4_experts(full_experts: nn.Module, *, expert_indices: torch.Tensor) -> nn.Module:
         from transformers.integrations.mxfp4 import Mxfp4GptOssExperts
 
+        local_num_experts = int(expert_indices.numel())
         local_config = type(
             "LocalMxfp4ExpertsConfig",
             (),
             {
-                "num_local_experts": int(length),
+                "num_local_experts": local_num_experts,
                 "intermediate_size": int(full_experts.intermediate_size),
                 "hidden_size": int(full_experts.hidden_size),
                 "swiglu_limit": float(getattr(full_experts, "limit", 7.0)),
@@ -1325,61 +1376,137 @@ class ExpertParallelGptOssExperts(nn.Module):
         for proj_name in ("gate_up_proj", "down_proj"):
             if proj_name in local_experts._parameters:
                 del local_experts._parameters[proj_name]
-        local_experts.gate_up_proj = ExpertParallelGptOssExperts._slice_custom_tensor_wrapper(
+        local_experts.gate_up_proj = ExpertParallelGptOssExperts._select_custom_tensor_wrapper(
             full_experts.gate_up_proj,
-            start=start,
-            length=length,
+            expert_indices=expert_indices,
         )
-        local_experts.down_proj = ExpertParallelGptOssExperts._slice_custom_tensor_wrapper(
+        local_experts.down_proj = ExpertParallelGptOssExperts._select_custom_tensor_wrapper(
             full_experts.down_proj,
-            start=start,
-            length=length,
+            expert_indices=expert_indices,
         )
         local_experts.gate_up_proj_bias = nn.Parameter(
-            ExpertParallelGptOssExperts._slice_expert_tensor_like(
+            ExpertParallelGptOssExperts._select_expert_tensor_like(
                 full_experts.gate_up_proj_bias,
-                start=start,
-                length=length,
+                expert_indices=expert_indices,
             ),
             requires_grad=False,
         )
         local_experts.down_proj_bias = nn.Parameter(
-            ExpertParallelGptOssExperts._slice_expert_tensor_like(
+            ExpertParallelGptOssExperts._select_expert_tensor_like(
                 full_experts.down_proj_bias,
-                start=start,
-                length=length,
+                expert_indices=expert_indices,
             ),
             requires_grad=False,
         )
-        local_experts.gate_up_proj_precision_config = ExpertParallelGptOssExperts._slice_precision_config_weight_scale(
+        local_experts.gate_up_proj_precision_config = ExpertParallelGptOssExperts._select_precision_config_weight_scale(
             full_experts.gate_up_proj_precision_config,
-            full_experts,
-            start,
-            length,
+            expert_indices,
         )
-        local_experts.down_proj_precision_config = ExpertParallelGptOssExperts._slice_precision_config_weight_scale(
+        local_experts.down_proj_precision_config = ExpertParallelGptOssExperts._select_precision_config_weight_scale(
             full_experts.down_proj_precision_config,
-            full_experts,
-            start,
-            length,
+            expert_indices,
         )
         local_experts.alpha = float(getattr(full_experts, "alpha", 1.702))
         local_experts.limit = float(getattr(full_experts, "limit", 7.0))
         local_experts.eval()
         return local_experts
 
+    def _owner_and_local_expert_indices(
+        self,
+        router_indices: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.partition_mode == "contiguous":
+            owner_ranks = torch.div(router_indices, self.local_num_experts, rounding_mode="floor")
+            local_expert_indices = router_indices % self.local_num_experts
+            return owner_ranks.to(torch.long), local_expert_indices.to(torch.long)
+        if self.partition_mode == "strided":
+            owner_ranks = router_indices % self.world_size
+            local_expert_indices = torch.div(router_indices, self.world_size, rounding_mode="floor")
+            return owner_ranks.to(torch.long), local_expert_indices.to(torch.long)
+        raise ValueError(f"Unsupported expert partition mode: {self.partition_mode!r}")
+
     def reset_microphase_stats(self) -> None:
         for key in self._microphase_stats:
             self._microphase_stats[key] = 0.0
+        for key in self._occupancy_stats:
+            self._occupancy_stats[key] = 0.0
+        self._pending_rank_loads = None
+        self._pending_routed_tokens = 0
+        self._pending_local_tokens = 0
 
-    def consume_microphase_stats(self) -> dict[str, float]:
+    def consume_microphase_stats(self) -> dict[str, Any]:
         stats = {key: float(value) for key, value in self._microphase_stats.items()}
+        occupancy = {key: float(value) for key, value in self._occupancy_stats.items()}
         self.reset_microphase_stats()
-        return stats
+        return {
+            "durations": stats,
+            "occupancy": occupancy,
+        }
 
     def _record_microphase(self, phase: str, duration_s: float) -> None:
         if phase in self._microphase_stats:
             self._microphase_stats[phase] += float(duration_s)
+
+    def _record_occupancy_snapshot(
+        self,
+        *,
+        rank_loads: torch.Tensor,
+        local_hist: torch.Tensor,
+    ) -> None:
+        if not self.profile_occupancy:
+            return
+        local_hist = local_hist.to(dtype=torch.int64)
+        if dist.is_available() and dist.is_initialized() and self.world_size > 1:
+            gathered = [torch.empty_like(local_hist) for _ in range(self.world_size)]
+            dist.all_gather(gathered, local_hist)
+            global_hist = torch.cat(gathered, dim=0)
+        else:
+            global_hist = local_hist
+
+        rank_loads_f = rank_loads.to(dtype=torch.float32)
+        rank_load_mean = float(rank_loads_f.mean().item()) if rank_loads_f.numel() > 0 else 0.0
+        rank_load_max = float(rank_loads_f.max().item()) if rank_loads_f.numel() > 0 else 0.0
+        rank_load_std = (
+            float(rank_loads_f.std(unbiased=False).item()) if rank_loads_f.numel() > 1 else 0.0
+        )
+        rank_load_imbalance = rank_load_max / max(rank_load_mean, 1e-6) if rank_load_mean > 0 else 0.0
+
+        local_active_experts = int((local_hist > 0).sum().item()) if local_hist.numel() > 0 else 0
+        local_max_tokens = int(local_hist.max().item()) if local_hist.numel() > 0 else 0
+
+        active_global_hist = global_hist[global_hist > 0]
+        global_active_experts = int(active_global_hist.numel())
+        global_max_tokens = int(global_hist.max().item()) if global_hist.numel() > 0 else 0
+        global_mean_active = (
+            float(active_global_hist.to(torch.float32).mean().item()) if global_active_experts > 0 else 0.0
+        )
+        topk = min(4, int(global_hist.numel()))
+        global_top4_expert_share = 0.0
+        if topk > 0:
+            global_total = float(global_hist.sum().item())
+            if global_total > 0:
+                global_top4_expert_share = float(
+                    torch.topk(global_hist.to(torch.float32), k=topk).values.sum().item() / global_total
+                )
+        global_expert_imbalance = (
+            global_max_tokens / max(global_mean_active, 1e-6) if global_mean_active > 0 else 0.0
+        )
+
+        self._occupancy_stats["sample_count"] += 1.0
+        self._occupancy_stats["routed_tokens"] += float(self._pending_routed_tokens)
+        self._occupancy_stats["local_tokens"] += float(self._pending_local_tokens)
+        self._occupancy_stats["rank_load_imbalance"] += float(rank_load_imbalance)
+        self._occupancy_stats["rank_load_std"] += float(rank_load_std)
+        self._occupancy_stats["local_active_experts"] += float(local_active_experts)
+        self._occupancy_stats["local_max_tokens_per_expert"] += float(local_max_tokens)
+        self._occupancy_stats["global_active_experts"] += float(global_active_experts)
+        self._occupancy_stats["global_max_tokens_per_expert"] += float(global_max_tokens)
+        self._occupancy_stats["global_mean_tokens_per_active_expert"] += float(global_mean_active)
+        self._occupancy_stats["global_top4_expert_share"] += float(global_top4_expert_share)
+        self._occupancy_stats["global_expert_imbalance"] += float(global_expert_imbalance)
+        self._pending_rank_loads = None
+        self._pending_routed_tokens = 0
+        self._pending_local_tokens = 0
 
     @staticmethod
     def _routing_torch_dist_for_rank(
@@ -1457,7 +1584,10 @@ class ExpertParallelGptOssExperts(nn.Module):
             device=local_expert_indices.device,
             dtype=torch.int32,
         )
-        global_expert_indices = (local_expert_indices + self.expert_start).to(torch.int32)
+        global_expert_indices = self.local_global_expert_indices_cpu.to(local_expert_indices.device).index_select(
+            0,
+            local_expert_indices,
+        ).to(torch.int32)
         topk_indx = torch.argsort(global_expert_indices, stable=True).to(torch.int32)
         gate_indx = torch.argsort(topk_indx).to(torch.int32)
         gate_scal = torch.ones((row_count,), device=local_expert_indices.device, dtype=torch.float32)
@@ -1508,10 +1638,13 @@ class ExpertParallelGptOssExperts(nn.Module):
         row_count = int(hidden_states.shape[0])
         if row_count == 0:
             return torch.zeros_like(hidden_states, dtype=hidden_states.dtype, device=hidden_states.device)
-        if self.local_mxfp4_routing_mode == "top1_local":
+        if self.local_mxfp4_routing_mode == "top1_local" or self.partition_mode != "contiguous":
             routing_data, gather_idx, scatter_idx = self._routing_top1_local_experts(local_expert_indices)
         else:
-            global_expert_indices = local_expert_indices.to(torch.long) + self.expert_start
+            global_expert_indices = self.local_global_expert_indices_cpu.to(local_expert_indices.device).index_select(
+                0,
+                local_expert_indices.to(torch.long),
+            )
             logits = hidden_states.new_full((row_count, self.num_experts), -1e9)
             logits.scatter_(1, global_expert_indices.unsqueeze(1), 0.0)
             routing_data, gather_idx, scatter_idx = self._routing_torch_dist_for_rank(
@@ -1561,11 +1694,29 @@ class ExpertParallelGptOssExperts(nn.Module):
             nonempty_counts.append(count)
 
         if not nonempty_hidden:
+            if self.profile_occupancy and self._pending_rank_loads is not None:
+                self._record_occupancy_snapshot(
+                    rank_loads=self._pending_rank_loads,
+                    local_hist=torch.zeros(
+                        (self.local_num_experts,),
+                        dtype=torch.int64,
+                        device=hidden_states.device,
+                    ),
+                )
             return [self._empty_like_rows(hidden_states, 0) for _ in range(self.world_size)]
 
         packed_hidden = torch.cat(nonempty_hidden, dim=0)
         packed_local_expert_indices = torch.cat(nonempty_local_expert_indices, dim=0)
         packed_routing_weights = torch.cat(nonempty_routing_weights, dim=0)
+        if self.profile_occupancy and self._pending_rank_loads is not None:
+            local_hist = torch.bincount(
+                packed_local_expert_indices,
+                minlength=self.local_num_experts,
+            )
+            self._record_occupancy_snapshot(
+                rank_loads=self._pending_rank_loads,
+                local_hist=local_hist,
+            )
         packed_output = self._local_forward(
             packed_hidden,
             packed_local_expert_indices,
@@ -1862,6 +2013,10 @@ class ExpertParallelGptOssExperts(nn.Module):
 
         count_work.wait()
         recv_counts = [int(x) for x in count_matrix[:, self.rank].tolist()]
+        if self.profile_occupancy:
+            self._pending_rank_loads = count_matrix.sum(dim=0).to(dtype=torch.float32)
+            self._pending_routed_tokens = int(send_counts_tensor.sum().item())
+            self._pending_local_tokens = int(sum(recv_counts))
         self._record_microphase("dispatch_counts", time.perf_counter() - dispatch_started_at)
 
         send_token_indices = self._split_tensor_by_counts(flat_token_idx, send_counts)
@@ -1985,8 +2140,7 @@ class ExpertParallelGptOssExperts(nn.Module):
 
         device = hidden_states.device
         valid_mask = (router_indices >= 0) & (router_indices < self.num_experts)
-        owner_ranks = torch.div(router_indices.clamp(min=0), self.local_num_experts, rounding_mode="floor")
-        local_expert_indices = (router_indices.clamp(min=0) % self.local_num_experts).to(torch.long)
+        owner_ranks, local_expert_indices = self._owner_and_local_expert_indices(router_indices.clamp(min=0))
         token_positions = torch.arange(hidden_states.shape[0], device=device, dtype=torch.long)
         token_positions = token_positions.unsqueeze(1).expand_as(router_indices)
 
@@ -2081,6 +2235,8 @@ def _enable_expert_parallel_for_hybrid_model(
     world_size: int,
     overlap_mode: str = "none",
     local_mxfp4_routing_mode: str = "dense_logits",
+    partition_mode: str = "contiguous",
+    profile_occupancy: bool = False,
 ) -> dict[str, Any]:
     base_model = _unwrap_model(student_model)
     layers = getattr(getattr(base_model, "model", None), "layers", None)
@@ -2106,6 +2262,8 @@ def _enable_expert_parallel_for_hybrid_model(
             world_size=world_size,
             overlap_mode=overlap_mode,
             local_mxfp4_routing_mode=local_mxfp4_routing_mode,
+            partition_mode=partition_mode,
+            profile_occupancy=profile_occupancy,
         )
         mlp.experts = patched
         experts_per_rank = patched.local_num_experts
@@ -2118,6 +2276,8 @@ def _enable_expert_parallel_for_hybrid_model(
         "num_experts": int(num_experts) if num_experts is not None else None,
         "experts_per_rank": int(experts_per_rank) if experts_per_rank is not None else None,
         "local_mxfp4_routing_mode": str(local_mxfp4_routing_mode),
+        "partition_mode": str(partition_mode),
+        "profile_occupancy": bool(profile_occupancy),
     }
 
 
@@ -2138,6 +2298,22 @@ def _consume_expert_parallel_microphase_stats(student_model: nn.Module) -> dict[
         "return_exchange": 0.0,
         "merge": 0.0,
     }
+    occupancy_sum_keys = (
+        "routed_tokens",
+        "local_tokens",
+        "rank_load_imbalance",
+        "rank_load_std",
+        "local_active_experts",
+        "local_max_tokens_per_expert",
+        "global_active_experts",
+        "global_max_tokens_per_expert",
+        "global_mean_tokens_per_active_expert",
+        "global_top4_expert_share",
+        "global_expert_imbalance",
+    )
+    occupancy_sums = {key: 0.0 for key in occupancy_sum_keys}
+    occupancy_max = {key: 0.0 for key in occupancy_sum_keys}
+    occupancy_sample_count = 0
     module_count = 0
     for module in base_model.modules():
         if not isinstance(module, ExpertParallelGptOssExperts):
@@ -2145,10 +2321,25 @@ def _consume_expert_parallel_microphase_stats(student_model: nn.Module) -> dict[
         module_count += 1
         stats = module.consume_microphase_stats()
         for key in aggregate:
-            aggregate[key] += float(stats.get(key, 0.0))
+            aggregate[key] += float(stats["durations"].get(key, 0.0))
+        occupancy = stats.get("occupancy", {})
+        occupancy_sample_count += int(occupancy.get("sample_count", 0.0))
+        for key in occupancy_sum_keys:
+            value = float(occupancy.get(key, 0.0))
+            occupancy_sums[key] += value
+            occupancy_max[key] = max(occupancy_max[key], value)
+    occupancy_mean = {
+        key: (value / float(occupancy_sample_count) if occupancy_sample_count > 0 else 0.0)
+        for key, value in occupancy_sums.items()
+    }
     return {
         "module_count": module_count,
         "durations": aggregate,
+        "occupancy": {
+            "sample_count": int(occupancy_sample_count),
+            "mean": occupancy_mean,
+            "max": occupancy_max,
+        },
     }
 
 
@@ -3564,6 +3755,8 @@ def main() -> None:
         "expert_parallel": bool(args.expert_parallel),
         "expert_parallel_overlap_mode": args.expert_parallel_overlap_mode,
         "local_mxfp4_routing_mode": args.local_mxfp4_routing_mode,
+        "expert_partition_mode": args.expert_partition_mode,
+        "expert_parallel_profile_occupancy": bool(args.expert_parallel_profile_occupancy),
         "gradient_checkpointing": bool(args.gradient_checkpointing),
         "gradient_checkpointing_mode": args.gradient_checkpointing_mode,
         "layers_per_checkpoint": args.layers_per_checkpoint,
@@ -3666,6 +3859,8 @@ def main() -> None:
             world_size=dist_ctx["world_size"],
             overlap_mode=args.expert_parallel_overlap_mode,
             local_mxfp4_routing_mode=args.local_mxfp4_routing_mode,
+            partition_mode=args.expert_partition_mode,
+            profile_occupancy=bool(args.expert_parallel_profile_occupancy),
         )
         manifest["expert_parallel_info"] = expert_parallel_info
         if dist_ctx["is_main_process"]:
@@ -3996,8 +4191,32 @@ def main() -> None:
                     step=global_step,
                     extra={
                         "expert_parallel_overlap_mode": args.expert_parallel_overlap_mode,
+                        "expert_partition_mode": args.expert_partition_mode,
                         "module_count": int(microphase_stats["module_count"]),
                     },
+                )
+            occupancy_stats = microphase_stats.get("occupancy", {})
+            if int(occupancy_stats.get("sample_count", 0)) > 0:
+                occupancy_extra = {
+                    "expert_parallel_overlap_mode": args.expert_parallel_overlap_mode,
+                    "local_mxfp4_routing_mode": args.local_mxfp4_routing_mode,
+                    "expert_partition_mode": args.expert_partition_mode,
+                    "module_count": int(microphase_stats["module_count"]),
+                    "sample_count": int(occupancy_stats["sample_count"]),
+                }
+                for prefix, payload in (
+                    ("mean", occupancy_stats.get("mean", {})),
+                    ("max", occupancy_stats.get("max", {})),
+                ):
+                    for key, value in payload.items():
+                        occupancy_extra[f"{key}_{prefix}"] = float(value)
+                _log_phase_timing(
+                    phase_log_path=phase_log_path,
+                    dist_ctx=dist_ctx,
+                    phase="first_expert_parallel_occupancy",
+                    started_at=time.perf_counter(),
+                    step=global_step,
+                    extra=occupancy_extra,
                 )
         if hybrid_shared_backbone and float(args.kl_weight) > 0 and is_first_process_step:
             hybrid_microphase_stats = _consume_hybrid_dual_microphase_stats(student_model)
