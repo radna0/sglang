@@ -579,6 +579,26 @@ class DFlashWorker:
             target_worker.model_runner.model_config.context_len
         )
 
+        draft_mem_fraction_override = getattr(
+            server_args, "speculative_draft_mem_fraction_static", None
+        )
+        if draft_mem_fraction_override is None:
+            draft_mem_fraction_env = (
+                os.environ.get("SGLANG_DFLASH_DRAFT_MEM_FRACTION_STATIC")
+                or os.environ.get("MEM_FRAC_DFLASH")
+                or ""
+            ).strip()
+            if draft_mem_fraction_env:
+                try:
+                    draft_mem_fraction_override = float(draft_mem_fraction_env)
+                except Exception:
+                    if self.tp_rank == 0:
+                        logger.warning(
+                            "Ignoring invalid DFLASH draft mem fraction override=%r",
+                            draft_mem_fraction_env,
+                        )
+                    draft_mem_fraction_override = None
+
         # The default speculative plumbing sets `draft_runner_cache_size` to the target worker's
         # KV-cache capacity. On single-GPU bring-up (especially with high --mem-fraction-static),
         # spawning a second worker with a target-sized KV cache can OOM. The draft model proposes
@@ -600,6 +620,16 @@ class DFlashWorker:
                         "Ignoring invalid SGLANG_DFLASH_DRAFT_RUNNER_CACHE_SIZE=%r",
                         draft_cache_cap_env,
                     )
+        elif draft_mem_fraction_override is not None:
+            draft_server_args.mem_fraction_static = float(draft_mem_fraction_override)
+            draft_server_args.draft_runner_cache_size = None
+            if self.tp_rank == 0:
+                logger.warning(
+                    "DFLASH draft mem_fraction_static overridden: draft_mem_fraction_static=%.4f "
+                    "(target mem_fraction_static=%.4f); draft_runner_cache_size will be profiled.",
+                    float(draft_server_args.mem_fraction_static),
+                    float(server_args.mem_fraction_static),
+                )
         self.draft_worker = TpModelWorker(
             server_args=draft_server_args,
             gpu_id=gpu_id,
@@ -1129,10 +1159,28 @@ class DFlashWorker:
         # allocator and req_to_token_pool are shared with target worker
         pass
 
+    def _free_nonshared_req_draft_kv(self, req) -> None:
+        if bool(getattr(self, "_dflash_draft_share_pools", True)):
+            return
+
+        req_pool_idx = getattr(req, "req_pool_idx", None)
+        draft_seq_len = int(getattr(req, "dflash_draft_seq_len", 0) or 0)
+        if req_pool_idx is None or draft_seq_len <= 0:
+            return
+
+        req_to_token_pool = self.draft_model_runner.req_to_token_pool
+        allocator = self.draft_model_runner.token_to_kv_pool_allocator
+        draft_cache_locs = req_to_token_pool.req_to_token[
+            req_pool_idx, :draft_seq_len
+        ].to(torch.int64)
+        valid_cache_locs = draft_cache_locs[draft_cache_locs > 0]
+        if valid_cache_locs.numel() > 0:
+            allocator.free(valid_cache_locs)
+        req_to_token_pool.req_to_token[req_pool_idx, :draft_seq_len] = 0
+
 
     def on_req_finished(self, req):
-        # allocator and req_to_token_pool are shared with the target worker;
-        # there is no separate draft allocation to release here.
+        self._free_nonshared_req_draft_kv(req)
         if hasattr(req, "dflash_draft_seq_len"):
             req.dflash_draft_seq_len = 0
         if hasattr(req, "dflash_ssd_cache"):

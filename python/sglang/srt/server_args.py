@@ -482,6 +482,7 @@ class ServerArgs:
     speculative_eagle_topk: Optional[int] = None
     speculative_num_draft_tokens: Optional[int] = None
     speculative_dflash_block_size: Optional[int] = None
+    speculative_draft_mem_fraction_static: Optional[float] = None
     speculative_accept_threshold_single: float = 1.0
     speculative_accept_threshold_acc: float = 1.0
     speculative_token_map: Optional[str] = None
@@ -4741,6 +4742,18 @@ class ServerArgs:
             type=int,
             help="DFLASH only. Block size (verify window length). Alias of --speculative-num-draft-tokens for DFLASH.",
             default=ServerArgs.speculative_dflash_block_size,
+        )
+        parser.add_argument(
+            "--speculative-draft-mem-fraction-static",
+            "--mem-frac-dflash",
+            dest="speculative_draft_mem_fraction_static",
+            type=float,
+            default=ServerArgs.speculative_draft_mem_fraction_static,
+            help=(
+                "DFLASH only. Override the draft worker mem_fraction_static used to "
+                "preallocate draft KV cache. If unset, the draft worker inherits "
+                "--mem-fraction-static from the target server args."
+            ),
         )
         parser.add_argument(
             "--speculative-accept-threshold-single",
