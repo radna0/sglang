@@ -500,21 +500,14 @@ def top_k_top_p_min_p_sampling_from_probs_torch(
     When sampling_seed is not None, deterministic inference will be enabled, it will sample
     with the sampling_seed of each request.
     """
-    probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
-    probs_sum = torch.cumsum(probs_sort, dim=-1)
-    probs_sort[
-        torch.arange(0, probs.shape[-1], device=probs.device).view(1, -1)
-        >= top_ks.view(-1, 1)
-    ] = 0.0
-    probs_sort[(probs_sum - probs_sort) > top_ps.view(-1, 1)] = 0.0
-
-    if need_min_p_sampling:
-        # TODO: probs_sort should be re-normalized for the use of multinomial_with_seed
-        assert (
-            sampling_seed is None
-        ), "With sampling seed, multinomial_with_seed will provide wrong results"
-        min_p_thresholds = probs_sort[:, 0] * min_ps
-        probs_sort[probs_sort < min_p_thresholds.view(-1, 1)] = 0.0
+    probs_sort, probs_idx = prepare_top_k_top_p_min_p_sorted_probs_torch(
+        probs,
+        top_ks,
+        top_ps,
+        min_ps,
+        need_min_p_sampling,
+    )
+    _sanitize_sampling_probs_for_multinomial_(probs_sort)
 
     if sampling_seed is None:
         sampled_index = torch.multinomial(probs_sort, num_samples=1)
@@ -532,6 +525,99 @@ def top_k_top_p_min_p_sampling_from_probs_torch(
     probs_idx = probs_idx.to(torch.int32)
     batch_next_token_ids = torch.gather(probs_idx, dim=1, index=sampled_index).view(-1)
     return batch_next_token_ids
+
+
+def _sanitize_sampling_probs_for_multinomial_(probs_sort: torch.Tensor) -> None:
+    """Make candidate weights safe for torch.multinomial.
+
+    This helper is intentionally generic: callers may pass either sorted
+    candidate weights or the full unsorted probability tensor. For rows that
+    already contain a valid probability distribution, it only normalizes.
+    """
+    if probs_sort.numel() == 0:
+        return
+
+    probs_sort.nan_to_num_(nan=0.0, posinf=0.0, neginf=0.0)
+    probs_sort.clamp_min_(0.0)
+
+    row_sums = probs_sort.sum(dim=-1, keepdim=True)
+    bad_rows = (~torch.isfinite(row_sums) | (row_sums <= 0)).view(-1)
+
+    if bad_rows.any():
+        probs_sort[bad_rows] = 0.0
+        probs_sort[bad_rows, 0] = 1.0
+        row_sums = probs_sort.sum(dim=-1, keepdim=True)
+
+    probs_sort.div_(row_sums)
+
+
+def prepare_top_k_top_p_min_p_sorted_probs_torch(
+    probs: torch.Tensor,
+    top_ks: torch.Tensor,
+    top_ps: torch.Tensor,
+    min_ps: torch.Tensor,
+    need_min_p_sampling: bool,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Prepare sorted-and-filtered candidate weights for PyTorch sampling.
+
+    When all requests use a bounded ``top_k``, use ``torch.topk`` to avoid a
+    full-vocabulary sort/copy. This is the common production sampled-decoding
+    case and materially reduces transient VRAM pressure.
+    """
+    if probs.numel() == 0:
+        return probs, probs.to(dtype=torch.long)
+
+    vocab_size = probs.shape[-1]
+    top_ks_view = top_ks.view(-1)
+    use_bounded_topk = top_ks_view.numel() > 0 and not torch.any(
+        top_ks_view >= TOP_K_ALL
+    )
+
+    if use_bounded_topk:
+        max_top_k = int(top_ks_view.max().item())
+        max_top_k = max(1, min(max_top_k, vocab_size))
+        if max_top_k < vocab_size:
+            probs_sort, probs_idx = torch.topk(
+                probs,
+                k=max_top_k,
+                dim=-1,
+                largest=True,
+                sorted=True,
+            )
+        else:
+            probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
+    else:
+        probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
+
+    _apply_top_k_top_p_min_p_filters_inplace(
+        probs_sort,
+        top_ks,
+        top_ps,
+        min_ps,
+        need_min_p_sampling,
+    )
+    return probs_sort, probs_idx
+
+
+def _apply_top_k_top_p_min_p_filters_inplace(
+    probs_sort: torch.Tensor,
+    top_ks: torch.Tensor,
+    top_ps: torch.Tensor,
+    min_ps: torch.Tensor,
+    need_min_p_sampling: bool,
+) -> None:
+    width = probs_sort.shape[-1]
+    cols = torch.arange(0, width, device=probs_sort.device).view(1, -1)
+    top_ks_clamped = torch.clamp(top_ks.view(-1), min=1, max=width)
+
+    probs_sort[cols >= top_ks_clamped.view(-1, 1)] = 0.0
+
+    probs_sum = torch.cumsum(probs_sort, dim=-1)
+    probs_sort[(probs_sum - probs_sort) > top_ps.view(-1, 1)] = 0.0
+
+    if need_min_p_sampling:
+        min_p_thresholds = probs_sort[:, 0] * min_ps.to(dtype=probs_sort.dtype)
+        probs_sort[probs_sort < min_p_thresholds.view(-1, 1)] = 0.0
 
 
 def top_k_top_p_min_p_sampling_from_logits_ascend(
@@ -557,6 +643,7 @@ def top_k_top_p_min_p_sampling_from_logits_ascend(
             min_p_mask = probs_top_k_top_p < min_p_thresholds.view(-1, 1)
             probs_top_k_top_p.masked_fill_(min_p_mask, 0.0)
 
+        _sanitize_sampling_probs_for_multinomial_(probs_top_k_top_p)
         batch_next_token_ids = torch.multinomial(probs_top_k_top_p, num_samples=1)
     else:
         probs = torch.softmax(logits, dim=-1)
@@ -579,6 +666,7 @@ def top_k_top_p_min_p_sampling_from_logits_ascend(
             min_p_mask = probs_sort < min_p_thresholds.view(-1, 1)
             probs_sort.masked_fill_(min_p_mask, 0.0)
 
+        _sanitize_sampling_probs_for_multinomial_(probs_sort)
         sampled_index = torch.multinomial(probs_sort, num_samples=1)
         probs_idx = probs_idx.to(torch.int32)
         batch_next_token_ids = torch.gather(probs_idx, dim=1, index=sampled_index)
@@ -639,6 +727,8 @@ def sampling_from_probs_torch(
 
     Note: For deterministic sampling from logprobs, use Sampler._sample_from_logprobs instead.
     """
+    _sanitize_sampling_probs_for_multinomial_(probs)
+
     if sampling_seed is None:
         sampled_index = torch.multinomial(probs, num_samples=1)
     else:
