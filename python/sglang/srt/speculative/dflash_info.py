@@ -51,6 +51,12 @@ if is_cuda():
     )
 
 
+def _top_p_is_effectively_disabled(top_ps: torch.Tensor) -> bool:
+    if top_ps.numel() == 0:
+        return True
+    return bool(torch.all(top_ps >= 1.0).item())
+
+
 @dataclass
 class DFlashDraftInput(SpecInput):
     """Per-batch DFlash draft state for spec-v1 (non-overlap) scheduling.
@@ -803,7 +809,8 @@ class DFlashVerifyInput(SpecInput):
                             sampling_info.min_ps, self.draft_token_num, dim=0
                         )
                         probs = top_k_renorm_prob(probs, expanded_top_ks)
-                        probs = top_p_renorm_prob(probs, expanded_top_ps)
+                        if not _top_p_is_effectively_disabled(expanded_top_ps):
+                            probs = top_p_renorm_prob(probs, expanded_top_ps)
                         sampled = min_p_sampling_from_probs(probs, expanded_min_ps)
                     else:
                         sampled = top_k_top_p_sampling_from_probs(
