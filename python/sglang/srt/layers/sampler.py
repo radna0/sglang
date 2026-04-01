@@ -1,5 +1,4 @@
 import logging
-import os
 from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
@@ -36,25 +35,6 @@ SYNC_TOKEN_IDS_ACROSS_TP = get_bool_env_var("SYNC_TOKEN_IDS_ACROSS_TP")
 SGLANG_RETURN_ORIGINAL_LOGPROB = get_bool_env_var("SGLANG_RETURN_ORIGINAL_LOGPROB")
 _CUSTOM_SAMPLER_FACTORIES: Dict[str, Callable[[], "Sampler"]] = {}
 _BUILT_IN_SAMPLING_BACKENDS = {"flashinfer", "pytorch", "ascend"}
-_FA3_SAMPLER_TRACE_COUNT = 0
-
-
-def _fa3_trace_sampler(msg: str, *args) -> None:
-    global _FA3_SAMPLER_TRACE_COUNT
-    enabled = get_bool_env_var("SGLANG_FA3_TRACE_SAMPLER")
-    if not enabled:
-        return
-    limit_raw = os.environ.get("SGLANG_FA3_TRACE_SAMPLER_LIMIT", "64")
-    try:
-        limit = int(limit_raw)
-    except Exception:
-        limit = 64
-    if limit >= 0 and _FA3_SAMPLER_TRACE_COUNT >= limit:
-        return
-    logger.info(msg, *args)
-    _FA3_SAMPLER_TRACE_COUNT += 1
-
-
 class Sampler(nn.Module):
     def __init__(self):
         super().__init__()
@@ -118,32 +98,10 @@ class Sampler(nn.Module):
 
         # Preprocess logits (custom processors and NaN handling)
         logits = self._preprocess_logits(logits, sampling_info)
-        _fa3_trace_sampler(
-            "[FA3Sampler] greedy=%s top_k=%s top_p=%s min_p=%s temperature=%s logits_shape=%s logits_dtype=%s finite=%s",
-            sampling_info.is_all_greedy,
-            sampling_info.top_ks[:4].detach().cpu().tolist(),
-            sampling_info.top_ps[:4].detach().cpu().tolist(),
-            sampling_info.min_ps[:4].detach().cpu().tolist(),
-            sampling_info.temperatures[:4].view(-1).detach().cpu().tolist(),
-            tuple(logits.shape),
-            logits.dtype,
-            bool(torch.isfinite(logits).all().item()),
-        )
 
         if sampling_info.is_all_greedy:
             # Use torch.argmax if all requests use greedy sampling
-            if logits.shape[0] > 0:
-                vals, ids = torch.topk(logits[0], k=min(16, logits.shape[-1]))
-                _fa3_trace_sampler(
-                    "[FA3Sampler] greedy_topk ids=%s vals=%s",
-                    ids.detach().cpu().tolist(),
-                    vals.detach().cpu().tolist(),
-                )
             batch_next_token_ids = torch.argmax(logits, -1)
-            _fa3_trace_sampler(
-                "[FA3Sampler] greedy_next_token_ids=%s",
-                batch_next_token_ids[:8].detach().cpu().tolist(),
-            )
             if return_logprob:
                 original_logprobs = logprobs = torch.nn.functional.log_softmax(
                     logits, dim=-1
@@ -222,10 +180,6 @@ class Sampler(nn.Module):
             )
 
         self._sync_token_ids_across_tp(batch_next_token_ids, sampling_info)
-        _fa3_trace_sampler(
-            "[FA3Sampler] final_next_token_ids=%s",
-            batch_next_token_ids[:8].detach().cpu().tolist(),
-        )
 
         return batch_next_token_ids
 
