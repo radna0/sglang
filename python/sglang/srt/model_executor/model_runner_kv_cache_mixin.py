@@ -440,8 +440,18 @@ class ModelRunnerKVCacheMixin:
             self.max_total_num_tokens = tensor.item()
 
         if not self.spec_algorithm.is_none() and self.is_draft_worker:
-            self.max_total_num_tokens = self.server_args.draft_runner_cache_size
-            max_num_reqs = self.server_args.max_num_reqs
+            draft_runner_cache_size = getattr(
+                self.server_args, "draft_runner_cache_size", None
+            )
+            if draft_runner_cache_size is not None:
+                self.max_total_num_tokens = int(draft_runner_cache_size)
+                max_num_reqs = self.server_args.max_num_reqs
+            else:
+                logger.info(
+                    "Draft worker using profiled KV capacity (no draft_runner_cache_size override). "
+                    "mem_fraction_static=%s",
+                    self.server_args.mem_fraction_static,
+                )
 
         # create token size for hybrid cache
         if self.is_hybrid_swa:
