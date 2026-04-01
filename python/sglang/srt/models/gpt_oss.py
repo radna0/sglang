@@ -67,10 +67,15 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.utils import (
+    create_fused_set_kv_buffer_arg,
+    enable_fused_set_kv_buffer,
+)
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import LazyValue, add_prefix, is_npu, make_layers
+from sglang.srt.utils import LazyValue, add_prefix, is_cuda, is_npu, make_layers
 from sglang.srt.utils.custom_op import register_custom_op
 
+_is_cuda = is_cuda()
 _is_npu = is_npu()
 
 
@@ -82,6 +87,74 @@ class GptOssConfig(PretrainedConfig):
 
 
 logger = logging.getLogger(__name__)
+
+
+def _fa3_tensor_stats(tensor: torch.Tensor) -> dict:
+    detached = tensor.detach()
+    return {
+        "shape": tuple(detached.shape),
+        "dtype": str(detached.dtype),
+        "contiguous": bool(detached.is_contiguous()),
+        "finite": bool(torch.isfinite(detached).all().item()),
+        "min": float(detached.min().item()),
+        "max": float(detached.max().item()),
+        "mean": float(detached.float().mean().item()),
+        "std": float(detached.float().std(unbiased=False).item()),
+    }
+
+
+def _fa3_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+@lru_cache(maxsize=None)
+def _fa3_int_set(name: str) -> frozenset[int]:
+    raw = os.environ.get(name, "")
+    values: set[int] = set()
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            values.add(int(part))
+        except ValueError:
+            logger.warning("[FA3SinkPolicy] ignoring invalid integer %r for %s", part, name)
+    return frozenset(values)
+
+
+def _fa3_trace_mlp_enabled(layer_id: int) -> bool:
+    if not _fa3_flag("SGLANG_FA3_TRACE_MLP_DETAILS"):
+        return False
+    trace_layers = _fa3_int_set("SGLANG_FA3_TRACE_MLP_LAYER_IDS")
+    return not trace_layers or layer_id in trace_layers
+
+
+def _fa3_topk_output_stats(topk_output) -> dict:
+    stats: dict[str, object] = {"format": type(topk_output).__name__}
+
+    if hasattr(topk_output, "router_logits"):
+        router_logits = getattr(topk_output, "router_logits")
+        if isinstance(router_logits, torch.Tensor):
+            stats["router_logits"] = _fa3_tensor_stats(router_logits)
+
+    if hasattr(topk_output, "topk_weights"):
+        topk_weights = getattr(topk_output, "topk_weights")
+        if isinstance(topk_weights, torch.Tensor):
+            weights_sum = topk_weights.sum(dim=-1)
+            stats["topk_weights"] = _fa3_tensor_stats(topk_weights)
+            stats["topk_weights_row_sum"] = _fa3_tensor_stats(weights_sum)
+
+    if hasattr(topk_output, "topk_ids"):
+        topk_ids = getattr(topk_output, "topk_ids")
+        if isinstance(topk_ids, torch.Tensor):
+            ids_detached = topk_ids.detach()
+            stats["topk_ids_shape"] = tuple(ids_detached.shape)
+            stats["topk_ids_min"] = int(ids_detached.min().item())
+            stats["topk_ids_max"] = int(ids_detached.max().item())
+            stats["topk_ids_unique"] = int(torch.unique(ids_detached).numel())
+            stats["topk_ids_head"] = ids_detached[: min(4, ids_detached.shape[0])].cpu().tolist()
+
+    return stats
 
 
 @lru_cache(maxsize=1)
@@ -203,17 +276,54 @@ class GptOssSparseMoeBlock(nn.Module):
         should_allreduce_fusion: bool = False,
     ) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
+        trace_mlp = _fa3_trace_mlp_enabled(self.layer_id)
+        if trace_mlp:
+            logger.info(
+                "[FA3MLP] layer=%d input=%s",
+                self.layer_id,
+                _fa3_tensor_stats(hidden_states),
+            )
         if is_in_piecewise_cuda_graph():
             final_hidden_states = moe_impl(self.layer_id, hidden_states)
         else:
             router_logits, _ = self.router(hidden_states)
+            if trace_mlp:
+                logger.info(
+                    "[FA3MLP] layer=%d router_logits=%s",
+                    self.layer_id,
+                    _fa3_tensor_stats(router_logits),
+                )
             topk_output = self.topk(hidden_states, router_logits)
+            if trace_mlp:
+                logger.info(
+                    "[FA3MLP] layer=%d topk=%s",
+                    self.layer_id,
+                    _fa3_topk_output_stats(topk_output),
+                )
             final_hidden_states = self.experts(hidden_states, topk_output)
+            if trace_mlp:
+                logger.info(
+                    "[FA3MLP] layer=%d experts_out=%s",
+                    self.layer_id,
+                    _fa3_tensor_stats(final_hidden_states),
+                )
 
         if self.tp_size > 1 and not should_allreduce_fusion:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+            if trace_mlp:
+                logger.info(
+                    "[FA3MLP] layer=%d allreduce_out=%s",
+                    self.layer_id,
+                    _fa3_tensor_stats(final_hidden_states),
+                )
 
         ans = final_hidden_states.view(num_tokens, hidden_dim)
+        if trace_mlp:
+            logger.info(
+                "[FA3MLP] layer=%d output=%s",
+                self.layer_id,
+                _fa3_tensor_stats(ans),
+            )
         return ans
 
 
@@ -316,6 +426,7 @@ class GptOssAttention(nn.Module):
         )
 
         assert layer_type in {"sliding_attention", "full_attention"}
+        self.layer_type = layer_type
         use_sliding_window = layer_type == "sliding_attention"
         self.attn = RadixAttention(
             self.num_heads,
@@ -334,24 +445,101 @@ class GptOssAttention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
+        fa3_trace_attn_details = _fa3_flag("SGLANG_FA3_TRACE_ATTN_DETAILS")
         if hidden_states.shape[0] == 0:
             return hidden_states, forward_batch, None
         qkv, _ = self.qkv_proj(hidden_states)
+        if fa3_trace_attn_details and self.layer_id >= 26:
+            logger.info(
+                "[FA3Attn] layer=%d qkv_proj=%s",
+                self.layer_id,
+                _fa3_tensor_stats(qkv),
+            )
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        if fa3_trace_attn_details and self.layer_id >= 26:
+            logger.info(
+                "[FA3Attn] layer=%d q=%s k=%s v=%s sinks=%s",
+                self.layer_id,
+                _fa3_tensor_stats(q),
+                _fa3_tensor_stats(k),
+                _fa3_tensor_stats(v),
+                _fa3_tensor_stats(self.sinks),
+            )
 
-        q, k = self.rotary_emb(positions, q, k)
+        extra_args = {}
+        if not _is_npu:
+            extra_args = {
+                "fused_set_kv_buffer_arg": (
+                    create_fused_set_kv_buffer_arg(
+                        value=v,
+                        layer=self.attn,
+                        forward_batch=forward_batch,
+                    )
+                    if enable_fused_set_kv_buffer(forward_batch)
+                    else None
+                ),
+            }
+
+        q, k = self.rotary_emb(positions, q, k, **extra_args)
+        if fa3_trace_attn_details and self.layer_id >= 26:
+            logger.info(
+                "[FA3Attn] layer=%d after_rope q=%s k=%s",
+                self.layer_id,
+                _fa3_tensor_stats(q),
+                _fa3_tensor_stats(k),
+            )
         inner_state = q, k, v, forward_batch
         return None, forward_batch, inner_state
 
     def forward_core(self, intermediate_state):
+        fa3_trace_attn_details = _fa3_flag("SGLANG_FA3_TRACE_ATTN_DETAILS")
         hidden_states, forward_batch, inner_state = intermediate_state
         if inner_state is None:
             return hidden_states
+        sink_policy = "normal"
+        if _fa3_flag("SGLANG_GPTOSS_DISABLE_SINKS"):
+            sinks = None
+            sink_policy = "global_off"
+        elif self.layer_id in _fa3_int_set("SGLANG_GPTOSS_DISABLE_SINKS_LAYER_IDS"):
+            sinks = None
+            sink_policy = "layer_off"
+        elif (
+            self.layer_type == "full_attention"
+            and _fa3_flag("SGLANG_GPTOSS_DISABLE_SINKS_FULL_ATTENTION")
+        ):
+            sinks = None
+            sink_policy = "full_attention_off"
+        elif _fa3_flag("SGLANG_GPTOSS_CLAMP_SINKS_NONNEG"):
+            sinks = self.sinks.clamp_min(0)
+            sink_policy = "clamp_nonneg"
+        else:
+            sinks = self.sinks
+        if _fa3_flag("SGLANG_FA3_TRACE_SINK_POLICY") and self.layer_id >= 24:
+            logger.info(
+                "[FA3SinkPolicy] layer=%d type=%s policy=%s sinks=%s",
+                self.layer_id,
+                self.layer_type,
+                sink_policy,
+                "None" if sinks is None else _fa3_tensor_stats(sinks),
+            )
         attn_output = self.attn(
             *inner_state,
-            sinks=self.sinks,
+            sinks=sinks,
+            save_kv_cache=not enable_fused_set_kv_buffer(forward_batch),
         )
+        if fa3_trace_attn_details and self.layer_id >= 26:
+            logger.info(
+                "[FA3Attn] layer=%d attn_output=%s",
+                self.layer_id,
+                _fa3_tensor_stats(attn_output),
+            )
         output, _ = self.o_proj(attn_output)
+        if fa3_trace_attn_details and self.layer_id >= 26:
+            logger.info(
+                "[FA3Attn] layer=%d o_proj=%s",
+                self.layer_id,
+                _fa3_tensor_stats(output),
+            )
         return output
 
     def forward(
@@ -464,18 +652,9 @@ class GptOssDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        fa4_sync_after_attn = (
-            os.environ.get("SGLANG_FA4_SYNC_AFTER_ATTN", "").strip().lower()
-            in ("1", "true", "yes", "on")
-        )
-        fa4_trace_layer_io = (
-            os.environ.get("SGLANG_FA4_TRACE_LAYER_IO", "").strip().lower()
-            in ("1", "true", "yes", "on")
-        )
-        fa4_sync_after_mlp = (
-            os.environ.get("SGLANG_FA4_SYNC_AFTER_MLP", "").strip().lower()
-            in ("1", "true", "yes", "on")
-        )
+        fa3_sync_after_attn = _fa3_flag("SGLANG_FA3_SYNC_AFTER_ATTN")
+        fa3_trace_layer_io = _fa3_flag("SGLANG_FA3_TRACE_LAYER_IO")
+        fa3_sync_after_mlp = _fa3_flag("SGLANG_FA3_SYNC_AFTER_MLP")
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states, residual, forward_batch
         )
@@ -486,38 +665,35 @@ class GptOssDecoderLayer(nn.Module):
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
             )
-            if fa4_trace_layer_io:
-                logger.info(
-                    "[FA4LayerIO] after_attn layer=%d shape=%s dtype=%s contiguous=%s",
-                    self.layer_id,
-                    tuple(hidden_states.shape),
-                    hidden_states.dtype,
-                    hidden_states.is_contiguous(),
-                )
-            if fa4_sync_after_attn and hidden_states.is_cuda:
+        if fa3_trace_layer_io:
+            logger.info(
+                "[FA3LayerIO] after_attn layer=%d stats=%s",
+                self.layer_id,
+                _fa3_tensor_stats(hidden_states),
+            )
+            if fa3_sync_after_attn and hidden_states.is_cuda:
                 if torch.cuda.is_current_stream_capturing():
-                    if fa4_trace_layer_io:
+                    if fa3_trace_layer_io:
                         logger.info(
-                            "[FA4LayerIO] sync_after_attn_skipped_capture layer=%d",
+                            "[FA3LayerIO] sync_after_attn_skipped_capture layer=%d",
                             self.layer_id,
                         )
                 else:
                     torch.cuda.synchronize(hidden_states.device)
-                    if fa4_trace_layer_io:
+                    if fa3_trace_layer_io:
                         logger.info(
-                            "[FA4LayerIO] sync_after_attn_ok layer=%d", self.layer_id
+                            "[FA3LayerIO] sync_after_attn_ok layer=%d", self.layer_id
                         )
 
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
-        if fa4_trace_layer_io:
+        if fa3_trace_layer_io:
             logger.info(
-                "[FA4LayerIO] before_mlp layer=%d shape=%s dtype=%s contiguous=%s",
+                "[FA3LayerIO] before_mlp layer=%d hidden=%s residual=%s",
                 self.layer_id,
-                tuple(hidden_states.shape),
-                hidden_states.dtype,
-                hidden_states.is_contiguous(),
+                _fa3_tensor_stats(hidden_states),
+                None if residual is None else _fa3_tensor_stats(residual),
             )
 
         should_allreduce_fusion = (
@@ -526,38 +702,36 @@ class GptOssDecoderLayer(nn.Module):
             )
         )
 
-        skip_mlp_for_fa4_warmup = str(
-            os.environ.get("SGLANG_FA4_WARMUP_SKIP_GPTOSS_MLP", "0")
+        skip_mlp_for_fa3_warmup = str(
+            os.environ.get("SGLANG_FA3_WARMUP_SKIP_GPTOSS_MLP", "0")
         ).strip().lower() in {"1", "true", "yes", "on"}
-        if skip_mlp_for_fa4_warmup:
+        if skip_mlp_for_fa3_warmup:
             if self.layer_id == 0:
                 logger.info(
-                    "[FA4Warmup] skipping GPT-OSS MLP during FlexFlash4 precapture warmup."
+                    "[FA3Warmup] skipping GPT-OSS MLP during FA3 precapture warmup."
                 )
             should_allreduce_fusion = False
         else:
             hidden_states = self.mlp(
                 hidden_states, forward_batch, should_allreduce_fusion
             )
-        if fa4_trace_layer_io:
+        if fa3_trace_layer_io:
             logger.info(
-                "[FA4LayerIO] after_mlp layer=%d shape=%s dtype=%s contiguous=%s",
+                "[FA3LayerIO] after_mlp layer=%d stats=%s",
                 self.layer_id,
-                tuple(hidden_states.shape),
-                hidden_states.dtype,
-                hidden_states.is_contiguous(),
+                _fa3_tensor_stats(hidden_states),
             )
-        if fa4_sync_after_mlp and hidden_states.is_cuda:
+        if fa3_sync_after_mlp and hidden_states.is_cuda:
             if torch.cuda.is_current_stream_capturing():
-                if fa4_trace_layer_io:
+                if fa3_trace_layer_io:
                     logger.info(
-                        "[FA4LayerIO] sync_after_mlp_skipped_capture layer=%d",
+                        "[FA3LayerIO] sync_after_mlp_skipped_capture layer=%d",
                         self.layer_id,
                     )
             else:
                 torch.cuda.synchronize(hidden_states.device)
-                if fa4_trace_layer_io:
-                    logger.info("[FA4LayerIO] sync_after_mlp_ok layer=%d", self.layer_id)
+                if fa3_trace_layer_io:
+                    logger.info("[FA3LayerIO] sync_after_mlp_ok layer=%d", self.layer_id)
 
         if should_allreduce_fusion:
             hidden_states._sglang_needs_allreduce_fusion = True
@@ -566,6 +740,13 @@ class GptOssDecoderLayer(nn.Module):
             hidden_states, residual = self.layer_communicator.postprocess_layer(
                 hidden_states, residual, forward_batch
             )
+            if fa3_trace_layer_io:
+                logger.info(
+                    "[FA3LayerIO] after_postprocess layer=%d hidden=%s residual=%s",
+                    self.layer_id,
+                    _fa3_tensor_stats(hidden_states),
+                    None if residual is None else _fa3_tensor_stats(residual),
+                )
 
         return hidden_states, residual
 
@@ -626,14 +807,10 @@ class GptOssModel(nn.Module):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
-        fa4_trace_model_tail = (
-            os.environ.get("SGLANG_FA4_TRACE_MODEL_TAIL", "").strip().lower()
-            in ("1", "true", "yes", "on")
-        )
-        fa4_sync_after_model = (
-            os.environ.get("SGLANG_FA4_SYNC_AFTER_MODEL", "").strip().lower()
-            in ("1", "true", "yes", "on")
-        )
+        fa3_trace_model_tail = _fa3_flag("SGLANG_FA3_TRACE_MODEL_TAIL")
+        fa3_trace_first_bad_layer = _fa3_flag("SGLANG_FA3_TRACE_FIRST_BAD_LAYER")
+        fa3_sync_after_model = _fa3_flag("SGLANG_FA3_SYNC_AFTER_MODEL")
+        fa3_reported_bad_layer = False
         if self.pp_group.is_first_rank:
             if input_embeds is None:
                 hidden_states = self.embed_tokens(input_ids)
@@ -654,6 +831,24 @@ class GptOssModel(nn.Module):
                 hidden_states, residual = layer(
                     positions, hidden_states, forward_batch, residual
                 )
+                if fa3_trace_first_bad_layer and not fa3_reported_bad_layer:
+                    hidden_ok = bool(torch.isfinite(hidden_states).all().item())
+                    residual_ok = (
+                        True
+                        if residual is None
+                        else bool(torch.isfinite(residual).all().item())
+                    )
+                    if not hidden_ok or not residual_ok:
+                        logger.info(
+                            "[FA3BadLayer] layer=%s forward_mode=%s hidden_ok=%s residual_ok=%s hidden=%s residual=%s",
+                            i,
+                            int(forward_batch.forward_mode),
+                            hidden_ok,
+                            residual_ok,
+                            _fa3_tensor_stats(hidden_states),
+                            None if residual is None else _fa3_tensor_stats(residual),
+                        )
+                        fa3_reported_bad_layer = True
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
                 {
@@ -667,19 +862,17 @@ class GptOssModel(nn.Module):
                     hidden_states = self.norm(hidden_states)
                 else:
                     hidden_states, _ = self.norm(hidden_states, residual)
-            if fa4_trace_model_tail:
+            if fa3_trace_model_tail:
                 logger.info(
-                    "[FA4ModelTail] after_norm shape=%s dtype=%s contiguous=%s",
-                    tuple(hidden_states.shape),
-                    hidden_states.dtype,
-                    hidden_states.is_contiguous(),
+                    "[FA3ModelTail] after_norm %s",
+                    _fa3_tensor_stats(hidden_states),
                 )
-            if fa4_sync_after_model and hidden_states.is_cuda:
+            if fa3_sync_after_model and hidden_states.is_cuda:
                 if torch.cuda.is_current_stream_capturing():
-                    logger.info("[FA4ModelTail] sync_after_norm_skipped_capture")
+                    logger.info("[FA3ModelTail] sync_after_norm_skipped_capture")
                 else:
                     torch.cuda.synchronize(hidden_states.device)
-                    logger.info("[FA4ModelTail] sync_after_norm_ok")
+                    logger.info("[FA3ModelTail] sync_after_norm_ok")
         if len(aux_hidden_states) == 0:
             return hidden_states
 
@@ -734,14 +927,8 @@ class GptOssForCausalLM(nn.Module):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
-        fa4_trace_model_tail = (
-            os.environ.get("SGLANG_FA4_TRACE_MODEL_TAIL", "").strip().lower()
-            in ("1", "true", "yes", "on")
-        )
-        fa4_sync_after_logits = (
-            os.environ.get("SGLANG_FA4_SYNC_AFTER_LOGITS", "").strip().lower()
-            in ("1", "true", "yes", "on")
-        )
+        fa3_trace_model_tail = _fa3_flag("SGLANG_FA3_TRACE_MODEL_TAIL")
+        fa3_sync_after_logits = _fa3_flag("SGLANG_FA3_SYNC_AFTER_LOGITS")
         hidden_states = self.model(
             input_ids,
             positions,
@@ -755,15 +942,13 @@ class GptOssForCausalLM(nn.Module):
 
         if self.pp_group.is_last_rank:
             final_hidden_states = hidden_states
-            if fa4_trace_model_tail:
+            if fa3_trace_model_tail:
                 logger.info(
-                    "[FA4ModelTail] before_logits shape=%s dtype=%s contiguous=%s",
-                    tuple(hidden_states.shape),
-                    hidden_states.dtype,
-                    hidden_states.is_contiguous(),
+                    "[FA3ModelTail] before_logits %s",
+                    _fa3_tensor_stats(hidden_states),
                 )
                 logger.info(
-                    "[FA4ModelTail] entering_logits_processor cls=%s",
+                    "[FA3ModelTail] entering_logits_processor cls=%s",
                     type(self.logits_processor).__name__,
                 )
             logits = self.logits_processor(
@@ -782,10 +967,30 @@ class GptOssForCausalLM(nn.Module):
                 # draft-KV append. Preserve the final LM-head-ready hidden states on a
                 # private attribute so tree verify can bypass `next_token_logits` safely.
                 logits._dflash_final_hidden_states = final_hidden_states
-            if fa4_trace_model_tail:
+            if _fa3_flag("SGLANG_FA3_TRACE_TOP_LOGITS") and not isinstance(
+                logits, torch.Tensor
+            ):
+                next_token_logits = getattr(logits, "next_token_logits", None)
+                if (
+                    isinstance(next_token_logits, torch.Tensor)
+                    and next_token_logits.dim() == 2
+                    and next_token_logits.shape[0] > 0
+                    and next_token_logits.shape[1] > 0
+                ):
+                    row0 = next_token_logits[0]
+                    topn = min(16, row0.shape[0])
+                    top_vals, top_ids = torch.topk(row0, k=topn)
+                    logger.info(
+                        "[FA3TopLogits] ids=%s vals=%s argmax_id=%s argmax_val=%s",
+                        top_ids.tolist(),
+                        [float(x) for x in top_vals.tolist()],
+                        int(top_ids[0].item()),
+                        float(top_vals[0].item()),
+                    )
+            if fa3_trace_model_tail:
                 if isinstance(logits, torch.Tensor):
                     logger.info(
-                        "[FA4ModelTail] after_logits tensor shape=%s dtype=%s contiguous=%s",
+                        "[FA3ModelTail] after_logits tensor shape=%s dtype=%s contiguous=%s",
                         tuple(logits.shape),
                         logits.dtype,
                         logits.is_contiguous(),
@@ -793,7 +998,7 @@ class GptOssForCausalLM(nn.Module):
                 else:
                     next_token_logits = getattr(logits, "next_token_logits", None)
                     logger.info(
-                        "[FA4ModelTail] after_logits output_cls=%s next_token_logits=%s",
+                        "[FA3ModelTail] after_logits output_cls=%s next_token_logits=%s",
                         type(logits).__name__,
                         None
                         if next_token_logits is None
@@ -807,15 +1012,15 @@ class GptOssForCausalLM(nn.Module):
                 logits, "next_token_logits", None
             )
             if (
-                fa4_sync_after_logits
+                fa3_sync_after_logits
                 and isinstance(sync_tensor, torch.Tensor)
                 and sync_tensor.is_cuda
             ):
                 if torch.cuda.is_current_stream_capturing():
-                    logger.info("[FA4ModelTail] sync_after_logits_skipped_capture")
+                    logger.info("[FA3ModelTail] sync_after_logits_skipped_capture")
                 else:
                     torch.cuda.synchronize(sync_tensor.device)
-                    logger.info("[FA4ModelTail] sync_after_logits_ok")
+                    logger.info("[FA3ModelTail] sync_after_logits_ok")
             return logits
         else:
             return hidden_states

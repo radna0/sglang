@@ -40,6 +40,15 @@ logger = logging.getLogger(__name__)
 DEFAULT_FORCE_STREAM_INTERVAL = 50
 
 
+def _fa3_trace_output_ids_enabled() -> bool:
+    return os.environ.get("SGLANG_FA3_TRACE_OUTPUT_IDS", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
 def _overlap_debug_enabled() -> bool:
     return (os.environ.get("SGLANG_DFLASH_DEBUG_OVERLAP_RELEASE") or "").strip().lower() not in (
         "",
@@ -1621,6 +1630,13 @@ class SchedulerOutputProcessorMixin:
         if reqs or is_idle_batch:
             if self.model_config.is_multimodal_gen:
                 return
+            if _fa3_trace_output_ids_enabled() and output_ids:
+                logger.info(
+                    "[FA3OutputPath][scheduler] rids=%s output_ids=%s decoded_texts=%s",
+                    rids[:2],
+                    output_ids[:2],
+                    decoded_texts[:2],
+                )
             self.send_to_detokenizer.send_output(
                 BatchTokenIDOutput(
                     rids=rids,

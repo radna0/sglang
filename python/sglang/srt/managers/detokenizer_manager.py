@@ -52,6 +52,15 @@ from sglang.utils import (
 
 logger = logging.getLogger(__name__)
 
+
+def _fa3_trace_output_ids_enabled() -> bool:
+    return os.environ.get("SGLANG_FA3_TRACE_OUTPUT_IDS", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
 # Maximum number of request states that detokenizer can hold. When exceeded,
 # oldest request states will be evicted. Default: 65536 (1<<16).
 # For more details, see: https://github.com/sgl-project/sglang/issues/2812
@@ -359,6 +368,13 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
 
     def handle_batch_token_id_out(self, recv_obj: BatchTokenIDOutput):
         # If handling idle batch, set output_strs to [].
+        if _fa3_trace_output_ids_enabled() and recv_obj.output_ids:
+            logger.info(
+                "[FA3OutputPath][detokenizer_in] rids=%s output_ids=%s decode_ids=%s",
+                recv_obj.rids[:2],
+                recv_obj.output_ids[:2],
+                recv_obj.decode_ids[:2],
+            )
         output_strs = (
             self._decode_batch_token_id_output(recv_obj)
             if len(recv_obj.rids) > 0
