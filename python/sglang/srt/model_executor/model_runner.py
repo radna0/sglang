@@ -371,7 +371,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 # if there is no aux layer, set to None
                 self.eagle_aux_hidden_state_layer_ids = None
 
-        if self.spec_algorithm.is_dflash() and not self.is_draft_worker:
+        if self.spec_algorithm.is_dflash_family() and not self.is_draft_worker:
             draft_model_config = ModelConfig.from_server_args(
                 server_args,
                 model_path=(server_args.speculative_draft_model_path),
@@ -1955,13 +1955,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.spec_algorithm.is_eagle()
             or self.spec_algorithm.is_standalone()
             or self.spec_algorithm.is_ngram()
-            or self.spec_algorithm.is_dflash()
+            or self.spec_algorithm.is_dflash_family()
         ):
-            if self.is_draft_worker:
-                if not self.spec_algorithm.is_dflash():
-                    raise RuntimeError("This should not happen")
-            capture_forward_mode = ForwardMode.TARGET_VERIFY
-            num_tokens_per_bs = self.server_args.speculative_num_draft_tokens
+            if not self.is_draft_worker:
+                capture_forward_mode = ForwardMode.TARGET_VERIFY
+                num_tokens_per_bs = self.server_args.speculative_num_draft_tokens
 
         if self.server_args.enable_return_hidden_states:
             capture_hidden_mode = CaptureHiddenMode.FULL
@@ -2086,7 +2084,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         seq_lens_sum=None,
                         seq_lens_cpu=None,
                     )
-            elif self.spec_algorithm.is_dflash():
+            elif self.spec_algorithm.is_dflash_family():
                 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 
                 spec_info = DFlashVerifyInput(
@@ -2257,13 +2255,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             not self.server_args.enable_piecewise_cuda_graph
             or not self.can_run_piecewise_cuda_graph()
         ):
-            return
-
-        if self.spec_algorithm.is_dflash():
-            log_info_on_rank0(
-                logger,
-                "Disable piecewise CUDA graph because DFLASH TARGET_VERIFY is not wired into PiecewiseCudaGraphRunner yet",
-            )
             return
 
         # Collect attention layers and moe layers from the model

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 
@@ -11,6 +11,7 @@ from sglang.srt.layers.sampler import (
     apply_custom_logit_processor,
     top_k_top_p_min_p_sampling_from_probs_torch,
 )
+from sglang.srt.managers.overlap_utils import FutureIndices
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
@@ -32,6 +33,7 @@ import os
 
 logger = logging.getLogger(__name__)
 _DFLASH_FIRST_COMPARE_LOGGED = False
+_DFLASH_FIRST_VERIFY_META_LOGGED = False
 
 
 def _compute_paged_keep_slots(
@@ -91,20 +93,69 @@ class DFlashDraftInput(SpecInput):
     # How many committed tokens are visible to the draft worker per request.
     draft_seq_lens: torch.Tensor
 
+    future_indices: Optional[FutureIndices] = None
+    new_seq_lens: torch.Tensor | None = None
+    verify_done: Optional[torch.cuda.Event] = None
+
     def __post_init__(self):
         super().__init__(spec_input_type=SpecInputType.DFLASH_DRAFT)
+        if (
+            self.new_seq_lens is None
+            and self.draft_seq_lens is not None
+            and self.ctx_lens is not None
+            and self.draft_seq_lens.numel() == self.ctx_lens.numel()
+        ):
+            self.new_seq_lens = self.draft_seq_lens + self.ctx_lens
 
     def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
         # Draft state does not change token accounting.
         return (1, 1)
 
+    @classmethod
+    def create_idle_input(cls, device: torch.device):
+        return cls(
+            verified_id=torch.empty((0,), dtype=torch.int64, device=device),
+            target_hidden=torch.empty((0,), dtype=torch.float32, device=device),
+            ctx_lens=torch.empty((0,), dtype=torch.int32, device=device),
+            draft_seq_lens=torch.empty((0,), dtype=torch.int32, device=device),
+            new_seq_lens=torch.empty((0,), dtype=torch.int32, device=device),
+        )
+
+    def prepare_for_decode(self, batch: ScheduleBatch):
+        if batch.forward_mode.is_idle():
+            return
+
+        batch.maybe_evict_swa()
+        batch.maybe_wait_verify_done()
+
+        batch.input_ids = self.verified_id
+        if self.new_seq_lens is not None:
+            batch.seq_lens = self.new_seq_lens
+            batch.seq_lens_cpu = self.new_seq_lens.to(
+                dtype=torch.int32, device="cpu"
+            )
+            batch.seq_lens_sum = int(self.new_seq_lens.sum().item())
+
     def filter_batch(self, new_indices: torch.Tensor, has_been_filtered: bool = True):
+        if self.future_indices is not None:
+            self.future_indices.indices = self.future_indices.indices[new_indices]
+            self.verified_id = self.verified_id[new_indices]
+            self.draft_seq_lens = self.draft_seq_lens[new_indices]
+            self.ctx_lens = self.ctx_lens[new_indices]
+            if self.new_seq_lens is not None:
+                self.new_seq_lens = self.new_seq_lens[new_indices]
+            if self.target_hidden is not None and self.target_hidden.numel() > 0:
+                self.target_hidden = self.target_hidden[:0]
+            return
+
         old_ctx_lens = self.ctx_lens
         old_target_hidden = self.target_hidden
 
         self.verified_id = self.verified_id[new_indices]
         self.ctx_lens = old_ctx_lens[new_indices]
         self.draft_seq_lens = self.draft_seq_lens[new_indices]
+        if self.new_seq_lens is not None:
+            self.new_seq_lens = self.new_seq_lens[new_indices]
 
         if old_target_hidden is None or old_target_hidden.numel() == 0:
             self.target_hidden = old_target_hidden
@@ -139,11 +190,49 @@ class DFlashDraftInput(SpecInput):
         )
 
     def merge_batch(self, spec_info: "DFlashDraftInput"):
+        if self.future_indices is not None:
+            assert spec_info.future_indices is not None
+            self.future_indices = FutureIndices(
+                indices=torch.cat(
+                    [self.future_indices.indices, spec_info.future_indices.indices],
+                    dim=0,
+                )
+            )
+            self.verified_id = torch.cat(
+                [self.verified_id, spec_info.verified_id], dim=0
+            )
+            self.draft_seq_lens = torch.cat(
+                [self.draft_seq_lens, spec_info.draft_seq_lens], dim=0
+            )
+            self.ctx_lens = torch.cat([self.ctx_lens, spec_info.ctx_lens], dim=0)
+            if self.new_seq_lens is None:
+                self.new_seq_lens = spec_info.new_seq_lens
+            elif spec_info.new_seq_lens is not None:
+                self.new_seq_lens = torch.cat(
+                    [self.new_seq_lens, spec_info.new_seq_lens], dim=0
+                )
+            if self.target_hidden is None or self.target_hidden.numel() == 0:
+                self.target_hidden = spec_info.target_hidden
+            elif (
+                spec_info.target_hidden is not None
+                and spec_info.target_hidden.numel() > 0
+            ):
+                self.target_hidden = torch.cat(
+                    [self.target_hidden, spec_info.target_hidden], dim=0
+                )
+            return
+
         self.verified_id = torch.cat([self.verified_id, spec_info.verified_id], dim=0)
         self.ctx_lens = torch.cat([self.ctx_lens, spec_info.ctx_lens], dim=0)
         self.draft_seq_lens = torch.cat(
             [self.draft_seq_lens, spec_info.draft_seq_lens], dim=0
         )
+        if self.new_seq_lens is None:
+            self.new_seq_lens = spec_info.new_seq_lens
+        elif spec_info.new_seq_lens is not None:
+            self.new_seq_lens = torch.cat(
+                [self.new_seq_lens, spec_info.new_seq_lens], dim=0
+            )
         if self.target_hidden is None or self.target_hidden.numel() == 0:
             self.target_hidden = spec_info.target_hidden
         elif (
@@ -373,8 +462,11 @@ class DFlashVerifyInput(SpecInput):
                 )
 
         candidates = self.draft_token.view(bs, self.draft_token_num)
+        verify_mode = "greedy"
+        target_predict = None
         if sampling_info is not None and not sampling_info.is_all_greedy:
             if sampling_info.sampling_seed is not None:
+                verify_mode = "seeded_target_only"
                 # The helper path draws fresh uniform samples internally, which
                 # breaks deterministic parity with the baseline seeded sampler.
                 # For seeded requests, sample the target verify rows inline with
@@ -424,12 +516,14 @@ class DFlashVerifyInput(SpecInput):
                     target_predict=target_predict,
                 )
             elif is_dflash_sampling_verify_available():
+                verify_mode = "sampling_helper"
                 accept_len, bonus = compute_dflash_sampling_accept_len_and_bonus(
                     candidates=candidates,
                     next_token_logits=logits_output.next_token_logits,
                     sampling_info=sampling_info,
                 )
             else:
+                verify_mode = "sampling_argmax_fallback"
                 target_predict = torch.argmax(
                     logits_output.next_token_logits, dim=-1
                 ).view(bs, self.draft_token_num)
@@ -457,6 +551,45 @@ class DFlashVerifyInput(SpecInput):
                 candidates=candidates,
                 target_predict=target_predict,
             )
+
+        if (
+            (os.environ.get("SGLANG_DFLASH_TRACE_FIRST_BLOCK") or "").strip().lower()
+            in ("1", "true", "yes", "on")
+            and bs > 0
+        ):
+            payload = {
+                "mode": verify_mode,
+                "draft_token_num": int(self.draft_token_num),
+                "sampling_info_present": sampling_info is not None,
+                "candidate0": candidates[0]
+                .detach()
+                .to("cpu", non_blocking=False)
+                .tolist(),
+                "accept_len0": int(accept_len[0].item()),
+                "bonus0": int(bonus[0].item()),
+            }
+            if sampling_info is not None:
+                payload["is_all_greedy"] = bool(sampling_info.is_all_greedy)
+                payload["top_k0"] = int(sampling_info.top_ks[0].item())
+                payload["top_p0"] = float(sampling_info.top_ps[0].item())
+                payload["min_p0"] = float(sampling_info.min_ps[0].item())
+                payload["temperature0"] = float(
+                    sampling_info.temperatures[0].item()
+                )
+            if target_predict is not None:
+                payload["target_predict0"] = (
+                    target_predict[0].detach().to("cpu", non_blocking=False).tolist()
+                )
+            if self.positions is not None and int(self.positions.numel()) >= int(
+                self.draft_token_num
+            ):
+                payload["positions0"] = (
+                    self.positions[: self.draft_token_num]
+                    .detach()
+                    .to("cpu", non_blocking=False)
+                    .tolist()
+                )
+            logger.info("DFLASH first verify meta: %s", payload)
 
         # Single D2H transfer: candidates[1:] + accept_len + bonus
         packed = torch.cat(

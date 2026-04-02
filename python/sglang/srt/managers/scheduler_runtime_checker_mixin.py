@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
 import warnings
 from typing import TYPE_CHECKING
@@ -12,6 +13,11 @@ from sglang.srt.utils.common import ceil_align, raise_error_or_warn
 from sglang.srt.utils.request_logger import disable_request_logging
 from sglang.srt.utils.watchdog import WatchdogRaw
 
+try:
+    from sglang.srt.mem_cache.session_aware_cache import SessionAwareCache
+except ModuleNotFoundError:
+    SessionAwareCache = None
+
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
 
@@ -19,6 +25,33 @@ logger = logging.getLogger(__name__)
 
 
 class SchedulerRuntimeCheckerMixin:
+    def _get_dflash_reserved_tokens(self: Scheduler) -> int:
+        try:
+            return max(
+                0,
+                int(
+                    (os.environ.get("SGLANG_DFLASH_SSD_RESERVED_TOKENS") or "0")
+                    .strip()
+                ),
+            )
+        except Exception:
+            return 0
+
+    def _session_held_tokens(self: Scheduler) -> int:
+        if SessionAwareCache is not None and isinstance(self.tree_cache, SessionAwareCache):
+            return self.tree_cache.session_held_tokens()
+        return 0
+
+    def _session_held_full_tokens(self: Scheduler) -> int:
+        if SessionAwareCache is not None and isinstance(self.tree_cache, SessionAwareCache):
+            return self.tree_cache.session_held_full_tokens()
+        return 0
+
+    def _session_held_swa_tokens(self: Scheduler) -> int:
+        if SessionAwareCache is not None and isinstance(self.tree_cache, SessionAwareCache):
+            return self.tree_cache.session_held_swa_tokens()
+        return 0
+
     def _get_token_info(self: Scheduler):
         available_size = self.token_to_kv_pool_allocator.available_size()
         evictable_size = self.tree_cache.evictable_size()
@@ -92,10 +125,20 @@ class SchedulerRuntimeCheckerMixin:
             swa_available_size,
             swa_evictable_size,
         ) = self._get_swa_token_info()
-        memory_leak = full_num_used != 0 or swa_num_used != 0
+        reserved_tokens = self._get_dflash_reserved_tokens()
+        session_held_full = self._session_held_full_tokens()
+        session_held_swa = self._session_held_swa_tokens()
+        full_protected = self.tree_cache.full_protected_size()
+        swa_protected = self.tree_cache.swa_protected_size()
+        full_leaked = full_num_used - full_protected - session_held_full
+        swa_leaked = swa_num_used - swa_protected - session_held_swa
+        full_ok = int(full_leaked) in (0, int(reserved_tokens))
+        swa_ok = int(swa_leaked) in (0, int(reserved_tokens))
+        memory_leak = not (full_ok and swa_ok)
         token_msg = (
-            f"{self.full_tokens_per_layer=}, {full_available_size=}, {full_evictable_size=}, {self.tree_cache.full_protected_size()=}\n"
-            f"{self.swa_tokens_per_layer=}, {swa_available_size=}, {swa_evictable_size=}, {self.tree_cache.swa_protected_size()=}\n"
+            f"{full_leaked=}, {swa_leaked=}\n"
+            f"{self.full_tokens_per_layer=}, {full_available_size=}, {full_evictable_size=}, {full_protected=}, {session_held_full=}, {reserved_tokens=}\n"
+            f"{self.swa_tokens_per_layer=}, {swa_available_size=}, {swa_evictable_size=}, {swa_protected=}, {session_held_swa=}, {reserved_tokens=}\n"
         )
         return memory_leak, token_msg
 
@@ -110,8 +153,9 @@ class SchedulerRuntimeCheckerMixin:
             mamba_available_size,
             mamba_evictable_size,
         ) = self._get_mamba_token_info()
+        session_held = self._session_held_tokens()
         memory_leak = (
-            full_num_used != self.tree_cache.full_protected_size()
+            full_num_used != self.tree_cache.full_protected_size() + session_held
             or mamba_num_used != self.tree_cache.mamba_protected_size()
         )
         if memory_leak:
@@ -150,14 +194,18 @@ class SchedulerRuntimeCheckerMixin:
     def _check_radix_cache_memory(self: Scheduler):
         _, _, available_size, evictable_size = self._get_token_info()
         protected_size = self.tree_cache.protected_size()
+        reserved_tokens = self._get_dflash_reserved_tokens()
+        session_held = self._session_held_tokens()
         memory_leak = (available_size + evictable_size) != (
-            # self.max_total_num_tokens
-            # if not self.enable_hierarchical_cache
-            # else self.max_total_num_tokens - protected_size
             self.max_total_num_tokens
             - protected_size
+            - session_held
+            - reserved_tokens
         )
-        token_msg = f"{self.max_total_num_tokens=}, {available_size=}, {evictable_size=}, {protected_size=}\n"
+        token_msg = (
+            f"{self.max_total_num_tokens=}, {available_size=}, {evictable_size=}, "
+            f"{protected_size=}, {session_held=}, {reserved_tokens=}\n"
+        )
         return memory_leak, token_msg
 
     def _get_batch_uncached_size(self: Scheduler, batch: ScheduleBatch) -> int:

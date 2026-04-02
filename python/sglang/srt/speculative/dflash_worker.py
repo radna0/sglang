@@ -36,6 +36,7 @@ logger = logging.getLogger(__name__)
 
 _FusedKVMaterializeHelper = None
 _DFLASH_FIRST_BLOCK_LOGGED = False
+_DFLASH_FIRST_APPEND_LOGGED = False
 
 
 def _get_fused_kv_materialize_helper():
@@ -95,9 +96,24 @@ class DFlashWorker:
         target_req_to_token_pool, target_token_to_kv_pool_allocator = (
             target_worker.get_memory_pool()
         )
-        shared_req_to_token_pool = (
-            None if self.use_compact_draft_cache else target_req_to_token_pool
-        )
+        share_pools_env = (
+            os.environ.get("SGLANG_DFLASH_DRAFT_SHARE_POOLS") or "1"
+        ).strip().lower()
+        share_pools = share_pools_env not in {"0", "false", "no", "off"}
+        self._dflash_draft_share_pools = bool(share_pools)
+        shared_req_to_token_pool = None
+        shared_token_to_kv_pool_allocator = None
+        if share_pools:
+            shared_req_to_token_pool = (
+                None if self.use_compact_draft_cache else target_req_to_token_pool
+            )
+            shared_token_to_kv_pool_allocator = target_token_to_kv_pool_allocator
+        elif self.tp_rank == 0:
+            logger.warning(
+                "DFLASH draft runner pool sharing disabled (SGLANG_DFLASH_DRAFT_SHARE_POOLS=%r). "
+                "Draft worker will allocate its own req_to_token_pool + KV allocator.",
+                share_pools_env,
+            )
         draft_server_args = deepcopy(server_args)
         draft_server_args.skip_tokenizer_init = True
         draft_backend = draft_server_args.speculative_draft_attention_backend
@@ -135,6 +151,34 @@ class DFlashWorker:
         draft_server_args.context_length = (
             target_worker.model_runner.model_config.context_len
         )
+        draft_mem_fraction_override = getattr(
+            server_args, "speculative_draft_mem_fraction_static", None
+        )
+        if draft_mem_fraction_override is None:
+            draft_mem_fraction_env = (
+                os.environ.get("SGLANG_DFLASH_DRAFT_MEM_FRACTION_STATIC")
+                or os.environ.get("MEM_FRAC_DFLASH")
+                or ""
+            ).strip()
+            if draft_mem_fraction_env:
+                try:
+                    draft_mem_fraction_override = float(draft_mem_fraction_env)
+                except Exception:
+                    if self.tp_rank == 0:
+                        logger.warning(
+                            "Ignoring invalid DFLASH draft mem fraction override=%r",
+                            draft_mem_fraction_env,
+                        )
+                    draft_mem_fraction_override = None
+        if draft_mem_fraction_override is not None:
+            draft_server_args.mem_fraction_static = float(draft_mem_fraction_override)
+            if self.tp_rank == 0:
+                logger.warning(
+                    "DFLASH draft mem_fraction_static overridden: draft_mem_fraction_static=%.4f "
+                    "(target mem_fraction_static=%.4f).",
+                    float(draft_server_args.mem_fraction_static),
+                    float(server_args.mem_fraction_static),
+                )
         saved_server_args = get_global_server_args()
         self.draft_worker = TpModelWorker(
             server_args=draft_server_args,
@@ -148,7 +192,7 @@ class DFlashWorker:
             nccl_port=nccl_port,
             is_draft_worker=True,
             req_to_token_pool=shared_req_to_token_pool,
-            token_to_kv_pool_allocator=target_token_to_kv_pool_allocator,
+            token_to_kv_pool_allocator=shared_token_to_kv_pool_allocator,
         )
         set_global_server_args_for_scheduler(saved_server_args)
         self.draft_model_runner = self.draft_worker.model_runner
@@ -525,6 +569,37 @@ class DFlashWorker:
             raise RuntimeError(
                 "Invariant broken: DFLASH batch has grammar constraints, but scheduler should have rejected this request."
             )
+        if (
+            self.tp_rank == 0
+            and (os.environ.get("SGLANG_DFLASH_TRACE_FIRST_BLOCK") or "").strip().lower()
+            in ("1", "true", "yes", "on")
+        ):
+            sampling_payload = {"present": batch.sampling_info is not None}
+            if batch.reqs:
+                req_sp = batch.reqs[0].sampling_params
+                sampling_payload.update(
+                    {
+                        "rid0": batch.reqs[0].rid,
+                        "req_top_k0": int(req_sp.top_k),
+                        "req_top_p0": float(req_sp.top_p),
+                        "req_min_p0": float(req_sp.min_p),
+                        "req_temperature0": float(req_sp.temperature),
+                        "req_max_new_tokens0": int(req_sp.max_new_tokens),
+                    }
+                )
+            if batch.sampling_info is not None and len(batch.sampling_info) > 0:
+                sampling_payload.update(
+                    {
+                        "is_all_greedy": bool(batch.sampling_info.is_all_greedy),
+                        "top_k0": int(batch.sampling_info.top_ks[0].item()),
+                        "top_p0": float(batch.sampling_info.top_ps[0].item()),
+                        "min_p0": float(batch.sampling_info.min_ps[0].item()),
+                        "temperature0": float(
+                            batch.sampling_info.temperatures[0].item()
+                        ),
+                    }
+                )
+            logger.info("DFLASH pre-verify sampling state: %s", sampling_payload)
         if batch.sampling_info is not None and not batch.sampling_info.is_all_greedy:
             if (
                 not is_dflash_sampling_verify_available()
@@ -990,6 +1065,28 @@ class DFlashWorker:
             draft_input.target_hidden = draft_input.target_hidden[:0]
             return
 
+        global _DFLASH_FIRST_APPEND_LOGGED
+        if (
+            not _DFLASH_FIRST_APPEND_LOGGED
+            and self.tp_rank == 0
+            and (os.environ.get("SGLANG_DFLASH_TRACE_FIRST_BLOCK") or "").strip().lower()
+            in ("1", "true", "yes", "on")
+            and bs > 0
+        ):
+            logger.info(
+                "DFLASH first target_hidden append: shape=%s dtype=%s total_ctx=%s ctx_lens=%s draft_seq_lens=%s",
+                tuple(draft_input.target_hidden.shape),
+                str(draft_input.target_hidden.dtype),
+                total_ctx,
+                draft_input.ctx_lens.detach()
+                .to("cpu", non_blocking=False)
+                .tolist(),
+                draft_input.draft_seq_lens.detach()
+                .to("cpu", non_blocking=False)
+                .tolist(),
+            )
+            _DFLASH_FIRST_APPEND_LOGGED = True
+
         target_req_to_token = batch.req_to_token_pool.req_to_token
         draft_req_to_token = self.draft_model_runner.req_to_token_pool.req_to_token
 
@@ -1324,12 +1421,15 @@ class DFlashWorker:
         batch.forward_mode = ForwardMode.DECODE
 
         num_accepted_tokens = sum(accept_length_per_req_cpu)
-        if not self._logged_first_verify and self.tp_rank == 0:
+        if (
+            self.tp_rank == 0
+            and (os.environ.get("SGLANG_DFLASH_TRACE_FIRST_BLOCK") or "").strip().lower()
+            in ("1", "true", "yes", "on")
+        ):
             logger.info(
                 "DFLASH verify completed. accept_length_per_req=%s",
                 accept_length_per_req_cpu,
             )
-            self._logged_first_verify = True
 
         return GenerationBatchResult(
             logits_output=logits_output,

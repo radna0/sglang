@@ -45,6 +45,14 @@ class GenerationBatchResult:
 
     # relay path: forward stream -> next step forward
     next_draft_input: Optional[EagleDraftInput] = None
+    next_out_cache_loc: Optional[torch.Tensor] = None
+
+    # DFLASH tree worker reuses the linear overlap-preprocessed result contract.
+    # On the clean baseline these remain inactive while overlap is disabled, but
+    # the fields must exist so tree workers can return the same result shape.
+    dflash_overlap_preprocessed: bool = False
+    requires_output_processing_barrier: bool = False
+    force_plain_decode_output_processing: bool = False
 
     # metrics
     expert_distribution_metrics: Optional[ExpertDistributionMetrics] = None

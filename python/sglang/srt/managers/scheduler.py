@@ -219,6 +219,7 @@ from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
 logger = logging.getLogger(__name__)
+_DFLASH_FIRST_SCHEDULER_SAMPLING_LOGGED = False
 
 # Test retract decode for debugging purposes
 TEST_RETRACT = envs.SGLANG_TEST_RETRACT.get()
@@ -1516,6 +1517,22 @@ class Scheduler(
                 # Use default bootstrap port
                 recv_req.bootstrap_port = self.server_args.disaggregation_bootstrap_port
 
+            if (
+                (os.environ.get("SGLANG_DFLASH_TRACE_FIRST_BLOCK") or "").strip().lower()
+                in ("1", "true", "yes", "on")
+            ):
+                sp = recv_req.sampling_params
+                logger.info(
+                    "DFLASH request sampling before Req: rid=%s {temperature=%s, top_p=%s, top_k=%s, min_p=%s, max_new_tokens=%s, seed=%s}",
+                    recv_req.rid,
+                    sp.temperature,
+                    sp.top_p,
+                    sp.top_k,
+                    sp.min_p,
+                    sp.max_new_tokens,
+                    sp.sampling_seed,
+                )
+
             req = Req(
                 recv_req.rid,
                 recv_req.input_text,
@@ -1656,7 +1673,7 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
-        if self.spec_algorithm.is_dflash():
+        if self.spec_algorithm.is_dflash_family():
             error_msg = validate_dflash_request(req)
             if error_msg is not None:
                 req.set_finish_with_abort(error_msg)

@@ -756,6 +756,16 @@ class PiecewiseCudaGraphRunner:
                     seq_lens_sum=None,
                     seq_lens_cpu=None,
                 )
+        elif self.model_runner.spec_algorithm.is_dflash_family():
+            from sglang.srt.speculative.dflash_info import DFlashVerifyInput
+
+            spec_info = DFlashVerifyInput(
+                draft_token=None,
+                positions=None,
+                draft_token_num=self.model_runner.server_args.speculative_num_draft_tokens,
+                custom_mask=None,
+                capture_hidden_mode=CaptureHiddenMode.FULL,
+            )
 
         return spec_info
 

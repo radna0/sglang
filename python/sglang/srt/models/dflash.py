@@ -260,6 +260,10 @@ class DFlashDraftModel(nn.Module):
     def __init__(self, config, quant_config=None, prefix: str = "") -> None:
         super().__init__()
         self.config = config
+        # The draft model consumes caller-provided input_embeds instead of owning
+        # a standalone token embedding table.
+        self.requires_input_embeds = True
+        self.embed_tokens = None
 
         hidden_size = int(config.hidden_size)
         num_layers = int(config.num_hidden_layers)
@@ -292,6 +296,12 @@ class DFlashDraftModel(nn.Module):
 
         self.block_size = draft_config.resolve_block_size(default=16)
 
+    def set_embed(self, embed) -> None:
+        self.embed_tokens = embed
+        # Once a shared target embedding is provided, callers no longer need to
+        # pass explicit input_embeds on every forward.
+        self.requires_input_embeds = False
+
     def project_target_hidden(self, target_hidden: torch.Tensor) -> torch.Tensor:
         """Project concatenated target-layer hidden states into draft hidden_size."""
         expected = int(self.fc.in_features)
@@ -306,6 +316,37 @@ class DFlashDraftModel(nn.Module):
             )
         return self.hidden_norm(self.fc(target_hidden))
 
+    def project_target_hidden_selected(
+        self,
+        target_hidden: torch.Tensor,
+        accepted_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        """Project only the accepted verify rows into draft hidden_size."""
+        expected = int(self.fc.in_features)
+        if target_hidden.ndim == 3:
+            flat_target_hidden = target_hidden.reshape(-1, target_hidden.shape[-1])
+        elif target_hidden.ndim == 2:
+            flat_target_hidden = target_hidden
+        else:
+            raise ValueError(
+                f"DFLASH target_hidden must be 2D or 3D, got shape={tuple(target_hidden.shape)}."
+            )
+        if int(flat_target_hidden.shape[-1]) != expected:
+            raise ValueError(
+                "DFLASH target_hidden feature dim mismatch. "
+                f"Expected last dim {expected}, got shape={tuple(target_hidden.shape)}."
+            )
+
+        accepted_indices = accepted_indices.to(
+            dtype=torch.int64, device=flat_target_hidden.device
+        )
+        selected_hidden = (
+            flat_target_hidden.index_select(0, accepted_indices)
+            if accepted_indices.numel() > 0
+            else flat_target_hidden[:0]
+        )
+        return self.hidden_norm(self.fc(selected_hidden))
+
     @torch.no_grad()
     def forward(
         self,
@@ -317,9 +358,11 @@ class DFlashDraftModel(nn.Module):
         pp_proxy_tensors=None,
     ) -> LogitsProcessorOutput:
         if input_embeds is None:
-            raise ValueError(
-                "DFlashDraftModel requires `input_embeds` (use the target embedding)."
-            )
+            if self.embed_tokens is None:
+                raise ValueError(
+                    "DFlashDraftModel requires `input_embeds` unless a shared target embedding has been set."
+                )
+            input_embeds = self.embed_tokens(input_ids)
         hidden_states = input_embeds
         residual: Optional[torch.Tensor] = None
 

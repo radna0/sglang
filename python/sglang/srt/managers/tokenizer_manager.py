@@ -123,6 +123,7 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 _REQUEST_STATE_WAIT_TIMEOUT = envs.SGLANG_REQUEST_STATE_WAIT_TIMEOUT.get()
 
 logger = logging.getLogger(__name__)
+_DFLASH_FIRST_REQUEST_SAMPLING_LOGGED = False
 
 
 @dataclasses.dataclass
@@ -911,6 +912,22 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         sampling_params = self.sampling_params_class(**sampling_kwargs)
         sampling_params.normalize(self.tokenizer)
         sampling_params.verify(self.model_config.vocab_size)
+        if (
+            isinstance(obj, GenerateReqInput)
+            and (os.environ.get("SGLANG_DFLASH_TRACE_FIRST_BLOCK") or "").strip().lower()
+            in ("1", "true", "yes", "on")
+        ):
+            logger.info(
+                "DFLASH request sampling after tokenization: rid=%s raw=%s normalized={temperature=%s, top_p=%s, top_k=%s, min_p=%s, max_new_tokens=%s, seed=%s}",
+                getattr(obj, "rid", None),
+                obj.sampling_params,
+                sampling_params.temperature,
+                sampling_params.top_p,
+                sampling_params.top_k,
+                sampling_params.min_p,
+                sampling_params.max_new_tokens,
+                sampling_params.sampling_seed,
+            )
 
         # Build return object
         if isinstance(obj, GenerateReqInput):

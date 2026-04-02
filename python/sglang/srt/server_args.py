@@ -479,6 +479,7 @@ class ServerArgs:
     speculative_attention_mode: str = "prefill"
     speculative_draft_attention_backend: Optional[str] = None
     speculative_draft_kv_cache_dtype: Optional[str] = None
+    speculative_draft_mem_fraction_static: Optional[float] = None
     speculative_moe_runner_backend: Optional[str] = None
     speculative_moe_a2a_backend: Optional[str] = None
     speculative_draft_model_quantization: Optional[str] = None
@@ -2490,6 +2491,151 @@ class ServerArgs:
                     "Mixed chunked prefill is disabled because of using dflash speculative decoding."
                 )
 
+        if self.speculative_algorithm == "DFLASH_TREE":
+            if self.enable_dp_attention:
+                raise ValueError(
+                    "Currently DFLASH_TREE speculative decoding does not support dp attention."
+                )
+
+            if self.pp_size != 1:
+                raise ValueError(
+                    "Currently DFLASH_TREE speculative decoding only supports pp_size == 1."
+                )
+
+            if self.speculative_draft_model_path is None:
+                raise ValueError(
+                    "DFLASH_TREE speculative decoding requires setting --speculative-draft-model-path."
+                )
+
+            if str(self.attention_backend or "") != "fa3":
+                raise ValueError(
+                    "DFLASH_TREE on the clean baseline requires --attention-backend fa3."
+                )
+            if self.decode_attention_backend is not None and str(
+                self.decode_attention_backend
+            ) != "fa3":
+                raise ValueError(
+                    "DFLASH_TREE on the clean baseline requires --decode-attention-backend fa3."
+                )
+            if self.speculative_draft_attention_backend is None:
+                self.speculative_draft_attention_backend = "fa3"
+            elif str(self.speculative_draft_attention_backend) != "fa3":
+                raise ValueError(
+                    "DFLASH_TREE on the clean baseline requires --speculative-draft-attention-backend fa3."
+                )
+
+            if self.speculative_eagle_topk is None:
+                self.speculative_eagle_topk = 4
+            elif int(self.speculative_eagle_topk) <= 0:
+                raise ValueError(
+                    "DFLASH_TREE requires --speculative-eagle-topk to be positive, "
+                    f"got {self.speculative_eagle_topk}."
+                )
+
+            if self.speculative_dflash_block_size is not None and int(
+                self.speculative_dflash_block_size
+            ) <= 0:
+                raise ValueError(
+                    "DFLASH_TREE requires --speculative-dflash-block-size to be positive, "
+                    f"got {self.speculative_dflash_block_size}."
+                )
+
+            if self.speculative_num_draft_tokens is None:
+                from sglang.srt.speculative.dflash_utils import (
+                    parse_dflash_draft_config,
+                )
+
+                model_override_args = json.loads(self.json_model_override_args)
+                inferred_block_size = None
+                try:
+                    from sglang.srt.utils.hf_transformers_utils import get_config
+
+                    draft_hf_config = get_config(
+                        self.speculative_draft_model_path,
+                        trust_remote_code=self.trust_remote_code,
+                        revision=self.speculative_draft_model_revision,
+                        model_override_args=model_override_args,
+                    )
+                    inferred_block_size = parse_dflash_draft_config(
+                        draft_hf_config=draft_hf_config
+                    ).resolve_block_size(default=None)
+                except Exception as e:
+                    logger.warning(
+                        "Failed to infer DFLASH_TREE block_size from draft model config; "
+                        "defaulting speculative_dflash_block_size to 16. Error: %s",
+                        e,
+                    )
+
+                if inferred_block_size is None:
+                    inferred_block_size = 16
+                    logger.warning(
+                        "speculative_dflash_block_size is not set; defaulting to %d for DFLASH_TREE.",
+                        inferred_block_size,
+                    )
+                self.speculative_dflash_block_size = int(inferred_block_size)
+            elif self.speculative_dflash_block_size is None:
+                self.speculative_dflash_block_size = int(
+                    self.speculative_num_draft_tokens
+                )
+
+            if self.speculative_num_steps is None:
+                self.speculative_num_steps = int(self.speculative_dflash_block_size) - 1
+            if int(self.speculative_num_steps) <= 0:
+                raise ValueError(
+                    "DFLASH_TREE requires speculative_num_steps to be positive. "
+                    f"Got {self.speculative_num_steps}."
+                )
+            if int(self.speculative_num_steps) >= int(
+                self.speculative_dflash_block_size
+            ):
+                raise ValueError(
+                    "DFLASH_TREE requires speculative_num_steps <= speculative_dflash_block_size - 1. "
+                    f"speculative_num_steps={self.speculative_num_steps}, "
+                    f"speculative_dflash_block_size={self.speculative_dflash_block_size}."
+                )
+
+            if self.speculative_num_draft_tokens is None:
+                self.speculative_num_draft_tokens = int(
+                    self.speculative_dflash_block_size
+                )
+            elif int(self.speculative_num_draft_tokens) != int(
+                self.speculative_dflash_block_size
+            ):
+                raise ValueError(
+                    "DFLASH_TREE requires speculative_num_draft_tokens == speculative_dflash_block_size. "
+                    f"speculative_num_draft_tokens={self.speculative_num_draft_tokens}, "
+                    f"speculative_dflash_block_size={self.speculative_dflash_block_size}."
+                )
+
+            if self.max_running_requests is None:
+                self.max_running_requests = 48
+                logger.warning(
+                    "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
+                )
+
+            quant_kv = {"fp8_e4m3", "fp8_e5m2", "fp4_e2m1"}
+            if (
+                self.speculative_draft_kv_cache_dtype is None
+                and self.kv_cache_dtype in quant_kv
+            ):
+                logger.warning(
+                    "DFLASH_TREE draft worker defaults to bfloat16 KV when target kv_cache_dtype=%s. "
+                    "Override with --speculative-draft-kv-cache-dtype if needed.",
+                    self.kv_cache_dtype,
+                )
+                self.speculative_draft_kv_cache_dtype = "bfloat16"
+
+            self.disable_overlap_schedule = True
+            logger.warning(
+                "Overlap scheduler is disabled when using DFLASH_TREE speculative decoding on the clean baseline."
+            )
+
+            if self.enable_mixed_chunk:
+                self.enable_mixed_chunk = False
+                logger.warning(
+                    "Mixed chunked prefill is disabled because of using DFLASH_TREE speculative decoding."
+                )
+
         if self.speculative_algorithm in ("EAGLE", "EAGLE3", "STANDALONE"):
             if self.speculative_algorithm == "STANDALONE" and self.enable_dp_attention:
                 # TODO: support dp attention for standalone speculative decoding
@@ -4062,7 +4208,7 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-algorithm",
             type=str,
-            choices=["DFLASH", "EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "NGRAM"],
+            choices=["DFLASH", "DFLASH_TREE", "EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "NGRAM"],
             help="Speculative algorithm.",
         )
         parser.add_argument(
@@ -4155,6 +4301,13 @@ class ServerArgs:
             choices=["auto", "fp8_e5m2", "fp8_e4m3", "bf16", "bfloat16", "fp4_e2m1"],
             default=ServerArgs.speculative_draft_kv_cache_dtype,
             help="Override the KV cache dtype for the DFLASH draft worker.",
+        )
+        parser.add_argument(
+            "--speculative-draft-mem-fraction-static",
+            dest="speculative_draft_mem_fraction_static",
+            type=float,
+            default=ServerArgs.speculative_draft_mem_fraction_static,
+            help="Override mem_fraction_static for the DFLASH draft worker.",
         )
         parser.add_argument(
             "--speculative-moe-runner-backend",
