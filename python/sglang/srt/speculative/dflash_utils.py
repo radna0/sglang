@@ -644,6 +644,9 @@ def compute_dflash_sampling_accept_len_and_bonus(
         draft_token_num=draft_token_num,
         device=device,
     )
+    predicts.zero_()
+    accept_index.fill_(-1)
+    accept_token_num.zero_()
     candidates_i64 = (
         candidates if candidates.dtype == torch.int64 else candidates.to(torch.int64)
     )
