@@ -719,10 +719,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             w13_weight_bias = layer.w13_weight_bias.to(torch.float32)
             layer.w13_weight_bias = Parameter(w13_weight_bias, requires_grad=False)
 
-            # Keep the Hopper MXFP4 scale layout on 4 warps so triton_kernels
-            # selects the 128-wide safe matmul specialization instead of the
-            # 256-wide variant that currently fails codegen on this stack.
-            num_warps = 4
+            # Keep the Hopper Triton-kernels MXFP4 scale layout aligned with the
+            # upstream 8-warp path. The tree-local 4-warp override corrupted the
+            # last expert's scale handling on this GPT-OSS H100 lane.
+            num_warps = 8
 
             w13_weight, w13_flex, w13_scale = _swizzle_mxfp4(
                 layer.w13_weight, layer.w13_weight_scale, num_warps
