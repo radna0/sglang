@@ -7,7 +7,10 @@ import torch
 
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.layers.sampler import apply_custom_logit_processor
+from sglang.srt.layers.sampler import (
+    apply_custom_logit_processor,
+    top_k_top_p_min_p_sampling_from_probs_torch,
+)
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
@@ -335,6 +338,7 @@ class DFlashVerifyInput(SpecInput):
             empty = torch.empty((0,), dtype=torch.int64, device=batch.device)
             return empty, empty.to(torch.int32), empty, []
 
+        global _DFLASH_FIRST_COMPARE_LOGGED
         bs = batch.batch_size()
         device = logits_output.next_token_logits.device
 
@@ -369,21 +373,74 @@ class DFlashVerifyInput(SpecInput):
                 )
 
         candidates = self.draft_token.view(bs, self.draft_token_num)
-        if (
-            sampling_info is not None
-            and not sampling_info.is_all_greedy
-            and is_dflash_sampling_verify_available()
-        ):
-            accept_len, bonus = compute_dflash_sampling_accept_len_and_bonus(
-                candidates=candidates,
-                next_token_logits=logits_output.next_token_logits,
-                sampling_info=sampling_info,
-            )
+        if sampling_info is not None and not sampling_info.is_all_greedy:
+            if sampling_info.sampling_seed is not None:
+                # The helper path draws fresh uniform samples internally, which
+                # breaks deterministic parity with the baseline seeded sampler.
+                # For seeded requests, sample the target verify rows inline with
+                # the same seeded torch path used by the normal sampler.
+                logits = logits_output.next_token_logits
+                expanded_temperature = torch.repeat_interleave(
+                    sampling_info.temperatures, self.draft_token_num, dim=0
+                )
+                probs = torch.softmax(logits / expanded_temperature.view(-1, 1), dim=-1)
+                expanded_top_ks = torch.repeat_interleave(
+                    sampling_info.top_ks, self.draft_token_num, dim=0
+                )
+                expanded_top_ps = torch.repeat_interleave(
+                    sampling_info.top_ps, self.draft_token_num, dim=0
+                )
+                expanded_min_ps = torch.repeat_interleave(
+                    sampling_info.min_ps, self.draft_token_num, dim=0
+                )
+                expanded_sampling_seed = torch.repeat_interleave(
+                    sampling_info.sampling_seed, self.draft_token_num, dim=0
+                )
+                verify_positions = self.positions
+                if (
+                    verify_positions is None
+                    or int(verify_positions.numel()) != int(bs * self.draft_token_num)
+                ):
+                    base_positions = batch.seq_lens.to(torch.int64)
+                    step_offsets = torch.arange(
+                        self.draft_token_num, device=device, dtype=torch.int64
+                    ).view(1, -1)
+                    verify_positions = (
+                        base_positions.view(-1, 1) + step_offsets
+                    ).reshape(-1)
+
+                sampled = top_k_top_p_min_p_sampling_from_probs_torch(
+                    probs,
+                    expanded_top_ks,
+                    expanded_top_ps,
+                    expanded_min_ps,
+                    bool(sampling_info.need_min_p_sampling),
+                    expanded_sampling_seed,
+                    verify_positions,
+                )
+                target_predict = sampled.view(bs, self.draft_token_num)
+                accept_len, bonus = compute_dflash_accept_len_and_bonus(
+                    candidates=candidates,
+                    target_predict=target_predict,
+                )
+            elif is_dflash_sampling_verify_available():
+                accept_len, bonus = compute_dflash_sampling_accept_len_and_bonus(
+                    candidates=candidates,
+                    next_token_logits=logits_output.next_token_logits,
+                    sampling_info=sampling_info,
+                )
+            else:
+                target_predict = torch.argmax(
+                    logits_output.next_token_logits, dim=-1
+                ).view(bs, self.draft_token_num)
+                accept_len, bonus = compute_dflash_accept_len_and_bonus(
+                    candidates=candidates,
+                    target_predict=target_predict,
+                )
         else:
             target_predict = torch.argmax(logits_output.next_token_logits, dim=-1).view(
                 bs, self.draft_token_num
             )
-            global _DFLASH_FIRST_COMPARE_LOGGED
             if (
                 not _DFLASH_FIRST_COMPARE_LOGGED
                 and (os.environ.get("SGLANG_DFLASH_TRACE_FIRST_BLOCK") or "").strip().lower()
