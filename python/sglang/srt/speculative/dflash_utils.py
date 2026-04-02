@@ -578,6 +578,22 @@ def compute_dflash_sampling_accept_len_and_bonus(
                     sampling_info.top_ps, draft_token_num, dim=0
                 )
                 topk_probs = top_p_renorm_prob(topk_probs, repeated_top_ps)
+            if bool(getattr(sampling_info, "need_min_p_sampling", False)):
+                repeated_min_ps = torch.repeat_interleave(
+                    sampling_info.min_ps, draft_token_num, dim=0
+                ).to(device=device, dtype=topk_probs.dtype)
+                base_probs = topk_probs
+                min_p_thresholds = (
+                    topk_probs.max(dim=-1, keepdim=True).values
+                    * repeated_min_ps.view(-1, 1)
+                )
+                topk_probs = topk_probs.masked_fill(topk_probs < min_p_thresholds, 0.0)
+                denom = topk_probs.sum(dim=-1, keepdim=True)
+                topk_probs = torch.where(
+                    denom > 0,
+                    topk_probs / denom.clamp_min(1e-20),
+                    base_probs,
+                )
 
             target_probs = torch.zeros_like(scaled_logits, dtype=topk_probs.dtype)
             target_probs.scatter_(1, topk_indices, topk_probs)
@@ -594,6 +610,24 @@ def compute_dflash_sampling_accept_len_and_bonus(
             target_probs = top_p_renorm_prob(
                 target_probs,
                 torch.repeat_interleave(sampling_info.top_ps, draft_token_num, dim=0),
+            )
+        if bool(getattr(sampling_info, "need_min_p_sampling", False)):
+            expanded_min_ps = torch.repeat_interleave(
+                sampling_info.min_ps, draft_token_num, dim=0
+            ).to(device=device, dtype=target_probs.dtype)
+            base_probs = target_probs
+            min_p_thresholds = (
+                target_probs.max(dim=-1, keepdim=True).values
+                * expanded_min_ps.view(-1, 1)
+            )
+            target_probs = target_probs.masked_fill(
+                target_probs < min_p_thresholds, 0.0
+            )
+            denom = target_probs.sum(dim=-1, keepdim=True)
+            target_probs = torch.where(
+                denom > 0,
+                target_probs / denom.clamp_min(1e-20),
+                base_probs,
             )
     target_probs = target_probs.view(bs, draft_token_num, -1).contiguous()
     draft_probs = torch.zeros_like(target_probs)
