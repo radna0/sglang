@@ -525,7 +525,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             w13_scale_permute_indices = _get_flashinfer_mxfp4_device_permute_indices(
                 w13_weight_scale[0].view(torch.uint8),
                 epilogue_tile_m,
-                num_elts_per_sf=16,
+                # MXFP4 uses 32-element blocks per scaling factor.
+                num_elts_per_sf=sf_block_size,
             )
             w13_bias_permute_indices = _get_flashinfer_mxfp4_device_permute_indices(
                 w13_bias[0].reshape(-1, 1),
@@ -539,7 +540,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             w2_scale_permute_indices = _get_flashinfer_mxfp4_device_permute_indices(
                 w2_weight_scale[0].view(torch.uint8),
                 epilogue_tile_m,
-                num_elts_per_sf=16,
+                # MXFP4 uses 32-element blocks per scaling factor.
+                num_elts_per_sf=sf_block_size,
             )
             w2_bias_permute_indices = _get_flashinfer_mxfp4_device_permute_indices(
                 w2_bias[0].reshape(-1, 1),
@@ -675,32 +677,73 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
             from triton_kernels.matmul_ogs import FlexCtx, PrecisionConfig
 
-            w13_weight_bias = layer.w13_weight_bias.to(torch.float32)
-            w2_weight_bias = layer.w2_weight_bias.to(torch.float32)
+            # The full MXFP4 expert shard is too large to swizzle both projections
+            # concurrently on a 1xH100 load. Move the non-target projection off the
+            # device, swizzle one projection at a time, then restore the other.
+            w2_weight_cpu = layer.w2_weight.detach().cpu()
+            w2_scale_cpu = layer.w2_weight_scale.detach().cpu()
+            w2_bias_cpu = layer.w2_weight_bias.detach().to(torch.float32).cpu()
+            del layer.w2_weight
+            del layer.w2_weight_scale
+            del layer.w2_weight_bias
+            torch.cuda.empty_cache()
 
+            w13_weight_bias = layer.w13_weight_bias.to(torch.float32)
             layer.w13_weight_bias = Parameter(w13_weight_bias, requires_grad=False)
-            layer.w2_weight_bias = Parameter(w2_weight_bias, requires_grad=False)
 
             num_warps = 8
 
             w13_weight, w13_flex, w13_scale = _swizzle_mxfp4(
                 layer.w13_weight, layer.w13_weight_scale, num_warps
             )
-            w2_weight, w2_flex, w2_scale = _swizzle_mxfp4(
-                layer.w2_weight, layer.w2_weight_scale, num_warps
-            )
 
             self.w13_precision_config = PrecisionConfig(
                 weight_scale=w13_scale, flex_ctx=FlexCtx(rhs_data=w13_flex)
             )
+            self.w13_weight_triton_tensor = w13_weight
+            logical_w13_shape = [
+                layer.num_local_experts,
+                layer.hidden_size,
+                2 * self.intermediate_size_per_partition,
+            ]
+            self.w13_weight_triton_tensor.shape = logical_w13_shape
+            del w13_weight, w13_flex, w13_scale
+            del layer.w13_weight
+            del layer.w13_weight_scale
+            torch.cuda.empty_cache()
+
+            # Restore the second projection only after the first one has been
+            # swizzled and its temporary buffers have been released.
+            layer.w2_weight = Parameter(
+                w2_weight_cpu.to(device=w13_weight_bias.device, non_blocking=False),
+                requires_grad=False,
+            )
+            layer.w2_weight_scale = Parameter(
+                w2_scale_cpu.to(device=w13_weight_bias.device, non_blocking=False),
+                requires_grad=False,
+            )
+            layer.w2_weight_bias = Parameter(
+                w2_bias_cpu.to(device=w13_weight_bias.device, non_blocking=False),
+                requires_grad=False,
+            )
+
+            w2_weight, w2_flex, w2_scale = _swizzle_mxfp4(
+                layer.w2_weight, layer.w2_weight_scale, num_warps
+            )
             self.w2_precision_config = PrecisionConfig(
                 weight_scale=w2_scale, flex_ctx=FlexCtx(rhs_data=w2_flex)
             )
-
-            self.w13_weight_triton_tensor = w13_weight
             self.w2_weight_triton_tensor = w2_weight
-            del layer.w13_weight
+            logical_w2_shape = [
+                layer.num_local_experts,
+                self.intermediate_size_per_partition,
+                layer.hidden_size,
+            ]
+            self.w2_weight_triton_tensor.shape = logical_w2_shape
+            del w2_weight, w2_flex, w2_scale
             del layer.w2_weight
+            del layer.w2_weight_scale
+            torch.cuda.empty_cache()
         else:
             from triton_kernels.numerics_details.mxfp import upcast_from_mxfp
 
