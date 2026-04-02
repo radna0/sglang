@@ -116,62 +116,6 @@ def create_flex_attention_backend(runner):
     return TorchFlexAttnBackend(runner)
 
 
-@register_attention_backend("flex_attention2")
-def create_flex_attention2_backend(runner):
-    # FlexAttention-II style backend: paged KV + BlockMask over the global KV cache
-    # to avoid per-request KV gathers in long-context regimes.
-    from sglang.srt.layers.attention.torch_flex2_backend import TorchFlexAttnBackendV2
-
-    return TorchFlexAttnBackendV2(runner)
-
-
-@register_attention_backend("flex_flash")
-def create_flex_flash_backend(runner):
-    # FlexAttention API, but request FlashAttention (CuTe/FA4) codepaths when available.
-    # This is useful for hybrid experiments where we want Flex masks/mods with FA speed.
-    from sglang.srt.layers.attention.torch_flex_backend import TorchFlexAttnBackend
-
-    return TorchFlexAttnBackend(runner, kernel_options={"force_flash": True})
-
-
-@register_attention_backend("flex_flash2")
-def create_flex_flash2_backend(runner):
-    # FlexAttention-II backend, but request FlashAttention (CuTe/FA4) codepaths when available.
-    from sglang.srt.layers.attention.torch_flex2_backend import TorchFlexAttnBackendV2
-
-    return TorchFlexAttnBackendV2(runner, kernel_options={"force_flash": True})
-
-
-@register_attention_backend("flex_flash2_delegate_fa3")
-def create_flex_flash2_delegate_fa3_backend(runner):
-    # For benchmarking/parity only: bypass FlexAttention entirely but keep the backend name
-    # in configs. This must avoid importing FlexAttention modules so it remains usable even
-    # when FlexAttention is unavailable/broken in a given environment.
-    from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
-
-    return FlashAttentionBackend(runner, fa_impl_ver=3)
-
-
-@register_attention_backend("flex_flash4")
-def create_flex_flash4_backend(runner):
-    from sglang.srt.layers.attention.flex_flash4_cute_backend import (
-        FlexFlash4CuteBackend,
-    )
-
-    return FlexFlash4CuteBackend(runner)
-
-
-@register_attention_backend("flex_flash4_legacy")
-def create_flex_flash4_legacy_backend(runner):
-    # Previous "flex_flash4" behavior: PyTorch FlexAttention V2 with force_flash.
-    from sglang.srt.layers.attention.torch_flex2_backend import TorchFlexAttnBackendV2
-
-    return TorchFlexAttnBackendV2(
-        runner,
-        kernel_options={"force_flash": True, "delegate_fa_impl": 4},
-    )
-
-
 @register_attention_backend("flashmla")
 def create_flashmla_backend(runner):
     from sglang.srt.layers.attention.flashmla_backend import FlashMLABackend

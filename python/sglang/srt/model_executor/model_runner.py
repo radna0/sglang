@@ -2436,6 +2436,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         """Initialize piecewise CUDA graph runner."""
         self.piecewise_cuda_graph_runner = None
 
+        if self.is_draft_worker and self.spec_algorithm.is_dflash_family():
+            logger.info(
+                "Disable piecewise CUDA graph for DFlash draft worker to preserve KV headroom."
+            )
+            return
+
         if self.server_args.disable_cuda_graph:
             logger.info(
                 "Disable piecewise CUDA graph because --disable-cuda-graph is set"

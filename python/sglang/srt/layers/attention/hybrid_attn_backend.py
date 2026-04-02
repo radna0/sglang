@@ -1,6 +1,3 @@
-import logging
-import os
-from functools import lru_cache
 from typing import Optional
 
 import torch
@@ -11,30 +8,6 @@ from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.speculative.spec_info import SpecInput
-
-logger = logging.getLogger(__name__)
-
-
-def _fa3_flag(name: str) -> bool:
-    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
-
-
-@lru_cache(maxsize=None)
-def _fa3_trace_layer_ids() -> frozenset[int]:
-    raw = os.environ.get("SGLANG_FA3_TRACE_BACKEND_LAYER_IDS", "")
-    values: set[int] = set()
-    for part in raw.split(","):
-        part = part.strip()
-        if not part:
-            continue
-        try:
-            values.add(int(part))
-        except ValueError:
-            logger.warning(
-                "[FA3Backend] ignoring invalid layer id %r in SGLANG_FA3_TRACE_BACKEND_LAYER_IDS",
-                part,
-            )
-    return frozenset(values)
 
 
 class HybridAttnBackend(AttentionBackend):
@@ -148,16 +121,6 @@ class HybridAttnBackend(AttentionBackend):
         save_kv_cache: bool = True,
         **kwargs,
     ):
-        if _fa3_flag("SGLANG_FA3_TRACE_BACKEND"):
-            trace_ids = _fa3_trace_layer_ids()
-            if not trace_ids or int(layer.layer_id) in trace_ids:
-                logger.info(
-                    "[FA3Backend] outer=%s mode=decode layer=%d selected=%s sinks=%s",
-                    self.__class__.__name__,
-                    int(layer.layer_id),
-                    self.decode_backend.__class__.__name__,
-                    kwargs.get("sinks") is not None,
-                )
         return self.decode_backend.forward_decode(
             q, k, v, layer, forward_batch, save_kv_cache, **kwargs
         )
