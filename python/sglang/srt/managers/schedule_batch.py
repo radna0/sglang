@@ -40,6 +40,7 @@ TODO(lmzheng): ModelWorkerBatch seems a bit redundant and we consider removing i
 import copy
 import dataclasses
 import logging
+import os
 import re
 import time
 from enum import Enum, auto
@@ -93,6 +94,7 @@ if TYPE_CHECKING:
 
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.managers.scheduler_metrics_mixin import PrefillStats
+    from sglang.srt.speculative.dflash_info import DFlashDraftInput
     from sglang.srt.speculative.eagle_info import EagleDraftInput
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 
@@ -1948,10 +1950,35 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def prepare_for_decode(self):
         self.forward_mode = ForwardMode.DECODE
         bs = len(self.reqs)
+        debug_prepare_state = (
+            os.environ.get("SGLANG_DEBUG_PREPARE_FOR_DECODE_STATE") or ""
+        ).strip().lower() in ("1", "true", "yes", "on")
+        debug_prepare_min_seqlen = int(
+            (os.environ.get("SGLANG_DEBUG_PREPARE_FOR_DECODE_MIN_SEQLEN") or "0").strip()
+            or "0"
+        )
+        should_log_prepare_state = (
+            debug_prepare_state
+            and not getattr(self, "_logged_prepare_decode_state_once", False)
+            and self.seq_lens is not None
+            and int(self.seq_lens.max().item()) >= debug_prepare_min_seqlen
+        )
+        if should_log_prepare_state:
+            logger.info(
+                "prepare_for_decode pre: spec=%s seq_lens=%s output_ids=%s req_output_lens=%s kv_committed_lens=%s kv_allocated_lens=%s",
+                getattr(self.spec_algorithm, "name", str(self.spec_algorithm)),
+                self.seq_lens.detach().to("cpu", non_blocking=False).tolist(),
+                None
+                if self.output_ids is None
+                else self.output_ids.detach().to("cpu", non_blocking=False).tolist(),
+                [len(req.output_ids) for req in self.reqs],
+                [int(req.kv_committed_len) for req in self.reqs],
+                [int(req.kv_allocated_len) for req in self.reqs],
+            )
 
         if self.is_spec_v2:
             # TODO(spec-v2): all spec v2 should go through this path
-            draft_input: EagleDraftInput = self.spec_info
+            draft_input: SpecInput = self.spec_info
             draft_input.prepare_for_decode(self)
 
         if not self.spec_algorithm.is_none():
@@ -2010,6 +2037,21 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.seq_lens_cpu.add_(1)
             self.orig_seq_lens.add_(1)
         self.seq_lens_sum += bs
+        if should_log_prepare_state:
+            logger.info(
+                "prepare_for_decode post: spec=%s seq_lens=%s input_ids=%s out_cache_loc=%s kv_committed_lens=%s kv_allocated_lens=%s",
+                getattr(self.spec_algorithm, "name", str(self.spec_algorithm)),
+                self.seq_lens.detach().to("cpu", non_blocking=False).tolist(),
+                None
+                if self.input_ids is None
+                else self.input_ids.detach().to("cpu", non_blocking=False).tolist(),
+                None
+                if self.out_cache_loc is None
+                else self.out_cache_loc.detach().to("cpu", non_blocking=False).tolist(),
+                [int(req.kv_committed_len) for req in self.reqs],
+                [int(req.kv_allocated_len) for req in self.reqs],
+            )
+            setattr(self, "_logged_prepare_decode_state_once", True)
 
         if get_global_server_args().enable_mamba_extra_buffer():
             self.mamba_track_indices = torch.tensor(
@@ -2031,7 +2073,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def maybe_wait_verify_done(self):
         if self.is_spec_v2:
-            draft_input: EagleDraftInput = self.spec_info
+            draft_input: SpecInput = self.spec_info
             if draft_input.verify_done is not None:
                 draft_input.verify_done.synchronize()
 
@@ -2237,6 +2279,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mamba_track_indices=self.mamba_track_indices,
             mamba_track_mask=self.mamba_track_mask,
             mamba_track_seqlens=self.mamba_track_seqlens,
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            tree_cache=self.tree_cache,
+            enable_overlap=self.enable_overlap,
         )
 
     def copy(self):
@@ -2417,6 +2463,13 @@ class ModelWorkerBatch:
     reqs: Optional[List[Req]] = None
     has_grammar: bool = False
 
+    # DFlash overlap bring-up still needs access to scheduler-owned cache state
+    # during verify/commit.
+    req_to_token_pool: Optional[ReqToTokenPool] = None
+    token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator] = None
+    tree_cache: Optional[BasePrefixCache] = None
+    enable_overlap: bool = False
+
     # For hidden states before normal
     return_hidden_states_before_norm: bool = False
 
@@ -2424,3 +2477,19 @@ class ModelWorkerBatch:
     mamba_track_indices: Optional[torch.Tensor] = None  # shape: [b], int64
     mamba_track_mask: Optional[torch.Tensor] = None  # shape: [b], bool
     mamba_track_seqlens: Optional[torch.Tensor] = None  # shape: [b], int64
+
+    @property
+    def device(self) -> torch.device:
+        return self.input_ids.device
+
+    def batch_size(self) -> int:
+        return int(self.seq_lens.shape[0])
+
+    def maybe_evict_swa(self):
+        return
+
+    def maybe_wait_verify_done(self):
+        spec_info = self.spec_info
+        verify_done = getattr(spec_info, "verify_done", None)
+        if verify_done is not None:
+            verify_done.synchronize()

@@ -15,13 +15,16 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
+import os
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
 from sglang.srt.distributed import get_pp_group, get_world_group
+from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
 from sglang.srt.managers.io_struct import (
     DestroyWeightsUpdateGroupReqInput,
     GetWeightsByNameReqInput,
@@ -38,10 +41,14 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
+from sglang.srt.layers.moe.utils import (
+    get_moe_runner_backend,
+    get_speculative_moe_runner_backend,
+)
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
-from sglang.srt.server_args import ServerArgs
+from sglang.srt.server_args import ServerArgs, get_global_server_args
 from sglang.srt.utils import MultiprocessingSerializer, broadcast_pyobj, set_random_seed
 from sglang.srt.utils.hf_transformers_utils import (
     get_processor,
@@ -55,6 +62,51 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
+
+
+def _parse_debug_seq_range() -> tuple[int, int] | None:
+    raw = (os.environ.get("SGLANG_DEBUG_MODEL_WORKER_SEQ_RANGE") or "").strip()
+    if not raw:
+        return None
+    try:
+        lo_s, hi_s = raw.split(":", 1)
+        lo = int(lo_s.strip())
+        hi = int(hi_s.strip())
+    except Exception:
+        return None
+    if hi < lo:
+        lo, hi = hi, lo
+    return lo, hi
+
+
+def _should_log_model_worker_batch(model_worker_batch: ModelWorkerBatch) -> bool:
+    seq_range = _parse_debug_seq_range()
+    if seq_range is None or model_worker_batch is None or model_worker_batch.seq_lens is None:
+        return False
+    try:
+        seq_max = int(model_worker_batch.seq_lens.max().item())
+    except Exception:
+        return False
+    return seq_range[0] <= seq_max <= seq_range[1]
+
+
+def _expert_location_signature(meta) -> dict | None:
+    if meta is None:
+        return None
+    try:
+        physical_to_logical = meta.physical_to_logical_map_cpu
+        payload = physical_to_logical.contiguous().numpy().tobytes()
+        return {
+            "sha1": hashlib.sha1(payload).hexdigest()[:16],
+            "head": physical_to_logical[
+                : min(2, physical_to_logical.shape[0]),
+                : min(16, physical_to_logical.shape[1]),
+            ]
+            .reshape(-1)
+            .tolist(),
+        }
+    except Exception:
+        return None
 
 
 class BaseTpWorker(ABC):
@@ -443,6 +495,139 @@ class TpModelWorker(BaseTpWorker):
         if model_worker_batch is not None:
             # update the consumer index of hicache to the running batch
             self.set_hicache_consumer(model_worker_batch.hicache_consumer_index)
+
+            if _should_log_model_worker_batch(model_worker_batch):
+                row = int(model_worker_batch.req_pool_indices.reshape(-1)[0].item())
+                seq_max = int(model_worker_batch.seq_lens.max().item())
+                tail_lo = max(0, seq_max - 8)
+                req_to_token_tail = self.model_runner.req_to_token_pool.req_to_token[
+                    row, tail_lo:seq_max
+                ]
+                input_embeds = getattr(model_worker_batch, "input_embeds", None)
+                if input_embeds is None:
+                    input_embeds_meta = None
+                else:
+                    flat = input_embeds.reshape(-1)
+                    sample = flat[: min(8, flat.numel())].detach().to(
+                        "cpu", non_blocking=False
+                    )
+                    input_embeds_meta = {
+                        "shape": tuple(input_embeds.shape),
+                        "dtype": str(input_embeds.dtype),
+                        "head": sample.tolist(),
+                    }
+                next_token_logits_buffer = getattr(
+                    model_worker_batch, "next_token_logits_buffer", None
+                )
+                if next_token_logits_buffer is None:
+                    next_token_logits_buffer_meta = None
+                else:
+                    next_token_logits_buffer_meta = {
+                        "shape": tuple(next_token_logits_buffer.shape),
+                        "dtype": str(next_token_logits_buffer.dtype),
+                    }
+                model = getattr(self.model_runner, "model", None)
+                inner_model = getattr(model, "model", None)
+                attn_backend = getattr(self.model_runner, "attn_backend", None)
+                global_server_args = get_global_server_args()
+                global_expert_location_metadata = get_global_expert_location_metadata()
+                state_meta = {
+                    "runner_spec_algorithm": getattr(
+                        getattr(self.model_runner, "spec_algorithm", None),
+                        "name",
+                        getattr(self.model_runner, "spec_algorithm", None),
+                    ),
+                    "runner_server_speculative_algorithm": getattr(
+                        getattr(self.model_runner, "server_args", None),
+                        "speculative_algorithm",
+                        None,
+                    ),
+                    "runner_dflash_use_aux_hidden_state": getattr(
+                        self.model_runner, "dflash_use_aux_hidden_state", None
+                    ),
+                    "model_capture_aux_hidden_states": getattr(
+                        model, "capture_aux_hidden_states", None
+                    ),
+                    "model_layers_to_capture": None
+                    if inner_model is None
+                    else list(getattr(inner_model, "layers_to_capture", []) or []),
+                    "attn_backend_cls": None
+                    if attn_backend is None
+                    else type(attn_backend).__name__,
+                    "attn_backend_speculative_num_steps": getattr(
+                        attn_backend, "speculative_num_steps", None
+                    ),
+                    "attn_backend_speculative_num_draft_tokens": getattr(
+                        attn_backend, "speculative_num_draft_tokens", None
+                    ),
+                    "global_speculative_algorithm": getattr(
+                        global_server_args, "speculative_algorithm", None
+                    ),
+                    "global_speculative_num_draft_tokens": getattr(
+                        global_server_args, "speculative_num_draft_tokens", None
+                    ),
+                    "global_attention_backend": getattr(
+                        global_server_args, "attention_backend", None
+                    ),
+                    "global_page_size": getattr(
+                        global_server_args, "page_size", None
+                    ),
+                    "global_moe_runner_backend": getattr(
+                        get_moe_runner_backend(),
+                        "name",
+                        get_moe_runner_backend(),
+                    ),
+                    "global_speculative_moe_runner_backend": getattr(
+                        get_speculative_moe_runner_backend(),
+                        "name",
+                        get_speculative_moe_runner_backend(),
+                    ),
+                    "global_expert_location_layers": None
+                    if global_expert_location_metadata is None
+                    else int(global_expert_location_metadata.num_layers),
+                    "global_expert_location_num_logical_experts": None
+                    if global_expert_location_metadata is None
+                    else int(global_expert_location_metadata.num_logical_experts),
+                    "global_expert_location_signature": _expert_location_signature(
+                        global_expert_location_metadata
+                    ),
+                }
+                logger.info(
+                    "model worker batch trace: spec=%s forward_mode=%s capture_hidden=%s seq_lens=%s input_ids=%s req_pool_indices=%s out_cache_loc=%s req_to_token_tail[%d:%d]=%s input_embeds=%s next_token_logits_buffer=%s state=%s",
+                    getattr(
+                        model_worker_batch.spec_algorithm,
+                        "name",
+                        model_worker_batch.spec_algorithm,
+                    ),
+                    getattr(
+                        model_worker_batch.forward_mode,
+                        "name",
+                        model_worker_batch.forward_mode,
+                    ),
+                    getattr(
+                        model_worker_batch.capture_hidden_mode,
+                        "name",
+                        model_worker_batch.capture_hidden_mode,
+                    ),
+                    model_worker_batch.seq_lens.detach()
+                    .to("cpu", non_blocking=False)
+                    .tolist(),
+                    model_worker_batch.input_ids.detach()
+                    .to("cpu", non_blocking=False)
+                    .tolist(),
+                    model_worker_batch.req_pool_indices.detach()
+                    .to("cpu", non_blocking=False)
+                    .tolist(),
+                    model_worker_batch.out_cache_loc.detach()
+                    .to("cpu", non_blocking=False)
+                    .tolist(),
+                    tail_lo,
+                    seq_max,
+                    req_to_token_tail.detach().to("cpu", non_blocking=False).tolist(),
+                    input_embeds_meta,
+                    next_token_logits_buffer_meta,
+                    state_meta,
+                )
 
             forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
         else:

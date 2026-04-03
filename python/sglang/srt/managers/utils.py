@@ -15,7 +15,9 @@ from sglang.srt.server_args import ServerArgs
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import GenerationBatchResult
+    from sglang.srt.speculative.dflash_info import DFlashDraftInput
     from sglang.srt.speculative.eagle_info import EagleDraftInput
+    from sglang.srt.speculative.spec_info import SpecInput
 
 
 logger = logging.getLogger(__name__)
@@ -44,10 +46,30 @@ class GenerationBatchResult:
     accept_lens: Optional[torch.Tensor] = None
 
     # relay path: forward stream -> next step forward
-    next_draft_input: Optional[EagleDraftInput] = None
+    next_draft_input: Optional["SpecInput"] = None
+    next_out_cache_loc: Optional[torch.Tensor] = None
+
+    # DFLASH overlap currently commits request/output state inside verify. In that
+    # mode, the scheduler only needs the copied logits/customized info, not the
+    # compact token payload again.
+    dflash_overlap_preprocessed: bool = False
+    requires_output_processing_barrier: bool = False
+    force_plain_decode_output_processing: bool = False
 
     # metrics
     expert_distribution_metrics: Optional[ExpertDistributionMetrics] = None
+
+    # DFLASH SSD speculative stats
+    spec_ssd_hit_ct: Optional[List[int]] = None
+    spec_ssd_prepare_ct: Optional[List[int]] = None
+    spec_ssd_prepare_failure_ct: Optional[List[int]] = None
+    spec_ssd_cache_pending: Optional[List[int]] = None
+    spec_ssd_overlap_launch_ct: Optional[List[int]] = None
+    spec_ssd_overlap_wait_ct: Optional[List[int]] = None
+    spec_ssd_difficulty_gate_skip_ct: Optional[List[int]] = None
+    spec_ssd_fanout_gate_skip_ct: Optional[List[int]] = None
+    spec_ssd_fanout_escalation_ct: Optional[List[int]] = None
+    spec_ssd_fanout_alt_budget: Optional[List[int]] = None
 
     def copy_to_cpu(self, return_logprob: bool):
         """Copy tensors to CPU in overlap scheduling.
@@ -67,10 +89,11 @@ class GenerationBatchResult:
             self.logits_output.hidden_states = self.logits_output.hidden_states.to(
                 "cpu", non_blocking=True
             )
-        self.next_token_ids = self.next_token_ids.to("cpu", non_blocking=True)
+        if not self.dflash_overlap_preprocessed and self.next_token_ids is not None:
+            self.next_token_ids = self.next_token_ids.to("cpu", non_blocking=True)
 
-        if self.accept_lens is not None:
-            self.accept_lens = self.accept_lens.to("cpu", non_blocking=True)
+            if self.accept_lens is not None:
+                self.accept_lens = self.accept_lens.to("cpu", non_blocking=True)
 
         if (x := self.expert_distribution_metrics) is not None:
             x.copy_to_cpu()

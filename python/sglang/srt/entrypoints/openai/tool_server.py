@@ -150,12 +150,15 @@ class DemoToolServer(ToolServer):
         )
 
         self.tools: dict[str, Tool] = {}
+        self._tool_types: dict[str, type[Tool]] = {}
         browser_tool = HarmonyBrowserTool()
         if browser_tool.enabled:
             self.tools["browser"] = browser_tool
+            self._tool_types["browser"] = HarmonyBrowserTool
         python_tool = HarmonyPythonTool()
         if python_tool.enabled:
             self.tools["python"] = python_tool
+            self._tool_types["python"] = HarmonyPythonTool
 
     def has_tool(self, tool_name: str):
         return tool_name in self.tools
@@ -172,4 +175,17 @@ class DemoToolServer(ToolServer):
 
     @asynccontextmanager
     async def get_tool_session(self, tool_name: str):
-        yield self.tools[tool_name]
+        tool = self.tools[tool_name]
+        if tool_name == "python":
+            tool_cls = self._tool_types[tool_name]
+            tool = tool_cls()
+            if not tool.enabled:
+                logger.warning("Tool %s could not be initialized", tool_name)
+                yield tool
+                return
+        try:
+            yield tool
+        finally:
+            close_fn = getattr(tool, "close", None)
+            if callable(close_fn):
+                close_fn()

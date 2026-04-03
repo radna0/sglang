@@ -20,6 +20,7 @@ import signal
 import sys
 import time
 from collections import deque
+from copy import deepcopy
 from dataclasses import dataclass
 from http import HTTPStatus
 from typing import Any, Deque, Dict, List, Optional, Tuple, Union
@@ -135,7 +136,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
 )
 from sglang.srt.managers.mm_utils import init_mm_embedding_cache, unwrap_shm_features
-from sglang.srt.managers.overlap_utils import FutureMap
+from sglang.srt.managers.overlap_utils import FutureIndices, FutureMap
 from sglang.srt.managers.prefill_delayer import (
     PrefillDelayer,
     PrefillDelayerSinglePassExecutor,
@@ -155,7 +156,7 @@ from sglang.srt.managers.schedule_policy import (
 )
 from sglang.srt.managers.scheduler_dp_attn_mixin import SchedulerDPAttnMixin
 from sglang.srt.managers.scheduler_input_blocker import SchedulerInputBlocker
-from sglang.srt.managers.scheduler_metrics_mixin import (
+from sglang.srt.observability.scheduler_metrics_mixin import (
     RECORD_STEP_TIME,
     PrefillStats,
     SchedulerMetricsMixin,
@@ -176,7 +177,6 @@ from sglang.srt.managers.scheduler_update_weights_mixin import (
 from sglang.srt.managers.session_controller import Session
 from sglang.srt.managers.utils import GenerationBatchResult, validate_input_length
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
@@ -519,8 +519,26 @@ class Scheduler(
     def init_tp_model_worker(self):
         from sglang.srt.managers.tp_worker import TpModelWorker
 
+        worker_server_args = self.server_args
+        if (
+            self.spec_algorithm.is_dflash_family()
+            and (os.environ.get("SGLANG_DFLASH_FRANKEN_TARGET_PLAIN") or "")
+            .strip()
+            .lower()
+            in ("1", "true", "yes", "on")
+        ):
+            worker_server_args = deepcopy(self.server_args)
+            worker_server_args.speculative_algorithm = None
+            worker_server_args.speculative_num_steps = None
+            worker_server_args.speculative_eagle_topk = None
+            worker_server_args.speculative_num_draft_tokens = None
+            if self.tp_rank == 0:
+                logger.warning(
+                    "DFLASH diagnostic: constructing target TpModelWorker with plain speculative_algorithm=None"
+                )
+
         self.tp_worker = TpModelWorker(
-            server_args=self.server_args,
+            server_args=worker_server_args,
             gpu_id=self.gpu_id,
             tp_rank=self.tp_rank,
             moe_ep_rank=self.moe_ep_rank,
@@ -863,7 +881,9 @@ class Scheduler(
         if self.draft_worker is None or self.spec_algorithm.is_ngram():
             draft_token_to_kv_pool = None
         elif self.spec_algorithm.supports_spec_v2() and self.enable_overlap:
-            if self.server_args.enable_multi_layer_eagle:
+            if self.spec_algorithm.is_dflash_family():
+                draft_runner = self.draft_worker.draft_model_runner
+            elif self.server_args.enable_multi_layer_eagle:
                 draft_runner = self.draft_worker.draft_worker.draft_runner_list[0]
             else:
                 draft_runner = self.draft_worker.draft_worker.draft_runner
@@ -1150,6 +1170,20 @@ class Scheduler(
             if self._engine_paused:
                 continue
 
+            # Some speculative workers, notably DFlash-family overlap-preprocessed
+            # decode, already commit request/KV state inside verify. Those results
+            # must be output-processed before the next scheduling step reuses the
+            # live running batch; otherwise the overlap loop can schedule against
+            # stale ownership and corrupt allocator state.
+            if self.result_queue and bool(
+                getattr(
+                    self.result_queue[0][1],
+                    "requires_output_processing_barrier",
+                    False,
+                )
+            ):
+                pop_and_process()
+
             # Get the next batch to run
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
@@ -1168,7 +1202,7 @@ class Scheduler(
                 batch_result = None
 
             # Process the last batch
-            if self.last_batch:
+            if self.last_batch and self.result_queue:
                 if not disable_overlap_for_batch:
                     pop_and_process()
             elif batch is None:
@@ -1562,6 +1596,26 @@ class Scheduler(
                 self.init_req_max_new_tokens(req)
                 self._add_request_to_queue(req)
                 return
+
+        if self.spec_algorithm.is_dflash_family() and req.return_logprob:
+            req.set_finish_with_abort(
+                "DFLASH speculative decoding does not support return_logprob yet."
+            )
+            self.init_req_max_new_tokens(req)
+            self._add_request_to_queue(req)
+            return
+        if self.spec_algorithm.is_dflash_family() and (
+            req.sampling_params.json_schema is not None
+            or req.sampling_params.regex is not None
+            or req.sampling_params.ebnf is not None
+            or req.sampling_params.structural_tag is not None
+        ):
+            req.set_finish_with_abort(
+                "DFLASH speculative decoding does not support grammar-constrained decoding yet."
+            )
+            self.init_req_max_new_tokens(req)
+            self._add_request_to_queue(req)
+            return
 
         # Handle multimodal inputs
         if recv_req.mm_inputs is not None:
@@ -2275,6 +2329,54 @@ class Scheduler(
         self.batch_record_ct = (self.batch_record_ct + 1) % 2
         self.batch_record_buf[self.batch_record_ct] = model_worker_batch
 
+    def _prepare_spec_v2_overlap_state(
+        self,
+        batch: ScheduleBatch,
+        batch_result: GenerationBatchResult,
+        future_indices: FutureIndices,
+    ) -> None:
+        """Move DFlash/Eagle next-draft state into the overlap scheduler contract.
+
+        This keeps the spec-v2 producer side explicit instead of leaving ad hoc
+        DFlash/Eagle behavior in the middle of `run_batch`.
+        """
+        next_draft_input = batch_result.next_draft_input
+        if next_draft_input is None:
+            raise RuntimeError(
+                "spec-v2 overlap requires next_draft_input from the speculative worker."
+            )
+
+        batch.spec_info = next_draft_input
+        batch.spec_info.future_indices = future_indices
+
+        new_seq_lens = getattr(next_draft_input, "new_seq_lens", None)
+        if new_seq_lens is None:
+            raise RuntimeError(
+                "spec-v2 overlap requires next_draft_input.new_seq_lens."
+            )
+
+        # The future value, usually for next batch preparation.
+        # Current implementation strictly synchronizes seq_lens at this boundary.
+        batch.seq_lens = new_seq_lens
+        batch.seq_lens_sum = int(new_seq_lens.sum().item())
+
+        if batch.spec_algorithm.is_dflash_family():
+            # Keep CPU-side scheduling state aligned with the DFlash-native future
+            # payload. This mirrors DFlashDraftInput.prepare_for_decode() but is
+            # done here so overlap scheduling can safely inspect the updated batch
+            # before the next round starts.
+            batch.seq_lens_cpu = new_seq_lens.to(dtype=torch.int32, device="cpu")
+
+            next_out_cache_loc = getattr(batch_result, "next_out_cache_loc", None)
+            if next_out_cache_loc is not None:
+                batch.out_cache_loc = next_out_cache_loc
+
+        # Keep req ownership intact until output processing runs. DFlash-family
+        # overlap may commit finish state inside verify, but KV release still
+        # happens in the decode output processor. Filtering here can drop the req
+        # before `_handle_dflash_overlap_preprocessed_req()` sees it, which leaks
+        # the verify-owned KV slots for that req.
+
     def run_batch(
         self,
         batch: ScheduleBatch,
@@ -2341,20 +2443,9 @@ class Scheduler(
                 future_indices_or_next_token_ids = -future_indices.indices
 
                 if batch.is_spec_v2:
-                    # FIXME(lsyin): tmp code for spec v2
-                    # We only keep future indices for next draft input
-
-                    batch.spec_info = batch_result.next_draft_input
-                    batch.spec_info.future_indices = future_indices
-
-                    # batch.spec_info = EagleDraftInput(
-                    #     future_indices=future_indices,
-                    #     verify_done=batch_result.next_draft_input.verify_done,
-                    # )
-
-                    # The future value, usually for next batch preparation
-                    # Current implementation strictly synchronizes the seq_lens
-                    batch.seq_lens = batch_result.next_draft_input.new_seq_lens
+                    self._prepare_spec_v2_overlap_state(
+                        batch, batch_result, future_indices
+                    )
             elif self.enable_pdmux and batch.forward_mode.is_split_prefill():
                 batch_result = self.tp_worker.forward_batch_split_prefill(batch)
                 future_indices_or_next_token_ids = batch_result.next_token_ids
@@ -2754,7 +2845,7 @@ class Scheduler(
             self.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
             # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
             if self.disaggregation_mode == DisaggregationMode.DECODE:
-                release_kv_cache(req, self.tree_cache)
+                self._release_kv_cache_and_draft(req)
             # For disaggregation prefill mode, free the metadata buffer index
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 release_req_to_metadata_buffer(
@@ -2766,7 +2857,7 @@ class Scheduler(
                 req.mamba_pool_idx is not None
                 and self.disaggregation_mode != DisaggregationMode.DECODE
             ):
-                release_kv_cache(req, self.tree_cache, is_insert=False)
+                self._release_kv_cache_and_draft(req, is_insert=False)
             logger.debug(f"Abort queued request. {req.rid=}")
 
         # Delete the requests in the grammar queue
@@ -3125,6 +3216,25 @@ def run_scheduler_process(
             thread_label = "Decode Scheduler"
         trace_set_thread_info(thread_label, tp_rank, dp_rank)
 
+    def _write_scheduler_exception_dump(traceback_text: str) -> str:
+        dump_name = (
+            f"sglang_scheduler_exception_gpu{gpu_id}_tp{tp_rank}_pp{pp_rank}_"
+            f"dp{dp_rank if dp_rank is not None else 'na'}_{int(time.time())}.log"
+        )
+        dump_path = os.path.join("/tmp", dump_name)
+        try:
+            with open(dump_path, "w", encoding="utf-8") as fp:
+                fp.write(traceback_text)
+                if not traceback_text.endswith("\n"):
+                    fp.write("\n")
+                fp.flush()
+                os.fsync(fp.fileno())
+        except Exception:
+            return ""
+        return dump_path
+
+    ready_sent = False
+
     # Create a scheduler and run the event loop
     try:
         scheduler = Scheduler(
@@ -3157,6 +3267,7 @@ def run_scheduler_process(
             )
 
         pipe_writer.send(result_dict)
+        ready_sent = True
 
         # Dispatch to the appropriate event loop based on the disaggregation mode
         disaggregation_mode: DisaggregationMode = scheduler.disaggregation_mode
@@ -3187,5 +3298,29 @@ def run_scheduler_process(
 
     except Exception:
         traceback = get_exception_traceback()
+        dump_path = _write_scheduler_exception_dump(traceback)
         logger.error(f"Scheduler hit an exception: {traceback}")
+        if dump_path:
+            logger.error(f"Scheduler exception dump written to: {dump_path}")
+            print(
+                f"[Scheduler] exception dump written to: {dump_path}",
+                file=sys.stderr,
+                flush=True,
+            )
+        if not ready_sent:
+            try:
+                pipe_writer.send(
+                    {
+                        "status": "error",
+                        "traceback": traceback,
+                        "traceback_path": dump_path,
+                        "tp_rank": tp_rank,
+                        "gpu_id": gpu_id,
+                    }
+                )
+                pipe_writer.close()
+                time.sleep(0.2)
+                raise SystemExit(1)
+            except Exception:
+                pass
         parent_process.send_signal(signal.SIGQUIT)
