@@ -465,7 +465,6 @@ def _extract_request_metrics(
         "spec_dflash_q_max_min_first",
         "spec_dflash_q_ent_mean_first",
         "spec_dflash_adaptive_temp_mul",
-        "spec_dflash_pq_disabled_rounds_left",
     )
     rows: list[dict[str, Any]] = []
     row_count = max(
@@ -548,7 +547,6 @@ def _aggregate_request_metrics(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "spec_dflash_q_max_min_first",
         "spec_dflash_q_ent_mean_first",
         "spec_dflash_adaptive_temp_mul",
-        "spec_dflash_pq_disabled_rounds_left",
     )
     out: dict[str, Any] = {}
     for key in numeric_keys:

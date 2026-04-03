@@ -262,20 +262,18 @@ class DFlashTreeWorker:
                 "falling back to 'flashinfer'."
             )
             draft_backend = "flashinfer"
+        elif draft_backend == "fa4":
+            logger.warning(
+                "DFLASH_TREE draft worker pins attention_backend='fa4' to 'fa3' for the stable production contract."
+            )
+            draft_backend = "fa3"
         elif draft_backend not in (
             "flashinfer",
             "fa3",
             "fa4",
-            "flex_attention",
-            "flex_attention2",
-            "flex_flash",
-            "flex_flash2",
-            "flex_flash2_delegate_fa3",
-            "flex_flash4",
         ):
             logger.warning(
-                "DFLASH_TREE draft worker only supports attention_backend in {'flashinfer', 'fa3', 'fa4', 'flex_attention', 'flex_attention2', 'flex_flash', 'flex_flash2', 'flex_flash2_delegate_fa3', 'flex_flash4'} for now, "
-                "but got %r. Falling back to 'flashinfer'.",
+                "DFLASH_TREE draft worker only supports attention_backend in {'flashinfer', 'fa3', 'fa4'} for now, but got %r. Falling back to 'flashinfer'.",
                 draft_backend,
             )
             draft_backend = "flashinfer"
@@ -464,6 +462,34 @@ class DFlashTreeWorker:
         # set_embed() flips requires_input_embeds.
         model_runner.init_device_graphs()
         model_runner.init_piecewise_cuda_graphs()
+
+    @contextlib.contextmanager
+    def _target_plain_runtime_scope(self):
+        use_plain_target_runtime = (
+            os.environ.get("SGLANG_DFLASH_TARGET_RUNTIME_PLAIN") or ""
+        ).strip().lower() in ("1", "true", "yes", "on")
+        if not use_plain_target_runtime:
+            yield
+            return
+
+        prev_enable_spec = self.target_worker.enable_spec
+        prev_runner_spec_algorithm = self.target_worker.model_runner.spec_algorithm
+        prev_runner_server_spec_algorithm = (
+            self.target_worker.model_runner.server_args.speculative_algorithm
+        )
+        self.target_worker.enable_spec = False
+        self.target_worker.model_runner.spec_algorithm = SpeculativeAlgorithm.NONE
+        self.target_worker.model_runner.server_args.speculative_algorithm = None
+        try:
+            yield
+        finally:
+            self.target_worker.enable_spec = prev_enable_spec
+            self.target_worker.model_runner.spec_algorithm = (
+                prev_runner_spec_algorithm
+            )
+            self.target_worker.model_runner.server_args.speculative_algorithm = (
+                prev_runner_server_spec_algorithm
+            )
 
     def _init_fused_kv_helper(self) -> None:
         try:
@@ -2243,16 +2269,36 @@ class DFlashTreeWorker:
             model_worker_batch = self._coerce_model_worker_batch(
                 batch, overlap_v2=overlap_v2
             )
-            model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
-
-            batch_result = self.target_worker.forward_batch_generation(
-                model_worker_batch, **kwargs
+            prefill_plain_target = (
+                os.environ.get("SGLANG_DFLASH_PREFILL_PLAIN_TARGET") or ""
+            ).strip().lower() in ("1", "true", "yes", "on")
+            prefill_skip_append = (
+                os.environ.get("SGLANG_DFLASH_PREFILL_SKIP_APPEND") or ""
+            ).strip().lower() in ("1", "true", "yes", "on")
+            model_worker_batch.capture_hidden_mode = (
+                CaptureHiddenMode.NULL
+                if prefill_plain_target
+                else CaptureHiddenMode.FULL
             )
+            orig_prefill_spec_algorithm = model_worker_batch.spec_algorithm
+            orig_prefill_spec_info = model_worker_batch.spec_info
+            if prefill_plain_target:
+                # Keep the clean target stack untouched and use the runtime's plain-target
+                # prefill contract instead of requiring a DFlash-specific model hook.
+                model_worker_batch.spec_algorithm = SpeculativeAlgorithm.NONE
+                model_worker_batch.spec_info = None
+            with self._target_plain_runtime_scope():
+                batch_result = self.target_worker.forward_batch_generation(
+                    model_worker_batch, **kwargs
+                )
+            if prefill_plain_target:
+                model_worker_batch.spec_algorithm = orig_prefill_spec_algorithm
+                model_worker_batch.spec_info = orig_prefill_spec_info
             logits_output, next_token_ids = (
                 batch_result.logits_output,
                 batch_result.next_token_ids,
             )
-            if logits_output.hidden_states is None:
+            if logits_output.hidden_states is None and not prefill_plain_target:
                 raise RuntimeError(
                     "DFLASH_TREE requires target aux hidden capture for prefill, but got None."
                 )
@@ -2277,12 +2323,28 @@ class DFlashTreeWorker:
             draft_input = DFlashDraftInput(
                 verified_id=next_token_ids.to(torch.int64),
                 target_hidden=logits_output.hidden_states,
-                ctx_lens=_to_int32_device_tensor(model_worker_batch.extend_seq_lens),
-                draft_seq_lens=_to_int32_device_tensor(
-                    model_worker_batch.extend_prefix_lens
+                ctx_lens=(
+                    torch.zeros(
+                        (batch.batch_size(),), dtype=torch.int32, device=next_token_ids.device
+                    )
+                    if prefill_plain_target
+                    else _to_int32_device_tensor(model_worker_batch.extend_seq_lens)
+                ),
+                draft_seq_lens=(
+                    _to_int32_device_tensor(model_worker_batch.extend_seq_lens)
+                    if prefill_plain_target
+                    else _to_int32_device_tensor(model_worker_batch.extend_prefix_lens)
                 ),
             )
-            self._append_target_hidden_to_draft_kv(batch, draft_input)
+            if prefill_plain_target:
+                draft_input.new_seq_lens = draft_input.draft_seq_lens.clone()
+            elif prefill_skip_append:
+                draft_input.draft_seq_lens = draft_input.draft_seq_lens + draft_input.ctx_lens
+                draft_input.new_seq_lens = draft_input.draft_seq_lens.clone()
+                draft_input.ctx_lens.zero_()
+                draft_input.target_hidden = draft_input.target_hidden[:0]
+            else:
+                self._append_target_hidden_to_draft_kv(batch, draft_input)
             batch.spec_info = draft_input
             if isinstance(batch, ScheduleBatch):
                 for req, draft_len in zip(batch.reqs, batch.seq_lens_cpu, strict=True):

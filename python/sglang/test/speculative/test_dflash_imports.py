@@ -38,5 +38,4 @@ class TestDflashImportRobustness(unittest.TestCase):
         ServerArgs.add_cli_args(parser)
         action = parser._option_string_actions["--speculative-dflash-verify-mode"]
         self.assertIn("target_only", action.choices)
-        self.assertIn("pq", action.choices)
         self.assertEqual("target_only", action.default)

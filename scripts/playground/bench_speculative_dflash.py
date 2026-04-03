@@ -20,9 +20,9 @@ Example (short smoke):
   python3 bench_speculative_dflash.py \
     --model-path /path/to/gpt-oss-120b \
     --speculative-draft-model-path /path/to/dflash-draft-ckpt \
-    --prefill-attention-backend fa4 \
-    --decode-attention-backend flex_flash4 \
-    --speculative-draft-attention-backend fa4 \
+    --prefill-attention-backend fa3 \
+    --decode-attention-backend fa3 \
+    --speculative-draft-attention-backend fa3 \
     --page-size 128 \
     --context-length 131072 \
     --tp-size 1 \
@@ -326,20 +326,14 @@ def _launch_and_bench(
     decode_len: int,
 ) -> Dict[str, Any]:
     env = {"SGLANG_RECORD_STEP_TIME": "1", **os.environ}
-    backends = {
-        str(getattr(server_args, "attention_backend", "") or ""),
-        str(getattr(server_args, "prefill_attention_backend", "") or ""),
-        str(getattr(server_args, "decode_attention_backend", "") or ""),
-        str(getattr(server_args, "speculative_draft_attention_backend", "") or ""),
-    }
-    if "fa4" in backends or "flex_flash4" in backends:
-        env["SGLANG_FA4_PREFER_HOPPER_FLASH_ATTN"] = "1"
-    if "flex_flash4" in backends:
-        env["SGLANG_FLEX_FLASH4_DELEGATE_FULL_DECODE"] = "1"
-        env["SGLANG_FLEX_FLASH4_DELEGATE_FULL_EXTEND"] = "1"
-        env["SGLANG_FLEX_FLASH4_DELEGATE_SLIDING_DECODE"] = "1"
-        env["SGLANG_FLEX_FLASH4_DELEGATE_SLIDING_EXTEND"] = "1"
-        env["SGLANG_FLEX_FLASH4_DELEGATE_QUANTIZED_KV"] = "1"
+    for attr in (
+        "attention_backend",
+        "prefill_attention_backend",
+        "decode_attention_backend",
+        "speculative_draft_attention_backend",
+    ):
+        if getattr(server_args, attr, None) == "fa4":
+            setattr(server_args, attr, "fa3")
     process = popen_launch_server(
         args.model_path,
         base_url,

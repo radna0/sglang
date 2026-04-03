@@ -542,42 +542,19 @@ class DFlashWorker:
                 "falling back to 'flashinfer'."
             )
             draft_backend = "flashinfer"
-
-        elif draft_backend in ("flex_flash4",):
-            # FlexFlash4 is a Hopper-first decode backend; draft proposal quality depends on
-            # matching the target distribution as closely as possible. In practice, using
-            # FlexFlash4 for the *draft worker* has shown severe acceptance collapse for GPT-OSS
-            # DFlash (even under deterministic sampling). Keep a safe default and require an
-            # explicit opt-in to use FlexFlash4 on the draft side.
-            allow_flex_draft = (os.environ.get("SGLANG_DFLASH_ALLOW_FLEX_DRAFT") or "").strip().lower() not in (
-                "",
-                "0",
-                "false",
-                "off",
-                "no",
+        elif draft_backend == "fa4":
+            logger.warning(
+                "DFLASH draft worker pins attention_backend='fa4' to 'fa3' for the stable production contract."
             )
-            if not allow_flex_draft:
-                logger.warning(
-                    "DFLASH draft attention_backend=%r is disabled by default (acceptance collapse observed). "
-                    "Falling back to 'fa3'. Set SGLANG_DFLASH_ALLOW_FLEX_DRAFT=1 to force-enable.",
-                    draft_backend,
-                )
-                draft_backend = "fa3"
+            draft_backend = "fa3"
+
         elif draft_backend not in (
             "flashinfer",
             "fa3",
             "fa4",
-            "flex_attention",
-            "flex_attention2",
-            "flex_flash",
-            "flex_flash2",
-            "flex_flash2_delegate_fa3",
-            "flex_flash4",
         ):
             logger.warning(
-                "DFLASH draft worker only supports attention_backend in {'flashinfer', 'fa3', 'fa4', 'flex_attention', 'flex_attention2', 'flex_flash', 'flex_flash2', 'flex_flash2_delegate_fa3', 'flex_flash4'} for now, "
-                "but got %r. Falling back to 'flashinfer'.",
-                supported_draft_backends,
+                "DFLASH draft worker only supports attention_backend in {'flashinfer', 'fa3', 'fa4'} for now, but got %r. Falling back to 'flashinfer'.",
                 draft_backend,
             )
             draft_backend = "flashinfer"
