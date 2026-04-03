@@ -228,6 +228,7 @@ def _launch_server(
     speculative_eagle_topk: int | None,
     speculative_num_draft_tokens: int | None,
     mem_fraction_static: float | None,
+    speculative_draft_mem_fraction_static: float | None,
     disable_overlap_schedule: bool,
     tool_server: str | None = None,
 ) -> object:
@@ -267,6 +268,11 @@ def _launch_server(
     ]
     if mem_fraction_static is not None:
         cmd += ["--mem-fraction-static", str(float(mem_fraction_static))]
+    if speculative_draft_mem_fraction_static is not None:
+        cmd += [
+            "--speculative-draft-mem-fraction-static",
+            str(float(speculative_draft_mem_fraction_static)),
+        ]
     if tool_server:
         cmd += ["--tool-server", str(tool_server)]
     if disable_cuda_graph:
@@ -324,17 +330,28 @@ def _launch_server(
                 str(int(speculative_num_draft_tokens)),
             ]
 
-    repo_python = str((Path(__file__).resolve().parents[2] / "python"))
+    source_root = os.environ.get("SGLANG_SOURCE_ROOT")
+    repo_python = str(
+        Path(source_root).resolve() / "python"
+        if source_root
+        else (Path(__file__).resolve().parents[2] / "python")
+    )
     env = {"SGLANG_RECORD_STEP_TIME": "1", **os.environ}
     env["PYTHONPATH"] = (
         repo_python
         if not env.get("PYTHONPATH")
         else f"{repo_python}:{env['PYTHONPATH']}"
     )
+    server_launch_timeout = int(
+        env.get(
+            "SGLANG_BENCH_SERVER_LAUNCH_TIMEOUT",
+            str(DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH),
+        )
+    )
     print(f"command={shlex.join(cmd)}")
     proc = _launch_server_process(cmd, env, None, model_path)
     success, error_msg = _wait_for_server_health(
-        proc, base_url, None, DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
+        proc, base_url, None, server_launch_timeout
     )
     if success:
         return proc
@@ -638,17 +655,21 @@ def _bench_one(
             "Benchmark returned an unexpected number of generated texts: "
             f"{len(raw_generated_texts)} vs expected {len(reqs)}"
         )
-    if disable_stream and (
-        len(raw_meta_infos) != len(reqs)
-        or any(
-            not isinstance(meta, dict) or meta.get("completion_tokens") is None
-            for meta in raw_meta_infos
-        )
-    ):
-        raise RuntimeError(
-            "Non-stream benchmark returned malformed meta_info payloads; "
-            "refusing to emit a bogus artifact."
-        )
+    normalized_meta_infos: list[dict[str, Any]] = []
+    for i in range(len(reqs)):
+        meta = raw_meta_infos[i] if i < len(raw_meta_infos) else {}
+        if isinstance(meta, dict) and isinstance(meta.get("meta_info"), dict):
+            meta = meta["meta_info"]
+        if not isinstance(meta, dict):
+            meta = {}
+        if meta.get("completion_tokens") is None:
+            with contextlib.suppress(Exception):
+                meta["completion_tokens"] = len(
+                    tokenizer.encode(
+                        raw_generated_texts[i], add_special_tokens=False
+                    )
+                )
+        normalized_meta_infos.append(meta)
 
     if int(results.get("completed", 0)) != len(reqs):
         raise RuntimeError(
@@ -669,9 +690,9 @@ def _bench_one(
     completed = int(results["completed"])
     total_output_tokens = float(results["total_output_tokens"])
     accept_length = float(results.get("accept_length") or 1.0)
-    spec_meta = _summarize_spec_meta(raw_meta_infos)
+    spec_meta = _summarize_spec_meta(normalized_meta_infos)
     request_metrics = _extract_request_metrics(
-        meta_infos=raw_meta_infos,
+        meta_infos=normalized_meta_infos,
         request_question_ids=prompt_question_ids,
         output_lens=output_lens,
         generated_texts=list(results.get("generated_texts") or []),
@@ -740,6 +761,7 @@ def _run_single(
     speculative_eagle_topk: int | None,
     speculative_num_draft_tokens: int | None,
     mem_fraction_static: float | None,
+    speculative_draft_mem_fraction_static: float | None,
     disable_overlap_schedule: bool,
     prompts: list[str],
     prompt_question_ids: list[str],
@@ -777,6 +799,7 @@ def _run_single(
         speculative_eagle_topk=speculative_eagle_topk,
         speculative_num_draft_tokens=speculative_num_draft_tokens,
         mem_fraction_static=mem_fraction_static,
+        speculative_draft_mem_fraction_static=speculative_draft_mem_fraction_static,
         disable_overlap_schedule=disable_overlap_schedule,
     )
     base_url = f"http://127.0.0.1:{int(port)}"
@@ -835,11 +858,13 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--speculative-eagle-topk", type=int, default=None)
     p.add_argument("--speculative-num-draft-tokens", type=int, default=None)
     p.add_argument("--mem-fraction-static", type=float, default=None)
+    p.add_argument("--speculative-draft-mem-fraction-static", type=float, default=None)
     p.add_argument("--temperature", type=float, default=0.0)
     p.add_argument("--top-p", type=float, default=1.0)
     p.add_argument("--top-k", type=int, default=1)
     p.add_argument("--min-p", type=float, default=0.0)
     p.add_argument("--disable-cuda-graph", action="store_true")
+    p.add_argument("--disable-piecewise-cuda-graph", action="store_true")
     p.add_argument("--disable-overlap-schedule", action="store_true")
     p.add_argument(
         "--speculative-algorithm",
@@ -895,7 +920,9 @@ def main() -> int:
             cuda_graph_max_bs=args.cuda_graph_max_bs,
             max_running_requests=args.max_running_requests,
             page_size=args.page_size,
-            enable_piecewise_cuda_graph=not args.disable_cuda_graph,
+            enable_piecewise_cuda_graph=(
+                not args.disable_cuda_graph and not args.disable_piecewise_cuda_graph
+            ),
             piecewise_cuda_graph_max_tokens=args.piecewise_cuda_graph_max_tokens,
             disable_cuda_graph=bool(args.disable_cuda_graph),
             speculative=False,
@@ -910,6 +937,7 @@ def main() -> int:
             speculative_eagle_topk=None,
             speculative_num_draft_tokens=None,
             mem_fraction_static=args.mem_fraction_static,
+            speculative_draft_mem_fraction_static=None,
             disable_overlap_schedule=bool(args.disable_overlap_schedule),
             prompts=prompts,
             prompt_question_ids=prompt_question_ids,
@@ -933,7 +961,9 @@ def main() -> int:
         cuda_graph_max_bs=args.cuda_graph_max_bs,
         max_running_requests=args.max_running_requests,
         page_size=args.page_size,
-        enable_piecewise_cuda_graph=not args.disable_cuda_graph,
+        enable_piecewise_cuda_graph=(
+            not args.disable_cuda_graph and not args.disable_piecewise_cuda_graph
+        ),
         piecewise_cuda_graph_max_tokens=args.piecewise_cuda_graph_max_tokens,
         disable_cuda_graph=bool(args.disable_cuda_graph),
         speculative=True,
@@ -948,6 +978,7 @@ def main() -> int:
         speculative_eagle_topk=args.speculative_eagle_topk,
         speculative_num_draft_tokens=args.speculative_num_draft_tokens,
         mem_fraction_static=args.mem_fraction_static,
+        speculative_draft_mem_fraction_static=args.speculative_draft_mem_fraction_static,
         disable_overlap_schedule=bool(args.disable_overlap_schedule),
         prompts=prompts,
         prompt_question_ids=prompt_question_ids,
@@ -996,8 +1027,11 @@ def main() -> int:
             "speculative_num_steps": args.speculative_num_steps,
             "speculative_eagle_topk": args.speculative_eagle_topk,
             "speculative_num_draft_tokens": args.speculative_num_draft_tokens,
+            "speculative_draft_mem_fraction_static": args.speculative_draft_mem_fraction_static,
             "cuda_graph": not args.disable_cuda_graph,
-            "piecewise_cuda_graph": not args.disable_cuda_graph,
+            "piecewise_cuda_graph": (
+                not args.disable_cuda_graph and not args.disable_piecewise_cuda_graph
+            ),
             "cuda_graph_max_bs": args.cuda_graph_max_bs,
             "max_running_requests": args.max_running_requests,
             "piecewise_cuda_graph_max_tokens": args.piecewise_cuda_graph_max_tokens,

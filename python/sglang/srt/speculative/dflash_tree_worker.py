@@ -11,6 +11,10 @@ import torch.nn.functional as F
 
 from sglang.srt.environ import envs
 from sglang.srt.distributed import get_tp_group
+from sglang.srt.layers.moe.utils import (
+    speculative_moe_a2a_backend_context,
+    speculative_moe_backend_context,
+)
 from sglang.srt.layers.sampler import apply_custom_logit_processor
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
@@ -29,9 +33,11 @@ from sglang.srt.speculative.dflash_utils import (
     apply_dflash_shared_pool_verify_append,
     apply_dflash_commit_mapping_updates,
     apply_dflash_indexed_cache_plan,
+    apply_dflash_target_only_cache_plan,
     apply_dflash_target_only_req_kv_accounting,
     build_dflash_tree_candidates_from_per_step_topk,
     build_dflash_indexed_cache_plan,
+    build_dflash_target_only_cache_plan,
     can_dflash_use_fused_qkv_proj,
     commit_dflash_proposed_tokens_to_req,
     commit_dflash_target_only_batch,
@@ -42,6 +48,7 @@ from sglang.srt.speculative.dflash_utils import (
     resolve_dflash_mask_token,
     resolve_dflash_mask_token_id,
     resolve_dflash_indexed_accept_indices,
+    rebuild_dflash_tree_predict_from_accept_index,
     sample_dflash_tree_branch_candidates_from_support,
     snapshot_dflash_request_sampling_params,
     update_dflash_req_verify_bookkeeping,
@@ -161,6 +168,19 @@ class DFlashTreeWorker:
             .lower()
             in ("1", "true", "yes", "on")
         )
+        self._enable_experimental_draft_fastpath = (
+            (os.environ.get("SGLANG_DFLASH_TREE_ENABLE_EXPERIMENTAL_DRAFT_FASTPATH") or "")
+            .strip()
+            .lower()
+            in ("1", "true", "yes", "on")
+        )
+        # Official DFLASH production design reuses the draft worker's fixed-size
+        # TARGET_VERIFY graphs. The dedicated DFLASH_TREE draft graph runner is an
+        # experimental branch-only optimization and must stay opt-in.
+        self._disable_draft_tree_fastpath = (
+            self._disable_draft_tree_fastpath
+            or not self._enable_experimental_draft_fastpath
+        )
         self._force_explicit_input_embeds = (
             (os.environ.get("SGLANG_DFLASH_TREE_FORCE_EXPLICIT_INPUT_EMBEDS") or "")
             .strip()
@@ -203,6 +223,23 @@ class DFlashTreeWorker:
             .lower()
             in ("1", "true", "yes", "on")
         )
+        self._compare_greedy_verify = (
+            (os.environ.get("SGLANG_DFLASH_TREE_COMPARE_GREEDY_VERIFY") or "")
+            .strip()
+            .lower()
+            in ("1", "true", "yes", "on")
+        )
+        try:
+            self._debug_accept_trace_remaining = max(
+                0,
+                int(
+                    (os.environ.get("SGLANG_DFLASH_TREE_DEBUG_ACCEPT_TRACE") or "0")
+                    .strip()
+                    or "0"
+                ),
+            )
+        except Exception:
+            self._debug_accept_trace_remaining = 0
 
         # Draft runner (separate KV cache + attention backend).
         # Share req_to_token_pool + token_to_kv_pool_allocator with the target worker (EAGLE3-style),
@@ -264,26 +301,41 @@ class DFlashTreeWorker:
         draft_server_args.speculative_num_steps = 1
         draft_server_args.speculative_eagle_topk = 1
 
-        self.draft_worker = TpModelWorker(
-            server_args=draft_server_args,
-            gpu_id=gpu_id,
-            tp_rank=tp_rank,
-            dp_rank=dp_rank,
-            moe_ep_rank=moe_ep_rank,
-            pp_rank=0,
-            attn_cp_rank=attn_cp_rank,
-            moe_dp_rank=moe_dp_rank,
-            nccl_port=nccl_port,
-            is_draft_worker=True,
-            req_to_token_pool=shared_req_to_token_pool,
-            token_to_kv_pool_allocator=shared_token_to_kv_pool_allocator,
-        )
+        with (
+            contextlib.nullcontext(),
+            speculative_moe_backend_context(),
+            speculative_moe_a2a_backend_context(),
+        ):
+            self.draft_worker = TpModelWorker(
+                server_args=draft_server_args,
+                gpu_id=gpu_id,
+                tp_rank=tp_rank,
+                dp_rank=dp_rank,
+                moe_ep_rank=moe_ep_rank,
+                pp_rank=0,
+                attn_cp_rank=attn_cp_rank,
+                moe_dp_rank=moe_dp_rank,
+                nccl_port=nccl_port,
+                is_draft_worker=True,
+                req_to_token_pool=shared_req_to_token_pool,
+                token_to_kv_pool_allocator=shared_token_to_kv_pool_allocator,
+            )
         self.draft_model_runner = self.draft_worker.model_runner
         self.draft_model = self.draft_model_runner.model
-        if hasattr(self.draft_model, "set_embed"):
+        # DFlash draft checkpoints are defined without their own embedding table and
+        # are expected to borrow the target embedding when we are not forcing the
+        # legacy explicit-input-embeds path.
+        if (
+            not self._force_explicit_input_embeds
+            and hasattr(self.draft_model, "set_embed")
+            and bool(
+            getattr(self.draft_model, "requires_input_embeds", False)
+            )
+        ):
             self.draft_model.set_embed(
                 self.target_worker.model_runner.model.get_input_embeddings()
             )
+            self._refresh_draft_graphs_after_embed_swap()
 
         self._mask_token = resolve_dflash_mask_token(
             draft_hf_config=self.draft_model_runner.model_config.hf_config
@@ -328,7 +380,9 @@ class DFlashTreeWorker:
                 )
             if self._disable_draft_tree_fastpath:
                 logger.info(
-                    "DFLASH_TREE dedicated draft fast path disabled via SGLANG_DFLASH_TREE_DISABLE_DRAFT_FASTPATH=1"
+                    "DFLASH_TREE using official draft-worker TARGET_VERIFY graph reuse path. "
+                    "Dedicated draft fast path is experimental and disabled by default; "
+                    "set SGLANG_DFLASH_TREE_ENABLE_EXPERIMENTAL_DRAFT_FASTPATH=1 to enable it."
                 )
             if self._use_safe_greedy_verify:
                 logger.info(
@@ -342,6 +396,10 @@ class DFlashTreeWorker:
             if self._assert_builder_equiv:
                 logger.info(
                     "DFLASH_TREE asserting optimized tree-builder equivalence against legacy builder via SGLANG_DFLASH_TREE_ASSERT_BUILDER_EQUIV=1"
+                )
+            if self._compare_greedy_verify:
+                logger.info(
+                    "DFLASH_TREE will compare GPU greedy verify against the CPU fallback via SGLANG_DFLASH_TREE_COMPARE_GREEDY_VERIFY=1"
                 )
 
         self._block_pos_offsets = torch.arange(
@@ -397,6 +455,15 @@ class DFlashTreeWorker:
         self._fused_kv_helper: Optional[object] = None
         if self._use_fused_kv_materialize:
             self._init_fused_kv_helper()
+
+    def _refresh_draft_graphs_after_embed_swap(self) -> None:
+        model_runner = self.draft_model_runner
+        # The draft worker is initialized before DFLASH_TREE decides whether to
+        # stay on explicit input_embeds or switch to shared target embeddings.
+        # Rebuild the generic graph runners on the live model contract after
+        # set_embed() flips requires_input_embeds.
+        model_runner.init_device_graphs()
+        model_runner.init_piecewise_cuda_graphs()
 
     def _init_fused_kv_helper(self) -> None:
         try:
@@ -744,7 +811,12 @@ class DFlashTreeWorker:
             if local_only_fast_path:
                 logits = torch.matmul(hs, weight[:num_org].T)
                 k_local = min(int(topk), int(num_org))
-                local_vals, local_ids = torch.topk(logits, k=k_local, dim=-1)
+                if k_local == 1:
+                    local_vals, local_ids = torch.max(
+                        logits, dim=-1, keepdim=True
+                    )
+                else:
+                    local_vals, local_ids = torch.topk(logits, k=k_local, dim=-1)
                 local_vals = local_vals.to(torch.float32)
                 local_ids = local_ids.to(torch.int64)
                 if k_local < int(topk):
@@ -760,9 +832,12 @@ class DFlashTreeWorker:
                     )
                     local_vals = torch.cat([local_vals, pad_vals], dim=1)
                     local_ids = torch.cat([local_ids, pad_ids], dim=1)
-                out_p[start:end].copy_(
-                    local_vals if return_logits else torch.softmax(local_vals, dim=1)
-                )
+                if return_logits:
+                    out_p[start:end].copy_(local_vals)
+                elif int(topk) == 1:
+                    out_p[start:end].fill_(1.0)
+                else:
+                    out_p[start:end].copy_(torch.softmax(local_vals, dim=1))
                 out_ids[start:end].copy_(local_ids)
                 continue
 
@@ -772,7 +847,12 @@ class DFlashTreeWorker:
             if num_org > 0:
                 base_logits = torch.matmul(hs, weight[:num_org].T)
                 k_base = min(int(topk), int(num_org))
-                base_vals, base_idx = torch.topk(base_logits, k=k_base, dim=-1)
+                if k_base == 1:
+                    base_vals, base_idx = torch.max(
+                        base_logits, dim=-1, keepdim=True
+                    )
+                else:
+                    base_vals, base_idx = torch.topk(base_logits, k=k_base, dim=-1)
                 local_vals_list.append(base_vals)
                 local_ids_list.append(base_idx.to(torch.int64) + org_vocab_start)
 
@@ -780,7 +860,12 @@ class DFlashTreeWorker:
                 added_weight = weight[num_org_padded : num_org_padded + num_added]
                 added_logits = torch.matmul(hs, added_weight.T)
                 k_added = min(int(topk), int(num_added))
-                added_vals, added_idx = torch.topk(added_logits, k=k_added, dim=-1)
+                if k_added == 1:
+                    added_vals, added_idx = torch.max(
+                        added_logits, dim=-1, keepdim=True
+                    )
+                else:
+                    added_vals, added_idx = torch.topk(added_logits, k=k_added, dim=-1)
                 local_vals_list.append(added_vals)
                 local_ids_list.append(added_idx.to(torch.int64) + added_vocab_start)
 
@@ -828,9 +913,12 @@ class DFlashTreeWorker:
                 global_vals = local_vals.to(torch.float32)
                 global_ids = local_ids
 
-            out_p[start:end].copy_(
-                global_vals if return_logits else torch.softmax(global_vals, dim=1)
-            )
+            if return_logits:
+                out_p[start:end].copy_(global_vals)
+            elif int(topk) == 1:
+                out_p[start:end].fill_(1.0)
+            else:
+                out_p[start:end].copy_(torch.softmax(global_vals, dim=1))
             out_ids[start:end].copy_(global_ids)
 
         return out_p, out_ids
@@ -976,7 +1064,6 @@ class DFlashTreeWorker:
             )
         if (
             self._draft_tree_cuda_graph_runner is not None
-            and forward_batch.input_embeds is None
             and self._draft_tree_cuda_graph_runner.can_run(forward_batch)
         ):
             return self._draft_tree_cuda_graph_runner.replay(forward_batch)
@@ -1387,8 +1474,29 @@ class DFlashTreeWorker:
         bs = batch.batch_size()
         device = self.model_runner.device
 
+        debug_sync_prep = (
+            (os.environ.get("SGLANG_DFLASH_TREE_DEBUG_PREP_SYNC") or "")
+            .strip()
+            .lower()
+            not in ("", "0", "false", "off", "no")
+        )
+
+        def _debug_sync(label: str) -> None:
+            if not debug_sync_prep or not torch.cuda.is_available():
+                return
+            try:
+                torch.cuda.synchronize(device)
+            except Exception as e:
+                raise RuntimeError(
+                    "DFLASH_TREE prepare_for_speculative_decoding failed after "
+                    f"{label}: bs={int(bs)} block_size={int(self.block_size)} "
+                    f"spec_steps={int(self.spec_steps)} topk={int(self.topk)} "
+                    f"num_verify_tokens={int(self.num_verify_tokens)}"
+                ) from e
+
         # 1) Append any newly committed tokens into the draft KV cache.
         self._append_target_hidden_to_draft_kv(batch, draft_input)
+        _debug_sync("append_target_hidden_to_draft_kv")
 
         target_model = self.target_worker.model_runner.model
         embed_module = None
@@ -1541,6 +1649,7 @@ class DFlashTreeWorker:
                 bs=bs,
                 batch=batch,
             )
+        _debug_sync("draft_tree_build_candidates")
 
         step_count = int(self.spec_steps)
         if step_count <= 0 or step_count >= int(self.block_size):
@@ -1577,6 +1686,7 @@ class DFlashTreeWorker:
             tree_mask_buf,
             position_buf,
         )
+        _debug_sync("build_tree_kernel_efficient")
 
         (
             sampling_temperatures,
@@ -1604,7 +1714,7 @@ class DFlashTreeWorker:
             sampling_top_ks=sampling_top_ks,
             sampling_min_ps=sampling_min_ps,
         )
-        if self._use_safe_greedy_verify:
+        if self._use_safe_greedy_verify or self._compare_greedy_verify:
             verify_input._dflash_tree_candidates_cpu = (
                 verify_tokens_flat.reshape(bs, self.num_verify_tokens)
                 .detach()
@@ -1625,12 +1735,16 @@ class DFlashTreeWorker:
             )
         batch.spec_info = verify_input
         batch.return_hidden_states = False
+        batch.return_hidden_states_before_norm = bool(
+            self._use_safe_greedy_verify and self._safe_greedy_from_hidden
+        )
         batch.forward_mode = (
             ForwardMode.TARGET_VERIFY
             if not batch.forward_mode.is_idle()
             else ForwardMode.IDLE
         )
         if not overlap_v2:
+            _debug_sync("prepare_for_verify_entry")
             verify_input.prepare_for_verify(batch, self.page_size)
         return None, None
 
@@ -1734,56 +1848,93 @@ class DFlashTreeWorker:
         )
         accept_token_num = torch.empty((bs,), dtype=torch.int32, device=batch.device)
 
-        if is_all_greedy or not TREE_SPEC_KERNEL_AVAILABLE:
-            if self._use_safe_greedy_verify:
-                if (
-                    self._safe_greedy_from_hidden
-                    and (
-                        getattr(logits_output, "_dflash_final_hidden_states", None)
-                        is not None
-                        or (
-                            logits_output.hidden_states is not None
-                            and logits_output.hidden_states.numel() > 0
-                        )
-                    )
-                ):
-                    target_model = self.target_worker.model_runner.model
-                    lm_head = getattr(target_model, "lm_head", None)
-                    if lm_head is None:
-                        raise RuntimeError(
-                            "DFLASH_TREE safe greedy-from-hidden verify requires the "
-                            "target model to expose `lm_head`."
-                        )
-                    final_hidden_states = getattr(
-                        logits_output, "_dflash_final_hidden_states", None
-                    )
-                    hidden_for_logits = (
-                        final_hidden_states
-                        if final_hidden_states is not None
-                        else logits_output.hidden_states
-                    )
-                    # The graph-backed target-verify path can hand us a replay-owned view.
-                    # Make the safe debug lane fully own a stable copy before reading LM-head
-                    # logits so we can distinguish lifetime issues from tree semantics bugs.
-                    hidden_for_logits = hidden_for_logits.detach().clone()
+        def _compute_greedy_target_predict() -> tuple[torch.Tensor, str, dict[str, int | None]]:
+            target_model = self.target_worker.model_runner.model
+            lm_head = getattr(target_model, "lm_head", None)
+            debug_info: dict[str, int | None] = {
+                "hidden_dim": None,
+                "lm_head_input_dim": None,
+                "final_hidden_dim": None,
+            }
+            if lm_head is not None:
+                final_hidden_states = getattr(
+                    logits_output, "_dflash_final_hidden_states", None
+                )
+                if final_hidden_states is not None and final_hidden_states.ndim >= 2:
+                    debug_info["final_hidden_dim"] = int(final_hidden_states.shape[-1])
+                hidden_for_logits = (
+                    final_hidden_states
+                    if final_hidden_states is not None
+                    else logits_output.hidden_states
+                )
+                if hidden_for_logits is not None and hidden_for_logits.ndim >= 2:
+                    debug_info["hidden_dim"] = int(hidden_for_logits.shape[-1])
+                lm_head_input_dim = None
+                if hasattr(lm_head, "weight") and lm_head.weight is not None:
+                    lm_head_input_dim = int(lm_head.weight.shape[-1])
+                    debug_info["lm_head_input_dim"] = lm_head_input_dim
+                can_use_hidden_logits = (
+                    hidden_for_logits is not None
+                    and hidden_for_logits.numel() > 0
+                    and lm_head_input_dim is not None
+                    and int(hidden_for_logits.shape[-1]) == lm_head_input_dim
+                )
+                if can_use_hidden_logits:
                     _, target_predict = self._topk_from_vocab_parallel_head(
                         hidden_states=hidden_for_logits,
                         lm_head=lm_head,
                         topk=1,
                         return_logits=True,
                     )
-                    target_predict_cpu = (
-                        target_predict.reshape(bs, verify_input.draft_token_num)
-                        .detach()
-                        .to("cpu", dtype=torch.int64, non_blocking=False)
+                    return (
+                        target_predict.reshape(bs, verify_input.draft_token_num),
+                        "hidden",
+                        debug_info,
                     )
-                else:
-                    target_predict_cpu = (
-                        torch.argmax(logits_output.next_token_logits, dim=-1)
-                        .reshape(bs, verify_input.draft_token_num)
-                        .detach()
-                        .to("cpu", dtype=torch.int64, non_blocking=False)
+
+            return (
+                torch.argmax(logits_output.next_token_logits, dim=-1).reshape(
+                    bs, verify_input.draft_token_num
+                ),
+                "logits",
+                debug_info,
+            )
+
+        if is_all_greedy or not TREE_SPEC_KERNEL_AVAILABLE:
+            if self._use_safe_greedy_verify:
+                target_predict_tensor, target_predict_source, target_predict_debug = (
+                    _compute_greedy_target_predict()
+                )
+                if self._debug_accept_trace_remaining > 0 and self.tp_rank == 0:
+                    first_draft = (
+                        candidates[:, 1]
+                        if candidates.shape[1] > 1
+                        else candidates[:, 0]
                     )
+                    first_target = target_predict_tensor[:, 0]
+                    first_match = float(
+                        (first_draft == first_target)
+                        .to(torch.float32)
+                        .mean()
+                        .item()
+                    )
+                    logger.info(
+                        "DFLASH_TREE accept trace: source=%s hidden_dim=%s final_hidden_dim=%s lm_head_in=%s first_match=%.4f first_draft=%s first_target=%s root=%s",
+                        target_predict_source,
+                        target_predict_debug["hidden_dim"],
+                        target_predict_debug["final_hidden_dim"],
+                        target_predict_debug["lm_head_input_dim"],
+                        first_match,
+                        first_draft.detach().to("cpu", non_blocking=False).tolist(),
+                        first_target.detach().to("cpu", non_blocking=False).tolist(),
+                        candidates[:, 0].detach().to("cpu", non_blocking=False).tolist(),
+                    )
+                    self._debug_accept_trace_remaining -= 1
+                target_predict_cpu = (
+                    target_predict_tensor
+                    .detach()
+                    .to("cpu", dtype=torch.int64, non_blocking=False)
+                )
                 predict, accept_index, accept_token_num = (
                     verify_dflash_tree_greedy_fallback(
                         candidates=getattr(
@@ -1810,9 +1961,11 @@ class DFlashTreeWorker:
                     )
                 )
             else:
-                target_predict = torch.argmax(
-                    logits_output.next_token_logits, dim=-1
-                ).reshape(bs, verify_input.draft_token_num)
+                (
+                    target_predict,
+                    _target_predict_source,
+                    _target_predict_debug,
+                ) = _compute_greedy_target_predict()
                 verify_tree_greedy_func(
                     predicts=predict,
                     accept_index=accept_index,
@@ -1824,6 +1977,54 @@ class DFlashTreeWorker:
                     target_predict=target_predict,
                     topk=int(verify_input.topk),
                 )
+                predict = rebuild_dflash_tree_predict_from_accept_index(
+                    accept_index=accept_index,
+                    candidates=candidates,
+                    retrive_index=verify_input.retrive_index,
+                    target_predict=target_predict,
+                    device=batch.device,
+                )
+                if self._compare_greedy_verify:
+                    ref_predict, ref_accept_index, ref_accept_token_num = (
+                        verify_dflash_tree_greedy_fallback(
+                            candidates=getattr(
+                                verify_input, "_dflash_tree_candidates_cpu", candidates
+                            ),
+                            retrive_index=getattr(
+                                verify_input,
+                                "_dflash_tree_retrive_index_cpu",
+                                verify_input.retrive_index,
+                            ),
+                            retrive_next_token=getattr(
+                                verify_input,
+                                "_dflash_tree_retrive_next_token_cpu",
+                                verify_input.retrive_next_token,
+                            ),
+                            retrive_next_sibling=getattr(
+                                verify_input,
+                                "_dflash_tree_retrive_next_sibling_cpu",
+                                verify_input.retrive_next_sibling,
+                            ),
+                            target_predict=target_predict.detach().to(
+                                "cpu", dtype=torch.int64, non_blocking=False
+                            ),
+                            num_speculative_tokens=int(accept_index.shape[1]),
+                            device=batch.device,
+                        )
+                    )
+                    mismatch = (
+                        not torch.equal(predict, ref_predict)
+                        or not torch.equal(accept_index, ref_accept_index)
+                        or not torch.equal(accept_token_num, ref_accept_token_num)
+                    )
+                    if mismatch:
+                        raise RuntimeError(
+                            "DFLASH_TREE greedy verify mismatch between GPU kernel and CPU fallback. "
+                            f"gpu_accept_index={accept_index.detach().to('cpu').tolist()} "
+                            f"cpu_accept_index={ref_accept_index.detach().to('cpu').tolist()} "
+                            f"gpu_accept_token_num={accept_token_num.detach().to('cpu').tolist()} "
+                            f"cpu_accept_token_num={ref_accept_token_num.detach().to('cpu').tolist()}"
+                        )
         else:
             expanded_temperature = torch.repeat_interleave(
                 temperatures, verify_input.draft_token_num, dim=0
@@ -1981,17 +2182,31 @@ class DFlashTreeWorker:
             accept_index=accept_index,
             commit_lens=commit_lens,
         )
-        cache_plan = build_dflash_indexed_cache_plan(
-            out_cache_loc=batch.out_cache_loc,
-            accepted_indices=accept_index_flat,
-            page_size=int(self.page_size),
-            borrowed_out_cache_loc=bool(overlap_v2),
-        )
-        apply_dflash_indexed_cache_plan(
-            batch=batch,
-            cache_plan=cache_plan,
-            page_size=int(self.page_size),
-        )
+        if overlap_v2:
+            cache_plan = build_dflash_indexed_cache_plan(
+                out_cache_loc=batch.out_cache_loc,
+                accepted_indices=accept_index_flat,
+                page_size=int(self.page_size),
+                borrowed_out_cache_loc=True,
+            )
+            apply_dflash_indexed_cache_plan(
+                batch=batch,
+                cache_plan=cache_plan,
+                page_size=int(self.page_size),
+            )
+        else:
+            cache_plan = build_dflash_target_only_cache_plan(
+                out_cache_loc=batch.out_cache_loc,
+                commit_lens=commit_lens,
+                seq_lens=batch.seq_lens,
+                draft_token_num=int(verify_input.draft_token_num),
+                page_size=int(self.page_size),
+            )
+            apply_dflash_target_only_cache_plan(
+                batch=batch,
+                cache_plan=cache_plan,
+                page_size=int(self.page_size),
+            )
 
         apply_dflash_target_only_req_kv_accounting(
             reqs=batch.reqs,

@@ -20,6 +20,7 @@ import signal
 import sys
 import time
 from collections import deque
+from copy import deepcopy
 from dataclasses import dataclass
 from http import HTTPStatus
 from typing import Any, Deque, Dict, List, Optional, Tuple, Union
@@ -518,8 +519,26 @@ class Scheduler(
     def init_tp_model_worker(self):
         from sglang.srt.managers.tp_worker import TpModelWorker
 
+        worker_server_args = self.server_args
+        if (
+            self.spec_algorithm.is_dflash_family()
+            and (os.environ.get("SGLANG_DFLASH_FRANKEN_TARGET_PLAIN") or "")
+            .strip()
+            .lower()
+            in ("1", "true", "yes", "on")
+        ):
+            worker_server_args = deepcopy(self.server_args)
+            worker_server_args.speculative_algorithm = None
+            worker_server_args.speculative_num_steps = None
+            worker_server_args.speculative_eagle_topk = None
+            worker_server_args.speculative_num_draft_tokens = None
+            if self.tp_rank == 0:
+                logger.warning(
+                    "DFLASH diagnostic: constructing target TpModelWorker with plain speculative_algorithm=None"
+                )
+
         self.tp_worker = TpModelWorker(
-            server_args=self.server_args,
+            server_args=worker_server_args,
             gpu_id=self.gpu_id,
             tp_rank=self.tp_rank,
             moe_ep_rank=self.moe_ep_rank,

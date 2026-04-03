@@ -3,6 +3,40 @@
 This file is the canonical run registry for GPT-OSS `showtime.py` / Harmony /
 PaCoRe / DFlash experiments on this branch.
 
+## Production Contract Snapshot
+
+These are the design locks that benchmark rows are expected to respect unless a row is
+explicitly marked experimental.
+
+- raw target model path: `/root/gpt-oss-120b`
+- inference attention backend: `fa3`
+- inference MoE backend: `triton_kernel`
+- target KV cache dtype: `fp8_e4m3`
+- draft KV cache dtype: `bfloat16`
+- Flex Attention banned for inference
+- production training contract:
+  - `BLOCK_SIZE=16`
+  - `TARGET_LAYERS=1,9,17,25,33`
+- DFlash draft model contract:
+  - no own LM head
+  - production lane uses explicit target-side embeddings
+- official graph contract:
+  - reuse fixed-size draft-worker `TARGET_VERIFY` graphs
+  - `DFLASH_TREE` follows that production default
+  - dedicated tree draft runner is experimental only
+- production raw-target tree lane:
+  - `DFLASH_TREE`
+  - `block=16`
+  - `steps=8`
+  - `topk=1`
+  - `vt=9`
+  - `FORCE_EXPLICIT_INPUT_EMBEDS=1`
+  - overlap off
+  - graph + piecewise graph on
+  - target `page_size=256`
+  - draft `page_size=1`
+  - piecewise CUDA graph max tokens `8192`
+
 Use it to answer four questions for every run:
 
 1. What exact regime was tested?
@@ -109,6 +143,7 @@ These are the current branch-level conclusions we already trust.
 | DFlash long-decode throughput depends heavily on local continuation predictability | confirmed |
 | High acceptance is useful but not a correctness oracle by itself | confirmed |
 | Tool-calling vs no-tool and greedy vs sampled must be separated | confirmed |
+| Production training contract is pinned at `BLOCK_SIZE=16` and target layers `1,9,17,25,33` | confirmed |
 | Baseline no-DFlash showtime 10-problem early-stop run | finished |
 | Baseline no-DFlash showtime 10-problem sampled full-round run | finished |
 | Mixed-pool `explore32 -> route8` route study is complete enough for now | confirmed |
@@ -133,6 +168,12 @@ Append new rows here. Keep failed and superseded runs; do not erase them.
 | `dflash_tree_batch_sweep_postfix` | running/partial | `DFLASH_TREE` | `no-tool` | `off` | `off/full-round` | `DFLASH/DFLASH_TREE` | `batched non-overlap tree vs linear using locked best configs` | `wall_tok_s + accept_length + correct_boxed_rate + batch speedup` | `/workspace/dflash_tree_batch_sweep_20260330_postfix` | partial results locked: block `4` `c=1` `306.603/274.120=1.1185x`, block `4` `c=4` `1194.003/1179.283=1.0125x`, both boxed-correct; `c=8` currently unstable on tree verify and under active debug; overlap forced off |
 | `dflash_tree_overlap_single_request_best` | prepared | `DFLASH_TREE` | `no-tool` | `off` | `off/full-round` | `DFLASH_TREE` | `tree overlap correctness + wall tok/s` | `wall_s_total + accept_length + correct_boxed_rate + overlap speedup` | `/workspace/dflash_tree_overlap_single_request_best_20260330` | prepared follow-up: single-request overlap compare using the best tree configs first (`block=4` and `block=8`) |
 | `dflash_tree_overlap_config_sweep_single_req` | prepared | `DFLASH_TREE` | `no-tool` | `off` | `off/full-round` | `DFLASH_TREE` | `tree overlap speedup across config grid` | `wall_s_total + accept_length + correct_boxed_rate + overlap speedup` | `/workspace/dflash_tree_overlap_config_sweep_20260330` | overlap sweep reuses the linear baselines from `dflash_tree_config_sweep_20260330` and scans the same compact tree grid |
+| `raw_target_semantic_matrix_20260403` | finished | `DFLASH/DFLASH_TREE` | `no-tool` | `off` | `off/full-round` | `DFLASH/DFLASH_TREE` | `raw original MXFP4 target acceptance + throughput sanity after target-side cleanup` | `wall_tok_s + accept_length + spec_accept_length_mean + correct_boxed_rate` | `/workspace/raw_target_semantic_matrix_20260403` | locked single-request full-length matrix on raw `/root/gpt-oss-120b`: linear block `8` `225.576 tok/s` accept `3.374`, tree block `8` `234.103 tok/s` accept `3.507`, linear block `16` `242.396 tok/s` accept `4.157`, tree block `16` `269.659 tok/s` accept `4.162`, all boxed-correct; sampled-target tree block `16` also finished at `249.920 tok/s`, accept `4.260`, boxed-correct |
+| `raw_target_block16_ablation_ladder` | running/partial | `DFLASH_TREE` | `no-tool` | `off` | `off/full-round` | `DFLASH_TREE` | `raw-target block16 tree speed ladder removing safety penalties one by one` | `wall_tok_s + accept_length + spec_accept_length_mean + correct_boxed_rate` | `/workspace/raw_target_block16_ablation_20260403_after_explicit_gate_fix` | fixed branch reruns now lock the current contract: safe baseline [baseline_safe.json](/workspace/raw_target_block16_ablation_20260403_after_explicit_gate_fix/baseline_safe.json) `270.124 tok/s`, accept `4.162`, request accept mean `4.213198`, boxed `1.0`; no-explicit [no_explicit_embeds.json](/workspace/raw_target_block16_ablation_20260403_after_explicit_gate_fix/no_explicit_embeds.json) `71.311 tok/s`, accept `1.038`, request accept mean `1.038798`, boxed `1.0`; no-safe [no_safe_greedy_retry1.json](/workspace/raw_target_block16_ablation_20260403_after_explicit_gate_fix/no_safe_greedy_retry1.json) `277.870 tok/s`, accept `4.162`, request accept mean `4.213198`, boxed `1.0`. Upstream root cause was the explicit-input-embeds handoff bug: `DFLASH_TREE` was still calling `draft_model.set_embed(...)` even with `FORCE_EXPLICIT_INPUT_EMBEDS=1`. After gating that call off, forced explicit input embeds remain required, but the safe greedy verify fallback is no longer required. Official v0.5.9 EAGLE3 reference is now locked too: draft branching is deterministic `softmax(next_token_logits) -> fast_topk`, worker-local, not request-sampling-driven. The explicit-input-embeds lane was also still accidentally blocking the dedicated draft runner with `forward_batch.input_embeds is None`; after removing that stale gate, the matched short fast-path rerun [raw_target_block16_debugprep_fast_nosync.json](/workspace/raw_target_block16_debugprep_fast_nosync.json) reached `169.135 tok/s` versus the matched no-fast control [raw_target_block16_debugprep_nofast.json](/workspace/raw_target_block16_debugprep_nofast.json) at `168.212 tok/s`, with identical acceptance. The first full-length contract-aligned fast-path run is now locked too: [raw_target_block16_fastpath_full_after_gatefix.json](/workspace/raw_target_block16_fastpath_full_after_gatefix.json) finished at `280.061 tok/s`, `output_tok_s_p20=282.223`, `accept_length=4.162`, request accept mean `4.213198`, boxed `1.0`. Current next cut is investigating why dropping explicit input embeds still collapses acceptance to about `1.04`, not more fast-path plumbing. |
+| `raw_target_block16_shared_embed_contract_matrix` | finished | `DFLASH_TREE` | `no-tool` | `off` | `off/short-probe` | `DFLASH_TREE` | `explicit-vs-shared embed contract check under eager/graph` | `wall_tok_s + spec_accept_length_mean` | `/workspace/raw_target_block16_shared_embed_acceptance_matrix_20260403` | design-lock result: explicit eager [explicit_eager.json](/workspace/raw_target_block16_shared_embed_acceptance_matrix_20260403/explicit_eager.json) `57.776 tok/s`, request accept mean `2.959538`; shared eager [shared_eager.json](/workspace/raw_target_block16_shared_embed_acceptance_matrix_20260403/shared_eager.json) `58.707 tok/s`, request accept mean `2.959538`; shared graph-only [shared_graph.json](/workspace/raw_target_block16_shared_embed_acceptance_matrix_20260403/shared_graph.json) `72.319 tok/s`, request accept mean `1.013861`; shared graph+piecewise [shared_graph_piecewise.json](/workspace/raw_target_block16_shared_embed_acceptance_matrix_20260403/shared_graph_piecewise.json) `72.370 tok/s`, request accept mean `1.013861`. This proves the shared-embed collapse is a graph-path problem, not eager-model math, and supports locking explicit input embeds as the official production contract on this branch. |
+| `current_branch_revalidation_matrix_block16` | finished | `DFLASH/DFLASH_TREE` | `no-tool` | `off` | `off/full-round` | `DFLASH/DFLASH_TREE` | `current-branch revalidation on the locked production contract` | `wall_tok_s + spec_accept_length_mean + correct_boxed_rate + matched speedup` | `/workspace/current_branch_revalidation_matrix_20260403` | locked on current branch: single greedy linear [linear_block16_single_greedy.json](/workspace/current_branch_revalidation_matrix_20260403/linear_block16_single_greedy.json) `242.050 tok/s`, request accept mean `4.215576`, boxed `1.0`; single greedy tree [tree_block16_single_greedy.json](/workspace/current_branch_revalidation_matrix_20260403/tree_block16_single_greedy.json) `282.106 tok/s`, request accept mean `4.213198`, boxed `1.0`, about `1.166x`; single sampled-target linear [linear_block16_single_sampled_target.json](/workspace/current_branch_revalidation_matrix_20260403/linear_block16_single_sampled_target.json) `130.920 tok/s`, request accept mean `2.280916`, boxed `1.0`; single sampled-target tree [tree_block16_single_sampled_target.json](/workspace/current_branch_revalidation_matrix_20260403/tree_block16_single_sampled_target.json) `298.124 tok/s`, request accept mean `4.885546`, boxed `1.0`, about `2.277x`; batched `c=4` greedy linear [linear_block16_c4_greedy.json](/workspace/current_branch_revalidation_matrix_20260403/linear_block16_c4_greedy.json) `879.568 tok/s`, request accept mean `4.249147`, boxed `1.0`; batched `c=4` greedy tree [tree_block16_c4_greedy_retry2.json](/workspace/current_branch_revalidation_matrix_20260403/tree_block16_c4_greedy_retry2.json) `1090.367 tok/s`, request accept mean `4.502712`, boxed `1.0`, about `1.239x`; batched `c=4` sampled-target linear [linear_block16_c4_sampled_target.json](/workspace/current_branch_revalidation_matrix_20260403/linear_block16_c4_sampled_target.json) `292.925 tok/s`, request accept mean `3.401920`, boxed `1.0`; batched `c=4` sampled-target tree [tree_block16_c4_sampled_target.json](/workspace/current_branch_revalidation_matrix_20260403/tree_block16_c4_sampled_target.json) `537.906 tok/s`, request accept mean `3.846302`, boxed `1.0`, about `1.836x`. The first batched `c=4` greedy tree run exposed a real `accept_index -> predict` rebuild bug; the fixed retry now proves the runtime contract is correct on the current branch. |
+| `reference5_tree_correctness_matrix_20260403_wave4` | running | `DFLASH_TREE` | `no-tool` | `off` | `off/full-round` | `DFLASH_TREE` | `raw-target correctness matrix on original showtime contract` | `wall_tok_s + accept_length + correct_boxed_rate` | `/workspace/reference5_tree_correctness_matrix_20260403_wave4` | relaunched after proving the failed `page_size=1` / `piecewise=65536` wave was a harness mismatch; this wave matches original showtime contract: target `page_size=256`, draft `page_size=1`, piecewise max tokens `8192`, `mem_fraction_static=0.90`, `speculative_draft_mem_fraction_static=0.97`, `SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE=0`, `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`, `SGLANG_CACHE_DIR=/workspace/sglang_cache`, `TRITON_CACHE_DIR=/workspace/triton_cache`, `TMPDIR=/workspace/tmp`, `concurrency=8`, 1 problem per GPU for `86e8e5`, `dd7f5e`, `a295e9`, `9c1c5f`, `92ba6a`, plus sampled backfill for the remaining two problems. |
+| `raw_target_block16_clean_targetreset_20260403` | running | `DFLASH_TREE` | `no-tool` | `off` | `off/full-round` | `DFLASH_TREE` | `strict single-request raw-target DFLASH_TREE on target-side main reset` | `wall_tok_s + accept_length + correct_boxed_rate` | `/workspace/raw_target_block16_clean_targetreset_20260403` | target-side layers/models restored back to `origin/main` first; this is the clean-baseline rerun that should be treated as authoritative for the locked single-request contract |
 
 ## Important Baseline Finding
 

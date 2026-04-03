@@ -18,6 +18,7 @@ from __future__ import annotations
 import datetime
 import dataclasses
 import gc
+import os
 import inspect
 import json
 import logging
@@ -258,6 +259,15 @@ UNBALANCED_MODEL_LOADING_TIMEOUT_S = 480  # leave more time for post data proces
 
 
 logger = logging.getLogger(__name__)
+
+
+def _dflash_aux_capture_disabled() -> bool:
+    return (os.environ.get("SGLANG_DFLASH_DISABLE_AUX_CAPTURE") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
 
 
 def resolve_language_model(model: nn.Module) -> nn.Module:
@@ -713,7 +723,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 self.eagle_aux_hidden_state_layer_ids
             )
 
-        if self.dflash_use_aux_hidden_state:
+        if self.dflash_use_aux_hidden_state and not _dflash_aux_capture_disabled():
             if not hasattr(self.model, "set_dflash_layers_to_capture"):
                 raise ValueError(
                     f"Model {self.model.__class__.__name__} does not implement set_dflash_layers_to_capture, "
@@ -2122,7 +2132,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if self.eagle_use_aux_hidden_state:
             self.model.set_eagle3_layers_to_capture()
-        if self.dflash_use_aux_hidden_state:
+        if self.dflash_use_aux_hidden_state and not _dflash_aux_capture_disabled():
             self.model.set_dflash_layers_to_capture(self.dflash_target_layer_ids)
 
         require_mlp_tp_gather_ = require_mlp_tp_gather(self.server_args)
@@ -2797,12 +2807,33 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 server_args=self.server_args,
             )
 
+        force_single_token_verify_decode = (
+            forward_batch.forward_mode.is_target_verify()
+            and (os.environ.get("SGLANG_DFLASH_SINGLE_TOKEN_VERIFY_USE_DECODE") or "")
+            .strip()
+            .lower()
+            not in ("", "0", "false", "off", "no")
+            and getattr(getattr(forward_batch, "spec_info", None), "draft_token_num", None)
+            == 1
+        )
+
         if forward_batch.forward_mode.is_decode():
             ret = self.forward_decode(
                 forward_batch,
                 skip_attn_backend_init=skip_attn_backend_init,
                 pp_proxy_tensors=pp_proxy_tensors,
             )
+        elif force_single_token_verify_decode:
+            orig_forward_mode = forward_batch.forward_mode
+            forward_batch.forward_mode = ForwardMode.DECODE
+            try:
+                ret = self.forward_decode(
+                    forward_batch,
+                    skip_attn_backend_init=skip_attn_backend_init,
+                    pp_proxy_tensors=pp_proxy_tensors,
+                )
+            finally:
+                forward_batch.forward_mode = orig_forward_mode
         elif forward_batch.forward_mode.is_split_prefill():
             ret = self.forward_split_prefill(
                 forward_batch,
@@ -2872,6 +2903,73 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             # entropy (high temperature) settings.
             sampling_info = dataclasses.replace(sampling_info, is_all_greedy=True)
 
+        debug_sample_pos_range = (os.environ.get("SGLANG_DEBUG_SAMPLE_POS_RANGE") or "").strip()
+        if debug_sample_pos_range:
+            try:
+                lo_s, hi_s = debug_sample_pos_range.split(":", 1)
+                dbg_lo = int(lo_s.strip())
+                dbg_hi = int(hi_s.strip())
+                if dbg_hi < dbg_lo:
+                    dbg_lo, dbg_hi = dbg_hi, dbg_lo
+            except Exception:
+                dbg_lo = dbg_hi = None
+            if dbg_lo is not None:
+                debug_positions = (
+                    forward_batch.positions
+                    if forward_batch.forward_mode.is_decode()
+                    else forward_batch.seq_lens - 1
+                )
+                if (
+                    debug_positions is not None
+                    and debug_positions.numel() > 0
+                    and int(debug_positions.max().item()) >= dbg_lo
+                    and int(debug_positions.min().item()) <= dbg_hi
+                ):
+                    logger.info(
+                        "sample input trace: spec=%s positions=%s seq_lens=%s seed=%s",
+                        getattr(forward_batch.spec_algorithm, "name", str(forward_batch.spec_algorithm)),
+                        debug_positions.detach().to("cpu", non_blocking=False).tolist(),
+                        None
+                        if forward_batch.seq_lens is None
+                        else forward_batch.seq_lens.detach().to("cpu", non_blocking=False).tolist(),
+                        None
+                        if sampling_info is None or sampling_info.sampling_seed is None
+                        else sampling_info.sampling_seed.detach().to("cpu", non_blocking=False).tolist(),
+                    )
+
+                    raw_topk_env = (os.environ.get("SGLANG_DEBUG_RAW_LOGITS_TOPK") or "").strip()
+                    try:
+                        raw_topk = int(raw_topk_env) if raw_topk_env else 0
+                    except Exception:
+                        raw_topk = 0
+                    if (
+                        raw_topk > 0
+                        and logits_output is not None
+                        and logits_output.next_token_logits is not None
+                    ):
+                        row_logits = logits_output.next_token_logits[0]
+                        top_k = min(raw_topk, int(row_logits.shape[-1]))
+                        if top_k > 0:
+                            top_vals, top_ids = torch.topk(row_logits, k=top_k, dim=-1)
+                            logger.info(
+                                "sample raw logits trace: spec=%s positions=%s top_ids=%s top_vals=%s",
+                                getattr(
+                                    forward_batch.spec_algorithm,
+                                    "name",
+                                    str(forward_batch.spec_algorithm),
+                                ),
+                                debug_positions.detach()
+                                .to("cpu", non_blocking=False)
+                                .tolist(),
+                                top_ids.detach().to("cpu", non_blocking=False).tolist(),
+                                [
+                                    round(float(x), 6)
+                                    for x in top_vals.detach()
+                                    .to("cpu", non_blocking=False)
+                                    .tolist()
+                                ],
+                            )
+
         self._preprocess_logits(logits_output, sampling_info)
         # Sample the next tokens
         next_token_ids = self.sampler(
@@ -2887,6 +2985,67 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 else forward_batch.seq_lens - 1
             ),
         )
+        debug_sample_trace_steps_env = (
+            os.environ.get("SGLANG_DEBUG_SAMPLE_TRACE_STEPS") or ""
+        ).strip()
+        try:
+            debug_sample_trace_steps = (
+                int(debug_sample_trace_steps_env) if debug_sample_trace_steps_env else 0
+            )
+        except Exception:
+            debug_sample_trace_steps = 0
+        if (
+            debug_sample_trace_steps > 0
+            and sampling_info is not None
+            and not sampling_info.is_all_greedy
+            and logits_output is not None
+            and logits_output.next_token_logits is not None
+            and next_token_ids is not None
+            and int(next_token_ids.numel()) > 0
+        ):
+            trace_ct = int(getattr(self, "_debug_sample_trace_ct", 0)) + 1
+            setattr(self, "_debug_sample_trace_ct", trace_ct)
+            if trace_ct <= debug_sample_trace_steps:
+                trace_positions = (
+                    forward_batch.positions
+                    if forward_batch.forward_mode.is_decode()
+                    else forward_batch.seq_lens - 1
+                )
+                row_logits = logits_output.next_token_logits[0]
+                trace_topk = min(8, int(row_logits.shape[-1]))
+                top_vals, top_ids = torch.topk(row_logits, k=trace_topk, dim=-1)
+                logger.info(
+                    "sample trace step=%s spec=%s positions=%s seq_lens=%s seed=%s sampled=%s top_ids=%s top_vals=%s",
+                    trace_ct,
+                    getattr(
+                        forward_batch.spec_algorithm,
+                        "name",
+                        str(forward_batch.spec_algorithm),
+                    ),
+                    None
+                    if trace_positions is None
+                    else trace_positions.detach()
+                    .to("cpu", non_blocking=False)
+                    .tolist(),
+                    None
+                    if forward_batch.seq_lens is None
+                    else forward_batch.seq_lens.detach()
+                    .to("cpu", non_blocking=False)
+                    .tolist(),
+                    None
+                    if sampling_info.sampling_seed is None
+                    else sampling_info.sampling_seed.detach()
+                    .to("cpu", non_blocking=False)
+                    .tolist(),
+                    next_token_ids.detach().to("cpu", non_blocking=False).tolist(),
+                    top_ids.detach().to("cpu", non_blocking=False).tolist(),
+                    [
+                        round(float(x), 6)
+                        for x in top_vals.detach()
+                        .to("cpu", non_blocking=False)
+                        .tolist()
+                    ],
+                )
         self.maybe_update_ngram_token_table(next_token_ids, forward_batch)
         return next_token_ids
 

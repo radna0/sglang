@@ -17,10 +17,8 @@
 
 import logging
 import math
-import os
-import time
 from collections.abc import Iterable
-from functools import lru_cache, partial
+from functools import partial
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -43,6 +41,7 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_rank,
     get_attention_tp_size,
@@ -55,6 +54,10 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.moe import get_moe_a2a_backend
+from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
+from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.moe.utils import filter_moe_weight_param_global_expert
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8_utils import dequant_mxfp4
@@ -79,6 +82,10 @@ _is_cuda = is_cuda()
 _is_npu = is_npu()
 
 
+if _is_cuda:
+    from sgl_kernel import FusedSetKVBufferArg  # noqa: F401
+
+
 class GptOssConfig(PretrainedConfig):
     model_type = "gpt_oss"
 
@@ -87,99 +94,6 @@ class GptOssConfig(PretrainedConfig):
 
 
 logger = logging.getLogger(__name__)
-
-
-def _fa3_tensor_stats(tensor: torch.Tensor) -> dict:
-    detached = tensor.detach()
-    return {
-        "shape": tuple(detached.shape),
-        "dtype": str(detached.dtype),
-        "contiguous": bool(detached.is_contiguous()),
-        "finite": bool(torch.isfinite(detached).all().item()),
-        "min": float(detached.min().item()),
-        "max": float(detached.max().item()),
-        "mean": float(detached.float().mean().item()),
-        "std": float(detached.float().std(unbiased=False).item()),
-    }
-
-
-def _fa3_flag(name: str) -> bool:
-    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
-
-
-@lru_cache(maxsize=None)
-def _fa3_int_set(name: str) -> frozenset[int]:
-    raw = os.environ.get(name, "")
-    values: set[int] = set()
-    for part in raw.split(","):
-        part = part.strip()
-        if not part:
-            continue
-        try:
-            values.add(int(part))
-        except ValueError:
-            logger.warning("[FA3SinkPolicy] ignoring invalid integer %r for %s", part, name)
-    return frozenset(values)
-
-
-def _fa3_trace_mlp_enabled(layer_id: int) -> bool:
-    if not _fa3_flag("SGLANG_FA3_TRACE_MLP_DETAILS"):
-        return False
-    trace_layers = _fa3_int_set("SGLANG_FA3_TRACE_MLP_LAYER_IDS")
-    return not trace_layers or layer_id in trace_layers
-
-
-def _fa3_topk_output_stats(topk_output) -> dict:
-    stats: dict[str, object] = {"format": type(topk_output).__name__}
-
-    if hasattr(topk_output, "router_logits"):
-        router_logits = getattr(topk_output, "router_logits")
-        if isinstance(router_logits, torch.Tensor):
-            stats["router_logits"] = _fa3_tensor_stats(router_logits)
-
-    if hasattr(topk_output, "topk_weights"):
-        topk_weights = getattr(topk_output, "topk_weights")
-        if isinstance(topk_weights, torch.Tensor):
-            weights_sum = topk_weights.sum(dim=-1)
-            stats["topk_weights"] = _fa3_tensor_stats(topk_weights)
-            stats["topk_weights_row_sum"] = _fa3_tensor_stats(weights_sum)
-
-    if hasattr(topk_output, "topk_ids"):
-        topk_ids = getattr(topk_output, "topk_ids")
-        if isinstance(topk_ids, torch.Tensor):
-            ids_detached = topk_ids.detach()
-            stats["topk_ids_shape"] = tuple(ids_detached.shape)
-            stats["topk_ids_min"] = int(ids_detached.min().item())
-            stats["topk_ids_max"] = int(ids_detached.max().item())
-            stats["topk_ids_unique"] = int(torch.unique(ids_detached).numel())
-            stats["topk_ids_head"] = ids_detached[: min(4, ids_detached.shape[0])].cpu().tolist()
-
-    return stats
-
-
-@lru_cache(maxsize=1)
-def _get_gpt_oss_moe_runtime():
-    """Import the MoE stack lazily.
-
-    GPT-OSS registration should not fail just because optional MoE backends
-    (FlashInfer/TVM-FFI-adjacent paths) are unavailable at import time.
-    """
-
-    from sglang.srt.layers.moe import get_moe_a2a_backend
-    from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
-    from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-    from sglang.srt.layers.moe.topk import TopK
-
-    return get_moe_a2a_backend, get_moe_impl_class, FusedMoE, TopK
-
-
-@lru_cache(maxsize=1)
-def _get_gpt_oss_communicator_runtime():
-    """Import communicator pieces lazily for the same reason as MoE."""
-
-    from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
-
-    return LayerCommunicator, LayerScatterModes
 
 
 # Aligned with HF's implementation, using sliding window inclusive with the last token
@@ -197,7 +111,6 @@ class GptOssSparseMoeBlock(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        _, get_moe_impl_class, _, TopK = _get_gpt_oss_moe_runtime()
         self.tp_size = get_tensor_model_parallel_world_size()
         self.layer_id = layer_id
         self.activation = config.hidden_act
@@ -254,7 +167,6 @@ class GptOssSparseMoeBlock(nn.Module):
         forward_batch: Optional[ForwardBatch] = None,
         should_allreduce_fusion: bool = False,
     ) -> torch.Tensor:
-        get_moe_a2a_backend, _, _, _ = _get_gpt_oss_moe_runtime()
         if not get_moe_a2a_backend().is_deepep():
             return self.forward_normal(hidden_states, should_allreduce_fusion)
         else:
@@ -276,54 +188,17 @@ class GptOssSparseMoeBlock(nn.Module):
         should_allreduce_fusion: bool = False,
     ) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
-        trace_mlp = _fa3_trace_mlp_enabled(self.layer_id)
-        if trace_mlp:
-            logger.info(
-                "[FA3MLP] layer=%d input=%s",
-                self.layer_id,
-                _fa3_tensor_stats(hidden_states),
-            )
         if is_in_piecewise_cuda_graph():
             final_hidden_states = moe_impl(self.layer_id, hidden_states)
         else:
             router_logits, _ = self.router(hidden_states)
-            if trace_mlp:
-                logger.info(
-                    "[FA3MLP] layer=%d router_logits=%s",
-                    self.layer_id,
-                    _fa3_tensor_stats(router_logits),
-                )
             topk_output = self.topk(hidden_states, router_logits)
-            if trace_mlp:
-                logger.info(
-                    "[FA3MLP] layer=%d topk=%s",
-                    self.layer_id,
-                    _fa3_topk_output_stats(topk_output),
-                )
             final_hidden_states = self.experts(hidden_states, topk_output)
-            if trace_mlp:
-                logger.info(
-                    "[FA3MLP] layer=%d experts_out=%s",
-                    self.layer_id,
-                    _fa3_tensor_stats(final_hidden_states),
-                )
 
         if self.tp_size > 1 and not should_allreduce_fusion:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
-            if trace_mlp:
-                logger.info(
-                    "[FA3MLP] layer=%d allreduce_out=%s",
-                    self.layer_id,
-                    _fa3_tensor_stats(final_hidden_states),
-                )
 
         ans = final_hidden_states.view(num_tokens, hidden_dim)
-        if trace_mlp:
-            logger.info(
-                "[FA3MLP] layer=%d output=%s",
-                self.layer_id,
-                _fa3_tensor_stats(ans),
-            )
         return ans
 
 
@@ -426,7 +301,6 @@ class GptOssAttention(nn.Module):
         )
 
         assert layer_type in {"sliding_attention", "full_attention"}
-        self.layer_type = layer_type
         use_sliding_window = layer_type == "sliding_attention"
         self.attn = RadixAttention(
             self.num_heads,
@@ -445,26 +319,10 @@ class GptOssAttention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
-        fa3_trace_attn_details = _fa3_flag("SGLANG_FA3_TRACE_ATTN_DETAILS")
         if hidden_states.shape[0] == 0:
             return hidden_states, forward_batch, None
         qkv, _ = self.qkv_proj(hidden_states)
-        if fa3_trace_attn_details and self.layer_id >= 26:
-            logger.info(
-                "[FA3Attn] layer=%d qkv_proj=%s",
-                self.layer_id,
-                _fa3_tensor_stats(qkv),
-            )
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        if fa3_trace_attn_details and self.layer_id >= 26:
-            logger.info(
-                "[FA3Attn] layer=%d q=%s k=%s v=%s sinks=%s",
-                self.layer_id,
-                _fa3_tensor_stats(q),
-                _fa3_tensor_stats(k),
-                _fa3_tensor_stats(v),
-                _fa3_tensor_stats(self.sinks),
-            )
 
         extra_args = {}
         if not _is_npu:
@@ -479,67 +337,20 @@ class GptOssAttention(nn.Module):
                     else None
                 ),
             }
-
         q, k = self.rotary_emb(positions, q, k, **extra_args)
-        if fa3_trace_attn_details and self.layer_id >= 26:
-            logger.info(
-                "[FA3Attn] layer=%d after_rope q=%s k=%s",
-                self.layer_id,
-                _fa3_tensor_stats(q),
-                _fa3_tensor_stats(k),
-            )
         inner_state = q, k, v, forward_batch
         return None, forward_batch, inner_state
 
     def forward_core(self, intermediate_state):
-        fa3_trace_attn_details = _fa3_flag("SGLANG_FA3_TRACE_ATTN_DETAILS")
         hidden_states, forward_batch, inner_state = intermediate_state
         if inner_state is None:
             return hidden_states
-        sink_policy = "normal"
-        if _fa3_flag("SGLANG_GPTOSS_DISABLE_SINKS"):
-            sinks = None
-            sink_policy = "global_off"
-        elif self.layer_id in _fa3_int_set("SGLANG_GPTOSS_DISABLE_SINKS_LAYER_IDS"):
-            sinks = None
-            sink_policy = "layer_off"
-        elif (
-            self.layer_type == "full_attention"
-            and _fa3_flag("SGLANG_GPTOSS_DISABLE_SINKS_FULL_ATTENTION")
-        ):
-            sinks = None
-            sink_policy = "full_attention_off"
-        elif _fa3_flag("SGLANG_GPTOSS_CLAMP_SINKS_NONNEG"):
-            sinks = self.sinks.clamp_min(0)
-            sink_policy = "clamp_nonneg"
-        else:
-            sinks = self.sinks
-        if _fa3_flag("SGLANG_FA3_TRACE_SINK_POLICY") and self.layer_id >= 24:
-            logger.info(
-                "[FA3SinkPolicy] layer=%d type=%s policy=%s sinks=%s",
-                self.layer_id,
-                self.layer_type,
-                sink_policy,
-                "None" if sinks is None else _fa3_tensor_stats(sinks),
-            )
         attn_output = self.attn(
             *inner_state,
-            sinks=sinks,
+            sinks=self.sinks,
             save_kv_cache=not enable_fused_set_kv_buffer(forward_batch),
         )
-        if fa3_trace_attn_details and self.layer_id >= 26:
-            logger.info(
-                "[FA3Attn] layer=%d attn_output=%s",
-                self.layer_id,
-                _fa3_tensor_stats(attn_output),
-            )
         output, _ = self.o_proj(attn_output)
-        if fa3_trace_attn_details and self.layer_id >= 26:
-            logger.info(
-                "[FA3Attn] layer=%d o_proj=%s",
-                self.layer_id,
-                _fa3_tensor_stats(output),
-            )
         return output
 
     def forward(
@@ -610,7 +421,6 @@ class GptOssDecoderLayer(nn.Module):
         is_previous_layer_sparse = True
         is_next_layer_sparse = True
 
-        LayerCommunicator, LayerScatterModes = _get_gpt_oss_communicator_runtime()
         self.layer_scatter_modes = LayerScatterModes.init_new(
             layer_id=layer_id,
             num_layers=config.num_hidden_layers,
@@ -652,9 +462,6 @@ class GptOssDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        fa3_sync_after_attn = _fa3_flag("SGLANG_FA3_SYNC_AFTER_ATTN")
-        fa3_trace_layer_io = _fa3_flag("SGLANG_FA3_TRACE_LAYER_IO")
-        fa3_sync_after_mlp = _fa3_flag("SGLANG_FA3_SYNC_AFTER_MLP")
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states, residual, forward_batch
         )
@@ -665,36 +472,10 @@ class GptOssDecoderLayer(nn.Module):
                 hidden_states=hidden_states,
                 forward_batch=forward_batch,
             )
-        if fa3_trace_layer_io:
-            logger.info(
-                "[FA3LayerIO] after_attn layer=%d stats=%s",
-                self.layer_id,
-                _fa3_tensor_stats(hidden_states),
-            )
-            if fa3_sync_after_attn and hidden_states.is_cuda:
-                if torch.cuda.is_current_stream_capturing():
-                    if fa3_trace_layer_io:
-                        logger.info(
-                            "[FA3LayerIO] sync_after_attn_skipped_capture layer=%d",
-                            self.layer_id,
-                        )
-                else:
-                    torch.cuda.synchronize(hidden_states.device)
-                    if fa3_trace_layer_io:
-                        logger.info(
-                            "[FA3LayerIO] sync_after_attn_ok layer=%d", self.layer_id
-                        )
 
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
-        if fa3_trace_layer_io:
-            logger.info(
-                "[FA3LayerIO] before_mlp layer=%d hidden=%s residual=%s",
-                self.layer_id,
-                _fa3_tensor_stats(hidden_states),
-                None if residual is None else _fa3_tensor_stats(residual),
-            )
 
         should_allreduce_fusion = (
             self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
@@ -702,36 +483,7 @@ class GptOssDecoderLayer(nn.Module):
             )
         )
 
-        skip_mlp_for_fa3_warmup = str(
-            os.environ.get("SGLANG_FA3_WARMUP_SKIP_GPTOSS_MLP", "0")
-        ).strip().lower() in {"1", "true", "yes", "on"}
-        if skip_mlp_for_fa3_warmup:
-            if self.layer_id == 0:
-                logger.info(
-                    "[FA3Warmup] skipping GPT-OSS MLP during FA3 precapture warmup."
-                )
-            should_allreduce_fusion = False
-        else:
-            hidden_states = self.mlp(
-                hidden_states, forward_batch, should_allreduce_fusion
-            )
-        if fa3_trace_layer_io:
-            logger.info(
-                "[FA3LayerIO] after_mlp layer=%d stats=%s",
-                self.layer_id,
-                _fa3_tensor_stats(hidden_states),
-            )
-        if fa3_sync_after_mlp and hidden_states.is_cuda:
-            if torch.cuda.is_current_stream_capturing():
-                if fa3_trace_layer_io:
-                    logger.info(
-                        "[FA3LayerIO] sync_after_mlp_skipped_capture layer=%d",
-                        self.layer_id,
-                    )
-            else:
-                torch.cuda.synchronize(hidden_states.device)
-                if fa3_trace_layer_io:
-                    logger.info("[FA3LayerIO] sync_after_mlp_ok layer=%d", self.layer_id)
+        hidden_states = self.mlp(hidden_states, forward_batch, should_allreduce_fusion)
 
         if should_allreduce_fusion:
             hidden_states._sglang_needs_allreduce_fusion = True
@@ -740,13 +492,6 @@ class GptOssDecoderLayer(nn.Module):
             hidden_states, residual = self.layer_communicator.postprocess_layer(
                 hidden_states, residual, forward_batch
             )
-            if fa3_trace_layer_io:
-                logger.info(
-                    "[FA3LayerIO] after_postprocess layer=%d hidden=%s residual=%s",
-                    self.layer_id,
-                    _fa3_tensor_stats(hidden_states),
-                    None if residual is None else _fa3_tensor_stats(residual),
-                )
 
         return hidden_states, residual
 
@@ -760,7 +505,6 @@ class GptOssModel(nn.Module):
         decoder_layer_type: type[nn.Module] = GptOssDecoderLayer,
     ) -> None:
         super().__init__()
-        self.config = config
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
         self.pp_group = get_pp_group()
@@ -807,10 +551,6 @@ class GptOssModel(nn.Module):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
-        fa3_trace_model_tail = _fa3_flag("SGLANG_FA3_TRACE_MODEL_TAIL")
-        fa3_trace_first_bad_layer = _fa3_flag("SGLANG_FA3_TRACE_FIRST_BAD_LAYER")
-        fa3_sync_after_model = _fa3_flag("SGLANG_FA3_SYNC_AFTER_MODEL")
-        fa3_reported_bad_layer = False
         if self.pp_group.is_first_rank:
             if input_embeds is None:
                 hidden_states = self.embed_tokens(input_ids)
@@ -831,24 +571,6 @@ class GptOssModel(nn.Module):
                 hidden_states, residual = layer(
                     positions, hidden_states, forward_batch, residual
                 )
-                if fa3_trace_first_bad_layer and not fa3_reported_bad_layer:
-                    hidden_ok = bool(torch.isfinite(hidden_states).all().item())
-                    residual_ok = (
-                        True
-                        if residual is None
-                        else bool(torch.isfinite(residual).all().item())
-                    )
-                    if not hidden_ok or not residual_ok:
-                        logger.info(
-                            "[FA3BadLayer] layer=%s forward_mode=%s hidden_ok=%s residual_ok=%s hidden=%s residual=%s",
-                            i,
-                            int(forward_batch.forward_mode),
-                            hidden_ok,
-                            residual_ok,
-                            _fa3_tensor_stats(hidden_states),
-                            None if residual is None else _fa3_tensor_stats(residual),
-                        )
-                        fa3_reported_bad_layer = True
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
                 {
@@ -862,22 +584,10 @@ class GptOssModel(nn.Module):
                     hidden_states = self.norm(hidden_states)
                 else:
                     hidden_states, _ = self.norm(hidden_states, residual)
-            if fa3_trace_model_tail:
-                logger.info(
-                    "[FA3ModelTail] after_norm %s",
-                    _fa3_tensor_stats(hidden_states),
-                )
-            if fa3_sync_after_model and hidden_states.is_cuda:
-                if torch.cuda.is_current_stream_capturing():
-                    logger.info("[FA3ModelTail] sync_after_norm_skipped_capture")
-                else:
-                    torch.cuda.synchronize(hidden_states.device)
-                    logger.info("[FA3ModelTail] sync_after_norm_ok")
         if len(aux_hidden_states) == 0:
             return hidden_states
 
         return hidden_states, aux_hidden_states
-
 
 
 class GptOssForCausalLM(nn.Module):
@@ -927,13 +637,12 @@ class GptOssForCausalLM(nn.Module):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
-        fa3_trace_model_tail = _fa3_flag("SGLANG_FA3_TRACE_MODEL_TAIL")
-        fa3_sync_after_logits = _fa3_flag("SGLANG_FA3_SYNC_AFTER_LOGITS")
         hidden_states = self.model(
             input_ids,
             positions,
             forward_batch,
             input_embeds,
+            pp_proxy_tensors=pp_proxy_tensors,
         )
 
         aux_hidden_states = None
@@ -941,87 +650,13 @@ class GptOssForCausalLM(nn.Module):
             hidden_states, aux_hidden_states = hidden_states
 
         if self.pp_group.is_last_rank:
-            final_hidden_states = hidden_states
-            if fa3_trace_model_tail:
-                logger.info(
-                    "[FA3ModelTail] before_logits %s",
-                    _fa3_tensor_stats(hidden_states),
-                )
-                logger.info(
-                    "[FA3ModelTail] entering_logits_processor cls=%s",
-                    type(self.logits_processor).__name__,
-                )
-            logits = self.logits_processor(
+            return self.logits_processor(
                 input_ids,
                 hidden_states,
                 self.lm_head,
                 forward_batch,
                 aux_hidden_states,
             )
-            if (
-                self.capture_aux_hidden_states
-                and forward_batch.forward_mode.is_target_verify()
-                and hasattr(logits, "__dict__")
-            ):
-                # DFLASH keeps aux hidden features in `logits_output.hidden_states` for
-                # draft-KV append. Preserve the final LM-head-ready hidden states on a
-                # private attribute so tree verify can bypass `next_token_logits` safely.
-                logits._dflash_final_hidden_states = final_hidden_states
-            if _fa3_flag("SGLANG_FA3_TRACE_TOP_LOGITS") and not isinstance(
-                logits, torch.Tensor
-            ):
-                next_token_logits = getattr(logits, "next_token_logits", None)
-                if (
-                    isinstance(next_token_logits, torch.Tensor)
-                    and next_token_logits.dim() == 2
-                    and next_token_logits.shape[0] > 0
-                    and next_token_logits.shape[1] > 0
-                ):
-                    row0 = next_token_logits[0]
-                    topn = min(16, row0.shape[0])
-                    top_vals, top_ids = torch.topk(row0, k=topn)
-                    logger.info(
-                        "[FA3TopLogits] ids=%s vals=%s argmax_id=%s argmax_val=%s",
-                        top_ids.tolist(),
-                        [float(x) for x in top_vals.tolist()],
-                        int(top_ids[0].item()),
-                        float(top_vals[0].item()),
-                    )
-            if fa3_trace_model_tail:
-                if isinstance(logits, torch.Tensor):
-                    logger.info(
-                        "[FA3ModelTail] after_logits tensor shape=%s dtype=%s contiguous=%s",
-                        tuple(logits.shape),
-                        logits.dtype,
-                        logits.is_contiguous(),
-                    )
-                else:
-                    next_token_logits = getattr(logits, "next_token_logits", None)
-                    logger.info(
-                        "[FA3ModelTail] after_logits output_cls=%s next_token_logits=%s",
-                        type(logits).__name__,
-                        None
-                        if next_token_logits is None
-                        else {
-                            "shape": tuple(next_token_logits.shape),
-                            "dtype": str(next_token_logits.dtype),
-                            "contiguous": bool(next_token_logits.is_contiguous()),
-                        },
-                    )
-            sync_tensor = logits if isinstance(logits, torch.Tensor) else getattr(
-                logits, "next_token_logits", None
-            )
-            if (
-                fa3_sync_after_logits
-                and isinstance(sync_tensor, torch.Tensor)
-                and sync_tensor.is_cuda
-            ):
-                if torch.cuda.is_current_stream_capturing():
-                    logger.info("[FA3ModelTail] sync_after_logits_skipped_capture")
-                else:
-                    torch.cuda.synchronize(sync_tensor.device)
-                    logger.info("[FA3ModelTail] sync_after_logits_ok")
-            return logits
         else:
             return hidden_states
 
@@ -1032,7 +667,6 @@ class GptOssForCausalLM(nn.Module):
     @property
     def end_layer(self):
         return self.model.end_layer
-
 
     def _get_default_weight_mapping(self):
         """Generate default weight name mapping for GptOss safetensors."""
@@ -1123,20 +757,8 @@ class GptOssForCausalLM(nn.Module):
     def _load_weights_mxfp4(self, weights, is_nextn, weight_name_mapping):
         mxfp4_weights = []
         normal_weights = []
-        partition_log_progress = (
-            os.environ.get("SGLANG_GPT_OSS_NORMAL_PROGRESS", "").strip().lower()
-            in ("1", "true", "yes", "on")
-        ) or (
-            os.environ.get("SGLANG_GPT_OSS_MXFP4_PROGRESS", "").strip().lower()
-            in ("1", "true", "yes", "on")
-        )
-        partition_every = int(
-            os.environ.get("SGLANG_GPT_OSS_NORMAL_PROGRESS_EVERY", "32") or "32"
-        )
-        partition_start = time.perf_counter()
-        total_weights = 0
 
-        for total_weights, (name, weight) in enumerate(weights, start=1):
+        for name, weight in weights:
             if (
                 ".experts" in name
                 and self.quant_config is not None
@@ -1145,27 +767,6 @@ class GptOssForCausalLM(nn.Module):
                 mxfp4_weights.append((name, weight))
             else:
                 normal_weights.append((name, weight))
-            if partition_log_progress and (
-                total_weights == 1
-                or (partition_every > 0 and total_weights % partition_every == 0)
-            ):
-                logging.info(
-                    "GPT-OSS load partition progress: %d total mxfp4=%d normal=%d last=%s elapsed_s=%.2f",
-                    total_weights,
-                    len(mxfp4_weights),
-                    len(normal_weights),
-                    name,
-                    time.perf_counter() - partition_start,
-                )
-
-        if partition_log_progress:
-            logging.info(
-                "GPT-OSS load partition end: total=%d mxfp4=%d normal=%d elapsed_s=%.2f",
-                total_weights,
-                len(mxfp4_weights),
-                len(normal_weights),
-                time.perf_counter() - partition_start,
-            )
 
         mxfp4_loaded_params = self._load_mxfp4_experts_weights(mxfp4_weights)
         self._load_normal_weights(
@@ -1180,19 +781,6 @@ class GptOssForCausalLM(nn.Module):
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
         mxfp4_block = 32
-        log_progress = (
-            os.environ.get("SGLANG_GPT_OSS_MXFP4_PROGRESS", "").strip().lower()
-            in ("1", "true", "yes", "on")
-        )
-        eager_cuda = (
-            os.environ.get("SGLANG_GPT_OSS_MXFP4_TRANSFER_MODE", "eager_cuda")
-            .strip()
-            .lower()
-            != "direct_copy"
-        )
-        progress_every = int(
-            os.environ.get("SGLANG_GPT_OSS_MXFP4_PROGRESS_EVERY", "4") or "4"
-        )
 
         moe_tp_rank = get_moe_tensor_parallel_rank()
         moe_tp_size = get_moe_tensor_parallel_world_size()
@@ -1224,31 +812,8 @@ class GptOssForCausalLM(nn.Module):
         moe_ep_rank_start = moe_ep_rank * moe_num_local_experts
         moe_ep_rank_end = (moe_ep_rank + 1) * moe_num_local_experts
 
-        total_weights = len(weights)
-        total_bytes = sum(weight.numel() * weight.element_size() for _, weight in weights)
-        bytes_done = 0
-        transfer_s_total = 0.0
-        loader_s_total = 0.0
-        overall_start = time.perf_counter()
-
-        if log_progress:
-            logging.info(
-                "GPT-OSS MXFP4 load begin: tensors=%d total_gb=%.3f tp=%d ep=%d transfer_mode=%s",
-                total_weights,
-                total_bytes / (1024**3),
-                moe_tp_size,
-                moe_ep_size,
-                "eager_cuda" if eager_cuda else "direct_copy",
-            )
-
-        for idx, (name, weight) in enumerate(weights, start=1):
-            weight_bytes = weight.numel() * weight.element_size()
-            transfer_start = time.perf_counter()
-            if eager_cuda and weight.device.type != "cuda":
-                weight = weight.cuda(non_blocking=False)
-                if log_progress:
-                    torch.cuda.synchronize(weight.device)
-            transfer_s_total += time.perf_counter() - transfer_start
+        for name, weight in weights:
+            weight = weight.cuda()
 
             if "gate_up_proj_blocks" in name:
                 # Handle MLP gate and up projection weights
@@ -1268,7 +833,6 @@ class GptOssForCausalLM(nn.Module):
 
                 param = params_dict[new_name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                loader_start = time.perf_counter()
                 weight_loader(
                     param,
                     narrow_weight,
@@ -1276,9 +840,6 @@ class GptOssForCausalLM(nn.Module):
                     shard_id=None,
                     expert_id=None,
                 )
-                if log_progress:
-                    torch.cuda.synchronize(param.device)
-                loader_s_total += time.perf_counter() - loader_start
                 loaded_params.add(new_name)
 
             elif "down_proj_blocks" in name:
@@ -1297,7 +858,6 @@ class GptOssForCausalLM(nn.Module):
 
                 param = params_dict[new_name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                loader_start = time.perf_counter()
                 weight_loader(
                     param,
                     narrow_weight,
@@ -1305,9 +865,6 @@ class GptOssForCausalLM(nn.Module):
                     shard_id=None,
                     expert_id=None,
                 )
-                if log_progress:
-                    torch.cuda.synchronize(param.device)
-                loader_s_total += time.perf_counter() - loader_start
                 loaded_params.add(new_name)
 
             elif "gate_up_proj_scales" in name:
@@ -1321,7 +878,6 @@ class GptOssForCausalLM(nn.Module):
 
                 param = params_dict[new_name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                loader_start = time.perf_counter()
                 weight_loader(
                     param,
                     narrow_weight,
@@ -1329,9 +885,6 @@ class GptOssForCausalLM(nn.Module):
                     shard_id=None,
                     expert_id=None,
                 )
-                if log_progress:
-                    torch.cuda.synchronize(param.device)
-                loader_s_total += time.perf_counter() - loader_start
                 loaded_params.add(new_name)
 
             elif "down_proj_scales" in name:
@@ -1345,7 +898,6 @@ class GptOssForCausalLM(nn.Module):
 
                 param = params_dict[new_name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                loader_start = time.perf_counter()
                 weight_loader(
                     param,
                     narrow_weight,
@@ -1353,9 +905,6 @@ class GptOssForCausalLM(nn.Module):
                     shard_id=None,
                     expert_id=None,
                 )
-                if log_progress:
-                    torch.cuda.synchronize(param.device)
-                loader_s_total += time.perf_counter() - loader_start
                 loaded_params.add(new_name)
             elif "gate_up_proj_bias" in name:
                 # Handle MLP gate and up projection biases
@@ -1368,7 +917,6 @@ class GptOssForCausalLM(nn.Module):
 
                 param = params_dict[new_name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                loader_start = time.perf_counter()
                 weight_loader(
                     param,
                     narrow_weight,
@@ -1376,9 +924,6 @@ class GptOssForCausalLM(nn.Module):
                     shard_id=None,
                     expert_id=None,
                 )
-                if log_progress:
-                    torch.cuda.synchronize(param.device)
-                loader_s_total += time.perf_counter() - loader_start
                 loaded_params.add(new_name)
 
             elif "down_proj_bias" in name:
@@ -1390,7 +935,6 @@ class GptOssForCausalLM(nn.Module):
                 new_name = name.replace("down_proj_bias", "w2_weight_bias")
                 param = params_dict[new_name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                loader_start = time.perf_counter()
                 weight_loader(
                     param,
                     narrow_weight,
@@ -1398,36 +942,7 @@ class GptOssForCausalLM(nn.Module):
                     shard_id=None,
                     expert_id=None,
                 )
-                if log_progress:
-                    torch.cuda.synchronize(param.device)
-                loader_s_total += time.perf_counter() - loader_start
                 loaded_params.add(new_name)
-
-            bytes_done += weight_bytes
-            if log_progress and (
-                idx == 1 or idx == total_weights or (progress_every > 0 and idx % progress_every == 0)
-            ):
-                logging.info(
-                    "GPT-OSS MXFP4 load progress: %d/%d last=%s bytes_gb=%.3f/%.3f transfer_s=%.2f loader_s=%.2f elapsed_s=%.2f",
-                    idx,
-                    total_weights,
-                    name,
-                    bytes_done / (1024**3),
-                    total_bytes / (1024**3),
-                    transfer_s_total,
-                    loader_s_total,
-                    time.perf_counter() - overall_start,
-                )
-
-        if log_progress:
-            logging.info(
-                "GPT-OSS MXFP4 load end: tensors=%d total_gb=%.3f transfer_s=%.2f loader_s=%.2f elapsed_s=%.2f",
-                total_weights,
-                total_bytes / (1024**3),
-                transfer_s_total,
-                loader_s_total,
-                time.perf_counter() - overall_start,
-            )
 
         return loaded_params
 
@@ -1438,14 +953,6 @@ class GptOssForCausalLM(nn.Module):
         weight_name_mapping: dict,
         other_loaded_param_names=[],
     ):
-        log_progress = (
-            os.environ.get("SGLANG_GPT_OSS_NORMAL_PROGRESS", "").strip().lower()
-            in ("1", "true", "yes", "on")
-        )
-        progress_every = int(
-            os.environ.get("SGLANG_GPT_OSS_NORMAL_PROGRESS_EVERY", "32") or "32"
-        )
-        phase_start = time.perf_counter()
         tp_rank = get_tensor_model_parallel_rank()
         if is_nextn:
             logging.warning(
@@ -1454,12 +961,6 @@ class GptOssForCausalLM(nn.Module):
             return
         weights = _canonicalize_weights(self.config, weights)
         weights = sorted(weights, key=lambda x: x[0])  # Sort by name for consistency
-        if log_progress:
-            logging.info(
-                "GPT-OSS normal load begin: canonicalized=%d elapsed_s=%.2f",
-                len(weights),
-                time.perf_counter() - phase_start,
-            )
 
         new_weights = []
         for name, p in weights:
@@ -1502,12 +1003,6 @@ class GptOssForCausalLM(nn.Module):
             else:
                 new_weights.append((name, p))
         weights = new_weights
-        if log_progress:
-            logging.info(
-                "GPT-OSS normal load after_qkv_split=%d elapsed_s=%.2f",
-                len(weights),
-                time.perf_counter() - phase_start,
-            )
 
         # Use provided weight name mapping if available, otherwise use default
         if weight_name_mapping is None:
@@ -1524,7 +1019,6 @@ class GptOssForCausalLM(nn.Module):
             ("qkv_proj", "k_proj", "k"),
             ("qkv_proj", "v_proj", "v"),
         ]
-        _, _, FusedMoE, _ = _get_gpt_oss_moe_runtime()
         expert_params_mapping = FusedMoE.make_expert_params_mapping_fused(
             ckpt_gate_up_proj_name="gate_up_proj",
             ckpt_down_proj_name="down_proj",
@@ -1534,8 +1028,7 @@ class GptOssForCausalLM(nn.Module):
 
         params_dict = dict(self.named_parameters())
 
-        total_weights = len(weights)
-        for idx, (name, loaded_weight) in enumerate(weights, start=1):
+        for name, loaded_weight in weights:
             loaded_weight = _WeightCreator.maybe_materialize(loaded_weight)
 
             # Apply weight name mapping if provided
@@ -1613,50 +1106,8 @@ class GptOssForCausalLM(nn.Module):
                     else:
                         logger.warning(f"Parameter {name} not found in params_dict")
 
-            if log_progress and (
-                idx == 1
-                or idx == total_weights
-                or (progress_every > 0 and idx % progress_every == 0)
-            ):
-                logging.info(
-                    "GPT-OSS normal load progress: %d/%d last=%s elapsed_s=%.2f",
-                    idx,
-                    total_weights,
-                    name,
-                    time.perf_counter() - phase_start,
-                )
-        if log_progress:
-            logging.info(
-                "GPT-OSS normal load end: total=%d elapsed_s=%.2f",
-                total_weights,
-                time.perf_counter() - phase_start,
-            )
-
-        # Fallback for FP8 KV Cache: initialize k_scale and v_scale to 1.0 if not present
-        device = next(self.parameters()).device
-        for layer_idx in range(self.config.num_hidden_layers):
-            layer = self.model.layers[layer_idx]
-            attn = getattr(getattr(layer, "self_attn", None), "attn", None)
-            if attn is not None:
-                if not hasattr(attn, "k_scale"):
-                    attn.k_scale = torch.tensor(1.0, dtype=torch.float32, device=device)
-                if not hasattr(attn, "v_scale"):
-                    attn.v_scale = torch.tensor(1.0, dtype=torch.float32, device=device)
-
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
-
-    def get_input_embeddings(self) -> nn.Embedding:
-        return self.model.embed_tokens
-
-    def load_kv_cache_scales(self, quantization_param_path: str) -> None:
-        logger.warning(
-            "Ignoring KV scale file for GPT-OSS FP8 path: %s. "
-            "The current GPT-OSS KV-scale loader is disabled because it is "
-            "numerically unstable in the validated DFlash FP8 serving path.",
-            quantization_param_path,
-        )
-        return
 
     def set_embed_and_head(self, embed, head):
         del self.model.embed_tokens.weight
@@ -1679,18 +1130,6 @@ class GptOssForCausalLM(nn.Module):
             # we plus 1 here because in sglang, for the ith layer, it takes the output
             # of the (i-1)th layer as aux hidden state
             self.model.layers_to_capture = [val + 1 for val in layer_ids]
-
-    def set_dflash_layers_to_capture(self, layer_ids: List[int]):
-        if not self.pp_group.is_last_rank:
-            return
-
-        if layer_ids is None:
-            raise ValueError(
-                "DFLASH requires explicit layer_ids for aux hidden capture."
-            )
-
-        self.capture_aux_hidden_states = True
-        self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):

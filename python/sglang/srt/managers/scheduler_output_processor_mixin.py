@@ -40,6 +40,32 @@ logger = logging.getLogger(__name__)
 DEFAULT_FORCE_STREAM_INTERVAL = 50
 
 
+def _parse_debug_output_len_range() -> tuple[int, int] | None:
+    raw = (os.environ.get("SGLANG_DEBUG_OUTPUT_ID_LEN_RANGE") or "").strip()
+    if not raw:
+        return None
+    try:
+        lo_s, hi_s = raw.split(":", 1)
+        lo = int(lo_s.strip())
+        hi = int(hi_s.strip())
+    except Exception:
+        return None
+    if hi < lo:
+        lo, hi = hi, lo
+    return lo, hi
+
+
+def _parse_debug_logits_topk() -> int:
+    raw = (os.environ.get("SGLANG_DEBUG_LOGITS_TOPK") or "").strip()
+    if not raw:
+        return 0
+    try:
+        k = int(raw)
+    except Exception:
+        return 0
+    return max(0, k)
+
+
 def _fa3_trace_output_ids_enabled() -> bool:
     return os.environ.get("SGLANG_FA3_TRACE_OUTPUT_IDS", "").strip().lower() in (
         "1",
@@ -772,6 +798,9 @@ class SchedulerOutputProcessorMixin:
         logits_output = result.logits_output
         can_run_cuda_graph = result.can_run_cuda_graph
         next_token_ids = result.next_token_ids
+        force_plain_decode_output_processing = bool(
+            getattr(result, "force_plain_decode_output_processing", False)
+        )
 
         dflash_overlap_preprocessed = (
             self.enable_overlap
@@ -780,7 +809,7 @@ class SchedulerOutputProcessorMixin:
             and bool(getattr(result, "dflash_overlap_preprocessed", False))
         )
 
-        if batch.spec_algorithm.is_none():
+        if batch.spec_algorithm.is_none() or force_plain_decode_output_processing:
             next_token_ids = next_token_ids.tolist()
             if batch.return_logprob:
                 next_token_logprobs = logits_output.next_token_logprobs.tolist()
@@ -790,7 +819,7 @@ class SchedulerOutputProcessorMixin:
             next_token_ids = [None] * len(batch.reqs)
 
         self.num_generated_tokens += len(batch.reqs)
-        if not batch.spec_algorithm.is_none():
+        if not batch.spec_algorithm.is_none() and not force_plain_decode_output_processing:
             self.update_spec_metrics(batch.batch_size(), result.num_accepted_tokens)
             self._accumulate_dflash_ssd_metrics(result, batch)
         if self.enable_metrics:
@@ -802,6 +831,7 @@ class SchedulerOutputProcessorMixin:
         # if finished, also clean up committed kv cache and over-allocated kv cache here
 
         # Check finish condition
+        debug_output_len_range = _parse_debug_output_len_range()
         for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
             req: Req
 
@@ -816,12 +846,50 @@ class SchedulerOutputProcessorMixin:
                 continue
 
             new_accepted_len = 1
-            if batch.spec_algorithm.is_none():
+            len_before = len(req.output_ids)
+            if batch.spec_algorithm.is_none() or force_plain_decode_output_processing:
                 req.output_ids.append(next_token_id)
             elif batch.is_spec_v2:
                 # Only spec v2's output_ids are updated here.
                 req.output_ids.extend(next_token_id)
                 new_accepted_len = len(next_token_id)
+            if (
+                debug_output_len_range is not None
+                and debug_output_len_range[0] <= len_before <= debug_output_len_range[1]
+            ):
+                logger.info(
+                    "decode output trace: spec=%s len_before=%d next_token=%s len_after=%d seq_len=%s",
+                    (
+                        "NONE"
+                        if force_plain_decode_output_processing
+                        else getattr(batch.spec_algorithm, "name", str(batch.spec_algorithm))
+                    ),
+                    int(len_before),
+                    next_token_id,
+                    int(len(req.output_ids)),
+                    int(batch.seq_lens[i].item()) if batch.seq_lens is not None else None,
+                )
+                debug_logits_topk = _parse_debug_logits_topk()
+                if (
+                    debug_logits_topk > 0
+                    and logits_output is not None
+                    and logits_output.next_token_logits is not None
+                ):
+                    row_logits = logits_output.next_token_logits[i]
+                    top_k = min(debug_logits_topk, int(row_logits.shape[-1]))
+                    if top_k > 0:
+                        top_vals, top_ids = torch.topk(row_logits, k=top_k, dim=-1)
+                        logger.info(
+                            "decode logits trace: len_before=%d top_ids=%s top_vals=%s",
+                            int(len_before),
+                            top_ids.detach().to("cpu", non_blocking=False).tolist(),
+                            [
+                                round(float(x), 6)
+                                for x in top_vals.detach()
+                                .to("cpu", non_blocking=False)
+                                .tolist()
+                            ],
+                        )
 
             # Update Mamba last track seqlen
             self._mamba_prefix_cache_update(req, batch, result, i)

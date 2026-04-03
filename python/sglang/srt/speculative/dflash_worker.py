@@ -5,7 +5,7 @@ import threading
 import time
 
 from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeoutError
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import Optional, Union
@@ -13,6 +13,10 @@ from typing import Optional, Union
 import torch
 
 from sglang.srt.distributed import get_tp_group
+from sglang.srt.layers.moe.utils import (
+    speculative_moe_a2a_backend_context,
+    speculative_moe_backend_context,
+)
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -25,7 +29,11 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-from sglang.srt.server_args import ServerArgs
+from sglang.srt.server_args import (
+    ServerArgs,
+    get_global_server_args,
+    set_global_server_args_for_scheduler,
+)
 from sglang.srt.speculative.dflash_info import DFlashDraftInput, DFlashVerifyInput
 
 from sglang.srt.speculative.dflash_controller import (
@@ -43,6 +51,7 @@ from sglang.srt.speculative.dflash_utils import (
     gather_dflash_committed_hidden,
     is_dflash_sampling_verify_available,
     parse_dflash_draft_config,
+    resolve_dflash_target_layer_ids,
     resolve_dflash_verify_append_path,
     resolve_dflash_verify_mask_policy,
     update_dflash_req_verify_bookkeeping,
@@ -147,6 +156,12 @@ class DFlashWorker:
         self.model_runner = target_worker.model_runner
         self.page_size = server_args.page_size
         self.device = target_worker.device
+        self._target_server_args = target_worker.model_runner.server_args
+        self._franken_target_plain = (
+            os.environ.get("SGLANG_DFLASH_FRANKEN_TARGET_PLAIN") or ""
+        ).strip().lower() in ("1", "true", "yes", "on")
+        self._plain_target_server_args = None
+        self._draft_server_args = None
 
         self._warned_sampling_fallback = False
         self._logged_first_verify = False
@@ -630,33 +645,104 @@ class DFlashWorker:
                     float(draft_server_args.mem_fraction_static),
                     float(server_args.mem_fraction_static),
                 )
-        self.draft_worker = TpModelWorker(
-            server_args=draft_server_args,
-            gpu_id=gpu_id,
-            tp_rank=tp_rank,
-            moe_ep_rank=moe_ep_rank,
-            pp_rank=0,
-            attn_cp_rank=attn_cp_rank,
-            moe_dp_rank=moe_dp_rank,
-            dp_rank=dp_rank,
-            nccl_port=nccl_port,
-            is_draft_worker=True,
-            req_to_token_pool=shared_req_to_token_pool,
-            token_to_kv_pool_allocator=shared_token_to_kv_pool_allocator,
-        )
+        with (
+            nullcontext(),
+            speculative_moe_backend_context(),
+            speculative_moe_a2a_backend_context(),
+        ):
+            self.draft_worker = TpModelWorker(
+                server_args=draft_server_args,
+                gpu_id=gpu_id,
+                tp_rank=tp_rank,
+                moe_ep_rank=moe_ep_rank,
+                pp_rank=0,
+                attn_cp_rank=attn_cp_rank,
+                moe_dp_rank=moe_dp_rank,
+                dp_rank=dp_rank,
+                nccl_port=nccl_port,
+                is_draft_worker=True,
+                req_to_token_pool=shared_req_to_token_pool,
+                token_to_kv_pool_allocator=shared_token_to_kv_pool_allocator,
+            )
         self.draft_model_runner = self.draft_worker.model_runner
+        self._draft_server_args = self.draft_model_runner.server_args
+        # DFLASH runs target + draft workers in-process. Keep the process-global
+        # server args pinned to the scheduler's DFLASH view by default, and switch
+        # only around explicit target/draft worker forwards. In Frankenstein mode,
+        # the target worker itself is born plain, so pinning the process-global
+        # defaults to the plain target args would make scheduler-side speculative
+        # accounting see None-valued draft settings. Allow a diagnostic override
+        # to pin the global process view back to a plain target server-args copy.
+        pin_plain_global_server_args = (
+            os.environ.get("SGLANG_DFLASH_GLOBAL_SERVER_ARGS_PLAIN") or ""
+        ).strip().lower() in ("1", "true", "yes", "on")
+        if pin_plain_global_server_args and self._franken_target_plain:
+            plain_server_args = deepcopy(self._target_server_args)
+            plain_server_args.speculative_algorithm = None
+            plain_server_args.speculative_num_steps = None
+            plain_server_args.speculative_eagle_topk = None
+            plain_server_args.speculative_num_draft_tokens = None
+            set_global_server_args_for_scheduler(plain_server_args)
+            if self.tp_rank == 0:
+                logger.warning(
+                    "DFLASH diagnostic: pinned process-global ServerArgs to a plain target view in Frankenstein mode."
+                )
+        else:
+            set_global_server_args_for_scheduler(
+                self.server_args
+                if self._franken_target_plain
+                else self._target_server_args
+            )
+        if (
+            os.environ.get("SGLANG_DFLASH_FORCE_PLAIN_TARGET_RUNNER", "")
+            .strip()
+            .lower()
+            in ("1", "true", "yes", "on")
+        ):
+            def _force_plain_attn_backend_state(backend):
+                if backend is None:
+                    return
+                for name, value in (
+                    ("speculative_num_steps", 0),
+                    ("speculative_num_draft_tokens", None),
+                ):
+                    if hasattr(backend, name):
+                        setattr(backend, name, value)
+                for child_name in ("decode_backend", "prefill_backend", "attn_backend"):
+                    child = getattr(backend, child_name, None)
+                    if child is not None and child is not backend:
+                        _force_plain_attn_backend_state(child)
+
+            _force_plain_attn_backend_state(
+                getattr(self.target_worker.model_runner, "attn_backend", None)
+            )
+            decode_group = getattr(
+                self.target_worker.model_runner, "decode_attn_backend_group", None
+            )
+            if decode_group is not None:
+                for backend in decode_group:
+                    _force_plain_attn_backend_state(backend)
+            _force_plain_attn_backend_state(
+                getattr(self.target_worker.model_runner, "decode_attn_backend", None)
+            )
+            if self.tp_rank == 0:
+                logger.warning(
+                    "DFLASH diagnostic: scrubbed speculative state from the embedded target attention backend "
+                    "while leaving scheduler/server_args unchanged."
+                )
         self.draft_model = self.draft_model_runner.model
-        if hasattr(self.draft_model, "set_embed"):
+        # DFlash draft checkpoints borrow the target embedding on the normal fast path.
+        if hasattr(self.draft_model, "set_embed") and bool(
+            getattr(self.draft_model, "requires_input_embeds", False)
+        ):
             self.draft_model.set_embed(
                 self.target_worker.model_runner.model.get_input_embeddings()
             )
-            # Keep linear DFLASH on the original explicit-input-embed path.
-            # This matches the stable production behavior and avoids relying on
-            # the newer self-embedding draft path while we validate regressions.
-            self.draft_model.requires_input_embeds = True
+            self._refresh_draft_graphs_after_embed_swap()
         draft_config = parse_dflash_draft_config(
             draft_hf_config=self.draft_model_runner.model_config.hf_config
         )
+        self._maybe_install_plain_target_dflash_capture()
         if server_args.speculative_num_draft_tokens is None:
             # Should not happen (ServerArgs should have inferred it), but keep a fallback.
             self.block_size = int(draft_config.resolve_block_size(default=16))
@@ -729,7 +815,6 @@ class DFlashWorker:
         self._draft_greedy_selected_ids_buf: Optional[torch.Tensor] = None
         self._draft_greedy_index_cap: int = 0
 
-
         self._draft_block_cache_loc_scratch: Optional[torch.Tensor] = None  # [cap_bs, block_size]
         self._draft_block_cache_loc_scratch_cap: int = 0
 
@@ -765,6 +850,7 @@ class DFlashWorker:
                 float(self._ssd_sampler_x),
                 bool(self._ssd_async_overlap),
             )
+
             if (
                 float(self._ssd_fanout_min_alt_prob) > 0.0
                 or float(self._ssd_fanout_skip_if_actual_prob_ge) < 1.0
@@ -842,6 +928,7 @@ class DFlashWorker:
                 fake_seq = torch.full(
                     (shadow_bs,), int(self.block_size), dtype=torch.int32, device=self.device
                 )
+
                 fake_seq_cpu = torch.full(
                     (shadow_bs,), int(self.block_size), dtype=torch.int32, device="cpu"
                 )
@@ -867,6 +954,125 @@ class DFlashWorker:
                     int(self.block_size),
                     int(self._ssd_shadow_block_cache_loc.numel()),
                 )
+
+    def _refresh_draft_graphs_after_embed_swap(self) -> None:
+        model_runner = self.draft_model_runner
+        # DFLASH linear reuses the draft worker's fixed-size TARGET_VERIFY graphs.
+        # If we swap the draft model onto shared embeddings after worker init, the
+        # graph runners must be rebuilt on the live requires_input_embeds contract.
+        model_runner.init_device_graphs()
+        model_runner.init_piecewise_cuda_graphs()
+
+    def _maybe_install_plain_target_dflash_capture(self) -> None:
+        if not self._franken_target_plain:
+            return
+
+        aux_capture_disabled = (
+            os.environ.get("SGLANG_DFLASH_DISABLE_AUX_CAPTURE") or ""
+        ).strip().lower() in ("1", "true", "yes", "on")
+        if aux_capture_disabled:
+            if self.tp_rank == 0:
+                logger.warning(
+                    "DFLASH diagnostic: skipping plain-target DFLASH aux-capture install because "
+                    "SGLANG_DFLASH_DISABLE_AUX_CAPTURE=1."
+                )
+            return
+
+        model_runner = self.target_worker.model_runner
+        draft_hf_config = self.draft_model_runner.model_config.hf_config
+        draft_num_layers = getattr(draft_hf_config, "num_hidden_layers", None)
+        target_num_layers = getattr(
+            model_runner.model_config.hf_config, "num_hidden_layers", None
+        )
+        if draft_num_layers is None or target_num_layers is None:
+            raise ValueError(
+                "DFLASH Frankenstein plain-target capture install requires both draft and target "
+                f"num_hidden_layers. Got draft={draft_num_layers}, target={target_num_layers}."
+            )
+
+        model_runner.dflash_use_aux_hidden_state = True
+        model_runner.dflash_target_layer_ids = resolve_dflash_target_layer_ids(
+            draft_hf_config=draft_hf_config,
+            target_num_layers=int(target_num_layers),
+            draft_num_layers=int(draft_num_layers),
+        )
+
+        if not hasattr(model_runner.model, "set_dflash_layers_to_capture"):
+            raise ValueError(
+                f"Model {model_runner.model.__class__.__name__} does not implement "
+                "set_dflash_layers_to_capture, which is required for DFLASH aux hidden capture."
+            )
+
+        model_runner.model.set_dflash_layers_to_capture(
+            model_runner.dflash_target_layer_ids
+        )
+        if self.tp_rank == 0:
+            logger.warning(
+                "DFLASH diagnostic: installed DFLASH target-layer capture on plain-born target worker. "
+                "target_layer_ids=%s",
+                list(model_runner.dflash_target_layer_ids),
+            )
+
+    @contextmanager
+    def _worker_server_args_scope(self, server_args: ServerArgs):
+        prev_server_args = get_global_server_args()
+        if prev_server_args is not server_args:
+            set_global_server_args_for_scheduler(server_args)
+        try:
+            yield
+        finally:
+            if get_global_server_args() is not prev_server_args:
+                set_global_server_args_for_scheduler(prev_server_args)
+
+    def _target_server_args_scope(self):
+        use_plain_target_server_args = (
+            os.environ.get("SGLANG_DFLASH_TARGET_SERVER_ARGS_PLAIN") or ""
+        ).strip().lower() in ("1", "true", "yes", "on")
+        if not use_plain_target_server_args:
+            return self._worker_server_args_scope(self._target_server_args)
+
+        if self._plain_target_server_args is None:
+            plain_server_args = deepcopy(self._target_server_args)
+            plain_server_args.speculative_algorithm = None
+            plain_server_args.speculative_num_steps = None
+            plain_server_args.speculative_eagle_topk = None
+            plain_server_args.speculative_num_draft_tokens = None
+            self._plain_target_server_args = plain_server_args
+
+        return self._worker_server_args_scope(self._plain_target_server_args)
+
+    @contextmanager
+    def _target_plain_runtime_scope(self):
+        use_plain_target_runtime = (
+            os.environ.get("SGLANG_DFLASH_TARGET_RUNTIME_PLAIN") or ""
+        ).strip().lower() in ("1", "true", "yes", "on")
+        if not use_plain_target_runtime:
+            yield
+            return
+
+        prev_enable_spec = self.target_worker.enable_spec
+        prev_runner_spec_algorithm = self.target_worker.model_runner.spec_algorithm
+        prev_runner_server_spec_algorithm = (
+            self.target_worker.model_runner.server_args.speculative_algorithm
+        )
+        self.target_worker.enable_spec = False
+        self.target_worker.model_runner.spec_algorithm = SpeculativeAlgorithm.NONE
+        self.target_worker.model_runner.server_args.speculative_algorithm = None
+        try:
+            yield
+        finally:
+            self.target_worker.enable_spec = prev_enable_spec
+            self.target_worker.model_runner.spec_algorithm = (
+                prev_runner_spec_algorithm
+            )
+            self.target_worker.model_runner.server_args.speculative_algorithm = (
+                prev_runner_server_spec_algorithm
+            )
+
+    def _draft_server_args_scope(self):
+        if self._draft_server_args is None:
+            raise RuntimeError("DFLASH draft server args are not initialized.")
+        return self._worker_server_args_scope(self._draft_server_args)
 
     def _init_fused_kv_helper(self) -> None:
         """Initialize the fused KV materialization helper with pre-stacked weights."""
@@ -951,11 +1157,15 @@ class DFlashWorker:
             self._fused_kv_helper = None
 
     def _ensure_draft_block_buffers(self, bs: int) -> None:
-        cap = (
-            0
-            if self._draft_block_ids_buf is None
-            else int(self._draft_block_ids_buf.shape[0])
+        have_all = (
+            self._draft_block_ids_buf is not None
+            and self._draft_block_positions_buf is not None
+            and self._draft_block_tokens_buf is not None
+            and self._draft_block_end_buf is not None
+            and self._draft_seq_lens_cpu_buf is not None
+            and self._draft_seq_lens_plus_cpu_buf is not None
         )
+        cap = 0 if not have_all else int(self._draft_block_ids_buf.shape[0])
         if cap >= int(bs):
             return
 
@@ -2584,7 +2794,7 @@ class DFlashWorker:
                     ),
                 )
 
-                with torch.inference_mode():
+                with self._draft_server_args_scope(), torch.inference_mode():
                     draft_hidden = self.draft_model_runner.forward(forward_batch).logits_output
             else:
                 block_cache_loc = out_cache_loc_override.view(-1)
@@ -2628,7 +2838,7 @@ class DFlashWorker:
                 )
 
 
-                with torch.inference_mode():
+                with self._draft_server_args_scope(), torch.inference_mode():
                     draft_hidden = self.draft_model_runner.forward(forward_batch).logits_output
 
             draft_hidden = draft_hidden.view(bs, draft_token_num, -1).clone()
@@ -2895,6 +3105,10 @@ class DFlashWorker:
     ) -> None:
         bs = batch.batch_size()
         draft_token_num = int(proposal.draft_token_num)
+        if self._draft_block_positions_buf is None or int(self._draft_block_positions_buf.shape[0]) < int(bs):
+            self._ensure_draft_block_buffers(bs)
+        if self._draft_block_positions_buf is None:
+            raise RuntimeError("DFLASH draft position buffer is missing.")
         positions_2d = self._draft_block_positions_buf[:bs, :draft_token_num]
         torch.add(
             batch.seq_lens.unsqueeze(1),
@@ -3036,12 +3250,26 @@ class DFlashWorker:
                         setattr(self, "_logged_survival_failfast", True)
                     verify_mode = "target_only"
         if proposal is None:
-            proposal = self._build_draft_proposal(
-                batch,
-                draft_input,
-                prefix_lens=batch.seq_lens,
-                seq_lens_cpu=batch.seq_lens_cpu,
+            skip_single_token_draft = (
+                int(self.block_size) == 1
+                and (os.environ.get("SGLANG_DFLASH_SINGLE_TOKEN_SKIP_DRAFT") or "")
+                .strip()
+                .lower()
+                not in ("", "0", "false", "off", "no")
             )
+            if skip_single_token_draft:
+                proposal = _DFlashDraftProposal(
+                    draft_tokens=draft_input.verified_id.to(torch.long).view(-1, 1).clone(),
+                    draft_token_num=1,
+                    verify_mode="target_only",
+                )
+            else:
+                proposal = self._build_draft_proposal(
+                    batch,
+                    draft_input,
+                    prefix_lens=batch.seq_lens,
+                    seq_lens_cpu=batch.seq_lens_cpu,
+                )
             if verify_mode == "target_only" and proposal.verify_mode == "pq":
                 proposal.verify_mode = "target_only"
         else:
@@ -3481,6 +3709,12 @@ class DFlashWorker:
 
         with self._draft_worker_lock:
             req_to_token = self.draft_model_runner.req_to_token_pool.req_to_token
+            debug_append_bounds = (os.environ.get("SGLANG_DFLASH_DEBUG_APPEND_BOUNDS") or "").strip().lower() in (
+                "1",
+                "true",
+                "yes",
+                "on",
+            )
 
             req_pool_indices = batch.req_pool_indices
             if req_pool_indices.dtype != torch.int64:
@@ -3546,6 +3780,23 @@ class DFlashWorker:
                             f"need_tokens={int(total_ctx)} available={int(allocator.available_size())}"
                         )
                     ctx_cache_loc = alloc[: int(total_ctx)].to(torch.int64)
+                    if debug_append_bounds:
+                        row = req_pool_indices.reshape(-1)[0]
+                        max_row = int(req_to_token.shape[0])
+                        max_pos = int(req_to_token.shape[1])
+                        pos_min = int(ctx_positions.min().item()) if int(ctx_positions.numel()) > 0 else -1
+                        pos_max = int(ctx_positions.max().item()) if int(ctx_positions.numel()) > 0 else -1
+                        if not (0 <= int(row.item()) < max_row):
+                            raise RuntimeError(
+                                f"DFLASH append row OOB: row={int(row.item())} max_row={max_row}"
+                            )
+                        if int(ctx_positions.numel()) > 0 and not (0 <= pos_min and pos_max < max_pos):
+                            raise RuntimeError(
+                                "DFLASH append position OOB: "
+                                f"pos_min={pos_min} pos_max={pos_max} max_pos={max_pos} "
+                                f"draft_seq_len={int(draft_seq_lens.reshape(-1)[0].item())} "
+                                f"ctx_len={int(ctx_lens.reshape(-1)[0].item())}"
+                            )
                     req_to_token[
                         req_pool_indices.reshape(-1)[0],
                         ctx_positions,
@@ -3613,6 +3864,21 @@ class DFlashWorker:
                     row_ids = req_pool_indices.repeat_interleave(
                         ctx_lens.to(torch.int64), dim=0
                     )
+                    if debug_append_bounds:
+                        max_row = int(req_to_token.shape[0])
+                        max_pos = int(req_to_token.shape[1])
+                        row_min = int(row_ids.min().item()) if int(row_ids.numel()) > 0 else -1
+                        row_max = int(row_ids.max().item()) if int(row_ids.numel()) > 0 else -1
+                        pos_min = int(ctx_positions.min().item()) if int(ctx_positions.numel()) > 0 else -1
+                        pos_max = int(ctx_positions.max().item()) if int(ctx_positions.numel()) > 0 else -1
+                        if int(row_ids.numel()) > 0 and not (0 <= row_min and row_max < max_row):
+                            raise RuntimeError(
+                                f"DFLASH append row OOB: row_min={row_min} row_max={row_max} max_row={max_row}"
+                            )
+                        if int(ctx_positions.numel()) > 0 and not (0 <= pos_min and pos_max < max_pos):
+                            raise RuntimeError(
+                                f"DFLASH append position OOB: pos_min={pos_min} pos_max={pos_max} max_pos={max_pos}"
+                            )
                     req_to_token[row_ids, ctx_positions] = ctx_cache_loc.to(torch.int32)
 
             self._project_and_write_target_hidden_to_draft_kv(
@@ -3916,6 +4182,9 @@ class DFlashWorker:
         **kwargs,
     ) -> GenerationBatchResult:
         self._maybe_finalize_ssd_overlap(block=False)
+        force_plain_shell = (
+            os.environ.get("SGLANG_DFLASH_FORCE_PLAIN_SHELL") or ""
+        ).strip().lower() in ("1", "true", "yes", "on")
         if getattr(batch, "return_logprob", False):
             raise RuntimeError(
                 "Invariant broken: DFLASH batch requested return_logprob, but scheduler should have rejected this request."
@@ -3925,16 +4194,39 @@ class DFlashWorker:
             model_worker_batch = self._coerce_model_worker_batch(
                 batch, overlap_v2=overlap_v2
             )
-            model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
-
-            batch_result = self.target_worker.forward_batch_generation(
-                model_worker_batch, **kwargs
+            prefill_plain_target = (
+                os.environ.get("SGLANG_DFLASH_PREFILL_PLAIN_TARGET") or ""
+            ).strip().lower() in ("1", "true", "yes", "on")
+            model_worker_batch.capture_hidden_mode = (
+                CaptureHiddenMode.NULL
+                if prefill_plain_target
+                else CaptureHiddenMode.FULL
             )
+            orig_prefill_spec_algorithm = model_worker_batch.spec_algorithm
+            orig_prefill_spec_info = model_worker_batch.spec_info
+            if prefill_plain_target:
+                # Make this a true plain target prefill probe. Leaving the batch-level
+                # DFLASH spec payload attached still exercises spec-aware ForwardBatch
+                # plumbing during extend/prefill.
+                model_worker_batch.spec_algorithm = SpeculativeAlgorithm.NONE
+                model_worker_batch.spec_info = None
+            prefill_skip_append = (
+                os.environ.get("SGLANG_DFLASH_PREFILL_SKIP_APPEND") or ""
+            ).strip().lower() in ("1", "true", "yes", "on")
+            try:
+                with self._target_server_args_scope(), self._target_plain_runtime_scope():
+                    batch_result = self.target_worker.forward_batch_generation(
+                        model_worker_batch, **kwargs
+                    )
+            finally:
+                if prefill_plain_target:
+                    model_worker_batch.spec_algorithm = orig_prefill_spec_algorithm
+                    model_worker_batch.spec_info = orig_prefill_spec_info
             logits_output, next_token_ids = (
                 batch_result.logits_output,
                 batch_result.next_token_ids,
             )
-            if logits_output.hidden_states is None:
+            if logits_output.hidden_states is None and not prefill_plain_target:
                 raise RuntimeError(
                     "DFLASH requires target aux hidden capture for prefill, but got None. "
                     "Make sure the target model has DFlash layers-to-capture configured."
@@ -3961,14 +4253,34 @@ class DFlashWorker:
 
             draft_input = DFlashDraftInput(
                 verified_id=next_token_ids.to(torch.int64),
-                target_hidden=logits_output.hidden_states,
-                ctx_lens=_to_int32_device_tensor(model_worker_batch.extend_seq_lens),
-                draft_seq_lens=_to_int32_device_tensor(
-                    model_worker_batch.extend_prefix_lens
+                target_hidden=(
+                    logits_output.hidden_states
+                    if logits_output.hidden_states is not None
+                    else torch.empty((0,), dtype=torch.bfloat16, device=next_token_ids.device)
+                ),
+                ctx_lens=(
+                    torch.zeros(
+                        (batch.batch_size(),), dtype=torch.int32, device=next_token_ids.device
+                    )
+                    if prefill_plain_target
+                    else _to_int32_device_tensor(model_worker_batch.extend_seq_lens)
+                ),
+                draft_seq_lens=(
+                    _to_int32_device_tensor(model_worker_batch.extend_seq_lens)
+                    if prefill_plain_target
+                    else _to_int32_device_tensor(model_worker_batch.extend_prefix_lens)
                 ),
             )
             self._maybe_finalize_ssd_overlap(block=True)
-            self._append_target_hidden_to_draft_kv(batch, draft_input)
+            if prefill_plain_target:
+                draft_input.new_seq_lens = draft_input.draft_seq_lens.clone()
+            elif prefill_skip_append:
+                draft_input.draft_seq_lens = draft_input.draft_seq_lens + draft_input.ctx_lens
+                draft_input.new_seq_lens = draft_input.draft_seq_lens.clone()
+                draft_input.ctx_lens.zero_()
+                draft_input.target_hidden = draft_input.target_hidden[:0]
+            else:
+                self._append_target_hidden_to_draft_kv(batch, draft_input)
 
             # Surface one-shot KV materialization validation stats via response meta_info.
             validate_kv = (os.environ.get("SGLANG_DFLASH_VALIDATE_DRAFT_KV") or "").strip().lower() not in (
@@ -3991,6 +4303,16 @@ class DFlashWorker:
                         setattr(self, "_attached_draft_kv_validate_once", True)
                     except Exception:
                         pass
+            if force_plain_shell:
+                batch.spec_info = None
+                return GenerationBatchResult(
+                    logits_output=logits_output,
+                    next_token_ids=next_token_ids,
+                    num_accepted_tokens=0,
+                    can_run_cuda_graph=batch_result.can_run_cuda_graph,
+                    force_plain_decode_output_processing=True,
+                )
+
             batch.spec_info = draft_input
 
             return GenerationBatchResult(
@@ -4038,11 +4360,165 @@ class DFlashWorker:
             )
 
         # Decode / target-verify stage.
+        if force_plain_shell:
+            orig_spec_algorithm = batch.spec_algorithm
+            orig_spec_info = batch.spec_info
+            batch.spec_algorithm = SpeculativeAlgorithm.NONE
+            batch.spec_info = None
+            with self._target_server_args_scope():
+                batch.prepare_for_decode()
+            batch.spec_algorithm = orig_spec_algorithm
+            batch.spec_info = orig_spec_info
+
+            model_worker_batch = self._coerce_model_worker_batch(
+                batch, overlap_v2=overlap_v2
+            )
+            model_worker_batch.spec_algorithm = SpeculativeAlgorithm.NONE
+            model_worker_batch.spec_info = None
+            model_worker_batch.capture_hidden_mode = CaptureHiddenMode.NULL
+            with self._target_server_args_scope(), self._target_plain_runtime_scope():
+                batch_result = self.target_worker.forward_batch_generation(
+                    model_worker_batch, **kwargs
+                )
+            return GenerationBatchResult(
+                logits_output=batch_result.logits_output,
+                next_token_ids=batch_result.next_token_ids,
+                num_accepted_tokens=0,
+                can_run_cuda_graph=batch_result.can_run_cuda_graph,
+                force_plain_decode_output_processing=True,
+            )
+
         draft_input = batch.spec_info
         if not isinstance(draft_input, DFlashDraftInput):
             raise RuntimeError(
                 "DFLASH decode requires DFlashDraftInput state on the running batch. "
                 "This usually means the request did not complete the prefill stage."
+            )
+
+        single_token_target_decode_bypass = (
+            self.block_size == 1
+            and (os.environ.get("SGLANG_DFLASH_SINGLE_TOKEN_TARGET_DECODE_BYPASS") or "")
+            .strip()
+            .lower()
+            in ("1", "true", "yes", "on")
+        )
+        if single_token_target_decode_bypass:
+            clean_decode_bypass = (
+                os.environ.get("SGLANG_DFLASH_SINGLE_TOKEN_TARGET_DECODE_CLEAN") or ""
+            ).strip().lower() in ("1", "true", "yes", "on")
+            skip_append = (os.environ.get("SGLANG_DFLASH_SINGLE_TOKEN_TARGET_DECODE_SKIP_APPEND") or "").strip().lower() in (
+                "1",
+                "true",
+                "yes",
+                "on",
+            )
+            debug_clean_bypass_state = (
+                os.environ.get("SGLANG_DFLASH_DEBUG_CLEAN_BYPASS_STATE") or ""
+            ).strip().lower() in ("1", "true", "yes", "on")
+            debug_clean_bypass_min_seqlen = int(
+                (os.environ.get("SGLANG_DFLASH_DEBUG_CLEAN_BYPASS_MIN_SEQLEN") or "0").strip()
+                or "0"
+            )
+            should_log_clean_bypass_state = (
+                debug_clean_bypass_state
+                and not getattr(self, "_logged_clean_bypass_state_once", False)
+                and batch.seq_lens is not None
+                and int(batch.seq_lens.max().item()) >= debug_clean_bypass_min_seqlen
+            )
+            if clean_decode_bypass and isinstance(batch, ScheduleBatch):
+                # A plain target decode requires the same allocation/accounting path as
+                # no-DFLASH decode. Simply dropping spec_info is not enough because
+                # speculative decode batches skip ScheduleBatch.prepare_for_decode().
+                if should_log_clean_bypass_state:
+                    logger.info(
+                        "DFLASH clean bypass pre-prepare: seq_lens=%s output_ids=%s verified_id=%s req_output_lens=%s",
+                        batch.seq_lens.detach().to("cpu", non_blocking=False).tolist(),
+                        None
+                        if batch.output_ids is None
+                        else batch.output_ids.detach()
+                        .to("cpu", non_blocking=False)
+                        .tolist(),
+                        draft_input.verified_id.detach()
+                        .to("cpu", non_blocking=False)
+                        .tolist(),
+                        [len(req.output_ids) for req in batch.reqs],
+                    )
+                orig_spec_algorithm = batch.spec_algorithm
+                orig_spec_info = batch.spec_info
+                batch.output_ids = draft_input.verified_id.to(torch.int64)
+                batch.spec_algorithm = SpeculativeAlgorithm.NONE
+                batch.spec_info = None
+                with self._target_server_args_scope():
+                    batch.prepare_for_decode()
+                batch.spec_algorithm = orig_spec_algorithm
+                batch.spec_info = orig_spec_info
+                if should_log_clean_bypass_state:
+                    logger.info(
+                        "DFLASH clean bypass post-prepare: seq_lens=%s input_ids=%s out_cache_loc=%s",
+                        batch.seq_lens.detach().to("cpu", non_blocking=False).tolist(),
+                        None
+                        if batch.input_ids is None
+                        else batch.input_ids.detach()
+                        .to("cpu", non_blocking=False)
+                        .tolist(),
+                        None
+                        if batch.out_cache_loc is None
+                        else batch.out_cache_loc.detach()
+                        .to("cpu", non_blocking=False)
+                        .tolist(),
+                    )
+                    setattr(self, "_logged_clean_bypass_state_once", True)
+            model_worker_batch = self._coerce_model_worker_batch(
+                batch, overlap_v2=overlap_v2
+            )
+            if clean_decode_bypass:
+                # Make this path a true plain target decode probe: do not carry the
+                # DFLASH draft payload into ForwardBatch / decode metadata plumbing.
+                model_worker_batch.spec_algorithm = SpeculativeAlgorithm.NONE
+                model_worker_batch.spec_info = None
+            model_worker_batch.capture_hidden_mode = (
+                CaptureHiddenMode.NULL if skip_append else CaptureHiddenMode.FULL
+            )
+            with self._target_server_args_scope(), self._target_plain_runtime_scope():
+                batch_result = self.target_worker.forward_batch_generation(
+                    model_worker_batch, **kwargs
+                )
+            logits_output, next_token_ids = (
+                batch_result.logits_output,
+                batch_result.next_token_ids,
+            )
+            if logits_output.hidden_states is None and not skip_append:
+                raise RuntimeError(
+                    "DFLASH single-token target-decode bypass requires captured hidden states."
+                )
+            draft_input.verified_id = next_token_ids.to(torch.int64)
+            draft_input.target_hidden = (
+                logits_output.hidden_states
+                if logits_output.hidden_states is not None
+                else torch.empty(
+                    (0,),
+                    dtype=torch.bfloat16,
+                    device=self.device,
+                )
+            )
+            draft_input.ctx_lens = torch.ones(
+                (batch.batch_size(),), dtype=torch.int32, device=self.device
+            )
+            if skip_append:
+                draft_input.target_hidden = draft_input.target_hidden[:0]
+                draft_input.ctx_lens.zero_()
+            else:
+                self._append_target_hidden_to_draft_kv(batch, draft_input)
+            logits_output.hidden_states = None
+            batch.spec_info = draft_input
+            batch.forward_mode = ForwardMode.DECODE
+            return GenerationBatchResult(
+                logits_output=logits_output,
+                next_token_ids=next_token_ids,
+                next_draft_input=self._build_future_draft_input(draft_input),
+                num_accepted_tokens=0,
+                can_run_cuda_graph=batch_result.can_run_cuda_graph,
+                force_plain_decode_output_processing=True,
             )
 
         self._prepare_for_speculative_decoding(batch, draft_input)
@@ -4069,9 +4545,10 @@ class DFlashWorker:
         )
         t0 = time.perf_counter() if timing_flag else 0.0
 
-        batch_result = self.target_worker.forward_batch_generation(
-            model_worker_batch, is_verify=True, **kwargs
-        )
+        with self._target_server_args_scope(), self._target_plain_runtime_scope():
+            batch_result = self.target_worker.forward_batch_generation(
+                model_worker_batch, is_verify=True, **kwargs
+            )
         logits_output, can_run_cuda_graph = (
             batch_result.logits_output,
             batch_result.can_run_cuda_graph,
@@ -4139,23 +4616,36 @@ class DFlashWorker:
                     e,
                 )
 
-        if not appended_from_verify:
-            if next_target_hidden is None:
-                next_target_hidden = gather_dflash_committed_hidden(
-                    hidden_states=logits_output.hidden_states,
-                    keep_mask=cache_plan.keep_mask,
-                    draft_token_num=int(verify_input.draft_token_num),
-                    accepted_indices=cache_plan.accepted_indices,
-                )
-            draft_input.target_hidden = next_target_hidden
-            draft_input.ctx_lens = commit_lens
-            self._append_target_hidden_to_draft_kv(batch, draft_input)
-        append_path = resolve_dflash_verify_append_path(
-            appended_from_verify=appended_from_verify,
-            fused_helper_active=bool(
-                self._use_fused_kv_materialize and self._fused_kv_helper is not None
-            ),
+        skip_verify_append = (os.environ.get("SGLANG_DFLASH_SKIP_VERIFY_APPEND") or "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
         )
+        if skip_verify_append:
+            if draft_input.target_hidden is not None and draft_input.target_hidden.numel() > 0:
+                draft_input.target_hidden = draft_input.target_hidden[:0]
+            if draft_input.ctx_lens is not None:
+                draft_input.ctx_lens = torch.zeros_like(commit_lens)
+            append_path = "skipped"
+        else:
+            if not appended_from_verify:
+                if next_target_hidden is None:
+                    next_target_hidden = gather_dflash_committed_hidden(
+                        hidden_states=logits_output.hidden_states,
+                        keep_mask=cache_plan.keep_mask,
+                        draft_token_num=int(verify_input.draft_token_num),
+                        accepted_indices=cache_plan.accepted_indices,
+                    )
+                draft_input.target_hidden = next_target_hidden
+                draft_input.ctx_lens = commit_lens
+                self._append_target_hidden_to_draft_kv(batch, draft_input)
+            append_path = resolve_dflash_verify_append_path(
+                appended_from_verify=appended_from_verify,
+                fused_helper_active=bool(
+                    self._use_fused_kv_materialize and self._fused_kv_helper is not None
+                ),
+            )
 
         self._update_req_dflash_debug_stats(
             batch=batch,

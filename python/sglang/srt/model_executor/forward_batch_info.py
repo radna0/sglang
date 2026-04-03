@@ -32,6 +32,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from functools import total_ordering
+import logging
+import os
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -69,6 +71,33 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 
 _is_npu = is_npu()
+logger = logging.getLogger(__name__)
+
+
+def _parse_debug_forward_batch_seq_range() -> tuple[int, int] | None:
+    raw = (os.environ.get("SGLANG_DEBUG_FORWARD_BATCH_SEQ_RANGE") or "").strip()
+    if not raw:
+        return None
+    try:
+        lo_s, hi_s = raw.split(":", 1)
+        lo = int(lo_s.strip())
+        hi = int(hi_s.strip())
+    except Exception:
+        return None
+    if hi < lo:
+        lo, hi = hi, lo
+    return lo, hi
+
+
+def _should_log_forward_batch_state(batch: "ForwardBatch") -> bool:
+    seq_range = _parse_debug_forward_batch_seq_range()
+    if seq_range is None or batch is None or batch.seq_lens is None:
+        return False
+    try:
+        seq_max = int(batch.seq_lens.max().item())
+    except Exception:
+        return False
+    return seq_range[0] <= seq_max <= seq_range[1]
 
 
 class ForwardMode(IntEnum):
@@ -517,6 +546,77 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 ret._compute_spec_mrope_positions(model_runner, batch)
             else:
                 ret._compute_mrope_positions(model_runner, batch)
+
+        if _should_log_forward_batch_state(ret):
+            if ret.input_embeds is None:
+                input_embeds_meta = None
+            else:
+                flat = ret.input_embeds.reshape(-1)
+                sample = flat[: min(8, flat.numel())].detach().to(
+                    "cpu", non_blocking=False
+                )
+                input_embeds_meta = {
+                    "shape": tuple(ret.input_embeds.shape),
+                    "dtype": str(ret.input_embeds.dtype),
+                    "head": sample.tolist(),
+                }
+            if ret.next_token_logits_buffer is None:
+                next_token_logits_buffer_meta = None
+            else:
+                next_token_logits_buffer_meta = {
+                    "shape": tuple(ret.next_token_logits_buffer.shape),
+                    "dtype": str(ret.next_token_logits_buffer.dtype),
+                }
+            logger.info(
+                "forward batch trace: spec=%s forward_mode=%s capture_hidden=%s seq_lens=%s extend_seq_lens=%s extend_prefix_lens=%s extend_start_loc=%s input_ids_head=%s input_ids_len=%s req_pool_indices=%s out_cache_head=%s out_cache_len=%s positions_head=%s input_embeds=%s next_token_logits_buffer=%s spec_info=%s",
+                getattr(ret.spec_algorithm, "name", ret.spec_algorithm),
+                getattr(ret.forward_mode, "name", ret.forward_mode),
+                getattr(ret.capture_hidden_mode, "name", ret.capture_hidden_mode),
+                ret.seq_lens.detach().to("cpu", non_blocking=False).tolist(),
+                None
+                if ret.extend_seq_lens is None
+                else ret.extend_seq_lens.detach()
+                .to("cpu", non_blocking=False)
+                .tolist(),
+                None
+                if ret.extend_prefix_lens is None
+                else ret.extend_prefix_lens.detach()
+                .to("cpu", non_blocking=False)
+                .tolist(),
+                None
+                if ret.extend_start_loc is None
+                else ret.extend_start_loc.detach()
+                .to("cpu", non_blocking=False)
+                .tolist(),
+                None
+                if ret.input_ids is None
+                else ret.input_ids[: min(8, ret.input_ids.numel())]
+                .detach()
+                .to("cpu", non_blocking=False)
+                .tolist(),
+                None if ret.input_ids is None else int(ret.input_ids.numel()),
+                None
+                if ret.req_pool_indices is None
+                else ret.req_pool_indices.detach()
+                .to("cpu", non_blocking=False)
+                .tolist(),
+                None
+                if ret.out_cache_loc is None
+                else ret.out_cache_loc[: min(8, ret.out_cache_loc.numel())]
+                .detach()
+                .to("cpu", non_blocking=False)
+                .tolist(),
+                None if ret.out_cache_loc is None else int(ret.out_cache_loc.numel()),
+                None
+                if ret.positions is None
+                else ret.positions[: min(8, ret.positions.numel())]
+                .detach()
+                .to("cpu", non_blocking=False)
+                .tolist(),
+                input_embeds_meta,
+                next_token_logits_buffer_meta,
+                None if ret.spec_info is None else type(ret.spec_info).__name__,
+            )
 
         # Init lora information
         if model_runner.server_args.enable_lora:

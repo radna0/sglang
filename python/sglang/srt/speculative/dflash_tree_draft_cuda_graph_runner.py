@@ -88,6 +88,19 @@ class DFlashTreeDraftCudaGraphRunner:
             .lower()
             in ("1", "true", "yes", "on")
         )
+        self.capture_topk_in_graph = (
+            (os.environ.get("SGLANG_DFLASH_TREE_CAPTURE_TOPK_IN_GRAPH") or "")
+            .strip()
+            .lower()
+            in ("1", "true", "yes", "on")
+        )
+        if not os.environ.get("SGLANG_DFLASH_TREE_CAPTURE_TOPK_IN_GRAPH"):
+            # The explicit-input-embeds lane is the production-aligned raw-target path.
+            # Keep graph replay for the draft forward, but run LM-head top-k eagerly after
+            # replay until the captured top-k path is proven stable there.
+            self.capture_topk_in_graph = not bool(
+                getattr(tree_worker, "_force_explicit_input_embeds", False)
+            )
 
         self.model_runner.attn_backend.init_cuda_graph_state(
             self.max_bs, self.max_num_token
@@ -103,6 +116,9 @@ class DFlashTreeDraftCudaGraphRunner:
             set_torch_compile_config()
 
         hidden_size = int(self.model_runner.model_config.hidden_size)
+        self.requires_input_embeds = bool(
+            getattr(self.model_runner.model, "requires_input_embeds", False)
+        )
         with torch.device(model_runner.device):
             self.input_ids = torch.zeros((self.max_num_token,), dtype=torch.int64)
             self.req_pool_indices = torch.zeros((self.max_bs,), dtype=torch.int32)
@@ -135,6 +151,13 @@ class DFlashTreeDraftCudaGraphRunner:
             self.hidden_states = torch.zeros(
                 (self.max_num_token, hidden_size), dtype=self.model_runner.dtype
             )
+            self.input_embeds = (
+                torch.zeros(
+                    (self.max_num_token, hidden_size), dtype=self.model_runner.dtype
+                )
+                if self.requires_input_embeds
+                else None
+            )
 
             if self.require_gathered_buffer:
                 if self.require_mlp_tp_gather:
@@ -161,6 +184,25 @@ class DFlashTreeDraftCudaGraphRunner:
             raise Exception(
                 f"Capture cuda graph failed: {e}\n{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
             )
+
+    def _maybe_debug_sync(self, label: str) -> None:
+        enabled = (
+            (os.environ.get("SGLANG_DFLASH_TREE_DEBUG_FASTPATH_SYNC") or "")
+            .strip()
+            .lower()
+            not in ("", "0", "false", "off", "no")
+        )
+        if not enabled or not torch.cuda.is_available():
+            return
+        try:
+            torch.cuda.synchronize(self.model_runner.device)
+        except Exception as e:
+            raise RuntimeError(
+                "DFLASH_TREE fastpath failed after "
+                f"{label}: block_size={self.block_size} spec_steps={self.spec_steps} "
+                f"topk={self.topk} capture_topk_in_graph={self.capture_topk_in_graph} "
+                f"capture_builder_in_graph={self.capture_builder_in_graph}"
+            ) from e
 
     def _cache_loc_dtype(self):
         return torch.int64
@@ -209,6 +251,9 @@ class DFlashTreeDraftCudaGraphRunner:
         seq_lens_cpu = self.seq_lens_cpu[:bs]
         out_cache_loc = self.out_cache_loc[:num_tokens]
         positions = self.positions[:num_tokens]
+        input_embeds = (
+            self.input_embeds[:num_tokens] if self.input_embeds is not None else None
+        )
         topk_p = self.topk_p[:bs]
         topk_index = self.topk_index[:bs]
         candidate_scores_buf = self.candidate_scores_buf[:bs]
@@ -251,6 +296,7 @@ class DFlashTreeDraftCudaGraphRunner:
             out_cache_loc=out_cache_loc,
             seq_lens_sum=seq_lens.sum().item(),
             positions=positions,
+            input_embeds=input_embeds,
             global_num_tokens_gpu=self.global_num_tokens_gpu,
             global_num_tokens_for_logprob_gpu=self.global_num_tokens_for_logprob_gpu,
             dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
@@ -278,12 +324,18 @@ class DFlashTreeDraftCudaGraphRunner:
                 forward_batch.dp_padding_mode.is_max_len(),
             )
             set_is_extend_in_batch(False)
+            forward_kwargs = {}
+            if self.requires_input_embeds and input_embeds is not None:
+                forward_kwargs["input_embeds"] = input_embeds
             draft_hidden = forward(
                 input_ids,
                 positions,
                 forward_batch,
+                **forward_kwargs,
             )
             self.hidden_states[:num_tokens].copy_(draft_hidden)
+            if not self.capture_topk_in_graph:
+                return self.hidden_states[:num_tokens]
             step_hidden = self.hidden_states[:num_tokens].view(
                 bs, self.block_size, -1
             )[:, 1 : 1 + self.spec_steps, :].reshape(-1, draft_hidden.shape[-1])
@@ -340,11 +392,15 @@ class DFlashTreeDraftCudaGraphRunner:
             self.out_cache_loc.zero_()
             self.positions.zero_()
             self.input_ids.zero_()
+            if self.input_embeds is not None:
+                self.input_embeds.zero_()
 
         num_tokens = bs * self.num_tokens_per_bs
         self.input_ids[:raw_num_token].copy_(forward_batch.input_ids)
         self.out_cache_loc[:raw_num_token].copy_(forward_batch.out_cache_loc)
         self.positions[:raw_num_token].copy_(forward_batch.positions)
+        if self.input_embeds is not None and forward_batch.input_embeds is not None:
+            self.input_embeds[:raw_num_token].copy_(forward_batch.input_embeds)
         self.req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices)
         self.seq_lens[:raw_bs].copy_(forward_batch.seq_lens)
         if forward_batch.seq_lens_cpu is not None:
@@ -382,6 +438,7 @@ class DFlashTreeDraftCudaGraphRunner:
         self.raw_bs = raw_bs
         self.bs = bs
         self._replay(forward_batch)
+        self._maybe_debug_sync("draft_graph_replay")
         output = self.output_buffers[bs]
 
         if bs != raw_bs:
@@ -400,10 +457,26 @@ class DFlashTreeDraftCudaGraphRunner:
                 )
             return parent_list, top_scores_index, draft_tokens
 
-        topk_p, topk_index = output
-        if bs != raw_bs:
-            topk_p = topk_p[:raw_bs]
-            topk_index = topk_index[:raw_bs]
+        if self.capture_topk_in_graph:
+            topk_p, topk_index = output
+            if bs != raw_bs:
+                topk_p = topk_p[:raw_bs]
+                topk_index = topk_index[:raw_bs]
+        else:
+            step_hidden = self.hidden_states[: raw_bs * self.block_size].view(
+                raw_bs, self.block_size, -1
+            )[:, 1 : 1 + self.spec_steps, :].reshape(-1, self.hidden_states.shape[-1])
+            topk_p_flat, topk_index_flat = self.tree_worker._topk_from_vocab_parallel_head(
+                hidden_states=step_hidden,
+                lm_head=self.tree_worker.target_worker.model_runner.model.lm_head,
+                topk=self.topk,
+            )
+            topk_p = topk_p_flat.view(raw_bs, self.spec_steps, self.topk)
+            topk_index = topk_index_flat.view(raw_bs, self.spec_steps, self.topk)
+        self._maybe_debug_sync("fastpath_topk")
+        # Break aliasing with graph-owned output buffers before eager candidate assembly.
+        topk_p = topk_p.clone()
+        topk_index = topk_index.clone()
         parent_list, top_scores_index, draft_tokens = (
             build_dflash_tree_candidates_from_per_step_topk(
                 topk_p=topk_p,
@@ -415,6 +488,7 @@ class DFlashTreeDraftCudaGraphRunner:
                 top_scores_index_buf=self.top_scores_index[:raw_bs],
             )
         )
+        self._maybe_debug_sync("fastpath_candidate_builder")
         if self.tree_worker._assert_builder_equiv:
             self.tree_worker._assert_tree_builder_equiv(
                 topk_p=topk_p,

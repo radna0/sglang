@@ -10,7 +10,10 @@ import torch
 
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.layers.sampler import apply_custom_logit_processor
+from sglang.srt.layers.sampler import (
+    apply_custom_logit_processor,
+    top_k_top_p_min_p_sampling_from_probs_torch,
+)
 from sglang.srt.managers.overlap_utils import FutureIndices
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.common import (
@@ -25,13 +28,13 @@ from sglang.srt.speculative.dflash_utils import (
     apply_dflash_target_only_req_kv_accounting,
     build_dflash_target_only_cache_plan,
     commit_dflash_target_only_batch,
-    commit_dflash_proposed_tokens_to_req,
     compute_dflash_accept_len_and_bonus,
     compute_dflash_sampling_accept_len_and_bonus,
     gather_dflash_committed_hidden,
     is_dflash_sampling_verify_available,
     materialize_dflash_target_only_commit_metadata,
     pack_dflash_target_only_commits,
+    write_req_to_token_pool_ranges,
 )
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
@@ -356,14 +359,30 @@ class DFlashVerifyInput(SpecInput):
         # locations. For DFlash, the verify tokens are uncommitted, so we must temporarily
         # materialize their loc mapping here; later, only committed tokens are kept and the
         # rest are freed/ignored.
-        assign_req_to_token_pool_func(
-            batch.req_pool_indices,
-            batch.req_to_token_pool.req_to_token,
-            prefix_lens,
-            end_offset,
-            batch.out_cache_loc,
-            bs,
+        use_direct_write = (os.environ.get("SGLANG_DFLASH_USE_DIRECT_REQ_TO_TOKEN_WRITE") or "").strip().lower() not in (
+            "",
+            "0",
+            "false",
+            "off",
+            "no",
         )
+        if use_direct_write:
+            write_req_to_token_pool_ranges(
+                req_to_token_pool=batch.req_to_token_pool,
+                req_pool_indices=batch.req_pool_indices,
+                start_offset=prefix_lens,
+                end_offset=end_offset,
+                out_cache_loc=batch.out_cache_loc,
+            )
+        else:
+            assign_req_to_token_pool_func(
+                batch.req_pool_indices,
+                batch.req_to_token_pool.req_to_token,
+                prefix_lens,
+                end_offset,
+                batch.out_cache_loc,
+                bs,
+            )
         debug_verify_mapping = (os.environ.get("SGLANG_DFLASH_DEBUG_VERIFY_MAPPING") or "").strip().lower() not in (
             "",
             "0",
@@ -462,14 +481,23 @@ class DFlashVerifyInput(SpecInput):
                     logger.exception("DFLASH verify debug-align failed: %s", e)
 
         bs = batch.batch_size()
-        assign_req_to_token_pool_func(
-            batch.req_pool_indices,
-            batch.req_to_token_pool.req_to_token,
-            batch.seq_lens,
-            end_offset,
-            batch.out_cache_loc,
-            bs,
-        )
+        if use_direct_write:
+            write_req_to_token_pool_ranges(
+                req_to_token_pool=batch.req_to_token_pool,
+                req_pool_indices=batch.req_pool_indices,
+                start_offset=batch.seq_lens,
+                end_offset=end_offset,
+                out_cache_loc=batch.out_cache_loc,
+            )
+        else:
+            assign_req_to_token_pool_func(
+                batch.req_pool_indices,
+                batch.req_to_token_pool.req_to_token,
+                batch.seq_lens,
+                end_offset,
+                batch.out_cache_loc,
+                bs,
+            )
 
         if not build_custom_mask:
             self.custom_mask = None
@@ -756,6 +784,12 @@ class DFlashVerifyInput(SpecInput):
                     .lower()
                     not in ("", "0", "false", "off", "no")
                 )
+                # The helper path draws fresh uniform samples and currently ignores
+                # request sampling seeds, which breaks seeded parity with baseline.
+                # Fall back to the seeded inline path whenever deterministic sampling
+                # is requested.
+                if sampling_info.sampling_seed is not None:
+                    sampled_helper_disable = True
                 sampled_helper_used = False
                 if not sampled_helper_disable and is_dflash_sampling_verify_available():
                     try:
@@ -803,23 +837,64 @@ class DFlashVerifyInput(SpecInput):
                     expanded_top_ps = torch.repeat_interleave(
                         sampling_info.top_ps, self.draft_token_num, dim=0
                     )
+                    expanded_min_ps = torch.repeat_interleave(
+                        sampling_info.min_ps, self.draft_token_num, dim=0
+                    )
+                    expanded_sampling_seed = (
+                        None
+                        if sampling_info.sampling_seed is None
+                        else torch.repeat_interleave(
+                            sampling_info.sampling_seed, self.draft_token_num, dim=0
+                        )
+                    )
+                    verify_positions = self.positions
+                    if (
+                        verify_positions is None
+                        or int(verify_positions.numel()) != int(bs * self.draft_token_num)
+                    ):
+                        base_positions = batch.seq_lens.to(torch.int64)
+                        step_offsets = torch.arange(
+                            self.draft_token_num,
+                            device=device,
+                            dtype=torch.int64,
+                        ).view(1, -1)
+                        verify_positions = (base_positions.view(-1, 1) + step_offsets).reshape(-1)
 
                     if sampling_info.need_min_p_sampling:
-                        expanded_min_ps = torch.repeat_interleave(
-                            sampling_info.min_ps, self.draft_token_num, dim=0
-                        )
-                        probs = top_k_renorm_prob(probs, expanded_top_ks)
-                        if not _top_p_is_effectively_disabled(expanded_top_ps):
-                            probs = top_p_renorm_prob(probs, expanded_top_ps)
-                        sampled = min_p_sampling_from_probs(probs, expanded_min_ps)
+                        if expanded_sampling_seed is None:
+                            probs = top_k_renorm_prob(probs, expanded_top_ks)
+                            if not _top_p_is_effectively_disabled(expanded_top_ps):
+                                probs = top_p_renorm_prob(probs, expanded_top_ps)
+                            sampled = min_p_sampling_from_probs(probs, expanded_min_ps)
+                        else:
+                            sampled = top_k_top_p_min_p_sampling_from_probs_torch(
+                                probs,
+                                expanded_top_ks,
+                                expanded_top_ps,
+                                expanded_min_ps,
+                                True,
+                                expanded_sampling_seed,
+                                verify_positions,
+                            )
                     else:
-                        sampled = top_k_top_p_sampling_from_probs(
-                            probs.contiguous(),
-                            expanded_top_ks,
-                            expanded_top_ps,
-                            filter_apply_order="joint",
-                            check_nan=False,
-                        )
+                        if expanded_sampling_seed is None:
+                            sampled = top_k_top_p_sampling_from_probs(
+                                probs.contiguous(),
+                                expanded_top_ks,
+                                expanded_top_ps,
+                                filter_apply_order="joint",
+                                check_nan=False,
+                            )
+                        else:
+                            sampled = top_k_top_p_min_p_sampling_from_probs_torch(
+                                probs,
+                                expanded_top_ks,
+                                expanded_top_ps,
+                                expanded_min_ps,
+                                False,
+                                expanded_sampling_seed,
+                                verify_positions,
+                            )
 
                     target_predict = sampled.view(bs, self.draft_token_num)
             # Ensure we always return basic debug scalars so harnesses can correlate
@@ -1286,123 +1361,138 @@ class DFlashVerifyInput(SpecInput):
         if timing_detail and t_after_accept == 0.0:
             t_after_accept = time.perf_counter()
 
-        # Single D2H transfer for CPU-side commit logic.
-        #
-        # For `verify_mode=target_only`, the committed tokens must be exactly the same
-        # as baseline (target) decoding in greedy mode. Even though accepted draft
-        # tokens are definitionally equal to `target_predict` for the accepted prefix,
-        # pack the target-predicted tokens directly to make token-parity robust under
-        # paged-KV backends.
+        accept_length_per_req_cpu: List[int] = []
         if use_pq:
-            # PQ needs candidates (draft proposals) + accept_len + bonus.
+            # Single D2H transfer for CPU-side commit logic.
             packed = torch.cat(
                 [candidates[:, 1:], accept_len.unsqueeze(1), bonus.unsqueeze(1)], dim=1
             ).cpu()
-        else:
-            packed = torch.cat([target_predict, accept_len.unsqueeze(1)], dim=1).cpu()
-        if timing_detail:
-            t_after_pack = time.perf_counter()
-
-        max_acc = self.draft_token_num - 1
-        accept_length_per_req_cpu: List[int] = []
-        commit_lens_cpu: List[int] = []
-        new_verified_list: List[int] = []
-
-        for i, req in enumerate(batch.reqs):
-            if use_pq:
+            if timing_detail:
+                t_after_pack = time.perf_counter()
+            max_acc = self.draft_token_num - 1
+            commit_lens_cpu: List[int] = []
+            new_verified_list: List[int] = []
+            for i, req in enumerate(batch.reqs):
                 # Layout: [candidates[:, 1:], accept_len, bonus]
                 acc_len = int(packed[i, max_acc].item())
                 proposed = packed[i, :acc_len].tolist() + [
                     int(packed[i, max_acc + 1].item())
                 ]
-            else:
-                # Layout: [target_predict (len=draft_token_num), accept_len]
-                acc_len = int(packed[i, self.draft_token_num].item())
-                proposed = packed[i, : acc_len + 1].tolist()
 
-            appended = 0
-            if (
-                req.grammar is None
-                and not req.sampling_params.stop_strs
-                and not req.sampling_params.stop_regex_strs
-            ):
-                remaining = int(req.sampling_params.max_new_tokens) - len(req.output_ids)
-                if remaining > 0:
-                    tokens = proposed[:remaining]
-                    if not req.sampling_params.ignore_eos:
-                        stop_token_ids = req.sampling_params.stop_token_ids
-                        eos_token_ids = req.eos_token_ids
-                        tokenizer = req.tokenizer
-                        tokenizer_eos = (
-                            tokenizer.eos_token_id if tokenizer is not None else None
-                        )
-                        additional_stop = (
-                            tokenizer.additional_stop_token_ids
-                            if tokenizer is not None
-                            else None
-                        )
-                        vocab_size = getattr(req, "vocab_size", None)
+                appended = 0
+                if (
+                    req.grammar is None
+                    and not req.sampling_params.stop_strs
+                    and not req.sampling_params.stop_regex_strs
+                ):
+                    remaining = int(req.sampling_params.max_new_tokens) - len(
+                        req.output_ids
+                    )
+                    if remaining > 0:
+                        tokens = proposed[:remaining]
+                        if not req.sampling_params.ignore_eos:
+                            stop_token_ids = req.sampling_params.stop_token_ids
+                            eos_token_ids = req.eos_token_ids
+                            tokenizer = req.tokenizer
+                            tokenizer_eos = (
+                                tokenizer.eos_token_id if tokenizer is not None else None
+                            )
+                            additional_stop = (
+                                tokenizer.additional_stop_token_ids
+                                if tokenizer is not None
+                                else None
+                            )
+                            vocab_size = getattr(req, "vocab_size", None)
 
-                        for j, token_id in enumerate(tokens):
-                            if vocab_size is not None and (
-                                int(token_id) > int(vocab_size) or int(token_id) < 0
-                            ):
-                                tokens = tokens[: j + 1]
-                                break
-                            if stop_token_ids and token_id in stop_token_ids:
-                                tokens = tokens[: j + 1]
-                                break
-                            if eos_token_ids and token_id in eos_token_ids:
-                                tokens = tokens[: j + 1]
-                                break
-                            if tokenizer_eos is not None and int(token_id) == int(
-                                tokenizer_eos
-                            ):
-                                tokens = tokens[: j + 1]
-                                break
-                            if additional_stop and token_id in additional_stop:
-                                tokens = tokens[: j + 1]
-                                break
+                            for j, token_id in enumerate(tokens):
+                                if vocab_size is not None and (
+                                    int(token_id) > int(vocab_size) or int(token_id) < 0
+                                ):
+                                    tokens = tokens[: j + 1]
+                                    break
+                                if stop_token_ids and token_id in stop_token_ids:
+                                    tokens = tokens[: j + 1]
+                                    break
+                                if eos_token_ids and token_id in eos_token_ids:
+                                    tokens = tokens[: j + 1]
+                                    break
+                                if tokenizer_eos is not None and int(token_id) == int(
+                                    tokenizer_eos
+                                ):
+                                    tokens = tokens[: j + 1]
+                                    break
+                                if additional_stop and token_id in additional_stop:
+                                    tokens = tokens[: j + 1]
+                                    break
 
-                    req.output_ids.extend(int(tok) for tok in tokens)
-                    appended = len(tokens)
-                    if appended > 0:
-                        req.check_finished(new_accepted_len=appended)
-            else:
-                for tok in proposed:
-                    req.output_ids.append(int(tok))
-                    appended += 1
-                    req.check_finished()
-                    if req.finished():
-                        break
-                    if req.grammar is not None:
-                        req.grammar.accept_token(int(tok))
+                        req.output_ids.extend(int(tok) for tok in tokens)
+                        appended = len(tokens)
+                        if appended > 0:
+                            req.check_finished(new_accepted_len=appended)
+                else:
+                    for tok in proposed:
+                        req.output_ids.append(int(tok))
+                        appended += 1
+                        req.check_finished()
+                        if req.finished():
+                            break
+                        if req.grammar is not None:
+                            req.grammar.accept_token(int(tok))
 
-            if req.output_ids:
-                new_verified_token = int(req.output_ids[-1])
-            elif req.origin_input_ids:
-                new_verified_token = int(req.origin_input_ids[-1])
-            else:
-                raise RuntimeError(
-                    "DFLASH verify cannot determine current token: both output_ids and "
-                    "origin_input_ids are empty."
-                )
+                if req.output_ids:
+                    new_verified_token = int(req.output_ids[-1])
+                elif req.origin_input_ids:
+                    new_verified_token = int(req.origin_input_ids[-1])
+                else:
+                    raise RuntimeError(
+                        "DFLASH verify cannot determine current token: both output_ids and "
+                        "origin_input_ids are empty."
+                    )
 
-            commit_lens_cpu.append(appended)
-            new_verified_list.append(new_verified_token)
-            accept_length_per_req_cpu.append(max(0, appended - 1))
-            req.spec_verify_ct += 1
-            req.spec_accepted_tokens += accept_length_per_req_cpu[-1]
-            if hasattr(req, "update_spec_acceptance_histogram"):
-                req.update_spec_acceptance_histogram(accept_length_per_req_cpu[-1])
+                commit_lens_cpu.append(appended)
+                new_verified_list.append(new_verified_token)
+                accept_length_per_req_cpu.append(max(0, appended - 1))
+                req.spec_verify_ct += 1
+                req.spec_accepted_tokens += accept_length_per_req_cpu[-1]
+                if hasattr(req, "update_spec_acceptance_histogram"):
+                    req.update_spec_acceptance_histogram(accept_length_per_req_cpu[-1])
 
-        if timing_detail:
-            t_after_commit = time.perf_counter()
+            if timing_detail:
+                t_after_commit = time.perf_counter()
 
-        commit_lens = torch.tensor(commit_lens_cpu, dtype=torch.int32, device=device)
-        new_verified_id = torch.tensor(
-            new_verified_list, dtype=torch.int64, device=device
-        )
+            commit_lens = torch.tensor(commit_lens_cpu, dtype=torch.int32, device=device)
+            new_verified_id = torch.tensor(
+                new_verified_list, dtype=torch.int64, device=device
+            )
+        else:
+            packed_target_only = pack_dflash_target_only_commits(
+                target_predict=target_predict.to(torch.int64),
+                accept_len=accept_len,
+            )
+            if timing_detail:
+                t_after_pack = time.perf_counter()
+
+            commit_results = commit_dflash_target_only_batch(
+                reqs=batch.reqs,
+                proposed_flat_cpu=packed_target_only.proposed_flat.cpu(),
+                commit_offsets_cpu=packed_target_only.commit_offsets.cpu(),
+                empty_error_prefix="DFLASH verify",
+            )
+            accept_length_per_req_cpu.extend(
+                result.accepted_draft_tokens for result in commit_results
+            )
+            commit_lens_cpu = [result.commit_len for result in commit_results]
+            commit_metadata = materialize_dflash_target_only_commit_metadata(
+                commit_results=commit_results,
+                device=device,
+                default_commit_lens=packed_target_only.commit_lens,
+                default_new_verified_id=packed_target_only.default_new_verified_id,
+            )
+            commit_lens = commit_metadata.commit_lens
+            new_verified_id = commit_metadata.new_verified_id
+            if timing_detail:
+                t_after_commit = time.perf_counter()
+
         cache_plan = build_dflash_target_only_cache_plan(
             out_cache_loc=batch.out_cache_loc,
             commit_lens=commit_lens,

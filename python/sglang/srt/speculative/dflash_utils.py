@@ -565,6 +565,40 @@ def _build_dflash_fast_finish_policy(req: Any) -> _DFlashFastFinishPolicy | None
     )
 
 
+def write_req_to_token_pool_ranges(
+    *,
+    req_to_token_pool: Any,
+    req_pool_indices: torch.Tensor,
+    start_offset: torch.Tensor,
+    end_offset: torch.Tensor,
+    out_cache_loc: torch.Tensor,
+) -> None:
+    """Write a packed set of per-request token ranges via ReqToTokenPool.write.
+
+    This mirrors the semantic contract of ``assign_req_to_token_pool_func`` while
+    using the same underlying ``req_to_token_pool.write`` path as normal decode.
+    """
+    lengths = (end_offset.to(torch.int64) - start_offset.to(torch.int64)).clamp_min(0)
+    total = int(lengths.sum().item())
+    if total <= 0:
+        return
+    if int(out_cache_loc.numel()) != total:
+        raise ValueError(
+            "Packed req_to_token write size mismatch: "
+            f"expected {total} values, got {int(out_cache_loc.numel())}."
+        )
+
+    max_len = int(lengths.max().item())
+    if max_len <= 0:
+        return
+
+    offs = torch.arange(max_len, device=req_pool_indices.device, dtype=torch.int64)
+    mask = offs.unsqueeze(0) < lengths.unsqueeze(1)
+    row_ids = req_pool_indices.to(torch.int64).unsqueeze(1).expand(-1, max_len)[mask]
+    col_ids = (start_offset.to(torch.int64).unsqueeze(1) + offs.unsqueeze(0))[mask]
+    req_to_token_pool.write((row_ids, col_ids), out_cache_loc.to(torch.int32))
+
+
 def commit_dflash_proposed_tokens_to_req(
     *,
     req: Any,
@@ -1562,14 +1596,30 @@ def apply_dflash_commit_mapping_updates(
 
     bs = int(commit_lens.shape[0])
     end_offset = batch.seq_lens + commit_lens.to(batch.seq_lens.dtype)
-    assign_req_to_token_pool_func(
-        batch.req_pool_indices,
-        batch.req_to_token_pool.req_to_token,
-        batch.seq_lens,
-        end_offset,
-        batch.out_cache_loc,
-        bs,
+    use_direct_write = (os.environ.get("SGLANG_DFLASH_USE_DIRECT_REQ_TO_TOKEN_WRITE") or "").strip().lower() not in (
+        "",
+        "0",
+        "false",
+        "off",
+        "no",
     )
+    if use_direct_write:
+        write_req_to_token_pool_ranges(
+            req_to_token_pool=batch.req_to_token_pool,
+            req_pool_indices=batch.req_pool_indices,
+            start_offset=batch.seq_lens,
+            end_offset=end_offset,
+            out_cache_loc=batch.out_cache_loc,
+        )
+    else:
+        assign_req_to_token_pool_func(
+            batch.req_pool_indices,
+            batch.req_to_token_pool.req_to_token,
+            batch.seq_lens,
+            end_offset,
+            batch.out_cache_loc,
+            bs,
+        )
     if int(clear_token_count) > 0:
         if clear_start is None or clear_end is None:
             raise ValueError(
@@ -1580,14 +1630,23 @@ def apply_dflash_commit_mapping_updates(
             dtype=torch.int64,
             device=commit_lens.device,
         )
-        assign_req_to_token_pool_func(
-            batch.req_pool_indices,
-            batch.req_to_token_pool.req_to_token,
-            clear_start,
-            clear_end,
-            pad_locs,
-            bs,
-        )
+        if use_direct_write:
+            write_req_to_token_pool_ranges(
+                req_to_token_pool=batch.req_to_token_pool,
+                req_pool_indices=batch.req_pool_indices,
+                start_offset=clear_start,
+                end_offset=clear_end,
+                out_cache_loc=pad_locs,
+            )
+        else:
+            assign_req_to_token_pool_func(
+                batch.req_pool_indices,
+                batch.req_to_token_pool.req_to_token,
+                clear_start,
+                clear_end,
+                pad_locs,
+                bs,
+            )
 
     batch.seq_lens.add_(commit_lens.to(batch.seq_lens.dtype))
     batch.seq_lens_cpu.add_(
@@ -1945,6 +2004,49 @@ def build_dflash_tree_candidates_from_per_step_topk(
                 f"need {parent_count}, got {int(parent_list_buf.shape[1])}."
             )
         parent_list = parent_list_buf[:, :parent_count]
+
+    if topk == 1:
+        # For topk==1 there is only one chain through the tree, so score values do
+        # not affect candidate selection or parent structure. Keep this path purely
+        # structural and avoid extra score kernels on the main block-16 tree lane.
+        flat_scores_all[:, :step_count].fill_(1.0)
+        flat_tokens_all[:, :step_count].copy_(topk_index[:, :, 0].to(torch.int64))
+        if parent_count > 0:
+            parent_list[:, 0].fill_(-1)
+            parent_list[:, 1].fill_(0)
+            if parent_count > 2:
+                parent_list[:, 2:parent_count].copy_(
+                    torch.arange(
+                        1,
+                        parent_count - 1,
+                        dtype=torch.long,
+                        device=topk_index.device,
+                    ).unsqueeze(0).expand(bs, -1)
+                )
+
+        verify_count = int(num_verify_tokens) - 1
+        if top_scores_index_buf is None:
+            top_scores_index = torch.empty(
+                (bs, verify_count), dtype=torch.long, device=topk_index.device
+            )
+        else:
+            if (
+                top_scores_index_buf.ndim != 2
+                or int(top_scores_index_buf.shape[0]) != bs
+                or int(top_scores_index_buf.shape[1]) < verify_count
+            ):
+                raise ValueError(
+                    "top_scores_index_buf must be 2D with shape [bs, >=num_verify_tokens-1], got "
+                    f"{tuple(top_scores_index_buf.shape)} for bs={bs} and num_verify_tokens={num_verify_tokens}."
+                )
+            top_scores_index = top_scores_index_buf[:, :verify_count]
+        top_scores_index.copy_(
+            torch.arange(
+                verify_count, dtype=torch.long, device=topk_index.device
+            ).unsqueeze(0).expand(bs, -1)
+        )
+        draft_tokens = flat_tokens_all[:, :verify_count]
+        return parent_list, top_scores_index, draft_tokens
 
     flat_scores_all[:, :topk].copy_(topk_p[:, 0, :].to(torch.float32))
     flat_tokens_all[:, :topk].copy_(topk_index[:, 0, :].to(torch.int64))
@@ -2312,6 +2414,7 @@ def verify_dflash_tree_greedy_fallback(
         "cpu", dtype=torch.int64, non_blocking=False
     )
     target_predict_flat_cpu = target_predict_cpu.reshape(-1)
+    target_predict_flat_cpu = target_predict_cpu.reshape(-1)
 
     predicts_cpu = torch.full(
         (bs * num_draft_tokens,), -1, dtype=torch.int32, device="cpu"
@@ -2356,6 +2459,97 @@ def verify_dflash_tree_greedy_fallback(
         accept_index_cpu.to(device=out_device, dtype=torch.int32),
         accept_token_num_cpu.to(device=out_device, dtype=torch.int32),
     )
+
+
+def rebuild_dflash_tree_predict_from_accept_index(
+    *,
+    accept_index: torch.Tensor,
+    candidates: torch.Tensor,
+    retrive_index: torch.Tensor,
+    target_predict: torch.Tensor,
+    device: torch.device | str | None = None,
+) -> torch.Tensor:
+    """Rebuild the greedy tree `predict` buffer from accepted indices.
+
+    The greedy verify kernel's accepted-chain metadata can still be correct even when the
+    mutable `predict` buffer diverges. This helper reconstructs the `predict` contract from:
+    - `accept_index`: accepted retrieve indices
+    - `candidates`: tree candidate ids at candidate-row positions
+    - `retrive_index`: retrieve index attached to each candidate-row position
+    - `target_predict`: argmax target token ids at each retrieve index
+
+    For each accepted edge, the previous accepted retrieve index emits the next accepted
+    candidate token. The last accepted retrieve index emits the bonus token from the target
+    distribution.
+    """
+    if accept_index.ndim != 2:
+        raise ValueError(
+            f"accept_index must be 2D, got shape={tuple(accept_index.shape)}."
+        )
+    if candidates.ndim != 2:
+        raise ValueError(
+            f"candidates must be 2D, got shape={tuple(candidates.shape)}."
+        )
+    if retrive_index.ndim != 2:
+        raise ValueError(
+            f"retrive_index must be 2D, got shape={tuple(retrive_index.shape)}."
+        )
+    if target_predict.ndim != 2:
+        raise ValueError(
+            f"target_predict must be 2D, got shape={tuple(target_predict.shape)}."
+        )
+    if tuple(candidates.shape) != tuple(retrive_index.shape):
+        raise ValueError(
+            "candidates/retrive_index shape mismatch: "
+            f"{tuple(candidates.shape)} vs {tuple(retrive_index.shape)}."
+        )
+    if tuple(candidates.shape) != tuple(target_predict.shape):
+        raise ValueError(
+            "candidates/target_predict shape mismatch: "
+            f"{tuple(candidates.shape)} vs {tuple(target_predict.shape)}."
+        )
+
+    bs, draft_token_num = candidates.shape
+    out_device = torch.device(device) if device is not None else candidates.device
+
+    accept_index_cpu = accept_index.detach().to("cpu", dtype=torch.int64, non_blocking=False)
+    candidates_cpu = candidates.detach().to("cpu", dtype=torch.int64, non_blocking=False)
+    retrive_index_cpu = retrive_index.detach().to(
+        "cpu", dtype=torch.int64, non_blocking=False
+    )
+    target_predict_cpu = target_predict.detach().to(
+        "cpu", dtype=torch.int64, non_blocking=False
+    )
+    target_predict_flat_cpu = target_predict_cpu.reshape(-1)
+
+    predicts_cpu = torch.full(
+        (bs * draft_token_num,), -1, dtype=torch.int32, device="cpu"
+    )
+
+    for bx in range(bs):
+        valid = accept_index_cpu[bx][accept_index_cpu[bx] != -1].tolist()
+        if not valid:
+            continue
+
+        retrieve_to_candidate = {}
+        for candidate_pos, retrieve_idx in enumerate(retrive_index_cpu[bx].tolist()):
+            retrieve_to_candidate[int(retrieve_idx)] = int(
+                candidates_cpu[bx, candidate_pos].item()
+            )
+
+        for cur_idx, next_idx in zip(valid, valid[1:]):
+            next_token = retrieve_to_candidate.get(int(next_idx))
+            if next_token is None:
+                raise RuntimeError(
+                    "DFLASH_TREE predict rebuild could not resolve accepted retrieve index "
+                    f"{int(next_idx)} in retrive_index row {retrive_index_cpu[bx].tolist()}."
+                )
+            predicts_cpu[int(cur_idx)] = int(next_token)
+
+        last_idx = int(valid[-1])
+        predicts_cpu[last_idx] = int(target_predict_flat_cpu[last_idx].item())
+
+    return predicts_cpu.to(device=out_device, dtype=torch.int32)
 
 
 def pack_dflash_indexed_commits(

@@ -46,6 +46,15 @@ logger = logging.getLogger(__name__)
 _is_npu = is_npu()
 
 
+def _dflash_target_init_plain_enabled(self: "ModelRunner") -> bool:
+    return (
+        self.spec_algorithm.is_dflash_family()
+        and not self.is_draft_worker
+        and (os.environ.get("SGLANG_DFLASH_TARGET_INIT_PLAIN") or "").strip().lower()
+        in ("1", "true", "yes", "on")
+    )
+
+
 @dataclass
 class MemoryPoolConfig:
     pass
@@ -147,7 +156,7 @@ class ModelRunnerKVCacheMixin:
             num_layers = self.num_effective_layers
 
         cell_size = self.get_cell_size_per_token(num_layers)
-        if self.spec_algorithm.is_dflash_family() and not self.is_draft_worker:
+        if self.spec_algorithm.is_dflash_family() and not self.is_draft_worker and not _dflash_target_init_plain_enabled(self):
             draft_num_layers = getattr(self, "dflash_draft_num_layers", None)
             if (
                 draft_num_layers is not None
@@ -457,7 +466,7 @@ class ModelRunnerKVCacheMixin:
         if self.is_hybrid_swa:
             self.set_num_tokens_hybrid_swa()
 
-        if not self.spec_algorithm.is_none() and not self.is_draft_worker:
+        if not self.spec_algorithm.is_none() and not self.is_draft_worker and not _dflash_target_init_plain_enabled(self):
             # Draft worker should use SWA adjusted max_total_num_tokens for cache size, otherwise it may cause oob in kv cache store
             self.server_args.draft_runner_cache_size = self.max_total_num_tokens
             self.server_args.max_num_reqs = max_num_reqs
@@ -476,7 +485,10 @@ class ModelRunnerKVCacheMixin:
         if self.req_to_token_pool is None:
             # FIXME(lsyin): this is the temporary fix for the context length issue when using speculative decoding
             extra_max_context_len = 4
-            if self.server_args.speculative_num_draft_tokens is not None:
+            if (
+                self.server_args.speculative_num_draft_tokens is not None
+                and not _dflash_target_init_plain_enabled(self)
+            ):
                 extra_max_context_len += self.server_args.speculative_num_draft_tokens
 
             if self.server_args.disaggregation_mode == "decode":
@@ -715,6 +727,7 @@ class ModelRunnerKVCacheMixin:
                         enable_alt_stream=not self.server_args.enable_pdmux,
                         enable_kv_cache_copy=(
                             self.server_args.speculative_algorithm is not None
+                            and not _dflash_target_init_plain_enabled(self)
                         ),
                     )
                 else:
@@ -734,6 +747,7 @@ class ModelRunnerKVCacheMixin:
                         enable_alt_stream=not self.server_args.enable_pdmux,
                         enable_kv_cache_copy=(
                             self.server_args.speculative_algorithm is not None
+                            and not _dflash_target_init_plain_enabled(self)
                         ),
                     )
 

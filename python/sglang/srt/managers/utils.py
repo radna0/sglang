@@ -54,6 +54,7 @@ class GenerationBatchResult:
     # compact token payload again.
     dflash_overlap_preprocessed: bool = False
     requires_output_processing_barrier: bool = False
+    force_plain_decode_output_processing: bool = False
 
     # metrics
     expert_distribution_metrics: Optional[ExpertDistributionMetrics] = None

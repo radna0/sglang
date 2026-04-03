@@ -15,7 +15,6 @@
 
 import dataclasses
 import logging
-import os
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -61,25 +60,6 @@ from sglang.srt.utils.common import is_npu, use_intel_amx_backend
 logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
-_fa4_logits_trace_count = 0
-
-
-def _fa4_trace_logits(msg: str, *args) -> None:
-    global _fa4_logits_trace_count
-    enabled = (
-        os.environ.get("SGLANG_FA4_TRACE_LOGITS", "").strip().lower()
-        in ("1", "true", "yes", "on")
-    )
-    if not enabled:
-        return
-    try:
-        limit = int(os.environ.get("SGLANG_FA4_TRACE_LOGITS_LIMIT", "256") or "256")
-    except Exception:
-        limit = 256
-    if limit >= 0 and _fa4_logits_trace_count >= limit:
-        return
-    logger.info(msg, *args)
-    _fa4_logits_trace_count += 1
 
 
 @dataclasses.dataclass
@@ -343,16 +323,6 @@ class LogitsProcessor(nn.Module):
             aux_hidden_states,
             logits_metadata,
         )
-        _fa4_trace_logits(
-            "[FA4Logits] pruned_states shape=%s dtype=%s sample_indices=%s input_logprob_indices=%s forward_mode=%s",
-            tuple(pruned_states.shape),
-            pruned_states.dtype,
-            None if sample_indices is None else tuple(sample_indices.shape),
-            None
-            if input_logprob_indices is None
-            else tuple(input_logprob_indices.shape),
-            logits_metadata.forward_mode,
-        )
 
         hidden_states_to_store = self._get_hidden_states_to_store(
             hidden_states,
@@ -368,17 +338,7 @@ class LogitsProcessor(nn.Module):
 
         if not logits_metadata.extend_return_logprob:
             # Compute logits for both input and sampled tokens.
-            _fa4_trace_logits(
-                "[FA4Logits] before_get_logits hidden=%s dtype=%s",
-                tuple(pruned_states.shape),
-                pruned_states.dtype,
-            )
             logits = self._get_logits(pruned_states, lm_head, logits_metadata)
-            _fa4_trace_logits(
-                "[FA4Logits] after_get_logits logits=%s dtype=%s",
-                tuple(logits.shape),
-                logits.dtype,
-            )
             sampled_logits = (
                 logits[sample_indices] if sample_indices is not None else logits
             )
@@ -859,27 +819,11 @@ class LogitsProcessor(nn.Module):
         last position (e.g., extend without input logprobs). The caller should
         guarantee the given hidden_states follow this constraint.
         """
-        _fa4_trace_logits(
-            "[FA4Logits] enter_get_logits hidden=%s dtype=%s",
-            tuple(hidden_states.shape),
-            hidden_states.dtype,
-        )
         hidden_states, local_hidden_states = self._gather_dp_attn_hidden_states(
             hidden_states, logits_metadata
         )
-        _fa4_trace_logits(
-            "[FA4Logits] after_dp_gather hidden=%s dtype=%s local_hidden=%s",
-            tuple(hidden_states.shape),
-            hidden_states.dtype,
-            None if local_hidden_states is None else tuple(local_hidden_states.shape),
-        )
 
         logits = self._compute_lm_head(hidden_states, lm_head, embedding_bias)
-        _fa4_trace_logits(
-            "[FA4Logits] after_lm_head logits=%s dtype=%s",
-            tuple(logits.shape),
-            logits.dtype,
-        )
 
         if self.logit_scale is not None:
             logits.mul_(self.logit_scale)
@@ -893,18 +837,8 @@ class LogitsProcessor(nn.Module):
         logits = self._scatter_dp_attn_logits(
             logits, local_hidden_states, logits_metadata
         )
-        _fa4_trace_logits(
-            "[FA4Logits] after_dp_scatter logits=%s dtype=%s",
-            tuple(logits.shape),
-            logits.dtype,
-        )
 
         logits = self._copy_logits_to_buffer(logits, logits_metadata)
-        _fa4_trace_logits(
-            "[FA4Logits] after_copy_buffer logits=%s dtype=%s",
-            tuple(logits.shape),
-            logits.dtype,
-        )
 
         if self.final_logit_softcapping:
             if not _is_npu:
@@ -913,11 +847,6 @@ class LogitsProcessor(nn.Module):
                 logits = self.final_logit_softcapping * torch.tanh(
                     logits / self.final_logit_softcapping
                 )
-            _fa4_trace_logits(
-                "[FA4Logits] after_softcap logits=%s dtype=%s",
-                tuple(logits.shape),
-                logits.dtype,
-            )
 
         return logits
 
@@ -929,22 +858,14 @@ class LogitsProcessor(nn.Module):
     ) -> torch.Tensor:
         if hasattr(lm_head, "set_lora") and hasattr(lm_head, "apply_lora"):
             # This is a LoRA-wrapped module, use its forward method
-            _fa4_trace_logits(
-                "[FA4Logits] lm_head_branch=lora hidden=%s hidden_dtype=%s",
-                tuple(hidden_states.shape),
-                hidden_states.dtype,
-            )
             logits = lm_head(hidden_states)
         elif hasattr(lm_head, "weight"):
             # Normal linear layer
-            branch = "matmul"
             if self.use_fp32_lm_head:
-                branch = "fp32_matmul"
                 logits = torch.matmul(
                     hidden_states.to(torch.float32), lm_head.weight.to(torch.float32).T
                 )
             elif use_intel_amx_backend(lm_head):
-                branch = "intel_amx"
                 logits = torch.ops.sgl_kernel.weight_packed_linear(
                     hidden_states.to(lm_head.weight.dtype),
                     lm_head.weight,
@@ -953,51 +874,22 @@ class LogitsProcessor(nn.Module):
                 )
             elif get_global_server_args().rl_on_policy_target is not None:
                 # Due to tie-weight, we may not be able to change lm_head's weight dtype
-                branch = "rl_bf16_tied"
                 logits = torch.matmul(
                     hidden_states.bfloat16(), lm_head.weight.T.bfloat16()
                 )
             else:
-                branch = "weight_dtype_matmul"
-                _fa4_trace_logits(
-                    "[FA4Logits] lm_head_branch=%s hidden=%s hidden_dtype=%s weight=%s weight_dtype=%s",
-                    branch,
-                    tuple(hidden_states.shape),
-                    hidden_states.dtype,
-                    tuple(lm_head.weight.shape),
-                    lm_head.weight.dtype,
-                )
                 logits = torch.matmul(
                     hidden_states.to(lm_head.weight.dtype), lm_head.weight.T
-                )
-            if branch != "weight_dtype_matmul":
-                _fa4_trace_logits(
-                    "[FA4Logits] lm_head_branch=%s hidden=%s hidden_dtype=%s weight=%s weight_dtype=%s",
-                    branch,
-                    tuple(hidden_states.shape),
-                    hidden_states.dtype,
-                    tuple(lm_head.weight.shape),
-                    lm_head.weight.dtype,
                 )
         else:
             # GGUF models
             # TODO: use weight_packed_linear for GGUF models
             if self.use_fp32_lm_head:
-                _fa4_trace_logits(
-                    "[FA4Logits] lm_head_branch=gguf_fp32 hidden=%s hidden_dtype=%s",
-                    tuple(hidden_states.shape),
-                    hidden_states.dtype,
-                )
                 with torch.cuda.amp.autocast(enabled=False):
                     logits = lm_head.quant_method.apply(
                         lm_head, hidden_states.to(torch.float32), embedding_bias
                     )
             else:
-                _fa4_trace_logits(
-                    "[FA4Logits] lm_head_branch=gguf_quant hidden=%s hidden_dtype=%s",
-                    tuple(hidden_states.shape),
-                    hidden_states.dtype,
-                )
                 logits = lm_head.quant_method.apply(
                     lm_head, hidden_states, embedding_bias
                 )
@@ -1063,9 +955,8 @@ class LogitsProcessor(nn.Module):
     ) -> torch.Tensor:
         if logits_metadata.next_token_logits_buffer is not None:
             logits_buffer = logits_metadata.next_token_logits_buffer
-            # Default buffer dtype is fp32, but CUDA-graph preallocation can be configured
-            # to fp16/bf16 to avoid OOMs for very large capture ladders.
-            logits_buffer.copy_(logits[:, : self.vocab_size].to(logits_buffer.dtype))
+            assert logits_buffer.dtype == torch.float
+            logits_buffer.copy_(logits[:, : self.vocab_size])
             logits = logits_buffer
         else:
             logits = logits[:, : self.vocab_size].float()
@@ -1164,7 +1055,7 @@ class LogitsProcessor(nn.Module):
                 input_token_ids_logprobs_val,
                 input_token_ids_logprobs_idx,
             ) = get_token_ids_logprobs_prefill(
-                sliced_logprobs, logits_metadata, no_copy_to_cpu=True
+                sliced_logprobs, logits_metadata, delay_cpu_copy=True
             )
 
         # Get the logprob of top-k tokens

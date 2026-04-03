@@ -339,6 +339,7 @@ def test_pack_dflash_indexed_commits():
 
 def test_verify_dflash_tree_greedy_fallback_matches_kernel_example():
     from sglang.srt.speculative.dflash_utils import (
+        rebuild_dflash_tree_predict_from_accept_index,
         verify_dflash_tree_greedy_fallback,
     )
 
@@ -391,6 +392,15 @@ def test_verify_dflash_tree_greedy_fallback_matches_kernel_example():
     assert predicts.tolist() == [3, -1, -1, 4, 5, 18, 11, -1, -1, -1, 12, 18]
     assert accept_index.tolist() == [[0, 3, 4, 5], [6, 10, 11, -1]]
     assert accept_token_num.tolist() == [3, 2]
+
+    rebuilt_predicts = rebuild_dflash_tree_predict_from_accept_index(
+        accept_index=accept_index,
+        candidates=candidates,
+        retrive_index=retrive_index,
+        target_predict=target_predict,
+        device="cpu",
+    )
+    assert rebuilt_predicts.tolist() == predicts.tolist()
 
 
 def test_build_dflash_tree_candidates_from_per_step_topk_matches_generic_builder():
@@ -467,6 +477,7 @@ def test_build_dflash_tree_candidates_from_per_step_topk_matches_generic_builder
 @pytest.mark.parametrize(
     ("bs", "step_count", "topk", "num_verify_tokens"),
     [
+        (1, 8, 1, 9),
         (2, 3, 2, 4),
         (3, 4, 2, 5),
         (2, 4, 4, 8),
@@ -582,6 +593,47 @@ def test_build_dflash_tree_candidates_from_per_step_topk_reuses_output_buffers()
     assert parent_list.tolist() == [[-1, 0, 1, 2, 4]]
     assert top_scores_index.tolist() == [[0, 1, 2]]
     assert draft_tokens.tolist() == [[10, 11, 20]]
+
+
+def test_build_dflash_tree_candidates_topk1_is_structural():
+    from sglang.srt.speculative.dflash_utils import (
+        build_dflash_tree_candidates_from_per_step_topk,
+    )
+
+    topk_p = torch.tensor(
+        [
+            [
+                [0.3],
+                [0.2],
+                [0.1],
+                [0.05],
+            ]
+        ],
+        dtype=torch.float32,
+    )
+    topk_index = torch.tensor(
+        [
+            [
+                [10],
+                [20],
+                [30],
+                [40],
+            ]
+        ],
+        dtype=torch.int64,
+    )
+
+    parent_list, top_scores_index, draft_tokens = (
+        build_dflash_tree_candidates_from_per_step_topk(
+            topk_p=topk_p,
+            topk_index=topk_index,
+            num_verify_tokens=5,
+        )
+    )
+
+    assert parent_list.tolist() == [[-1, 0, 1, 2]]
+    assert top_scores_index.tolist() == [[0, 1, 2, 3]]
+    assert draft_tokens.tolist() == [[10, 20, 30, 40]]
 
 
 def test_sample_dflash_tree_branch_candidates_vectorized_paths():
@@ -737,6 +789,51 @@ def test_dflash_tree_topk_from_vocab_parallel_head_fast_path(monkeypatch):
     )
     assert torch.equal(logits_ids, ref_ids.to(torch.int64))
     assert torch.allclose(logits_out, ref_vals.to(torch.float32), atol=1e-6)
+
+
+def test_dflash_tree_topk_from_vocab_parallel_head_top1_argmax_path():
+    from sglang.srt.speculative.dflash_tree_worker import DFlashTreeWorker
+
+    lm_head = SimpleNamespace(
+        weight=torch.tensor(
+            [
+                [1.0, 0.0],
+                [0.0, 1.0],
+                [1.0, 1.0],
+            ],
+            dtype=torch.float32,
+        ),
+        shard_indices=SimpleNamespace(
+            num_org_elements=3,
+            num_org_elements_padded=3,
+            num_added_elements=0,
+            org_vocab_start_index=0,
+            added_vocab_start_index=3,
+        ),
+    )
+    hidden_states = torch.tensor(
+        [
+            [2.0, 0.5],
+            [0.1, 3.0],
+        ],
+        dtype=torch.float32,
+    )
+
+    probs, token_ids = DFlashTreeWorker._topk_from_vocab_parallel_head(
+        object(),
+        hidden_states=hidden_states,
+        lm_head=lm_head,
+        topk=1,
+        chunk_size=8,
+    )
+
+    logits = hidden_states @ lm_head.weight.T
+    ref_ids = torch.argmax(logits, dim=-1, keepdim=True)
+    ref_vals = logits.gather(1, ref_ids)
+    ref_probs = torch.softmax(ref_vals, dim=-1)
+
+    assert torch.equal(token_ids, ref_ids.to(torch.int64))
+    assert torch.allclose(probs, ref_probs.to(torch.float32), atol=1e-6)
 
 
 def test_resolve_dflash_overlap_token_ids():
@@ -898,6 +995,26 @@ def test_build_dflash_target_only_cache_plan_page_size_2_cpu_alignment():
     assert plan.clear_start.tolist() == [5]
     assert plan.clear_end.tolist() == [8]
     assert plan.clear_token_count == 3
+
+
+def test_build_dflash_target_only_cache_plan_page_size_256_commit_boundary():
+    from sglang.srt.speculative.dflash_utils import build_dflash_target_only_cache_plan
+
+    plan = build_dflash_target_only_cache_plan(
+        out_cache_loc=torch.arange(256, 265, dtype=torch.int64),
+        commit_lens=torch.tensor([1], dtype=torch.int32),
+        seq_lens=torch.tensor([256], dtype=torch.int32),
+        draft_token_num=9,
+        page_size=256,
+    )
+    assert plan.keep_mask.tolist() == [[True, False, False, False, False, False, False, False, False]]
+    assert plan.accepted_indices.tolist() == [0]
+    assert plan.compact_out_cache_loc.tolist() == [256]
+    assert plan.evicted_slots.numel() == 0
+    assert plan.evicted_pages is None
+    assert plan.clear_start.tolist() == [257]
+    assert plan.clear_end.tolist() == [265]
+    assert plan.clear_token_count == 8
 
 
 def test_build_dflash_shared_pool_append_plan():

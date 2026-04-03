@@ -16,7 +16,6 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from functools import lru_cache
-import os
 from typing import TYPE_CHECKING, Any, Optional, Tuple
 
 import numpy as np
@@ -107,13 +106,6 @@ class WeightsMapper:
 
 def enable_fused_set_kv_buffer(forward_batch: ForwardBatch):
     """Enable fused set_kv_buffer only on CUDA with bfloat16 KV cache."""
-    if os.environ.get("SGLANG_DISABLE_FUSED_SET_KV_BUFFER", "").strip().lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
-    ):
-        return False
     return (
         _is_cuda
         and hasattr(forward_batch.token_to_kv_pool, "dtype")

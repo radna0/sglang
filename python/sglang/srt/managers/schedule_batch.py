@@ -40,6 +40,7 @@ TODO(lmzheng): ModelWorkerBatch seems a bit redundant and we consider removing i
 import copy
 import dataclasses
 import logging
+import os
 import re
 import time
 from enum import Enum, auto
@@ -1949,6 +1950,31 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def prepare_for_decode(self):
         self.forward_mode = ForwardMode.DECODE
         bs = len(self.reqs)
+        debug_prepare_state = (
+            os.environ.get("SGLANG_DEBUG_PREPARE_FOR_DECODE_STATE") or ""
+        ).strip().lower() in ("1", "true", "yes", "on")
+        debug_prepare_min_seqlen = int(
+            (os.environ.get("SGLANG_DEBUG_PREPARE_FOR_DECODE_MIN_SEQLEN") or "0").strip()
+            or "0"
+        )
+        should_log_prepare_state = (
+            debug_prepare_state
+            and not getattr(self, "_logged_prepare_decode_state_once", False)
+            and self.seq_lens is not None
+            and int(self.seq_lens.max().item()) >= debug_prepare_min_seqlen
+        )
+        if should_log_prepare_state:
+            logger.info(
+                "prepare_for_decode pre: spec=%s seq_lens=%s output_ids=%s req_output_lens=%s kv_committed_lens=%s kv_allocated_lens=%s",
+                getattr(self.spec_algorithm, "name", str(self.spec_algorithm)),
+                self.seq_lens.detach().to("cpu", non_blocking=False).tolist(),
+                None
+                if self.output_ids is None
+                else self.output_ids.detach().to("cpu", non_blocking=False).tolist(),
+                [len(req.output_ids) for req in self.reqs],
+                [int(req.kv_committed_len) for req in self.reqs],
+                [int(req.kv_allocated_len) for req in self.reqs],
+            )
 
         if self.is_spec_v2:
             # TODO(spec-v2): all spec v2 should go through this path
@@ -2011,6 +2037,21 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.seq_lens_cpu.add_(1)
             self.orig_seq_lens.add_(1)
         self.seq_lens_sum += bs
+        if should_log_prepare_state:
+            logger.info(
+                "prepare_for_decode post: spec=%s seq_lens=%s input_ids=%s out_cache_loc=%s kv_committed_lens=%s kv_allocated_lens=%s",
+                getattr(self.spec_algorithm, "name", str(self.spec_algorithm)),
+                self.seq_lens.detach().to("cpu", non_blocking=False).tolist(),
+                None
+                if self.input_ids is None
+                else self.input_ids.detach().to("cpu", non_blocking=False).tolist(),
+                None
+                if self.out_cache_loc is None
+                else self.out_cache_loc.detach().to("cpu", non_blocking=False).tolist(),
+                [int(req.kv_committed_len) for req in self.reqs],
+                [int(req.kv_allocated_len) for req in self.reqs],
+            )
+            setattr(self, "_logged_prepare_decode_state_once", True)
 
         if get_global_server_args().enable_mamba_extra_buffer():
             self.mamba_track_indices = torch.tensor(
