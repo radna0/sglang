@@ -157,8 +157,25 @@ class PiecewiseCudaGraphRunner:
             "eager",
             "inductor",
         ], "By now, only eager and inductor are supported for piecewise cuda graph compiler."
+        capture_sizes = self.model_runner.server_args.piecewise_cuda_graph_tokens
+        if (
+            model_runner.spec_algorithm.is_eagle()
+            or model_runner.spec_algorithm.is_standalone()
+            or model_runner.spec_algorithm.is_dflash_family()
+        ) and not self.model_runner.is_draft_worker:
+            verify_block = self.model_runner.server_args.speculative_num_draft_tokens
+            max_verify_tokens = verify_block * model_runner.req_to_token_pool.size
+            capture_sizes = [
+                size
+                for size in capture_sizes
+                if size % verify_block == 0 and size <= max_verify_tokens
+            ]
+            if verify_block not in capture_sizes:
+                capture_sizes.append(verify_block)
+            capture_sizes = sorted(set(capture_sizes))
+
         self.compile_config = CompilationConfig(
-            self.model_runner.server_args.piecewise_cuda_graph_tokens,
+            capture_sizes,
             self.model_runner.server_args.piecewise_cuda_graph_compiler,
             self.model_runner.server_args.enable_torch_compile_debug_mode,
         )
@@ -176,6 +193,12 @@ class PiecewiseCudaGraphRunner:
         )
         self.capture_forward_mode = ForwardMode.EXTEND
         self.capture_hidden_mode = CaptureHiddenMode.NULL
+        if (
+            model_runner.spec_algorithm.is_eagle()
+            or model_runner.spec_algorithm.is_standalone()
+            or model_runner.spec_algorithm.is_dflash_family()
+        ) and not self.model_runner.is_draft_worker:
+            self.capture_forward_mode = ForwardMode.TARGET_VERIFY
 
         # If returning hidden states is enabled, set initial capture hidden mode to full to avoid double-capture on startup
         if model_runner.server_args.enable_return_hidden_states:
@@ -310,9 +333,16 @@ class PiecewiseCudaGraphRunner:
             if self.mamba_track_seqlens is not None
             else None
         )
+        spec_info = self.get_spec_info(num_tokens)
+        capture_hidden_mode = self.capture_hidden_mode
+        if capture_hidden_mode != CaptureHiddenMode.FULL:
+            capture_hidden_mode = (
+                spec_info.capture_hidden_mode if spec_info else CaptureHiddenMode.NULL
+            )
+
         with torch.device(self.device):
             forward_batch = ForwardBatch(
-                forward_mode=ForwardMode.EXTEND,
+                forward_mode=self.capture_forward_mode,
                 batch_size=1,
                 input_ids=input_ids,
                 input_embeds=input_embeds,
@@ -345,11 +375,11 @@ class PiecewiseCudaGraphRunner:
                 dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
                 global_dp_buffer_len=None,
                 mrope_positions=mrope_positions,
-                spec_algorithm=None,
-                spec_info=None,
-                capture_hidden_mode=CaptureHiddenMode.NULL,
+                spec_algorithm=self.model_runner.spec_algorithm,
+                spec_info=spec_info,
+                capture_hidden_mode=capture_hidden_mode,
                 num_token_non_padded=None,
-                global_forward_mode=ForwardMode.EXTEND,
+                global_forward_mode=self.capture_forward_mode,
                 lora_ids=None,
             )
 
@@ -461,9 +491,16 @@ class PiecewiseCudaGraphRunner:
         else:
             lora_ids = None
 
+        spec_info = self.get_spec_info(num_tokens)
+        capture_hidden_mode = self.capture_hidden_mode
+        if capture_hidden_mode != CaptureHiddenMode.FULL:
+            capture_hidden_mode = (
+                spec_info.capture_hidden_mode if spec_info else CaptureHiddenMode.NULL
+            )
+
         with torch.device(self.device):
             forward_batch = ForwardBatch(
-                forward_mode=ForwardMode.EXTEND,
+                forward_mode=self.capture_forward_mode,
                 batch_size=bs,
                 input_ids=input_ids,
                 input_embeds=input_embeds,
@@ -496,11 +533,11 @@ class PiecewiseCudaGraphRunner:
                 dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
                 global_dp_buffer_len=None,
                 mrope_positions=mrope_positions,
-                spec_algorithm=None,
-                spec_info=None,
-                capture_hidden_mode=CaptureHiddenMode.NULL,
+                spec_algorithm=self.model_runner.spec_algorithm,
+                spec_info=spec_info,
+                capture_hidden_mode=capture_hidden_mode,
                 num_token_non_padded=None,
-                global_forward_mode=ForwardMode.EXTEND,
+                global_forward_mode=self.capture_forward_mode,
                 lora_ids=None,
             )
             self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
