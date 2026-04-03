@@ -334,7 +334,7 @@ def _launch_server(
     repo_python = str(
         Path(source_root).resolve() / "python"
         if source_root
-        else (Path(__file__).resolve().parents[2] / "python")
+        else (Path(__file__).resolve().parents[3] / "python")
     )
     env = {"SGLANG_RECORD_STEP_TIME": "1", **os.environ}
     env["PYTHONPATH"] = (
@@ -826,7 +826,7 @@ def _parse_args() -> argparse.Namespace:
         description="Benchmark GPT-OSS DFlash on the local reference problems."
     )
     p.add_argument("--model-path", required=True)
-    p.add_argument("--draft-model-path", required=True)
+    p.add_argument("--draft-model-path", default=None)
     p.add_argument("--reference-csv", default="/root/reference.csv")
     p.add_argument("--question-ids", default="92ba6a,9c1c5f,a295e9")
     p.add_argument("--out-json", default=None)
@@ -869,6 +869,11 @@ def _parse_args() -> argparse.Namespace:
         type=str,
         choices=["DFLASH", "DFLASH_TREE"],
         default="DFLASH",
+    )
+    p.add_argument(
+        "--baseline-only",
+        action="store_true",
+        help="Run only the plain baseline model and skip the speculative leg.",
     )
     p.add_argument("--disable-stream", action="store_true")
     return p.parse_args()
@@ -949,46 +954,50 @@ def main() -> int:
             disable_stream=bool(args.disable_stream),
         )
 
-    dflash = _run_single(
-        model_path=args.model_path,
-        port=args.dflash_port,
-        attention_backend=args.attention_backend,
-        moe_runner_backend=args.moe_runner_backend,
-        kv_cache_dtype=args.kv_cache_dtype,
-        context_length=args.context_length,
-        cuda_graph_max_bs=args.cuda_graph_max_bs,
-        max_running_requests=args.max_running_requests,
-        page_size=args.page_size,
-        enable_piecewise_cuda_graph=(
-            not args.disable_cuda_graph and not args.disable_piecewise_cuda_graph
-        ),
-        piecewise_cuda_graph_max_tokens=args.piecewise_cuda_graph_max_tokens,
-        disable_cuda_graph=bool(args.disable_cuda_graph),
-        speculative=True,
-        speculative_algorithm=args.speculative_algorithm,
-        draft_model_path=args.draft_model_path,
-        draft_attention_backend=args.draft_attention_backend,
-        draft_kv_cache_dtype=args.draft_kv_cache_dtype,
-        draft_page_size=args.draft_page_size,
-        speculative_moe_runner_backend=args.speculative_moe_runner_backend,
-        speculative_dflash_block_size=args.speculative_dflash_block_size,
-        speculative_num_steps=args.speculative_num_steps,
-        speculative_eagle_topk=args.speculative_eagle_topk,
-        speculative_num_draft_tokens=args.speculative_num_draft_tokens,
-        mem_fraction_static=args.mem_fraction_static,
-        speculative_draft_mem_fraction_static=args.speculative_draft_mem_fraction_static,
-        disable_overlap_schedule=bool(args.disable_overlap_schedule),
-        prompts=prompts,
-        prompt_question_ids=prompt_question_ids,
-        prompt_expected_answers=prompt_expected_answers,
-        concurrency=args.concurrency,
-        output_lens=output_lens,
-        temperature=args.temperature,
-        top_p=args.top_p,
-        top_k=args.top_k,
-        min_p=args.min_p,
-        disable_stream=bool(args.disable_stream),
-    )
+    dflash: BenchRun | None = None
+    if not args.baseline_only:
+        if not args.draft_model_path:
+            raise ValueError("--draft-model-path is required unless --baseline-only is set")
+        dflash = _run_single(
+            model_path=args.model_path,
+            port=args.dflash_port,
+            attention_backend=args.attention_backend,
+            moe_runner_backend=args.moe_runner_backend,
+            kv_cache_dtype=args.kv_cache_dtype,
+            context_length=args.context_length,
+            cuda_graph_max_bs=args.cuda_graph_max_bs,
+            max_running_requests=args.max_running_requests,
+            page_size=args.page_size,
+            enable_piecewise_cuda_graph=(
+                not args.disable_cuda_graph and not args.disable_piecewise_cuda_graph
+            ),
+            piecewise_cuda_graph_max_tokens=args.piecewise_cuda_graph_max_tokens,
+            disable_cuda_graph=bool(args.disable_cuda_graph),
+            speculative=True,
+            speculative_algorithm=args.speculative_algorithm,
+            draft_model_path=args.draft_model_path,
+            draft_attention_backend=args.draft_attention_backend,
+            draft_kv_cache_dtype=args.draft_kv_cache_dtype,
+            draft_page_size=args.draft_page_size,
+            speculative_moe_runner_backend=args.speculative_moe_runner_backend,
+            speculative_dflash_block_size=args.speculative_dflash_block_size,
+            speculative_num_steps=args.speculative_num_steps,
+            speculative_eagle_topk=args.speculative_eagle_topk,
+            speculative_num_draft_tokens=args.speculative_num_draft_tokens,
+            mem_fraction_static=args.mem_fraction_static,
+            speculative_draft_mem_fraction_static=args.speculative_draft_mem_fraction_static,
+            disable_overlap_schedule=bool(args.disable_overlap_schedule),
+            prompts=prompts,
+            prompt_question_ids=prompt_question_ids,
+            prompt_expected_answers=prompt_expected_answers,
+            concurrency=args.concurrency,
+            output_lens=output_lens,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            top_k=args.top_k,
+            min_p=args.min_p,
+            disable_stream=bool(args.disable_stream),
+        )
 
     report = {
         "regime": {
@@ -1041,23 +1050,26 @@ def main() -> int:
             "min_p": args.min_p,
             "disable_stream": bool(args.disable_stream),
             "skip_baseline": bool(args.skip_baseline),
+            "baseline_only": bool(args.baseline_only),
         },
         "baseline": asdict(baseline.summary) if baseline is not None else None,
         "baseline_request_metrics": baseline.request_metrics if baseline is not None else [],
         "baseline_request_metric_aggregate": (
             baseline.request_metric_aggregate if baseline is not None else {}
         ),
-        "dflash": asdict(dflash.summary),
-        "dflash_request_metrics": dflash.request_metrics,
-        "dflash_request_metric_aggregate": dflash.request_metric_aggregate,
+        "dflash": asdict(dflash.summary) if dflash is not None else None,
+        "dflash_request_metrics": dflash.request_metrics if dflash is not None else [],
+        "dflash_request_metric_aggregate": (
+            dflash.request_metric_aggregate if dflash is not None else {}
+        ),
         "speedup_req_s": (
             round(dflash.summary.req_s / baseline.summary.req_s, 4)
-            if baseline is not None and baseline.summary.req_s
+            if baseline is not None and baseline.summary.req_s and dflash is not None
             else None
         ),
         "speedup_wall_tok_s": (
             round(dflash.summary.wall_tok_s / baseline.summary.wall_tok_s, 4)
-            if baseline is not None and baseline.summary.wall_tok_s
+            if baseline is not None and baseline.summary.wall_tok_s and dflash is not None
             else None
         ),
         "speedup_output_tok_s_p20": (
@@ -1066,7 +1078,9 @@ def main() -> int:
                 / (baseline.summary.output_tok_s_p20 or 1.0),
                 4,
             )
-            if baseline is not None and baseline.summary.output_tok_s_p20
+            if baseline is not None
+            and baseline.summary.output_tok_s_p20
+            and dflash is not None
             else None
         ),
     }
@@ -1079,7 +1093,8 @@ def main() -> int:
     rows: list[tuple[str, BenchResult]] = []
     if baseline is not None:
         rows.append(("baseline", baseline.summary))
-    rows.append(("dflash", dflash.summary))
+    if dflash is not None:
+        rows.append(("dflash", dflash.summary))
     for name, bench in rows:
         accept_min_max = (
             "n/a"

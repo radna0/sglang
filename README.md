@@ -1041,7 +1041,7 @@ Code paths:
 
 - `/workspace/sglang-dflash-line/python/sglang/srt/model_executor/cuda_graph_runner.py`
 - `/workspace/sglang-dflash-line/python/sglang/srt/speculative/dflash_worker.py`
-- `/workspace/sglang-dflash-line/scripts/playground/bench_reference_dflash.py`
+- `/workspace/sglang-dflash-line/scripts/playground/dflash/bench_reference.py`
 
 ### Graph-On Local Harness Results, `context_length=65536`, `decode_len=2048`, `page=1`, `draft_page=1`, `block=16`
 
@@ -1686,7 +1686,7 @@ Relevant files:
 - `python/sglang/srt/speculative/dflash_utils.py`
 - `python/sglang/srt/speculative/triton_ops/fused_kv_materialize.py`
 - `python/sglang/bench_serving.py`
-- `scripts/playground/bench_reference_dflash.py`
+- `scripts/playground/dflash/bench_reference.py`
 
 Implemented:
 
@@ -1752,7 +1752,7 @@ export SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE=0
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export SGLANG_DFLASH_TIMING=1
 
-/venv/main/bin/python /workspace/sglang-dflash-line/scripts/playground/bench_reference_dflash.py \
+/venv/main/bin/python /workspace/sglang-dflash-line/scripts/playground/dflash/bench_reference.py \
   --model-path /workspace/offload_root/gpt-oss-120b \
   --draft-model-path /root/epoch_65_step_23760 \
   --reference-csv /root/reference.csv \
@@ -1791,7 +1791,7 @@ Key artifacts:
 
 ## Exploration Router Prototype
 
-`scripts/playground/route_reference_dflash.py` is the current application-layer
+`scripts/playground/dflash/route_reference.py` is the current application-layer
 prototype for EAFT/FailFast-style branch routing on GPT-OSS DFLASH.
 
 Current policy shape:
@@ -1934,7 +1934,7 @@ These are now the working contracts for inference benchmarking on this branch.
 - That production script locks:
   - `BLOCK_SIZE=16`
   - `TARGET_LAYERS=1,9,17,25,33`
-  - training attention backend = `flex_attention`
+  - training attention backend is pinned by the production script
 - Inference must therefore preserve the training-aligned DFlash contract:
   - tree and linear inference may benchmark `block=8` or `block=4`
   - but `block=16` remains the primary contract-aligned lane

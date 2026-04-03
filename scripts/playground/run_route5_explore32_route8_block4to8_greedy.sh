@@ -10,7 +10,7 @@ mkdir -p "${ROOT_DIR}"
 
 export PYTHONPATH="/workspace/sglang-dflash-line/python"
 
-/venv/main/bin/python /workspace/sglang-dflash-line/scripts/playground/route_reference_dflash.py \
+/venv/main/bin/python /workspace/sglang-dflash-line/scripts/playground/dflash/route_reference.py \
   --reference-csv /root/reference.csv \
   --question-ids "86e8e5,dd7f5e,a295e9,9c1c5f,92ba6a" \
   --out-json "${OUT_JSON}" \

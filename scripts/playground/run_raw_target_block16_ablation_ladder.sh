@@ -5,7 +5,7 @@ ROOT_DIR="${1:-/workspace/raw_target_block16_ablation_20260403}"
 mkdir -p "${ROOT_DIR}"
 
 PYTHON_BIN="${PYTHON_BIN:-/workspace/venv-dflash/bin/python}"
-SCRIPT="${SCRIPT:-/workspace/sglang-dflash-tree-active/scripts/playground/bench_reference_dflash.py}"
+SCRIPT="${SCRIPT:-/workspace/sglang-dflash-tree-active/scripts/playground/dflash/bench_reference.py}"
 MODEL_PATH="${MODEL_PATH:-/root/gpt-oss-120b}"
 DRAFT_MODEL_PATH="${DRAFT_MODEL_PATH:-/workspace/30_03_DFLASH/root/epoch_65_step_23760}"
 REFERENCE_CSV="${REFERENCE_CSV:-/workspace/30_03_DFLASH/root/reference.csv}"

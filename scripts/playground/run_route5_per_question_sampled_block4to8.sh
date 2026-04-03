@@ -24,7 +24,7 @@ for qid in "${QIDS[@]}"; do
   continue_port=$((PORT_CONTINUE_BASE + i))
   out_json="${ROOT_DIR}/${qid}.json"
 
-  /venv/main/bin/python /workspace/sglang-dflash-line/scripts/playground/route_reference_dflash.py \
+  /venv/main/bin/python /workspace/sglang-dflash-line/scripts/playground/dflash/route_reference.py \
     --reference-csv /root/reference.csv \
     --question-ids "${qid}" \
     --out-json "${out_json}" \

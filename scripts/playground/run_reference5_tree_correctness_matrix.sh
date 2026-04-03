@@ -37,7 +37,7 @@ run_one() {
     export PYTHONPATH="${REPO}/python"
     export SGLANG_DFLASH_DRAFT_SHARE_POOLS=1
     export SGLANG_DFLASH_TREE_FORCE_EXPLICIT_INPUT_EMBEDS=1
-    exec "${PYTHON}" "${REPO}/scripts/playground/bench_reference_dflash.py" \
+    exec "${PYTHON}" "${REPO}/scripts/playground/dflash/bench_reference.py" \
       --model-path "${MODEL}" \
       --draft-model-path "${DRAFT}" \
       --reference-csv "${REFERENCE_CSV}" \

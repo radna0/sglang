@@ -7,7 +7,7 @@ Design goals (for our repo workflow):
     but also supports short decode smoke runs to avoid wasting 30+ minutes.
 
 Example (short smoke):
-  python3 scripts/playground/bench_speculative_dflash.py \\
+  python3 scripts/playground/dflash/bench_speculative.py \\
     --model-path /path/to/gpt-oss-120b \\
     --draft-model-path /path/to/dflash_draft_ckpt \\
     --attention-backend fa3 \\
@@ -17,7 +17,7 @@ Example (short smoke):
     --concurrency 1
 
 
-  python3 bench_speculative_dflash.py \
+  python3 bench_speculative.py \
     --model-path /path/to/gpt-oss-120b \
     --speculative-draft-model-path /path/to/dflash-draft-ckpt \
     --prefill-attention-backend fa3 \

@@ -32,7 +32,7 @@ from transformers import AutoTokenizer
 from sglang.bench_serving import DatasetRow, benchmark, set_global_args
 from sglang.test.test_utils import kill_process_tree
 
-from bench_reference_dflash import (
+from bench_reference import (
     BenchResult,
     _aggregate_request_metrics,
     _build_sampling_params,

@@ -90,7 +90,7 @@ Notes:
 If you have a repo checkout (so you can run `scripts/`), use the dedicated sweeper:
 
 ```bash
-python3 scripts/playground/bench_speculative_dflash.py \
+python3 scripts/playground/dflash/bench_speculative.py \
   --model-path "/kaggle/input/models/danielhanchen/gpt-oss-120b/transformers/default/1" \
   --speculative-draft-model-path "/kaggle/working/dflash_draft/epoch_0_step_11200" \
   --attention-backend fa3 \

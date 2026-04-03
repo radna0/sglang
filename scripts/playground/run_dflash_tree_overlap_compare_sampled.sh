@@ -60,14 +60,14 @@ COMMON_ARGS=(
 NON_OVERLAP_JSON="${ROOT_DIR}/non_overlap.json"
 OVERLAP_JSON="${ROOT_DIR}/overlap.json"
 
-/venv/main/bin/python /workspace/sglang-dflash-line/scripts/playground/bench_reference_dflash.py \
+/venv/main/bin/python /workspace/sglang-dflash-line/scripts/playground/dflash/bench_reference.py \
   "${COMMON_ARGS[@]}" \
   --dflash-port 23520 \
   --disable-overlap-schedule \
   --out-json "${NON_OVERLAP_JSON}" \
   > "${ROOT_DIR}/non_overlap.log" 2>&1
 
-/venv/main/bin/python /workspace/sglang-dflash-line/scripts/playground/bench_reference_dflash.py \
+/venv/main/bin/python /workspace/sglang-dflash-line/scripts/playground/dflash/bench_reference.py \
   "${COMMON_ARGS[@]}" \
   --dflash-port 23521 \
   --out-json "${OVERLAP_JSON}" \

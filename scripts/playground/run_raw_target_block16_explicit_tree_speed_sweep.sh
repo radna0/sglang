@@ -6,7 +6,7 @@ mkdir -p "$ROOT"
 
 PYTHON_BIN="${PYTHON_BIN:-/workspace/venv-dflash/bin/python}"
 REPO_ROOT="${REPO_ROOT:-/workspace/sglang-dflash-tree-active}"
-SCRIPT="${REPO_ROOT}/scripts/playground/bench_reference_dflash.py"
+SCRIPT="${REPO_ROOT}/scripts/playground/dflash/bench_reference.py"
 PYTHONPATH_ROOT="${REPO_ROOT}/python"
 
 MODEL_PATH="${MODEL_PATH:-/root/gpt-oss-120b}"

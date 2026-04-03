@@ -42,7 +42,7 @@ from openai_harmony import (
 
 from sglang.test.test_utils import kill_process_tree
 
-from bench_reference_dflash import _launch_server
+from dflash.bench_reference import _launch_server
 
 
 SHOWTIME_SYSTEM_PROMPT = (

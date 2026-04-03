@@ -146,7 +146,10 @@ def _parse_args() -> argparse.Namespace:
         description="Sweep explore32->route8 over the reference problems one problem at a time."
     )
     root = Path(__file__).resolve().parents[2]
-    p.add_argument("--route-script", default=str(Path(__file__).with_name("route_reference_dflash.py")))
+    p.add_argument(
+        "--route-script",
+        default=str(Path(__file__).with_name("dflash") / "route_reference.py"),
+    )
     p.add_argument("--model-path", default="/workspace/offload_root/gpt-oss-120b")
     p.add_argument("--draft-model-path", default="/root/epoch_65_step_23760")
     p.add_argument("--reference-csv", default="/root/reference.csv")

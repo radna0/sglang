@@ -50,7 +50,7 @@ run_bench() {
   local draft_branch_mode="${14:-topk}"
 
   local cmd=(
-    /venv/main/bin/python /workspace/sglang-dflash-line/scripts/playground/bench_reference_dflash.py
+    /venv/main/bin/python /workspace/sglang-dflash-line/scripts/playground/dflash/bench_reference.py
     --model-path "${MODEL_PATH}"
     --draft-model-path "${DRAFT_MODEL_PATH}"
     --reference-csv "${REFERENCE_CSV}"
