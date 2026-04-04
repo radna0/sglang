@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT=/workspace/showtime_reference_matrix_20260404
+ROOT=/workspace/showtime_routeonly_b4to16_20260404
 SHOWTIME_ROOT=/workspace/showtime_exact_local_20260404
 SHOWTIME_PY="$SHOWTIME_ROOT/showtime.py"
 PYTHON=/workspace/venv-dflash/bin/python
@@ -18,7 +18,7 @@ mkdir -p "$ROOT/refs"
 import pandas as pd
 from pathlib import Path
 
-root = Path("/workspace/showtime_reference_matrix_20260404")
+root = Path("/workspace/showtime_routeonly_b4to16_20260404")
 ref_src = Path("/workspace/30_03_DFLASH/root/reference.csv")
 qids = ["86e8e5", "dd7f5e", "a295e9", "9c1c5f"]
 df = pd.read_csv(ref_src)
@@ -31,24 +31,13 @@ PY
 
 launch_job() {
   local gpu="$1"
-  local mode="$2"
-  local qid="$3"
-  local port="$4"
+  local qid="$2"
+  local port="$3"
 
-  local name="gpu${gpu}_${mode}_${qid}"
+  local name="gpu${gpu}_route_${qid}"
   local work_root="$ROOT/$name"
   local log="$work_root/run.log"
   mkdir -p "$work_root"
-
-  local pacore_widths=""
-  local route_enable="0"
-  local pacore_workers=""
-  if [[ "$mode" == "route" ]]; then
-    route_enable="1"
-  else
-    pacore_widths="16,8,4"
-    pacore_workers="4"
-  fi
 
   nohup env \
     CUDA_VISIBLE_DEVICES="$gpu" \
@@ -73,13 +62,11 @@ launch_job() {
     SHOWTIME_TOP_P=1.0 \
     SHOWTIME_TOP_K=1 \
     SHOWTIME_MIN_P=0.0 \
-    SHOWTIME_ENABLE_ROUTE_EXPLORE="$route_enable" \
+    SHOWTIME_ENABLE_ROUTE_EXPLORE=1 \
     SHOWTIME_ROUTE_EXPLORATION_WIDTH=32 \
     SHOWTIME_ROUTE_PROMOTE_WIDTH=8 \
     SHOWTIME_ROUTE_EXPLORATION_BLOCK_SIZE=4 \
-    SHOWTIME_ROUTE_CONTINUATION_BLOCK_SIZE=8 \
-    SHOWTIME_PACORE_WIDTHS="$pacore_widths" \
-    SHOWTIME_PACORE_WORKERS="$pacore_workers" \
+    SHOWTIME_ROUTE_CONTINUATION_BLOCK_SIZE=16 \
     "$PYTHON" -u "$SHOWTIME_PY" >"$log" 2>&1 &
 
   local pid=$!
@@ -87,13 +74,13 @@ launch_job() {
   echo "$name pid=$pid log=$log"
 }
 
-launch_job 0 route 86e8e5 33000
-launch_job 1 route dd7f5e 33001
-launch_job 2 route a295e9 33002
-launch_job 3 route 9c1c5f 33003
-launch_job 4 pacore 86e8e5 33004
-launch_job 5 pacore dd7f5e 33005
-launch_job 6 pacore a295e9 33006
-launch_job 7 pacore 9c1c5f 33007
+for p in 33100 33101 33102 33103; do
+  fuser -k "${p}/tcp" 2>/dev/null || true
+done
+
+launch_job 0 86e8e5 33100
+launch_job 1 dd7f5e 33101
+launch_job 2 a295e9 33102
+launch_job 3 9c1c5f 33103
 
 echo "root=$ROOT"
