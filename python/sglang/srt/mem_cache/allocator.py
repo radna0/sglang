@@ -515,6 +515,23 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if self.debug_mode:
             assert len(torch.unique(self.free_pages)) == len(self.free_pages)
 
+    def free_page_indices(self, free_page_indices: torch.Tensor):
+        if free_page_indices.numel() == 0:
+            return
+
+        if self.is_not_in_free_group:
+            if self.need_sort:
+                self.release_pages = torch.cat((free_page_indices, self.release_pages))
+            else:
+                self.free_pages = torch.cat((free_page_indices, self.free_pages))
+        else:
+            # Preserve deferred-free semantics by storing token slots that map
+            # back to these page IDs if/when the grouped free path is flushed.
+            self.free_group.append(free_page_indices * self.page_size)
+
+        if self.debug_mode:
+            assert len(torch.unique(self.free_pages)) == len(self.free_pages)
+
     def clear(self):
         # The padded slot 0 is used for writing dummy outputs from padded tokens.
         self.free_pages = torch.arange(

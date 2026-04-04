@@ -63,6 +63,10 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 
+def _model_requires_input_embeds(model_runner: "ModelRunner") -> bool:
+    return bool(getattr(model_runner.model, "requires_input_embeds", False))
+
+
 @contextmanager
 def freeze_gc(enable_cudagraph_gc: bool):
     """
@@ -168,6 +172,11 @@ class PiecewiseCudaGraphRunner:
             )
 
         self.quant_config = getattr(self.model_runner.model, "quant_config", None)
+        self.is_multimodal = model_runner.is_multimodal
+        self.requires_input_embeds = bool(
+            getattr(self.model_runner.model, "requires_input_embeds", False)
+        )
+        self.has_input_embeds_buffer = self.is_multimodal or self.requires_input_embeds
 
         # Batch sizes to capture
         self.capture_num_tokens = self.compile_config.get_capture_sizes()
@@ -184,7 +193,6 @@ class PiecewiseCudaGraphRunner:
         self.max_num_tokens = max(self.capture_num_tokens)
         self.max_bs = model_runner.req_to_token_pool.size
 
-        self.is_multimodal = model_runner.is_multimodal
         self.mamba_track_enabled = self.is_mamba_track_enabled()
 
         # Graph inputs
@@ -217,9 +225,9 @@ class PiecewiseCudaGraphRunner:
 
             self.tbo_plugin = TboCudaGraphRunnerPlugin()
 
-            if (
-                self.is_multimodal
-            ):  # Only create input_embeds and mrope_positions for multimodal model to save memory
+            if self.has_input_embeds_buffer:
+                # Keep a persistent input-embed buffer whenever the underlying model
+                # consumes caller-provided embeds (multimodal or DFlash draft).
                 # 1. In multimodal, we only compile and capture the language model part.
                 # 2. The embedder is outside of the graph, but cuda graph requires the input embeds to have a fixed memory address.
                 # 3. Input embeds is a pre-allocated buffer. In model.forward, we copy the embed output to this buffer.
@@ -227,9 +235,15 @@ class PiecewiseCudaGraphRunner:
                     (self.max_num_tokens, self.model_runner.model_config.hidden_size),
                     dtype=self.model_runner.dtype,
                 )
+            else:
+                self.input_embeds = None
+
+            if self.is_multimodal:
                 self.mrope_positions = torch.zeros(
                     (3, self.max_num_tokens), dtype=torch.int64
                 )
+            else:
+                self.mrope_positions = None
 
         self.attention_layers = self.model_runner.attention_layers
         self.moe_layers = self.model_runner.moe_layers
@@ -245,7 +259,8 @@ class PiecewiseCudaGraphRunner:
                 self.model_runner.model, "language_model", self.model_runner.model
             )
             with patch_model(
-                language_model.model, self.compile_config.compiler
+                getattr(language_model, "model", language_model),
+                self.compile_config.compiler,
             ) as patched_model:
                 install_torch_compiled(
                     patched_model,
@@ -286,7 +301,11 @@ class PiecewiseCudaGraphRunner:
     def warmup_torch_compile(self, num_tokens: int):
         """Warmup the model with a simple forward pass before CUDA graph capture."""
         input_ids = self.input_ids[:num_tokens]
-        input_embeds = self.input_embeds[:num_tokens] if self.is_multimodal else None
+        input_embeds = (
+            self.input_embeds[:num_tokens]
+            if self.input_embeds is not None
+            else None
+        )
         positions = self.positions[:num_tokens]
         mrope_positions = (
             self.mrope_positions[:, :num_tokens] if self.is_multimodal else None
@@ -358,6 +377,9 @@ class PiecewiseCudaGraphRunner:
         forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
         set_dp_buffer_len(None, num_tokens, forward_batch.dp_padding_mode.is_max_len())
         set_is_extend_in_batch(False)
+        forward_kwargs = {}
+        if _model_requires_input_embeds(self.model_runner) and input_embeds is not None:
+            forward_kwargs["input_embeds"] = input_embeds
         with set_forward_context(
             forward_batch,
             self.attention_layers,
@@ -369,6 +391,7 @@ class PiecewiseCudaGraphRunner:
                 forward_batch.input_ids,
                 forward_batch.positions,
                 forward_batch,
+                **forward_kwargs,
             )
 
     def _cache_loc_dtype(self):
@@ -426,7 +449,11 @@ class PiecewiseCudaGraphRunner:
 
         # Graph inputs
         input_ids = self.input_ids[:num_tokens]
-        input_embeds = self.input_embeds[:num_tokens] if self.is_multimodal else None
+        input_embeds = (
+            self.input_embeds[:num_tokens]
+            if self.input_embeds is not None
+            else None
+        )
 
         out_cache_loc = self.out_cache_loc[:num_tokens]
         out_cache_loc_swa = (
@@ -524,6 +551,8 @@ class PiecewiseCudaGraphRunner:
             set_is_extend_in_batch(False)
 
             kwargs = {}
+            if _model_requires_input_embeds(self.model_runner) and input_embeds is not None:
+                kwargs["input_embeds"] = input_embeds
             with set_forward_context(
                 forward_batch,
                 self.attention_layers,
@@ -563,8 +592,8 @@ class PiecewiseCudaGraphRunner:
                 self.out_cache_loc_swa.zero_()
             self.input_ids[num_tokens:static_num_tokens].zero_()
             self.positions[num_tokens:static_num_tokens].zero_()
-            if self.is_multimodal:
-                self.input_embeds[:, num_tokens:static_num_tokens].zero_()
+            if self.input_embeds is not None:
+                self.input_embeds[num_tokens:static_num_tokens].zero_()
             if forward_batch.mrope_positions is not None:
                 self.mrope_positions[:, num_tokens:static_num_tokens].zero_()
 
@@ -573,6 +602,8 @@ class PiecewiseCudaGraphRunner:
         self.input_ids[:num_tokens].copy_(forward_batch.input_ids)
         self.positions[:num_tokens].copy_(forward_batch.positions)
         self.out_cache_loc[:num_tokens].copy_(forward_batch.out_cache_loc)
+        if self.input_embeds is not None and forward_batch.input_embeds is not None:
+            self.input_embeds[:num_tokens].copy_(forward_batch.input_embeds)
         if self.out_cache_loc_swa is not None:
             self.out_cache_loc_swa[: self.raw_num_tokens].copy_(
                 self.model_runner.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
@@ -624,7 +655,9 @@ class PiecewiseCudaGraphRunner:
 
         input_ids = self.input_ids[:static_num_tokens]
         input_embeds = (
-            self.input_embeds[:static_num_tokens] if self.is_multimodal else None
+            self.input_embeds[:static_num_tokens]
+            if self.input_embeds is not None
+            else None
         )
 
         mrope_positions = (
@@ -695,6 +728,14 @@ class PiecewiseCudaGraphRunner:
             # Due to the dispatch kernel for MLA model, we init the metadata with original forward_batch
             self.model_runner.attn_backend.init_forward_metadata(forward_batch)
             static_forward_batch = self.replay_prepare(forward_batch, **kwargs)
+            input_embeds = (
+                static_forward_batch.input_embeds
+                if static_forward_batch.input_embeds is not None
+                else None
+            )
+            forward_kwargs = {}
+            if _model_requires_input_embeds(self.model_runner) and input_embeds is not None:
+                forward_kwargs["input_embeds"] = input_embeds
             # Replay
             with set_forward_context(
                 static_forward_batch,
@@ -708,10 +749,10 @@ class PiecewiseCudaGraphRunner:
                         static_forward_batch.input_ids,
                         static_forward_batch.positions,
                         static_forward_batch,
-                        **kwargs,
+                        **forward_kwargs,
                     )
                 if isinstance(output, LogitsProcessorOutput):
-                    return LogitsProcessorOutput(
+                    ret = LogitsProcessorOutput(
                         next_token_logits=output.next_token_logits[
                             : self.raw_num_tokens
                         ],
@@ -721,6 +762,11 @@ class PiecewiseCudaGraphRunner:
                             else None
                         ),
                     )
+                    if getattr(output, "_dflash_final_hidden_states", None) is not None:
+                        ret._dflash_final_hidden_states = (
+                            output._dflash_final_hidden_states[: self.raw_num_tokens]
+                        )
+                    return ret
                 elif isinstance(output, EmbeddingPoolerOutput):
                     return output
                 else:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
@@ -23,6 +24,7 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.speculative.dflash_utils import resolve_dflash_overlap_token_ids
 from sglang.srt.tracing.trace import trace_slice, trace_slice_batch, trace_slice_end
 
 if TYPE_CHECKING:
@@ -38,11 +40,53 @@ logger = logging.getLogger(__name__)
 DEFAULT_FORCE_STREAM_INTERVAL = 50
 
 
+def _fa3_trace_output_ids_enabled() -> bool:
+    return os.environ.get("SGLANG_FA3_TRACE_OUTPUT_IDS", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _overlap_debug_enabled() -> bool:
+    return (os.environ.get("SGLANG_DFLASH_DEBUG_OVERLAP_RELEASE") or "").strip().lower() not in (
+        "",
+        "0",
+        "false",
+        "off",
+        "no",
+    )
+
+
 class SchedulerOutputProcessorMixin:
     """
     This class implements the output processing logic for Scheduler.
     We put them into a separate file to make the `scheduler.py` shorter.
     """
+
+    def _release_kv_cache_and_draft(
+        self: Scheduler, req: Req, *, is_insert: bool = True
+    ):
+        if req.req_pool_idx is None:
+            if _overlap_debug_enabled():
+                logger.warning(
+                    "Skip generic KV release for already-detached DFlash req: rid=%s completed=%s committed_len=%s allocated_len=%s",
+                    getattr(req, "rid", None),
+                    getattr(req, "finished", lambda: False)() if hasattr(req, "finished") else None,
+                    getattr(req, "kv_committed_len", None),
+                    getattr(req, "kv_allocated_len", None),
+                )
+            draft_worker = getattr(self, "draft_worker", None)
+            hook = getattr(draft_worker, "on_req_finished", None) if draft_worker else None
+            if hook is not None:
+                hook(req)
+            return
+        release_kv_cache(req, self.tree_cache, is_insert=is_insert)
+        draft_worker = getattr(self, "draft_worker", None)
+        hook = getattr(draft_worker, "on_req_finished", None) if draft_worker else None
+        if hook is not None:
+            hook(req)
 
     def _get_storage_backend_type(self) -> str:
         """Get storage backend type from tree_cache."""
@@ -96,7 +140,7 @@ class SchedulerOutputProcessorMixin:
                     req.rid,
                     thread_finish_flag=True,
                 )
-                release_kv_cache(req, self.tree_cache)
+                self._release_kv_cache_and_draft(req)
 
         # Note: Logprobs should be handled on the prefill engine.
         trace_slice_batch(RequestStage.DECODE_FAKE_OUTPUT, batch.reqs)
@@ -120,6 +164,242 @@ class SchedulerOutputProcessorMixin:
                 if k not in req.customized_info:
                     req.customized_info[k] = []
                 req.customized_info[k].append(v[i])
+
+    def _handle_dflash_overlap_preprocessed_req(
+        self: Scheduler,
+        req: Req,
+        i: int,
+        logits_output: LogitsProcessorOutput,
+    ) -> None:
+        """Handle a DFlash req whose output_ids/finish state were committed in verify.
+
+        In this mode the output processor should only:
+        - release KV exactly once for newly finished requests
+        - collect customized_info
+        - avoid replaying token commit logic
+        """
+        if not req.is_retracted and req.req_pool_idx is not None:
+            # DFlash overlap commits output_ids inside verify. Tree-cache refresh and
+            # final release paths consume fill_ids/cache_protected_len, so rebuild the
+            # request-visible sequence before any cache action runs.
+            req.fill_ids = req.origin_input_ids + req.output_ids
+
+        if self.enable_overlap and (req.finished() or req.is_retracted):
+            if _overlap_debug_enabled():
+                logger.warning(
+                    "DFLASH overlap pre-processed req: rid=%s finished=%s retracted=%s req_pool_idx=%s kv_committed_len=%s kv_allocated_len=%s cache_protected_len=%s prefix_indices_len=%s committed_freed=%s overalloc_freed=%s",
+                    getattr(req, "rid", None),
+                    req.finished(),
+                    req.is_retracted,
+                    getattr(req, "req_pool_idx", None),
+                    getattr(req, "kv_committed_len", None),
+                    getattr(req, "kv_allocated_len", None),
+                    getattr(req, "cache_protected_len", None),
+                    (
+                        None
+                        if getattr(req, "prefix_indices", None) is None
+                        else int(len(getattr(req, "prefix_indices")))
+                    ),
+                    getattr(req, "kv_committed_freed", None),
+                    getattr(req, "kv_overallocated_freed", None),
+            )
+            if req.finished() and req.req_pool_idx is not None:
+                if not req.kv_overallocated_freed:
+                    # Keep the overallocated tail intact here. In overlap mode the
+                    # committed prefix is refreshed into the tree cache first, then
+                    # `release_kv_cache()` frees the remaining speculative tail via
+                    # `pop_overallocated_kv_cache()`. Collapsing the allocator length
+                    # early would strand borrowed verify slots and trigger an idle leak.
+                    self.maybe_collect_routed_experts(req)
+                    committed_token_len = int(
+                        getattr(req, "kv_committed_len", 0) or 0
+                    )
+                    if committed_token_len <= 0 or committed_token_len > len(req.fill_ids):
+                        committed_token_len = len(req.fill_ids)
+                    prefix_indices = getattr(req, "prefix_indices", None)
+                    prefix_indices_len = (
+                        0 if prefix_indices is None else int(len(prefix_indices))
+                    )
+                    cache_protected_len = int(
+                        getattr(req, "cache_protected_len", 0) or 0
+                    )
+                    needs_cache_refresh = (
+                        cache_protected_len < committed_token_len
+                        or prefix_indices_len < committed_token_len
+                    )
+                    refreshed_prefix = None
+                    req_to_token_pool = getattr(self, "req_to_token_pool", None)
+                    if needs_cache_refresh:
+                        current_prefix = getattr(req, "prefix_indices", None)
+                        if (
+                            current_prefix is not None
+                            and int(len(current_prefix)) >= committed_token_len
+                        ):
+                            refreshed_prefix = current_prefix[:committed_token_len].to(
+                                torch.int64, copy=True
+                            )
+                        elif req_to_token_pool is not None and req.req_pool_idx is not None:
+                            refreshed_prefix = req_to_token_pool.req_to_token[
+                                req.req_pool_idx, :committed_token_len
+                            ].to(torch.int64, copy=True)
+                        if refreshed_prefix is not None:
+                            req.prefix_indices = refreshed_prefix
+                            if (
+                                req_to_token_pool is not None
+                                and req.req_pool_idx is not None
+                            ):
+                                req_to_token_pool.write(
+                                    (req.req_pool_idx, slice(0, committed_token_len)),
+                                    refreshed_prefix,
+                                )
+                    if self.server_args.disaggregation_decode_enable_offload_kvcache:
+                        if not self.decode_offload_manager.offload_kv_cache(req):
+                            if _overlap_debug_enabled():
+                                req_row = (
+                                    req_to_token_pool.req_to_token[
+                                        req.req_pool_idx, : len(req.fill_ids)
+                                    ]
+                                    if req_to_token_pool is not None
+                                    and req.req_pool_idx is not None
+                                    else None
+                                )
+                                prefix_dump = (
+                                    None
+                                    if refreshed_prefix is None
+                                    else (
+                                        refreshed_prefix.tolist()
+                                        if refreshed_prefix.numel() <= 16
+                                        else refreshed_prefix[-8:].tolist()
+                                    )
+                                )
+                                req_row_dump = (
+                                    req_row.tolist()
+                                    if req_row.numel() <= 16
+                                    else req_row[-8:].tolist()
+                                )
+                                logger.warning(
+                                    "DFLASH overlap refreshed pre-processed req bookkeeping: rid=%s committed_token_len=%s cache_protected_len=%s prefix_indices_len=%s prefix_dump=%s req_row_dump=%s",
+                                    getattr(req, "rid", None),
+                                    committed_token_len,
+                                    getattr(req, "cache_protected_len", None),
+                                    (
+                                        None
+                                        if refreshed_prefix is None
+                                        else int(len(refreshed_prefix))
+                                    ),
+                                    prefix_dump,
+                                    req_row_dump,
+                                )
+                            if req.req_pool_idx is not None:
+                                self._release_kv_cache_and_draft(req, is_insert=False)
+                            else:
+                                if _overlap_debug_enabled():
+                                    logger.warning(
+                                        "DFLASH overlap finished req already released before final cleanup; skipping generic release: "
+                                        "rid=%s kv_committed_len=%s kv_allocated_len=%s committed_freed=%s overalloc_freed=%s",
+                                        getattr(req, "rid", None),
+                                        getattr(req, "kv_committed_len", None),
+                                        getattr(req, "kv_allocated_len", None),
+                                        getattr(req, "kv_committed_freed", None),
+                                        getattr(req, "kv_overallocated_freed", None),
+                                    )
+                                draft_worker = getattr(self, "draft_worker", None)
+                                hook = (
+                                    getattr(draft_worker, "on_req_finished", None)
+                                    if draft_worker
+                                    else None
+                                )
+                                if hook is not None:
+                                    hook(req)
+                    else:
+                        if _overlap_debug_enabled():
+                            print(
+                                "DFLASH overlap final release debug "
+                                f"rid={getattr(req, 'rid', None)} "
+                                f"kv_committed_len={getattr(req, 'kv_committed_len', None)} "
+                                f"kv_allocated_len={getattr(req, 'kv_allocated_len', None)} "
+                                f"fill_ids_len={len(req.fill_ids)} "
+                                f"output_ids_len={len(req.output_ids)} "
+                                f"prefix_indices_len={0 if getattr(req, 'prefix_indices', None) is None else len(getattr(req, 'prefix_indices'))} "
+                                f"cache_protected_len={getattr(req, 'cache_protected_len', None)}",
+                                flush=True,
+                            )
+                        if _overlap_debug_enabled() and needs_cache_refresh:
+                            req_row = (
+                                req_to_token_pool.req_to_token[
+                                    req.req_pool_idx, : len(req.fill_ids)
+                                ]
+                                if req_to_token_pool is not None
+                                and req.req_pool_idx is not None
+                                else None
+                            )
+                            prefix_dump = (
+                                None
+                                if refreshed_prefix is None
+                                else (
+                                    refreshed_prefix.tolist()
+                                    if refreshed_prefix.numel() <= 16
+                                    else refreshed_prefix[-8:].tolist()
+                                )
+                            )
+                            req_row_dump = (
+                                req_row.tolist()
+                                if req_row.numel() <= 16
+                                else req_row[-8:].tolist()
+                            )
+                            logger.warning(
+                                "DFLASH overlap refreshed pre-processed req bookkeeping: rid=%s committed_token_len=%s cache_protected_len=%s prefix_indices_len=%s prefix_dump=%s req_row_dump=%s",
+                                getattr(req, "rid", None),
+                                committed_token_len,
+                                getattr(req, "cache_protected_len", None),
+                                (
+                                    None
+                                    if refreshed_prefix is None
+                                    else int(len(refreshed_prefix))
+                                ),
+                                prefix_dump,
+                                req_row_dump,
+                            )
+                        if req.req_pool_idx is not None:
+                            self._release_kv_cache_and_draft(req, is_insert=False)
+                        else:
+                            if _overlap_debug_enabled():
+                                logger.warning(
+                                    "DFLASH overlap finished req already released before final cleanup; skipping generic release: "
+                                    "rid=%s kv_committed_len=%s kv_allocated_len=%s committed_freed=%s overalloc_freed=%s",
+                                    getattr(req, "rid", None),
+                                    getattr(req, "kv_committed_len", None),
+                                    getattr(req, "kv_allocated_len", None),
+                                    getattr(req, "kv_committed_freed", None),
+                                    getattr(req, "kv_overallocated_freed", None),
+                                )
+                            draft_worker = getattr(self, "draft_worker", None)
+                            hook = (
+                                getattr(draft_worker, "on_req_finished", None)
+                                if draft_worker
+                                else None
+                            )
+                            if hook is not None:
+                                hook(req)
+
+                    req.time_stats.completion_time = time.perf_counter()
+                    if _overlap_debug_enabled():
+                        logger.warning(
+                            "DFLASH overlap released pre-processed req: rid=%s req_pool_idx=%s committed_freed=%s overalloc_freed=%s",
+                            getattr(req, "rid", None),
+                            getattr(req, "req_pool_idx", None),
+                            getattr(req, "kv_committed_freed", None),
+                            getattr(req, "kv_overallocated_freed", None),
+                        )
+        elif not req.is_retracted and req.req_pool_idx is not None:
+            # DFlash overlap already committed the accepted prefix and KV mapping in
+            # verify. With the overlap output-processing barrier in place, this
+            # callback now runs before the next scheduling step can reuse the live
+            # running batch. At this point we must refresh the unfinished request in
+            # radix/SWA so queued prefills cannot evict the just-committed prefix.
+            self.tree_cache.cache_unfinished_req(req)
+
+        self.maybe_collect_customized_info(i, req, logits_output)
 
     def process_batch_result_prefill(
         self: Scheduler,
@@ -176,7 +456,7 @@ class SchedulerOutputProcessorMixin:
 
                     if req.finished():
                         self.maybe_collect_routed_experts(req)
-                        release_kv_cache(req, self.tree_cache)
+                        self._release_kv_cache_and_draft(req)
                         req.time_stats.completion_time = time.perf_counter()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
                         # This updates radix so others can match
@@ -310,7 +590,7 @@ class SchedulerOutputProcessorMixin:
                     req.check_finished()
 
                     if req.finished():
-                        release_kv_cache(req, self.tree_cache)
+                        self._release_kv_cache_and_draft(req)
                     else:
                         self.tree_cache.cache_unfinished_req(req)
                 else:
@@ -341,19 +621,27 @@ class SchedulerOutputProcessorMixin:
         assert result.next_token_ids.is_cpu
         assert result.accept_lens.is_cpu
 
-        next_token_ids = result.next_token_ids.tolist()
         accept_lens = result.accept_lens.tolist()
         result.num_accepted_tokens = sum(accept_lens) - len(batch.reqs)
-        result.accept_length_per_req_cpu = [x - 1 for x in accept_lens]
+        if result.accept_length_per_req_cpu is None:
+            result.accept_length_per_req_cpu = [x - 1 for x in accept_lens]
 
-        predict_tokens = []
+        if batch.spec_algorithm.is_dflash_family():
+            predict_tokens = resolve_dflash_overlap_token_ids(
+                flat_token_ids=result.next_token_ids,
+                accept_lens=result.accept_lens,
+            )
+            return predict_tokens
+
+        next_token_ids = result.next_token_ids.tolist()
         stride = self.draft_worker.speculative_num_draft_tokens
+        predict_tokens = [
+            next_token_ids[i * stride : i * stride + accept_lens[i]]
+            for i, _req in enumerate(batch.reqs)
+        ]
 
         for i, req in enumerate(batch.reqs):
             req.kv_committed_len += accept_lens[i]
-            predict_tokens.append(
-                next_token_ids[i * stride : i * stride + accept_lens[i]]
-            )
             req.spec_verify_ct += 1
 
             accepted_draft_tokens = result.accept_length_per_req_cpu[i]
@@ -361,6 +649,65 @@ class SchedulerOutputProcessorMixin:
             req.update_spec_acceptance_histogram(accepted_draft_tokens)
 
         return predict_tokens
+
+    def _accumulate_dflash_ssd_metrics(
+        self: Scheduler, result: GenerationBatchResult, batch: ScheduleBatch
+    ) -> None:
+        hit_cts = getattr(result, "spec_ssd_hit_ct", None)
+        prepare_cts = getattr(result, "spec_ssd_prepare_ct", None)
+        prepare_failure_cts = getattr(result, "spec_ssd_prepare_failure_ct", None)
+        cache_pending = getattr(result, "spec_ssd_cache_pending", None)
+        overlap_launch_cts = getattr(result, "spec_ssd_overlap_launch_ct", None)
+        overlap_wait_cts = getattr(result, "spec_ssd_overlap_wait_ct", None)
+        difficulty_gate_skip_cts = getattr(
+            result, "spec_ssd_difficulty_gate_skip_ct", None
+        )
+        fanout_gate_skip_cts = getattr(result, "spec_ssd_fanout_gate_skip_ct", None)
+        fanout_escalation_cts = getattr(
+            result, "spec_ssd_fanout_escalation_ct", None
+        )
+        fanout_alt_budget = getattr(result, "spec_ssd_fanout_alt_budget", None)
+
+        if (
+            hit_cts is None
+            and prepare_cts is None
+            and prepare_failure_cts is None
+            and cache_pending is None
+            and overlap_launch_cts is None
+            and overlap_wait_cts is None
+            and difficulty_gate_skip_cts is None
+            and fanout_gate_skip_cts is None
+            and fanout_escalation_cts is None
+            and fanout_alt_budget is None
+        ):
+            return
+
+        for i, req in enumerate(batch.reqs):
+            if hit_cts is not None and i < len(hit_cts):
+                req.spec_ssd_hit_ct = int(hit_cts[i])
+            if prepare_cts is not None and i < len(prepare_cts):
+                req.spec_ssd_prepare_ct = int(prepare_cts[i])
+            if prepare_failure_cts is not None and i < len(prepare_failure_cts):
+                req.spec_ssd_prepare_failure_ct = int(prepare_failure_cts[i])
+            if cache_pending is not None and i < len(cache_pending):
+                req.spec_ssd_cache_pending = int(cache_pending[i])
+            if overlap_launch_cts is not None and i < len(overlap_launch_cts):
+                req.spec_ssd_overlap_launch_ct = int(overlap_launch_cts[i])
+            if overlap_wait_cts is not None and i < len(overlap_wait_cts):
+                req.spec_ssd_overlap_wait_ct = int(overlap_wait_cts[i])
+            if (
+                difficulty_gate_skip_cts is not None
+                and i < len(difficulty_gate_skip_cts)
+            ):
+                req.spec_ssd_difficulty_gate_skip_ct = int(
+                    difficulty_gate_skip_cts[i]
+                )
+            if fanout_gate_skip_cts is not None and i < len(fanout_gate_skip_cts):
+                req.spec_ssd_fanout_gate_skip_ct = int(fanout_gate_skip_cts[i])
+            if fanout_escalation_cts is not None and i < len(fanout_escalation_cts):
+                req.spec_ssd_fanout_escalation_ct = int(fanout_escalation_cts[i])
+            if fanout_alt_budget is not None and i < len(fanout_alt_budget):
+                req.spec_ssd_fanout_alt_budget = int(fanout_alt_budget[i])
 
     def process_batch_result_idle(
         self: Scheduler,
@@ -397,7 +744,7 @@ class SchedulerOutputProcessorMixin:
                 req.output_ids.append(next_token_id)
                 req.check_finished()
                 if req.finished():
-                    release_kv_cache(req, self.tree_cache)
+                    self._release_kv_cache_and_draft(req)
                     req.time_stats.completion_time = time.perf_counter()
                     break
 
@@ -422,22 +769,30 @@ class SchedulerOutputProcessorMixin:
         if result.copy_done is not None:
             result.copy_done.synchronize()
 
-        logits_output, next_token_ids, can_run_cuda_graph = (
-            result.logits_output,
-            result.next_token_ids,
-            result.can_run_cuda_graph,
+        logits_output = result.logits_output
+        can_run_cuda_graph = result.can_run_cuda_graph
+        next_token_ids = result.next_token_ids
+
+        dflash_overlap_preprocessed = (
+            self.enable_overlap
+            and batch.is_spec_v2
+            and batch.spec_algorithm.is_dflash_family()
+            and bool(getattr(result, "dflash_overlap_preprocessed", False))
         )
 
         if batch.spec_algorithm.is_none():
             next_token_ids = next_token_ids.tolist()
             if batch.return_logprob:
                 next_token_logprobs = logits_output.next_token_logprobs.tolist()
-        elif batch.is_spec_v2:
+        elif batch.is_spec_v2 and not dflash_overlap_preprocessed:
             next_token_ids = self._resolve_spec_overlap_token_ids(result, batch)
+        elif dflash_overlap_preprocessed:
+            next_token_ids = [None] * len(batch.reqs)
 
         self.num_generated_tokens += len(batch.reqs)
         if not batch.spec_algorithm.is_none():
             self.update_spec_metrics(batch.batch_size(), result.num_accepted_tokens)
+            self._accumulate_dflash_ssd_metrics(result, batch)
         if self.enable_metrics:
             self.metrics_collector.increment_cuda_graph_pass(value=can_run_cuda_graph)
 
@@ -450,10 +805,14 @@ class SchedulerOutputProcessorMixin:
         for i, (req, next_token_id) in enumerate(zip(batch.reqs, next_token_ids)):
             req: Req
 
-            if self.enable_overlap and (req.finished() or req.is_retracted):
-                # NOTE: This (req.finished() or req.is_retracted) should only happen when overlap scheduling is enabled.
-                # (currently not, e.g. Eagle V1 still check finish during forward)
-                # And all the over-allocated tokens will be freed in `release_kv_cache`.
+            if dflash_overlap_preprocessed and (
+                self.enable_overlap and (req.finished() or req.is_retracted)
+            ):
+                self._handle_dflash_overlap_preprocessed_req(req, i, logits_output)
+                continue
+
+            if dflash_overlap_preprocessed:
+                self._handle_dflash_overlap_preprocessed_req(req, i, logits_output)
                 continue
 
             new_accepted_len = 1
@@ -475,9 +834,9 @@ class SchedulerOutputProcessorMixin:
                 if self.server_args.disaggregation_decode_enable_offload_kvcache:
                     # Asynchronously offload KV cache; release_kv_cache will be called after Device->Host transfer completes
                     if not self.decode_offload_manager.offload_kv_cache(req):
-                        release_kv_cache(req, self.tree_cache)
+                        self._release_kv_cache_and_draft(req)
                 else:
-                    release_kv_cache(req, self.tree_cache)
+                    self._release_kv_cache_and_draft(req)
 
                 req.time_stats.completion_time = time.perf_counter()
 
@@ -1042,6 +1401,140 @@ class SchedulerOutputProcessorMixin:
                     spec_verify_ct.append(req.spec_verify_ct)
                     spec_accepted_tokens.append(req.spec_accepted_tokens)
                     spec_acceptance_histogram.append(req.spec_acceptance_histogram)
+                    customized_info.setdefault("spec_ssd_hit_ct", []).append(
+                        int(getattr(req, "spec_ssd_hit_ct", 0))
+                    )
+                    customized_info.setdefault("spec_ssd_prepare_ct", []).append(
+                        int(getattr(req, "spec_ssd_prepare_ct", 0))
+                    )
+                    customized_info.setdefault("spec_ssd_prepare_failure_ct", []).append(
+                        int(getattr(req, "spec_ssd_prepare_failure_ct", 0))
+                    )
+                    customized_info.setdefault("spec_ssd_cache_pending", []).append(
+                        int(
+                            getattr(req, "spec_ssd_cache_pending", 0)
+                            or len(getattr(req, "dflash_ssd_cache", {}) or {})
+                            or (
+                                1
+                                if getattr(req, "dflash_ssd_cached_proposal", None)
+                                is not None
+                                else 0
+                            )
+                        )
+                    )
+                    customized_info.setdefault("spec_ssd_overlap_launch_ct", []).append(
+                        int(getattr(req, "spec_ssd_overlap_launch_ct", 0))
+                    )
+                    customized_info.setdefault("spec_ssd_overlap_wait_ct", []).append(
+                        int(getattr(req, "spec_ssd_overlap_wait_ct", 0))
+                    )
+                    customized_info.setdefault(
+                        "spec_ssd_difficulty_gate_skip_ct", []
+                    ).append(int(getattr(req, "spec_ssd_difficulty_gate_skip_ct", 0)))
+                    customized_info.setdefault(
+                        "spec_ssd_fanout_gate_skip_ct", []
+                    ).append(int(getattr(req, "spec_ssd_fanout_gate_skip_ct", 0)))
+                    customized_info.setdefault(
+                        "spec_ssd_fanout_escalation_ct", []
+                    ).append(int(getattr(req, "spec_ssd_fanout_escalation_ct", 0)))
+                    customized_info.setdefault(
+                        "spec_ssd_fanout_alt_budget", []
+                    ).append(int(getattr(req, "spec_ssd_fanout_alt_budget", 0)))
+                    customized_info.setdefault(
+                        "spec_accept_length_step_min", []
+                    ).append(
+                        (
+                            None
+                            if getattr(req, "spec_accept_length_step_min", None)
+                            is None
+                            else int(getattr(req, "spec_accept_length_step_min", 0))
+                        )
+                    )
+                    customized_info.setdefault(
+                        "spec_accept_length_step_max", []
+                    ).append(
+                        (
+                            None
+                            if getattr(req, "spec_accept_length_step_max", None)
+                            is None
+                            else int(getattr(req, "spec_accept_length_step_max", 0))
+                        )
+                    )
+                    customized_info.setdefault("spec_dflash_verify_mode_last", []).append(
+                        getattr(req, "spec_dflash_verify_mode_last", None)
+                    )
+                    customized_info.setdefault("spec_dflash_debug_stat_ct", []).append(
+                        int(getattr(req, "spec_dflash_debug_stat_ct", 0))
+                    )
+                    customized_info.setdefault(
+                        "spec_dflash_verify_append_path_last", []
+                    ).append(getattr(req, "spec_dflash_verify_append_path_last", None))
+                    for key in (
+                        "spec_dflash_verify_append_path_fused_ct",
+                        "spec_dflash_verify_append_path_direct_ct",
+                        "spec_dflash_verify_append_path_staged_ct",
+                    ):
+                        customized_info.setdefault(key, []).append(
+                            int(getattr(req, key, 0))
+                        )
+                    customized_info.setdefault("spec_dflash_max_steps_last", []).append(
+                        (
+                            None
+                            if getattr(req, "spec_dflash_max_steps_last", None) is None
+                            else int(getattr(req, "spec_dflash_max_steps_last", 0))
+                        )
+                    )
+                    customized_info.setdefault("spec_dflash_max_steps_min", []).append(
+                        (
+                            None
+                            if getattr(req, "spec_dflash_max_steps_min", None) is None
+                            else int(getattr(req, "spec_dflash_max_steps_min", 0))
+                        )
+                    )
+                    customized_info.setdefault("spec_dflash_max_steps_max", []).append(
+                        (
+                            None
+                            if getattr(req, "spec_dflash_max_steps_max", None) is None
+                            else int(getattr(req, "spec_dflash_max_steps_max", 0))
+                        )
+                    )
+                    customized_info.setdefault("spec_dflash_max_steps_mean", []).append(
+                        getattr(req, "spec_dflash_max_steps_mean", None)
+                    )
+                    for key in (
+                        "spec_dflash_effective_draft_token_num_last",
+                        "spec_dflash_effective_draft_token_num_min",
+                        "spec_dflash_effective_draft_token_num_max",
+                        "spec_dflash_effective_draft_token_num_mean",
+                        "spec_dflash_effective_step_count_last",
+                        "spec_dflash_effective_step_count_min",
+                        "spec_dflash_effective_step_count_max",
+                        "spec_dflash_effective_step_count_mean",
+                        "spec_dflash_total_draft_token_num",
+                    ):
+                        customized_info.setdefault(key, []).append(
+                            getattr(req, key, None)
+                        )
+                    for key in (
+                        "spec_dflash_accept_ratio_mean",
+                        "spec_dflash_tv_mean",
+                        "spec_dflash_p_entropy_mean",
+                        "spec_dflash_q_entropy_mean",
+                        "spec_dflash_p_max_mean",
+                        "spec_dflash_q_max_mean",
+                        "spec_dflash_q_max_mean_first",
+                        "spec_dflash_q_max_min_first",
+                        "spec_dflash_q_ent_mean_first",
+                        "spec_dflash_adaptive_temp_mul",
+                    ):
+                        customized_info.setdefault(key, []).append(
+                            getattr(req, key, None)
+                        )
+                    customized_info.setdefault(
+                        "spec_dflash_pq_disabled_rounds_left", []
+                    ).append(
+                        int(getattr(req, "spec_dflash_pq_disabled_rounds_left", 0))
+                    )
 
                 if return_logprob:
                     if (
@@ -1137,6 +1630,13 @@ class SchedulerOutputProcessorMixin:
         if reqs or is_idle_batch:
             if self.model_config.is_multimodal_gen:
                 return
+            if _fa3_trace_output_ids_enabled() and output_ids:
+                logger.info(
+                    "[FA3OutputPath][scheduler] rids=%s output_ids=%s decoded_texts=%s",
+                    rids[:2],
+                    output_ids[:2],
+                    decoded_texts[:2],
+                )
             self.send_to_detokenizer.send_output(
                 BatchTokenIDOutput(
                     rids=rids,

@@ -87,6 +87,8 @@ class CUDAPiecewiseBackend:
         # the entries for different shapes that we need to either
         # compile or capture cudagraph
         self.concrete_size_entries: dict[int, ConcreteSizeEntry] = {}
+        self._runtime_capture_stream: Optional[torch.cuda.Stream] = None
+        self._logged_runtime_capture_stream_fallback = False
 
         # to_be_compiled_sizes tracks the remaining sizes to compile,
         # and updates during the compilation process, so we need to copy it
@@ -167,9 +169,19 @@ class CUDAPiecewiseBackend:
                     stack.enter_context(patch("torch.cuda.empty_cache", lambda: None))
                 # mind-exploding: carefully manage the reference and memory.
                 stream = get_pcg_capture_stream()
-                assert (
-                    stream is not None
-                ), "PCG capture stream is not set, please check if runtime recompilation happened"
+                used_runtime_capture_stream = False
+                if stream is None:
+                    if self._runtime_capture_stream is None:
+                        self._runtime_capture_stream = torch.cuda.Stream()
+                    stream = self._runtime_capture_stream
+                    used_runtime_capture_stream = True
+                    if not self._logged_runtime_capture_stream_fallback:
+                        logger.warning(
+                            "PCG capture stream was not set during runtime piecewise capture; "
+                            "falling back to a dedicated CUDA stream for lazy capture."
+                        )
+                        self._logged_runtime_capture_stream_fallback = True
+                    stream.wait_stream(torch.cuda.current_stream())
                 with torch.cuda.graph(cudagraph, pool=self.graph_pool, stream=stream):
                     # `output` is managed by pytorch's cudagraph pool
                     output = entry.runnable(*args)
@@ -183,6 +195,8 @@ class CUDAPiecewiseBackend:
 
             # here we always use weak ref for the output
             # to save memory
+            if used_runtime_capture_stream:
+                torch.cuda.current_stream().wait_stream(stream)
             entry.output = weak_ref_tensors(output)
             entry.cudagraph = cudagraph
 

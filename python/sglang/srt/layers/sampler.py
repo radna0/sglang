@@ -37,6 +37,31 @@ _CUSTOM_SAMPLER_FACTORIES: Dict[str, Callable[[], "Sampler"]] = {}
 _BUILT_IN_SAMPLING_BACKENDS = {"flashinfer", "pytorch", "ascend"}
 
 
+def _normalize_sampling_strategy_name(name: Optional[str]) -> Optional[str]:
+    if not name:
+        return None
+    normalized = str(name).strip().lower().replace("-", "_")
+    if normalized in ("p_less", "pless"):
+        return "p_less"
+    if normalized in ("p_less_norm", "pless_norm"):
+        return "p_less_norm"
+    return None
+
+
+def _get_sampling_strategy_names(
+    sampling_info: SamplingBatchInfo,
+) -> Optional[List[Optional[str]]]:
+    custom_params = getattr(sampling_info, "custom_params", None)
+    if custom_params is None:
+        return None
+    return [
+        _normalize_sampling_strategy_name(
+            params.get("sampling_strategy") if isinstance(params, dict) else None
+        )
+        for params in custom_params
+    ]
+
+
 class Sampler(nn.Module):
     def __init__(self):
         super().__init__()
@@ -197,29 +222,69 @@ class Sampler(nn.Module):
         Used for standard sampling with flashinfer/pytorch backends.
         Handles both simple (direct multinomial) and complex (top-k/top-p/min-p) cases.
         """
+        strategy_names = _get_sampling_strategy_names(sampling_info)
+        if strategy_names is not None and any(name is not None for name in strategy_names):
+            backend = get_global_server_args().sampling_backend
+            if backend != "pytorch":
+                raise ValueError(
+                    "p-less sampling currently requires sampling_backend='pytorch'."
+                )
+            return sample_from_probs_with_strategies_torch(
+                probs=probs,
+                top_ks=sampling_info.top_ks,
+                top_ps=sampling_info.top_ps,
+                min_ps=sampling_info.min_ps,
+                sampling_seed=sampling_info.sampling_seed,
+                positions=positions,
+                strategy_names=strategy_names,
+            )
+
+        return self._sample_from_probs_default(
+            probs=probs,
+            top_ks=sampling_info.top_ks,
+            top_ps=sampling_info.top_ps,
+            min_ps=sampling_info.min_ps,
+            need_min_p_sampling=sampling_info.need_min_p_sampling,
+            sampling_seed=sampling_info.sampling_seed,
+            positions=positions,
+            simple_sampling_case=simple_sampling_case,
+        )
+
+    def _sample_from_probs_default(
+        self,
+        *,
+        probs: torch.Tensor,
+        top_ks: torch.Tensor,
+        top_ps: torch.Tensor,
+        min_ps: torch.Tensor,
+        need_min_p_sampling: bool,
+        sampling_seed: Optional[torch.Tensor],
+        positions: torch.Tensor,
+        simple_sampling_case: bool,
+    ) -> torch.Tensor:
         if simple_sampling_case:
             batch_next_token_ids = sampling_from_probs_torch(
                 probs,
-                sampling_seed=sampling_info.sampling_seed,
+                sampling_seed=sampling_seed,
                 positions=positions,
             )
         else:
             backend = get_global_server_args().sampling_backend
             if backend == "flashinfer":
                 assert (
-                    sampling_info.sampling_seed is None
+                    sampling_seed is None
                 ), "Sampling seed is not supported for flashinfer backend"
-                if sampling_info.need_min_p_sampling:
-                    probs = top_k_renorm_prob(probs, sampling_info.top_ks)
-                    probs = top_p_renorm_prob(probs, sampling_info.top_ps)
+                if need_min_p_sampling:
+                    probs = top_k_renorm_prob(probs, top_ks)
+                    probs = top_p_renorm_prob(probs, top_ps)
                     batch_next_token_ids = min_p_sampling_from_probs(
-                        probs, sampling_info.min_ps
+                        probs, min_ps
                     )
                 else:
                     batch_next_token_ids = top_k_top_p_sampling_from_probs(
                         probs.contiguous(),
-                        sampling_info.top_ks,
-                        sampling_info.top_ps,
+                        top_ks,
+                        top_ps,
                         filter_apply_order="joint",
                         check_nan=self.use_nan_detection,
                     )
@@ -227,11 +292,11 @@ class Sampler(nn.Module):
                 # A slower fallback implementation with torch native operations.
                 batch_next_token_ids = top_k_top_p_min_p_sampling_from_probs_torch(
                     probs,
-                    sampling_info.top_ks,
-                    sampling_info.top_ps,
-                    sampling_info.min_ps,
-                    sampling_info.need_min_p_sampling,
-                    sampling_info.sampling_seed,
+                    top_ks,
+                    top_ps,
+                    min_ps,
+                    need_min_p_sampling,
+                    sampling_seed,
                     positions,
                 )
             else:
@@ -456,21 +521,14 @@ def top_k_top_p_min_p_sampling_from_probs_torch(
     When sampling_seed is not None, deterministic inference will be enabled, it will sample
     with the sampling_seed of each request.
     """
-    probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
-    probs_sum = torch.cumsum(probs_sort, dim=-1)
-    probs_sort[
-        torch.arange(0, probs.shape[-1], device=probs.device).view(1, -1)
-        >= top_ks.view(-1, 1)
-    ] = 0.0
-    probs_sort[(probs_sum - probs_sort) > top_ps.view(-1, 1)] = 0.0
-
-    if need_min_p_sampling:
-        # TODO: probs_sort should be re-normalized for the use of multinomial_with_seed
-        assert (
-            sampling_seed is None
-        ), "With sampling seed, multinomial_with_seed will provide wrong results"
-        min_p_thresholds = probs_sort[:, 0] * min_ps
-        probs_sort[probs_sort < min_p_thresholds.view(-1, 1)] = 0.0
+    probs_sort, probs_idx = prepare_top_k_top_p_min_p_sorted_probs_torch(
+        probs,
+        top_ks,
+        top_ps,
+        min_ps,
+        need_min_p_sampling,
+    )
+    _sanitize_sampling_probs_for_multinomial_(probs_sort)
 
     if sampling_seed is None:
         sampled_index = torch.multinomial(probs_sort, num_samples=1)
@@ -488,6 +546,99 @@ def top_k_top_p_min_p_sampling_from_probs_torch(
     probs_idx = probs_idx.to(torch.int32)
     batch_next_token_ids = torch.gather(probs_idx, dim=1, index=sampled_index).view(-1)
     return batch_next_token_ids
+
+
+def _sanitize_sampling_probs_for_multinomial_(probs_sort: torch.Tensor) -> None:
+    """Make candidate weights safe for torch.multinomial.
+
+    This helper is intentionally generic: callers may pass either sorted
+    candidate weights or the full unsorted probability tensor. For rows that
+    already contain a valid probability distribution, it only normalizes.
+    """
+    if probs_sort.numel() == 0:
+        return
+
+    probs_sort.nan_to_num_(nan=0.0, posinf=0.0, neginf=0.0)
+    probs_sort.clamp_min_(0.0)
+
+    row_sums = probs_sort.sum(dim=-1, keepdim=True)
+    bad_rows = (~torch.isfinite(row_sums) | (row_sums <= 0)).view(-1)
+
+    if bad_rows.any():
+        probs_sort[bad_rows] = 0.0
+        probs_sort[bad_rows, 0] = 1.0
+        row_sums = probs_sort.sum(dim=-1, keepdim=True)
+
+    probs_sort.div_(row_sums)
+
+
+def prepare_top_k_top_p_min_p_sorted_probs_torch(
+    probs: torch.Tensor,
+    top_ks: torch.Tensor,
+    top_ps: torch.Tensor,
+    min_ps: torch.Tensor,
+    need_min_p_sampling: bool,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Prepare sorted-and-filtered candidate weights for PyTorch sampling.
+
+    When all requests use a bounded ``top_k``, use ``torch.topk`` to avoid a
+    full-vocabulary sort/copy. This is the common production sampled-decoding
+    case and materially reduces transient VRAM pressure.
+    """
+    if probs.numel() == 0:
+        return probs, probs.to(dtype=torch.long)
+
+    vocab_size = probs.shape[-1]
+    top_ks_view = top_ks.view(-1)
+    use_bounded_topk = top_ks_view.numel() > 0 and not torch.any(
+        top_ks_view >= TOP_K_ALL
+    )
+
+    if use_bounded_topk:
+        max_top_k = int(top_ks_view.max().item())
+        max_top_k = max(1, min(max_top_k, vocab_size))
+        if max_top_k < vocab_size:
+            probs_sort, probs_idx = torch.topk(
+                probs,
+                k=max_top_k,
+                dim=-1,
+                largest=True,
+                sorted=True,
+            )
+        else:
+            probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
+    else:
+        probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
+
+    _apply_top_k_top_p_min_p_filters_inplace(
+        probs_sort,
+        top_ks,
+        top_ps,
+        min_ps,
+        need_min_p_sampling,
+    )
+    return probs_sort, probs_idx
+
+
+def _apply_top_k_top_p_min_p_filters_inplace(
+    probs_sort: torch.Tensor,
+    top_ks: torch.Tensor,
+    top_ps: torch.Tensor,
+    min_ps: torch.Tensor,
+    need_min_p_sampling: bool,
+) -> None:
+    width = probs_sort.shape[-1]
+    cols = torch.arange(0, width, device=probs_sort.device).view(1, -1)
+    top_ks_clamped = torch.clamp(top_ks.view(-1), min=1, max=width)
+
+    probs_sort[cols >= top_ks_clamped.view(-1, 1)] = 0.0
+
+    probs_sum = torch.cumsum(probs_sort, dim=-1)
+    probs_sort[(probs_sum - probs_sort) > top_ps.view(-1, 1)] = 0.0
+
+    if need_min_p_sampling:
+        min_p_thresholds = probs_sort[:, 0] * min_ps.to(dtype=probs_sort.dtype)
+        probs_sort[probs_sort < min_p_thresholds.view(-1, 1)] = 0.0
 
 
 def top_k_top_p_min_p_sampling_from_logits_ascend(
@@ -513,6 +664,7 @@ def top_k_top_p_min_p_sampling_from_logits_ascend(
             min_p_mask = probs_top_k_top_p < min_p_thresholds.view(-1, 1)
             probs_top_k_top_p.masked_fill_(min_p_mask, 0.0)
 
+        _sanitize_sampling_probs_for_multinomial_(probs_top_k_top_p)
         batch_next_token_ids = torch.multinomial(probs_top_k_top_p, num_samples=1)
     else:
         probs = torch.softmax(logits, dim=-1)
@@ -535,6 +687,7 @@ def top_k_top_p_min_p_sampling_from_logits_ascend(
             min_p_mask = probs_sort < min_p_thresholds.view(-1, 1)
             probs_sort.masked_fill_(min_p_mask, 0.0)
 
+        _sanitize_sampling_probs_for_multinomial_(probs_sort)
         sampled_index = torch.multinomial(probs_sort, num_samples=1)
         probs_idx = probs_idx.to(torch.int32)
         batch_next_token_ids = torch.gather(probs_idx, dim=1, index=sampled_index)
@@ -595,6 +748,8 @@ def sampling_from_probs_torch(
 
     Note: For deterministic sampling from logprobs, use Sampler._sample_from_logprobs instead.
     """
+    _sanitize_sampling_probs_for_multinomial_(probs)
+
     if sampling_seed is None:
         sampled_index = torch.multinomial(probs, num_samples=1)
     else:
@@ -603,6 +758,132 @@ def sampling_from_probs_torch(
             torch.log(probs), sampling_seed, positions
         )
     batch_next_token_ids = sampled_index.view(-1).to(torch.int32)
+    return batch_next_token_ids
+
+
+def p_less_sampling_from_probs_torch(
+    probs: torch.Tensor,
+    *,
+    normalized_variant: bool,
+    sampling_seed: Optional[torch.Tensor] = None,
+    positions: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    probs = probs.clone()
+    sq_sum = probs.square().sum(dim=-1, keepdim=True)
+    if normalized_variant:
+        vocab_size = probs.shape[-1]
+        threshold = (vocab_size * sq_sum - 1.0) / max(vocab_size - 1, 1)
+    else:
+        threshold = sq_sum
+    probs[probs < threshold.to(dtype=probs.dtype)] = 0.0
+    _sanitize_sampling_probs_for_multinomial_(probs)
+
+    if sampling_seed is None:
+        sampled_index = torch.multinomial(probs, num_samples=1)
+    else:
+        sampled_index = multinomial_with_seed(
+            torch.log(probs.to(torch.float64)), sampling_seed, positions
+        )
+    return sampled_index.view(-1).to(torch.int32)
+
+
+def sample_from_probs_default_torch(
+    *,
+    probs: torch.Tensor,
+    top_ks: torch.Tensor,
+    top_ps: torch.Tensor,
+    min_ps: torch.Tensor,
+    need_min_p_sampling: bool,
+    sampling_seed: Optional[torch.Tensor],
+    positions: Optional[torch.Tensor],
+    simple_sampling_case: bool,
+) -> torch.Tensor:
+    if simple_sampling_case:
+        return sampling_from_probs_torch(
+            probs,
+            sampling_seed=sampling_seed,
+            positions=positions,
+        )
+
+    return top_k_top_p_min_p_sampling_from_probs_torch(
+        probs,
+        top_ks,
+        top_ps,
+        min_ps,
+        need_min_p_sampling,
+        sampling_seed,
+        positions,
+    )
+
+
+def sample_from_probs_with_strategies_torch(
+    *,
+    probs: torch.Tensor,
+    top_ks: torch.Tensor,
+    top_ps: torch.Tensor,
+    min_ps: torch.Tensor,
+    sampling_seed: Optional[torch.Tensor],
+    positions: torch.Tensor,
+    strategy_names: List[Optional[str]],
+) -> torch.Tensor:
+    if len(strategy_names) != probs.shape[0]:
+        raise ValueError(
+            f"Sampling strategy metadata length mismatch: got {len(strategy_names)} "
+            f"for batch size {probs.shape[0]}."
+        )
+
+    batch_next_token_ids = torch.empty(
+        probs.shape[0], dtype=torch.int32, device=probs.device
+    )
+    device = probs.device
+    strategy_tensor = torch.tensor(
+        [
+            1
+            if name == "p_less"
+            else 2
+            if name == "p_less_norm"
+            else 0
+            for name in strategy_names
+        ],
+        dtype=torch.int32,
+        device=device,
+    )
+    default_mask = strategy_tensor == 0
+
+    for strategy_id, normalized_variant in ((1, False), (2, True)):
+        mask = strategy_tensor == strategy_id
+        if not mask.any():
+            continue
+        batch_next_token_ids[mask] = p_less_sampling_from_probs_torch(
+            probs[mask],
+            normalized_variant=normalized_variant,
+            sampling_seed=sampling_seed[mask] if sampling_seed is not None else None,
+            positions=positions[mask] if positions is not None else None,
+        )
+
+    if default_mask.any():
+        top_ks_subset = top_ks[default_mask]
+        top_ps_subset = top_ps[default_mask]
+        min_ps_subset = min_ps[default_mask]
+        need_top_p_subset = bool(torch.any(top_ps_subset != 1.0))
+        need_top_k_subset = bool(torch.any(top_ks_subset != TOP_K_ALL))
+        need_min_p_subset = bool(torch.any(min_ps_subset > 0))
+        simple_subset = not (
+            need_top_p_subset or need_top_k_subset or need_min_p_subset
+        )
+        batch_next_token_ids[default_mask] = sample_from_probs_default_torch(
+            probs=probs[default_mask],
+            top_ks=top_ks_subset,
+            top_ps=top_ps_subset,
+            min_ps=min_ps_subset,
+            need_min_p_sampling=need_min_p_subset,
+            sampling_seed=(
+                sampling_seed[default_mask] if sampling_seed is not None else None
+            ),
+            positions=positions[default_mask] if positions is not None else None,
+            simple_sampling_case=simple_subset,
+        )
+
     return batch_next_token_ids
 
 

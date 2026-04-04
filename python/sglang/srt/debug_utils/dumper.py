@@ -163,6 +163,10 @@ class _Dumper:
         self._captured_output_data: Optional[dict] = None
         self._rpc_broadcast: "_RpcBroadcastBase" = _LocalOnlyBroadcast(self)
 
+    @property
+    def may_enable(self) -> bool:
+        return self._config.enable or self._config.server_port_parsed is not None
+
     def on_forward_pass_start(self):
         """This should be called on all ranks."""
 
@@ -273,6 +277,15 @@ class _Dumper:
 
     def configure_default(self, **kwargs) -> None:
         self._config = self._config.with_defaults(**kwargs)
+
+    def apply_source_patches(self) -> None:
+        # Newer model_runner code expects this hook to exist, but the older dumper
+        # implementation used on the dflash branch has no source patcher subsystem.
+        return
+
+    def register_non_intrusive_dumper(self, model: "torch.nn.Module") -> None:
+        # Compatibility no-op for newer model_runner callsites.
+        return
 
     def dump_dict(self, name_prefix, data, save: bool = True, **kwargs):
         data = _obj_to_dict(data)

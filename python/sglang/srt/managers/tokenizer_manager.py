@@ -125,6 +125,15 @@ _REQUEST_STATE_WAIT_TIMEOUT = envs.SGLANG_REQUEST_STATE_WAIT_TIMEOUT.get()
 logger = logging.getLogger(__name__)
 
 
+def _fa3_trace_output_ids_enabled() -> bool:
+    return os.environ.get("SGLANG_FA3_TRACE_OUTPUT_IDS", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
 @dataclasses.dataclass
 class ReqState:
     """Store the state a request."""
@@ -1128,6 +1137,13 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             out = state.out_list[-1]
 
             state.out_list = []
+            if _fa3_trace_output_ids_enabled():
+                logger.info(
+                    "[FA3OutputPath][tokenizer_yield] rid=%s out_output_ids=%s finished=%s",
+                    obj.rid,
+                    out.get("output_ids"),
+                    state.finished,
+                )
             if state.finished:
                 # For non-streaming cases, response has not been sent yet (`response_sent_to_client_ts` has not been set yet).
                 # Record response sent time right before we log finished results and metrics.
@@ -1490,6 +1506,13 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 )
                 continue
 
+            if _fa3_trace_output_ids_enabled():
+                logger.info(
+                    "[FA3OutputPath][tokenizer_in] rid=%s recv_output_ids=%s",
+                    rid,
+                    recv_obj.output_ids[i] if getattr(recv_obj, "output_ids", None) else None,
+                )
+
             # Build meta_info and return value
             meta_info = {
                 "id": rid,
@@ -1611,6 +1634,14 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 if self.server_args.enable_lora and state.obj.lora_path:
                     asyncio.create_task(self.lora_registry.release(state.obj.lora_id))
 
+            if _fa3_trace_output_ids_enabled():
+                logger.info(
+                    "[FA3OutputPath][tokenizer_out_dict] rid=%s out_output_ids=%s state_output_ids=%s finished=%s",
+                    rid,
+                    out_dict.get("output_ids"),
+                    state.output_ids,
+                    state.finished,
+                )
             state.out_list.append(out_dict)
             state.event.set()
 
@@ -1841,8 +1872,19 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             and len(recv_obj.spec_accepted_tokens) > i
         ):
             # The draft tokens per speculative step (excluding the target-sampled token).
-            num_guess_tokens = self.server_args.speculative_num_draft_tokens - 1
-            total_draft_tokens = recv_obj.spec_verify_ct[i] * num_guess_tokens
+            total_draft_tokens = None
+            if (
+                getattr(recv_obj, "customized_info", None)
+                and recv_obj.customized_info.get("spec_dflash_total_draft_token_num")
+                and recv_obj.customized_info["spec_dflash_total_draft_token_num"][i]
+                is not None
+            ):
+                total_draft_tokens = int(
+                    recv_obj.customized_info["spec_dflash_total_draft_token_num"][i]
+                )
+            else:
+                num_guess_tokens = self.server_args.speculative_num_draft_tokens - 1
+                total_draft_tokens = recv_obj.spec_verify_ct[i] * num_guess_tokens
             accepted_tokens = recv_obj.spec_accepted_tokens[i]
 
             # Calculate per-request acceptance rate and average acceptance length.

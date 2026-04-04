@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
+import os
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
@@ -24,6 +26,30 @@ if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.spec_info import SpecInput
+
+
+logger = logging.getLogger(__name__)
+
+
+def _fa3_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _fa3_trace_layer_ids() -> frozenset[int]:
+    raw = os.environ.get("SGLANG_FA3_TRACE_BACKEND_LAYER_IDS", "")
+    values: set[int] = set()
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            values.add(int(part))
+        except ValueError:
+            logger.warning(
+                "[FA3Backend] ignoring invalid layer id %r in SGLANG_FA3_TRACE_BACKEND_LAYER_IDS",
+                part,
+            )
+    return frozenset(values)
 
 
 def logit_capping_mod(logit_capping_method, logit_cap):
@@ -601,8 +627,10 @@ class TritonAttnBackend(AttentionBackend):
                     )
                 )
 
-            custom_mask = self.cuda_graph_custom_mask
-            custom_mask[: spec_info.custom_mask.shape[0]] = spec_info.custom_mask
+            custom_mask = None
+            if spec_info is not None and spec_info.custom_mask is not None:
+                custom_mask = self.cuda_graph_custom_mask
+                custom_mask[: spec_info.custom_mask.shape[0]] = spec_info.custom_mask
             seq_mask_len = self.num_draft_tokens * (seq_lens + self.num_draft_tokens)
             mask_indptr = self.mask_indptr[: bs + 1]
             mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len, dim=0)
@@ -752,8 +780,10 @@ class TritonAttnBackend(AttentionBackend):
                         self.token_to_kv_pool_allocator,
                     )
                 )
-            custom_mask = self.cuda_graph_custom_mask
-            custom_mask[: spec_info.custom_mask.shape[0]] = spec_info.custom_mask
+            custom_mask = None
+            if spec_info is not None and spec_info.custom_mask is not None:
+                custom_mask = self.cuda_graph_custom_mask
+                custom_mask[: spec_info.custom_mask.shape[0]] = spec_info.custom_mask
             seq_mask_len = self.num_draft_tokens * (seq_lens + self.num_draft_tokens)
             mask_indptr = self.mask_indptr[: bs + 1]
             mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len, dim=0)
@@ -1004,6 +1034,15 @@ class TritonAttnBackend(AttentionBackend):
         save_kv_cache=True,
         sinks=None,
     ):
+        if _fa3_flag("SGLANG_FA3_TRACE_BACKEND"):
+            trace_ids = _fa3_trace_layer_ids()
+            if not trace_ids or int(layer.layer_id) in trace_ids:
+                logger.info(
+                    "[FA3Backend] concrete=%s mode=decode layer=%d sinks=%s",
+                    self.__class__.__name__,
+                    int(layer.layer_id),
+                    sinks is not None,
+                )
         # During torch.compile, there is a bug in rotary_emb that causes the
         # output value to have a 3D tensor shape. This reshapes the output correctly.
         q = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
