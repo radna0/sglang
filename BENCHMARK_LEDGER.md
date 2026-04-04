@@ -3,6 +3,24 @@
 This file is the canonical run registry for GPT-OSS `showtime.py` / Harmony /
 PaCoRe / DFlash experiments on this branch.
 
+## Locked Current-Branch Proof Contract
+
+The current proof lane for `reference.csv` on this branch is locked to:
+
+- target `page_size=1`
+- draft `page_size=1`
+- `share_pools=False`
+- `block_size=4`
+- `speculative_num_draft_tokens=4`
+- `mem_fraction_static=0.90`
+- `speculative_draft_mem_fraction_static=0.97`
+- FA3
+- full decode CUDA graph + piecewise CUDA graph
+- overlap disabled
+
+This is the geometry that current-branch proof runs must use unless a row explicitly says
+otherwise.
+
 Use it to answer four questions for every run:
 
 1. What exact regime was tested?
@@ -128,11 +146,128 @@ Append new rows here. Keep failed and superseded runs; do not erase them.
 | `route5_explore32_route8_block8` | finished | `explore32->route8` | `no-tool` | `off` | `router early-promotion` | `DFLASH` | `route selection quality + final routed quality` | `wall_s_total + route/explore/continue split` | `/workspace/route5_explore32_route8_block8_20260328` | finished: explore `3146.926 tok/s`, continue `791.732 tok/s`, boxed-correct `0.75` |
 | `route5_explore32_route8_block4to8_greedy` | finished | `explore32->route8` | `no-tool` | `off` | `router early-promotion` | `DFLASH` | `route selection quality + final routed quality` | `wall_s_total + route/explore/continue split` | `/workspace/route5_explore32_route8_block4to8_greedy_20260329` | finished: exploration `3439.704 tok/s`, continuation `803.360 tok/s`, boxed-correct `0.75` |
 | `route5_explore32_route8_block4to8_sampled` | finished | `explore32->route8` | `no-tool` | `off` | `router early-promotion` | `DFLASH` | `route selection quality + final routed quality` | `wall_s_total + route/explore/continue split` | `/workspace/route5_explore32_route8_block4to8_sampled_20260329` | finished: exploration `2275.360 tok/s`, continuation `557.241 tok/s`, boxed-correct `0.75` |
+| `route_ckpt213_shared_adaptivecap_bad` | superseded | `explore32->route8` | `no-tool` | `off` | `router early-promotion + adaptive continuation cap` | `DFLASH` | `route selection quality + final routed quality` | `wall_s_total + route/explore/continue split` | `/workspace/route_ckpt213_shared_adaptivecap_20260404` | invalidated: controller bug self-locked continuation to `accept_len=1.00`, `accept_rate=0.06`, about `290-308 tok/s` by hard-capping to one step too early |
+| `route_ckpt213_shared_adaptivecap_safe` | running/partial | `explore32->route8` | `no-tool` | `off` | `router early-promotion + adaptive continuation cap` | `DFLASH` | `route selection quality + final routed quality` | `wall_s_total + route/explore/continue split` | `/workspace/route_ckpt213_shared_adaptivecap_safe_20260404` | corrected controller defaults removed the immediate self-lock, but current long-context continuation is still weak: live `299-332 tok/s`, `accept_len ~1.00-1.01`, `accept_rate ~0.06`; continuation server is `ctx=65536`, `c=8`, `block=16`, shared-pool |
 | `dflash_tree_config_sweep_single_req` | finished | `DFLASH_TREE` | `no-tool` | `off` | `off/full-round` | `DFLASH_TREE` | `tree verify correctness + wall tok/s` | `wall_s_total + accept_length + correct_boxed_rate` | `/workspace/dflash_tree_config_sweep_20260330` | sweep finished: block `4` best is `steps=3 topk=4 vt=4` (`271.792 tok/s`, `1.065x`), block `8` best is `steps=4 topk=2 vt=6` (`299.849 tok/s`, `1.074x`), block `16` best is `steps=8 topk=1 vt=9` (`332.333 tok/s`, `1.127x`) |
 | `tree_vs_linear_single_req_locked_postfix` | finished | `DFLASH_TREE` | `no-tool` | `off` | `off/full-round` | `DFLASH/DFLASH_TREE` | `single-request apples-to-apples tree vs linear` | `wall_tok_s + accept_length + correct_boxed_rate` | `/workspace/tree_vs_linear_apples_20260330` | locked after benchmark-driver fixes: block `4` `304.201/274.047=1.110x`, block `8` `343.534/301.705=1.139x`, block `16` `385.327/315.758=1.221x`, all boxed-correct |
 | `dflash_tree_batch_sweep_postfix` | running/partial | `DFLASH_TREE` | `no-tool` | `off` | `off/full-round` | `DFLASH/DFLASH_TREE` | `batched non-overlap tree vs linear using locked best configs` | `wall_tok_s + accept_length + correct_boxed_rate + batch speedup` | `/workspace/dflash_tree_batch_sweep_20260330_postfix` | partial results locked: block `4` `c=1` `306.603/274.120=1.1185x`, block `4` `c=4` `1194.003/1179.283=1.0125x`, both boxed-correct; `c=8` currently unstable on tree verify and under active debug; overlap forced off |
 | `dflash_tree_overlap_single_request_best` | prepared | `DFLASH_TREE` | `no-tool` | `off` | `off/full-round` | `DFLASH_TREE` | `tree overlap correctness + wall tok/s` | `wall_s_total + accept_length + correct_boxed_rate + overlap speedup` | `/workspace/dflash_tree_overlap_single_request_best_20260330` | prepared follow-up: single-request overlap compare using the best tree configs first (`block=4` and `block=8`) |
 | `dflash_tree_overlap_config_sweep_single_req` | prepared | `DFLASH_TREE` | `no-tool` | `off` | `off/full-round` | `DFLASH_TREE` | `tree overlap speedup across config grid` | `wall_s_total + accept_length + correct_boxed_rate + overlap speedup` | `/workspace/dflash_tree_overlap_config_sweep_20260330` | overlap sweep reuses the linear baselines from `dflash_tree_config_sweep_20260330` and scans the same compact tree grid |
+
+## 2026-04-04 Route Continuation Correction
+
+The adaptive-cap route wave on `ckpt213` needs a clear correction because the early
+continuation readout looked much better than the real long-context continuation state.
+
+Locked facts for the current live route lane:
+
+- run root: `/workspace/route_ckpt213_shared_adaptivecap_safe_20260404`
+- serving contract:
+  - shared-pool
+  - target `page_size=1`
+  - draft `page_size=1`
+  - continuation `DFLASH block_size=16`
+  - continuation server `context_length=65536`
+  - continuation server `max_running_requests=8`
+- problem set:
+  - `86e8e5`
+  - `dd7f5e`
+  - `a295e9`
+  - `9c1c5f`
+  - `92ba6a`
+
+Route-budget semantics from `scripts/playground/route_reference_dflash.py`:
+
+- full per-request decode budgets for this 5-problem ladder are:
+  - `64545`
+  - `64687`
+  - `64786`
+  - `64814`
+  - `64839`
+- corresponding prompt lengths are only:
+  - `185`
+  - `210`
+  - `238`
+  - `337`
+  - `479`
+- exploration always gets an `8192` token cap per request
+- exploration is chunked in `2048`-token rounds
+- continuation receives the remaining budget after exploration
+- because the router enforces `exploration_min_rounds=2`, continuation starts only after at least
+  `4096` exploration tokens per surviving branch
+- therefore the continuation output budget is at least in the range:
+  - `60449..60743` if routing stops after 2 rounds
+  - `56353..56647` if routing uses the full 8192-token exploration budget
+
+Important correction:
+
+- the earlier `1.7k-2.3k tok/s` continuation numbers were from the early window right after
+  promotion, before the longer continuation matured
+- the current real long-context continuation state is much worse
+- live server-side continuation metrics are now:
+  - GPU3 greedy `4->16`: about `331.5 tok/s`, `avg_spec_accept_length 1.011`
+  - GPU4 greedy `8->16`: about `323.9 tok/s`, `avg_spec_accept_length 1.014`
+  - GPU5 sampled `4->16`: about `298.9 tok/s`, `avg_spec_accept_length 1.000`
+- live decode logs match that:
+  - `accept_len ~1.00`
+  - `accept_rate ~0.06`
+
+Current live continuation token load, sampled during this bad tail:
+
+- GPU3 greedy `4->16`: `67373` total live full tokens across 8 routed requests
+  - about `8422` tokens/request on average
+- GPU4 greedy `8->16`: `57133` total live full tokens across 8 routed requests
+  - about `7142` tokens/request on average
+- GPU5 sampled `4->16`: `47867` total live full tokens across 8 routed requests
+  - about `5983` tokens/request on average
+
+Conclusion:
+
+- yes, continuation throughput is already falling sharply as the promoted continuation gets longer
+- the route lane is not currently in a healthy long-context continuation regime
+- do not compare the early continuation burst against the older locked route results
+  (`803 tok/s`, accept `4.208`) without accounting for this long-context degradation
+
+## 2026-04-04 Pure Target-Only Control Check
+
+A direct target-only control was launched to test the user's claim that the current
+shared-pool DFLASH route continuation is worse than plain target decode with
+`kv_cache_dtype=fp8_e4m3`.
+
+Control artifact target:
+
+- `/workspace/target_only_fp8_ctx65536_c8_20260404/greedy_reference5_c8.json`
+
+Control regime:
+
+- target only, no DFLASH
+- same long-decode serving contract:
+  - `context_length=65536`
+  - `concurrency=8`
+  - `page_size=1`
+  - `kv_cache_dtype=fp8_e4m3`
+  - FA3
+  - full CUDA graph + piecewise CUDA graph
+  - overlap disabled
+- prompt set:
+  - the same 5-problem route ladder repeated to 8 requests
+  - this is not the promoted continuation text from the route worker
+  - it is still a valid same-contract long-decode control
+
+Live result:
+
+- target-only control entered real decode at about `650-720 tok/s`
+- at the same time, the current DFLASH route continuation tail was only about `299-332 tok/s`
+
+Immediate read:
+
+- the user's claim is correct
+- under the current bad continuation regime, plain target-only FP8 serving is roughly
+  `1.96x` to `2.41x` faster than the DFLASH continuation tail
+- this is a severe regression signal against the current route continuation path
+- final benchmark JSON for the target-only control had not landed yet when this note was added,
+  but the live decode comparison is already decisive enough to reject the current DFLASH
+  continuation state as acceptable
 
 ## Important Baseline Finding
 
@@ -282,3 +417,184 @@ Current checkpoint:
   - overlap-v2
   - fused / CUDA-graph / mixed-precision verify
   - linear + tree-verify completion
+
+## 2026-04-04 Pure DFLASH FP8 Draft-KV Investigation
+
+This section supersedes the old "route study is complete enough for now" framing for the current branch.
+The active engineering question is no longer routing policy first; it is whether pure DFLASH can inherit
+the same kind of fast FP8 decode behavior as plain target-only GPT-OSS.
+
+### Core architectural finding
+
+- There is already a hidden decode-style DFLASH draft proposal path in:
+  - [dflash_worker.py](/workspace/sglang-dflash-pagesize-fix-old/python/sglang/srt/speculative/dflash_worker.py)
+  - env gate: `SGLANG_DFLASH_PROPOSAL_USE_DECODE=1`
+- Before 2026-04-04, that path did not get matching draft decode CUDA graphs because the draft worker
+  still captured `TARGET_VERIFY` graphs.
+- Fixed in:
+  - [cuda_graph_runner.py](/workspace/sglang-dflash-pagesize-fix-old/python/sglang/srt/model_executor/cuda_graph_runner.py)
+- New behavior:
+  - if `SGLANG_DFLASH_PROPOSAL_USE_DECODE=1` and the worker is the DFLASH draft worker,
+    draft CUDA-graph capture now uses `ForwardMode.DECODE` with `num_tokens_per_bs=1`
+  - this gives the draft worker its own fixed-shape decode graph path instead of reusing
+    fixed-width `TARGET_VERIFY` graphs
+
+### Immediate consequence
+
+- no-scale `fp8_e4m3` draft-KV + shared pools + decode-style draft proposal now starts cleanly
+- the previous blocker was draft CUDA-graph capture; that blocker is gone on the new architecture
+- this was proven on the exact ckpt213 shared-pool contract with:
+  - target KV `fp8_e4m3`
+  - draft KV `fp8_e4m3`
+  - page size `1`
+  - shared pools `on`
+  - no KV scales
+
+### Exact route comparison now running
+
+Root:
+
+- [route_ckpt213_shared_decodeproposal_draftkv_20260404](/workspace/route_ckpt213_shared_decodeproposal_draftkv_20260404)
+
+Contract:
+
+- exact preserved route contract
+- `explore32 -> route8 -> greedy -> 4 -> 16`
+- ckpt213
+- shared pools
+- target KV `fp8_e4m3`
+- decode-style draft proposal enabled
+
+#### BF16 draft-KV control
+
+- path:
+  - [bf16_gpu3/result.json](/workspace/route_ckpt213_shared_decodeproposal_draftkv_20260404/bf16_gpu3/result.json)
+- first real exploration decode window:
+  - `accept_len ~2.04 - 2.36`
+  - `accept_rate ~0.51 - 0.59`
+  - `gen throughput ~2388 - 2733 tok/s`
+- conclusion:
+  - decode-style draft proposal + matching draft decode graphs is a real speedup path
+  - this is the first healthy pure-DFLASH route lane on the new draft architecture
+
+#### FP8 draft-KV, no scales
+
+- path:
+  - [fp8/result.json](/workspace/route_ckpt213_shared_decodeproposal_draftkv_20260404/fp8/result.json)
+- first real exploration decode window:
+  - `accept_len ~1.00`
+  - `accept_rate ~0.25`
+  - `gen throughput ~1140 - 1200 tok/s`
+- conclusion:
+  - the new architecture fixed startup and graph capture
+  - but plain no-scale draft KV `fp8_e4m3` still collapses draft quality badly on the same route workload
+
+### Current interpretation
+
+- the graph/capture architecture was one blocker, and it is now largely fixed
+- the remaining blocker is draft quality under no-scale `fp8_e4m3`
+- because BF16 draft-KV on the same decode-style path is healthy while FP8 draft-KV is not, the
+  current regression is now strongly isolated to draft numerical behavior rather than route policy
+  or target verify architecture
+
+### Active next isolate
+
+- same exact route contract
+- draft KV `fp8_e4m3`
+- keep draft Q in bf16 while storing KV in fp8:
+  - env: `SGLANG_DFLASH_DRAFT_FP8_KEEP_Q_BF16=1`
+- live path:
+  - [fp8_keepq/result.json](/workspace/route_ckpt213_shared_decodeproposal_draftkv_20260404/fp8_keepq/result.json)
+
+Purpose:
+
+1. If `fp8_keepq` recovers acceptance, the problem is likely the draft attention compute path
+   around the FP8 Q cast.
+2. If `fp8_keepq` still collapses, the problem is much more likely the no-scale KV storage path itself.
+
+### 2026-04-04 BF16 draft fast path promoted to default policy
+
+Code changes:
+
+- [dflash_worker.py](/workspace/sglang-dflash-pagesize-fix-old/python/sglang/srt/speculative/dflash_worker.py)
+  - decode-style draft proposal is now auto-enabled by default on the stable fast lane:
+    - shared pools
+    - `page_size=1`
+    - greedy sampling
+    - non-FP8 draft KV
+- [cuda_graph_runner.py](/workspace/sglang-dflash-pagesize-fix-old/python/sglang/srt/model_executor/cuda_graph_runner.py)
+  - matching DFLASH draft `DECODE` cuda-graph capture is now auto-enabled by default on the same stable lane
+
+Meaning:
+
+- the fast BF16 draft path no longer requires `SGLANG_DFLASH_PROPOSAL_USE_DECODE=1`
+- the environment gate is still available for forcing behavior, but the stable BF16 path now opts into it automatically
+
+Validation:
+
+- `py_compile` clean for both files
+
+Fresh proof status:
+
+- a clean BF16 rerun on the new default path was launched
+- it did not fail in DFLASH code
+- it failed in target startup due GPU memory pressure from other live jobs on the machine
+
+So the current blocker to the next apples-to-apples number is environment headroom, not the code-side default-path implementation.
+
+### 2026-04-04 BF16 draft default-path proof run recovered cleanly
+
+Environment was cleaned by killing a stale 8-GPU `train_dflash.py` job and clearing dead CUDA contexts.
+
+Run:
+
+- [route_ckpt213_shared_greedy_b4to16_bf16_default_20260404/result.json](/workspace/route_ckpt213_shared_greedy_b4to16_bf16_default_20260404/result.json)
+
+Exact contract:
+
+- ckpt213
+- shared pools
+- target KV `fp8_e4m3`
+- draft KV `bfloat16`
+- exact route contract `explore32 -> route8 -> greedy -> 4 -> 16`
+- no `SGLANG_DFLASH_PROPOSAL_USE_DECODE` env override
+
+Observed startup markers:
+
+- `DFLASH draft cuda-graph mode overridden to DECODE to match decode-style draft proposal.`
+- target server uses KV cache dtype `torch.float8_e4m3fn`
+- draft server uses KV cache dtype `torch.bfloat16`
+
+Locked exploration-phase result from the live benchmark:
+
+- output token throughput: `2491.15 tok/s`
+- total token throughput: `2852.64 tok/s`
+- accept length: `2.29`
+
+Representative exploration decode windows from the same run:
+
+- `accept_len ~2.04 - 2.90`
+- `accept_rate ~0.51 - 0.73`
+- `gen throughput ~2355 - 3251 tok/s`
+
+Meaning:
+
+- the BF16 draft fast path is now proven healthy again on the new default policy, not only behind
+  the old env-gated experiment
+- the next remaining question is continuation throughput, not whether the default BF16 path works
+
+### Active paired experiment: decode-style target verify
+
+Run:
+
+- [route_ckpt213_shared_greedy_b4to16_bf16_decodeverify_20260404/result.json](/workspace/route_ckpt213_shared_greedy_b4to16_bf16_decodeverify_20260404/result.json)
+
+Change:
+
+- same exact contract as above
+- plus env `SGLANG_DFLASH_VERIFY_USE_DECODE_BATCH=1`
+
+Purpose:
+
+- test whether speculative target verify can directly reuse more of the plain target-only decode path
+  instead of paying the current `TARGET_VERIFY` / `forward_extend()` cost structure

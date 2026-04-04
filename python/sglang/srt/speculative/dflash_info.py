@@ -38,8 +38,6 @@ from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
 from sglang.srt.utils import is_cuda
 
 logger = logging.getLogger(__name__)
-
-_DFLASH_PQ_STATS_LOGGED = False
 _DFLASH_VERIFY_TIMING_DETAIL_LOGGED = False
 
 if is_cuda():
@@ -93,6 +91,7 @@ class DFlashDraftInput(SpecInput):
     future_indices: Optional[FutureIndices] = None
     new_seq_lens: torch.Tensor | None = None
     verify_done: Optional[torch.cuda.Event] = None
+    plain_decode_only: bool = False
 
     def __post_init__(self):
         super().__init__(spec_input_type=SpecInputType.DFLASH_DRAFT)
@@ -217,6 +216,9 @@ class DFlashDraftInput(SpecInput):
                 self.target_hidden = torch.cat(
                     [self.target_hidden, spec_info.target_hidden], dim=0
                 )
+            self.plain_decode_only = bool(
+                self.plain_decode_only or spec_info.plain_decode_only
+            )
             return
 
         self.verified_id = torch.cat([self.verified_id, spec_info.verified_id], dim=0)
@@ -238,6 +240,23 @@ class DFlashDraftInput(SpecInput):
             self.target_hidden = torch.cat(
                 [self.target_hidden, spec_info.target_hidden], dim=0
             )
+        self.plain_decode_only = bool(
+            self.plain_decode_only or spec_info.plain_decode_only
+        )
+
+
+@dataclass
+class DFlashVerifyTimingStats:
+    tokens_committed: int
+    logitsproc_s: float
+    accept_s: float
+    pack_gpu_s: float
+    pack_d2h_s: float
+    commit_cpu_s: float
+    kv_free_s: float
+    mapping_s: float
+    hidden_s: float
+    total_s: float
 
 
 @dataclass
@@ -248,6 +267,7 @@ class DFlashVerifyResult:
     accept_length_per_req_cpu: List[int]
     dflash_debug: Optional[Dict[str, Any]]
     cache_plan: Any
+    timing_stats: DFlashVerifyTimingStats | None = None
 
 
 @dataclass
@@ -270,21 +290,22 @@ class DFlashVerifyInput(SpecInput):
     # Shape info for padding (e.g., DP attention / CUDA graph).
     num_tokens_per_batch: int = -1
 
-    # Verification rule under non-greedy sampling:
-    #   - "target_only": sample from target p and accept only exact matches (current default).
-    #   - "pq": true speculative sampling with draft probabilities q (accept with min(1, p/q)).
+    # Verification rule under non-greedy sampling.
+    # DFLASH now uses a single target-only contract:
+    # sample from target p and accept only exact matches.
     verify_mode: str = "target_only"
 
-    # Draft-side distribution (q) for pq verification.
+    # Legacy draft-side proposal distribution storage.
+    # Kept for compatibility with older checkpoints / payloads but unused by the
+    # target-only verify contract.
     # Shape: [bs, draft_token_num - 1, draft_topk] where draft_topk matches the draft sampling top-k.
-    # Only populated when verify_mode == "pq" and the request uses non-greedy sampling.
     draft_topk: int = 0
     draft_topk_ids: torch.Tensor | None = None
     draft_topk_probs: torch.Tensor | None = None
 
     # Optional per-request cap on how many speculative steps to attempt (FailFast/DAWN-style).
-    # Shape: [bs] int32 on device; each value is in [1, draft_token_num - 1].
-    # When provided, pq verification will "stop early" for requests whose cap is reached by
+    # Shape: [bs] int32 on device; each value is in [0, draft_token_num - 1].
+    # When provided, target-only verification will "stop early" for requests whose cap is reached by
     # sampling the bonus token from the target distribution at that step and ending speculation.
     max_steps_per_req: torch.Tensor | None = None
 
@@ -583,6 +604,7 @@ class DFlashVerifyInput(SpecInput):
                 accept_length_per_req_cpu=[],
                 dflash_debug=None,
                 cache_plan=None,
+                timing_stats=None,
             )
 
         bs = batch.batch_size()
@@ -598,10 +620,34 @@ class DFlashVerifyInput(SpecInput):
             "off",
             "no",
         )
-        t0 = time.perf_counter() if timing_detail else 0.0
+        profile_timing = timing_detail or (os.environ.get("SGLANG_DFLASH_PROFILE") or "").strip().lower() not in (
+            "",
+            "0",
+            "false",
+            "off",
+            "no",
+        )
+        profile_sync = profile_timing and device.type != "cpu" and (
+            os.environ.get("SGLANG_DFLASH_PROFILE_SYNC") or ""
+        ).strip().lower() not in (
+            "0",
+            "false",
+            "off",
+            "no",
+        )
+
+        def _profile_sync() -> None:
+            if not profile_sync:
+                return
+            torch.get_device_module(device).synchronize()
+
+        if profile_timing:
+            _profile_sync()
+        t0 = time.perf_counter() if profile_timing else 0.0
         t_after_logitproc = 0.0
         t_after_accept = 0.0
         t_after_pack = 0.0
+        t_after_d2h = 0.0
         t_after_commit = 0.0
         t_after_kv_free = 0.0
         t_after_mapping = 0.0
@@ -632,50 +678,9 @@ class DFlashVerifyInput(SpecInput):
                     )
                 )
 
-        if timing_detail:
+        if profile_timing:
+            _profile_sync()
             t_after_logitproc = time.perf_counter()
-
-        use_pq = False
-        if sampling_info is not None and not sampling_info.is_all_greedy:
-            verify_mode = str(getattr(self, "verify_mode", "target_only"))
-            topk_max = int(torch.max(sampling_info.top_ks).item())
-            # PQ (p/q + residual sampling) is the distribution-correct speculative sampling
-            # path. Enable by default; allow explicit opt-out if needed.
-            pq_disable = (os.environ.get("SGLANG_DFLASH_PQ_DISABLE") or "").strip().lower() in (
-                "1",
-                "true",
-                "on",
-                "yes",
-            )
-            pq_enable = not pq_disable
-            use_pq = (
-                verify_mode == "pq"
-                and pq_enable
-                and self.draft_topk_ids is not None
-                and self.draft_topk_probs is not None
-                and int(self.draft_topk) > 0
-                and topk_max > 0
-                # SGLang uses a huge TOP_K_ALL value for "whole vocab"; pq needs a small finite top_k.
-                and topk_max < (1 << 20)
-            )
-            if verify_mode == "pq" and not pq_enable and not getattr(self, "_warned_pq_enable", False):
-                logger.warning(
-                    "DFLASH pq requested but disabled (unset SGLANG_DFLASH_PQ_DISABLE to allow pq). Falling back to target_only."
-                )
-                setattr(self, "_warned_pq_enable", True)
-            if (
-                verify_mode == "pq"
-                and pq_enable
-                and not use_pq
-                and not getattr(self, "_warned_pq_disabled", False)
-            ):
-                logger.warning(
-                    "DFLASH pq requested but disabled: draft_topk=%s topk_max=%s has_q=%s",
-                    getattr(self, "draft_topk", None),
-                    topk_max,
-                    bool(self.draft_topk_ids is not None and self.draft_topk_probs is not None),
-                )
-                setattr(self, "_warned_pq_disabled", True)
 
         dflash_debug: Optional[Dict[str, Any]] = None
         # Lightweight diagnostics for paged-KV bring-up: acceptance collapse often correlates with
@@ -735,674 +740,169 @@ class DFlashVerifyInput(SpecInput):
                 print(f"[DFLASH] paged verify geometry (first): {dbg_base}", flush=True)
                 setattr(self, "_logged_paged_verify_stats", True)
 
-        if sampling_info is None or sampling_info.is_all_greedy or not use_pq:
-            # Adaptive cap currently uses accept EMA plus draft-side q stats. Computing
-            # full target-side entropy/max over the whole vocab on every greedy verify
-            # round is much more expensive and should stay opt-in.
-            targetonly_scalar_stats = (
-                (os.environ.get("SGLANG_DFLASH_TARGETONLY_SCALAR_STATS") or "")
+        # Adaptive cap currently uses accept EMA plus draft-side q stats. Computing
+        # full target-side entropy/max over the whole vocab on every greedy verify
+        # round is much more expensive and should stay opt-in.
+        targetonly_scalar_stats = (
+            (os.environ.get("SGLANG_DFLASH_TARGETONLY_SCALAR_STATS") or "")
+            .strip()
+            .lower()
+            not in ("", "0", "false", "off", "no")
+        )
+        sampled_helper_used = False
+        if sampling_info is None or sampling_info.is_all_greedy:
+            target_predict = torch.argmax(
+                logits_output.next_token_logits, dim=-1
+            ).view(bs, self.draft_token_num)
+        else:
+            sampled_helper_disable = (
+                (os.environ.get("SGLANG_DFLASH_DISABLE_TARGETONLY_SAMPLED_HELPER") or "")
                 .strip()
                 .lower()
                 not in ("", "0", "false", "off", "no")
             )
-            if sampling_info is None or sampling_info.is_all_greedy:
-                target_predict = torch.argmax(
-                    logits_output.next_token_logits, dim=-1
-                ).view(bs, self.draft_token_num)
-            else:
-                sampled_helper_disable = (
-                    (os.environ.get("SGLANG_DFLASH_DISABLE_TARGETONLY_SAMPLED_HELPER") or "")
-                    .strip()
-                    .lower()
-                    not in ("", "0", "false", "off", "no")
-                )
-                sampled_helper_used = False
-                if not sampled_helper_disable and is_dflash_sampling_verify_available():
-                    try:
-                        accept_len, bonus, target_predict = (
-                            compute_dflash_sampling_accept_len_and_bonus(
-                                candidates=candidates,
-                                next_token_logits=logits_output.next_token_logits,
-                                sampling_info=sampling_info,
-                                max_steps_per_req=self.max_steps_per_req,
-                                return_proposed_tokens=True,
-                            )
-                        )
-                        sampled_helper_used = True
-                    except Exception as e:
-                        if not getattr(
-                            self, "_warned_targetonly_sampled_helper_fallback", False
-                        ):
-                            logger.warning(
-                                "DFLASH target_only sampled helper failed, falling back to inline path: %s",
-                                e,
-                            )
-                            setattr(
-                                self,
-                                "_warned_targetonly_sampled_helper_fallback",
-                                True,
-                            )
-
-                if not sampled_helper_used:
-                    # Target-only speculative sampling: sample target tokens for each verify position
-                    # and accept draft tokens only while they match the sampled target tokens.
-                    #
-                    # This produces the exact target distribution (same as baseline) without requiring
-                    # draft probabilities q(token).
-                    logits = logits_output.next_token_logits
-                    expanded_temperature = torch.repeat_interleave(
-                        sampling_info.temperatures, self.draft_token_num, dim=0
-                    )
-                    probs = torch.softmax(
-                        logits / expanded_temperature.view(-1, 1), dim=-1
-                    )
-
-                    expanded_top_ks = torch.repeat_interleave(
-                        sampling_info.top_ks, self.draft_token_num, dim=0
-                    )
-                    expanded_top_ps = torch.repeat_interleave(
-                        sampling_info.top_ps, self.draft_token_num, dim=0
-                    )
-
-                    if sampling_info.need_min_p_sampling:
-                        expanded_min_ps = torch.repeat_interleave(
-                            sampling_info.min_ps, self.draft_token_num, dim=0
-                        )
-                        probs = top_k_renorm_prob(probs, expanded_top_ks)
-                        if not _top_p_is_effectively_disabled(expanded_top_ps):
-                            probs = top_p_renorm_prob(probs, expanded_top_ps)
-                        sampled = min_p_sampling_from_probs(probs, expanded_min_ps)
-                    else:
-                        sampled = top_k_top_p_sampling_from_probs(
-                            probs.contiguous(),
-                            expanded_top_ks,
-                            expanded_top_ps,
-                            filter_apply_order="joint",
-                            check_nan=False,
-                        )
-
-                    target_predict = sampled.view(bs, self.draft_token_num)
-            # Ensure we always return basic debug scalars so harnesses can correlate
-            # accept collapse with paged-KV geometry.
-            dflash_debug = dict(dbg_base)
-            dflash_debug["targetonly_sampled_helper"] = (
-                0
-                if (sampling_info is None or sampling_info.is_all_greedy)
-                else int(sampled_helper_used)
-            )
-            if targetonly_scalar_stats and int(self.draft_token_num) > 1:
+            if not sampled_helper_disable and is_dflash_sampling_verify_available():
                 try:
-                    step_count = int(self.draft_token_num - 1)
-                    target_logits = logits_output.next_token_logits.view(
-                        bs, self.draft_token_num, -1
-                    )[:, :step_count, :].reshape(
-                        -1, logits_output.next_token_logits.shape[-1]
+                    accept_len, bonus, target_predict = (
+                        compute_dflash_sampling_accept_len_and_bonus(
+                            candidates=candidates,
+                            next_token_logits=logits_output.next_token_logits,
+                            sampling_info=sampling_info,
+                            max_steps_per_req=self.max_steps_per_req,
+                            return_proposed_tokens=True,
+                        )
                     )
-                    target_log_probs = torch.log_softmax(
-                        target_logits.to(torch.float32), dim=-1
-                    )
-                    target_probs = torch.exp(target_log_probs)
-                    p_entropy = -(target_probs * target_log_probs).sum(dim=-1)
-                    p_max = target_probs.max(dim=-1).values
-                    dflash_debug["p_entropy_mean"] = float(p_entropy.mean().item())
-                    dflash_debug["p_max_mean"] = float(p_max.mean().item())
-                except Exception:
-                    pass
-
-            if sampling_info is None or sampling_info.is_all_greedy or not sampled_helper_used:
-                accept_len, bonus = compute_dflash_accept_len_and_bonus(
-                    candidates=candidates,
-                    target_predict=target_predict,
-                    max_steps_per_req=self.max_steps_per_req,
-                )
-            if timing_detail:
-                t_after_accept = time.perf_counter()
-        else:
-            # True speculative sampling (maximal coupling) using draft probabilities q:
-            # accept a draft token y with prob min(1, p(y)/q(y)); on rejection, sample
-            # from the residual (p - q)+. This preserves the exact target distribution
-            # while avoiding the entropy ceiling of target-only exact-match sampling.
-            if (
-                self.draft_topk_ids is None
-                or self.draft_topk_probs is None
-                or int(self.draft_topk) <= 0
-            ):
-                raise RuntimeError(
-                    "DFLASH pq verification requires draft_topk_ids/draft_topk_probs."
-                )
-
-            step_count = int(self.draft_token_num - 1)
-            num_rows = int(bs * self.draft_token_num)
-            device = logits_output.next_token_logits.device
-
-            # Build per-position target distributions p over top-k.
-            expanded_temperature = torch.repeat_interleave(
-                sampling_info.temperatures, self.draft_token_num, dim=0
-            ).to(device)
-            expanded_top_ks = torch.repeat_interleave(
-                sampling_info.top_ks, self.draft_token_num, dim=0
-            ).to(device)
-            expanded_top_ps = torch.repeat_interleave(
-                sampling_info.top_ps, self.draft_token_num, dim=0
-            ).to(device)
-            expanded_min_ps = torch.repeat_interleave(
-                sampling_info.min_ps, self.draft_token_num, dim=0
-            ).to(device)
-
-            topk = int(torch.max(expanded_top_ks).item())
-            if topk <= 0 or topk == -1:
-                raise RuntimeError(
-                    f"DFLASH pq verification requires finite top_k (>0), got topk={topk}."
-                )
-
-            logits = logits_output.next_token_logits
-            if int(logits.shape[0]) != num_rows:
-                raise RuntimeError(
-                    f"DFLASH verify logits shape mismatch: logits.shape[0]={int(logits.shape[0])} vs expected {num_rows}."
-                )
-            p_vals, p_ids = torch.topk(logits, k=topk, dim=-1)
-            p_vals = p_vals.to(torch.float32) / expanded_temperature.to(torch.float32).view(
-                -1, 1
-            )
-            p_probs = torch.softmax(p_vals, dim=1)
-
-            # Apply the same filtering semantics as SGLang's CUDA sampler:
-            # - when min_p is OFF: joint top-k/top-p
-            # - when min_p is ON:  top-k -> top-p -> min-p
-            from sglang.srt.speculative.pq_filter import (
-                filter_topk_probs_like_sglang_sampler,
-            )
-
-            p_probs = filter_topk_probs_like_sglang_sampler(
-                p_probs,
-                temperatures=torch.ones_like(expanded_temperature, device=device),
-                top_ks=expanded_top_ks,
-                top_ps=expanded_top_ps,
-                min_ps=expanded_min_ps,
-                need_min_p_sampling=bool(sampling_info.need_min_p_sampling),
-                no_min_p_filter_apply_order="joint",
-            )
-            # Safety: multinomial asserts if probs contain NaN/Inf/negative or if rows are all-zero.
-            # Keep verification robust even if upstream kernels produce transient NaNs.
-            p_probs = torch.where(torch.isfinite(p_probs), p_probs, torch.zeros_like(p_probs)).clamp_min(0.0)
-            p_denom = p_probs.sum(dim=-1, keepdim=True)
-            p_fallback = torch.zeros_like(p_probs)
-            p_fallback[:, :1] = 1.0
-            p_probs = torch.where(p_denom > 0, p_probs / p_denom.clamp_min(1e-20), p_fallback)
-
-            # Draft (q) distribution over top-k, provided by the draft worker.
-            q_ids = self.draft_topk_ids.to(device)
-            q_probs = self.draft_topk_probs.to(torch.float32).to(device)
-            q_probs = torch.where(torch.isfinite(q_probs), q_probs, torch.zeros_like(q_probs)).clamp_min(0.0)
-            q_denom = q_probs.sum(dim=-1, keepdim=True)
-            q_fallback = torch.zeros_like(q_probs)
-            q_fallback[:, :, :1] = 1.0
-            q_probs = torch.where(q_denom > 0, q_probs / q_denom.clamp_min(1e-20), q_fallback)
-
-            def _env_flag(name: str) -> bool:
-                v = (os.environ.get(name) or "").strip().lower()
-                return v not in ("", "0", "false", "off", "no")
-
-            # Optional invariants to catch silent coupling/normalization bugs during development.
-            asserts_flag = _env_flag("SGLANG_DFLASH_PQ_ASSERTS")
-            if asserts_flag:
-                with torch.no_grad():
-                    if torch.isnan(q_probs).any() or torch.isinf(q_probs).any():
-                        raise RuntimeError("DFLASH pq: q_probs contains NaN/Inf.")
-                    q_s = q_probs.sum(dim=-1)  # [bs, step_count]
-                    if not torch.allclose(
-                        q_s, torch.ones_like(q_s), atol=5e-3, rtol=1e-3
+                    sampled_helper_used = True
+                except Exception as e:
+                    if not getattr(
+                        self, "_warned_targetonly_sampled_helper_fallback", False
                     ):
-                        raise RuntimeError(
-                            f"DFLASH pq: q_probs rows not normalized: min={float(q_s.min().item()):.6f} max={float(q_s.max().item()):.6f}"
+                        logger.warning(
+                            "DFLASH target_only sampled helper failed, falling back to inline path: %s",
+                            e,
                         )
-                    if torch.isnan(p_probs).any() or torch.isinf(p_probs).any():
-                        raise RuntimeError("DFLASH pq: p_probs contains NaN/Inf.")
-                    p_s = p_probs.sum(dim=-1)  # [bs*block]
-                    # Allow all-zero rows in extreme filter cases.
-                    mask = p_s > 0
-                    if bool(mask.any()):
-                        if not torch.allclose(
-                            p_s[mask],
-                            torch.ones_like(p_s[mask]),
-                            atol=5e-3,
-                            rtol=1e-3,
-                        ):
-                            raise RuntimeError(
-                                f"DFLASH pq: p_probs rows not normalized: min={float(p_s[mask].min().item()):.6f} max={float(p_s[mask].max().item()):.6f}"
-                            )
+                        setattr(
+                            self,
+                            "_warned_targetonly_sampled_helper_fallback",
+                            True,
+                        )
 
-            # candidates[:, 1:] are the proposed draft tokens y_1..y_K.
-            proposed = candidates[:, 1:]
-            accept_len = torch.zeros((bs,), dtype=torch.int32, device=device)
-            bonus = torch.empty((bs,), dtype=torch.int64, device=device)
-            alive = torch.ones((bs,), dtype=torch.bool, device=device)
-
-            # Step stats are expensive only in terms of extra storage/logging; the pq loop
-            # already computes p/q terms. Scalar summaries are cheap and can be used for
-            # adaptive controllers.
-            collect_step_stats = _env_flag("SGLANG_DFLASH_PQ_STEP_STATS")
-            collect_scalar_stats = (
-                collect_step_stats
-                or _env_flag("SGLANG_DFLASH_PQ_SCALAR_STATS")
-                or _env_flag("SGLANG_DFLASH_ADAPTIVE_PQ")
-            )
-            # Diagnostics (TV/entropy/top-k overlap) add meaningful extra compute. Keep them
-            # behind an explicit flag so we can always emit scalar acceptance stats without
-            # perturbing throughput-critical benchmarks.
-            collect_diag_stats = bool(collect_step_stats or _env_flag("SGLANG_DFLASH_PQ_DIAG_STATS"))
-            need_diag = bool(collect_diag_stats)
-
-            # Debug stats to understand acceptance under high-entropy sampling.
-            # These help distinguish "algorithm bug" (p/q wrong) vs "draft distribution mismatch" (q far from p).
-            p_y_sum = torch.zeros((), dtype=torch.float32, device=device)
-            q_y_sum = torch.zeros((), dtype=torch.float32, device=device)
-            a_sum = torch.zeros((), dtype=torch.float32, device=device)
-            tv_sum = torch.zeros((), dtype=torch.float32, device=device)
-            q_mass_in_p_sum = torch.zeros((), dtype=torch.float32, device=device)
-            topk_overlap_sum = torch.zeros((), dtype=torch.float32, device=device)
-            p_y_zero = torch.zeros((), dtype=torch.float32, device=device)
-            q_y_zero = torch.zeros((), dtype=torch.float32, device=device)
-            p_ent_sum = torch.zeros((), dtype=torch.float32, device=device)
-            q_ent_sum = torch.zeros((), dtype=torch.float32, device=device)
-            p_max_sum = torch.zeros((), dtype=torch.float32, device=device)
-            q_max_sum = torch.zeros((), dtype=torch.float32, device=device)
-            stat_count = torch.zeros((), dtype=torch.float32, device=device)
-
-            step_stat_count = None
-            step_a_sum = None
-            step_tv_sum = None
-            step_p_y_zero = None
-            step_q_y_zero = None
-            step_p_ent_sum = None
-            step_q_ent_sum = None
-            step_p_max_sum = None
-            step_q_max_sum = None
-            if collect_step_stats:
-                step_stat_count = torch.zeros((step_count,), dtype=torch.float32, device=device)
-                step_a_sum = torch.zeros((step_count,), dtype=torch.float32, device=device)
-                step_tv_sum = torch.zeros((step_count,), dtype=torch.float32, device=device)
-                step_p_y_zero = torch.zeros((step_count,), dtype=torch.float32, device=device)
-                step_q_y_zero = torch.zeros((step_count,), dtype=torch.float32, device=device)
-                step_p_ent_sum = torch.zeros((step_count,), dtype=torch.float32, device=device)
-                step_q_ent_sum = torch.zeros((step_count,), dtype=torch.float32, device=device)
-                step_p_max_sum = torch.zeros((step_count,), dtype=torch.float32, device=device)
-                step_q_max_sum = torch.zeros((step_count,), dtype=torch.float32, device=device)
-
-            # Precompute row indices for each step: row = req_idx * block + step
-            req_rows = (
-                torch.arange(bs, device=device, dtype=torch.int64) * self.draft_token_num
-            )
-
-            for step in range(step_count):
-                if not bool(alive.any()):
-                    break
-                row = req_rows + int(step)
-                y = proposed[:, step]
-
-                p_ids_step = p_ids[row]
-                p_probs_step = p_probs[row]
-
-                # DAWN/FailFast: stop early for some requests and sample the "bonus" token
-                # immediately from the target distribution at this step. This keeps the
-                # overall generation distribution exact, while avoiding wasted speculation
-                # in hard/conflict regions.
-                if self.max_steps_per_req is not None:
-                    caps = self.max_steps_per_req.to(device)
-                    stop_mask = alive & (int(step) >= caps.to(torch.int64))
-                    if bool(stop_mask.any()):
-                        stop_idx = torch.nonzero(stop_mask, as_tuple=False).view(-1)
-                        p_ids_stop = p_ids_step[stop_idx]
-                        p_probs_stop = p_probs_step[stop_idx]
-                        sampled_col = torch.multinomial(p_probs_stop, num_samples=1).view(-1)
-                        sampled_tok = p_ids_stop.gather(
-                            1, sampled_col.to(torch.int64).view(-1, 1)
-                        ).view(-1)
-                        bonus[stop_idx] = sampled_tok
-                        alive[stop_idx] = False
-                        if not bool(alive.any()):
-                            break
-                p_y = (p_probs_step * (p_ids_step == y[:, None])).sum(dim=1)
-
-                q_ids_step = q_ids[:, step, :]
-                q_probs_step = q_probs[:, step, :]
-                q_y = (q_probs_step * (q_ids_step == y[:, None])).sum(dim=1)
-
-                ratio = torch.where(q_y > 0, p_y / q_y, torch.zeros_like(p_y))
-                a = torch.minimum(ratio, torch.ones_like(ratio))
-
-                tv = None
-                p_ent = None
-                q_ent = None
-                p_max = None
-                q_max = None
-                q_on_p_sum = None
-                topk_inter = None
-                if need_diag:
-                    # Estimate TV(p, q) for this step (both after filters).
-                    # Achievable maximal-coupling match probability is 1 - TV.
-                    q_on_p = (
-                        q_probs_step[:, None, :]
-                        * (q_ids_step[:, None, :] == p_ids_step[:, :, None])
-                    ).sum(dim=2)  # [bs, topk]
-                    q_on_p_sum = q_on_p.sum(dim=1)  # [bs]
-                    # Intersection size between p top-k ids and q top-k ids.
-                    # (Counts how many draft top-k tokens are also in target top-k.)
-                    topk_inter = (
-                        (q_ids_step[:, :, None] == p_ids_step[:, None, :])
-                        .any(dim=2)
-                        .sum(dim=1)
-                        .to(torch.float32)
-                    )
-                    l1 = (p_probs_step - q_on_p).abs().sum(dim=1) + (
-                        (1.0 - q_on_p_sum).clamp_min(0.0)
-                    )
-                    tv = 0.5 * l1  # [bs]
-
-                    # Entropy / confidence diagnostics (computed on the *filtered/renormalized* supports).
-                    p_probs_safe = p_probs_step.clamp_min(1e-20)
-                    q_probs_safe = q_probs_step.clamp_min(1e-20)
-                    p_ent = -(p_probs_safe * torch.log(p_probs_safe)).sum(dim=1)  # [bs]
-                    q_ent = -(q_probs_safe * torch.log(q_probs_safe)).sum(dim=1)  # [bs]
-                    p_max = p_probs_step.max(dim=1).values  # [bs]
-                    q_max = q_probs_step.max(dim=1).values  # [bs]
-
-                # Accumulate stats only for still-alive requests.
-                mask_f = alive.to(torch.float32)
-                stat_count = stat_count + mask_f.sum().to(torch.float32)
-                p_y_sum = p_y_sum + (p_y.to(torch.float32) * mask_f).sum().to(torch.float32)
-                q_y_sum = q_y_sum + (q_y.to(torch.float32) * mask_f).sum().to(torch.float32)
-                a_sum = a_sum + (a.to(torch.float32) * mask_f).sum().to(torch.float32)
-                p_y_zero = p_y_zero + ((p_y <= 0).to(torch.float32) * mask_f).sum().to(torch.float32)
-                q_y_zero = q_y_zero + ((q_y <= 0).to(torch.float32) * mask_f).sum().to(torch.float32)
-                if need_diag and tv is not None and q_on_p_sum is not None and topk_inter is not None:
-                    tv_sum = tv_sum + (tv.to(torch.float32) * mask_f).sum().to(torch.float32)
-                    q_mass_in_p_sum = q_mass_in_p_sum + (q_on_p_sum.to(torch.float32) * mask_f).sum().to(torch.float32)
-                    topk_overlap_sum = topk_overlap_sum + (topk_inter.to(torch.float32) * mask_f).sum().to(torch.float32)
-                if need_diag and p_ent is not None and q_ent is not None and p_max is not None and q_max is not None:
-                    p_ent_sum = p_ent_sum + (p_ent.to(torch.float32) * mask_f).sum().to(torch.float32)
-                    q_ent_sum = q_ent_sum + (q_ent.to(torch.float32) * mask_f).sum().to(torch.float32)
-                    p_max_sum = p_max_sum + (p_max.to(torch.float32) * mask_f).sum().to(torch.float32)
-                    q_max_sum = q_max_sum + (q_max.to(torch.float32) * mask_f).sum().to(torch.float32)
-
-                if collect_step_stats and step_stat_count is not None:
-                    step_stat_count[step] = step_stat_count[step] + mask_f.sum().to(torch.float32)
-                    step_a_sum[step] = step_a_sum[step] + (a.to(torch.float32) * mask_f).sum().to(torch.float32)
-                    step_p_y_zero[step] = step_p_y_zero[step] + ((p_y <= 0).to(torch.float32) * mask_f).sum().to(torch.float32)
-                    step_q_y_zero[step] = step_q_y_zero[step] + ((q_y <= 0).to(torch.float32) * mask_f).sum().to(torch.float32)
-                    if tv is not None:
-                        step_tv_sum[step] = step_tv_sum[step] + (tv.to(torch.float32) * mask_f).sum().to(torch.float32)
-                    if p_ent is not None and q_ent is not None and p_max is not None and q_max is not None:
-                        step_p_ent_sum[step] = step_p_ent_sum[step] + (p_ent.to(torch.float32) * mask_f).sum().to(torch.float32)
-                        step_q_ent_sum[step] = step_q_ent_sum[step] + (q_ent.to(torch.float32) * mask_f).sum().to(torch.float32)
-                        step_p_max_sum[step] = step_p_max_sum[step] + (p_max.to(torch.float32) * mask_f).sum().to(torch.float32)
-                        step_q_max_sum[step] = step_q_max_sum[step] + (q_max.to(torch.float32) * mask_f).sum().to(torch.float32)
-
-                u = torch.rand_like(a)
-                accept = (u < a) & alive
-                reject = (~accept) & alive
-                accept_len = accept_len + accept.to(torch.int32)
-
-                if bool(reject.any()):
-                    # Residual distribution on p's support: (p - q)+.
-                    #
-                    # Performance: compute the residual only for rejected rows, not the full batch.
-                    rej_idx = torch.nonzero(reject, as_tuple=False).view(-1)
-                    p_ids_rej = p_ids_step[rej_idx]
-                    p_probs_rej = p_probs_step[rej_idx]
-                    q_ids_rej = q_ids_step[rej_idx]
-                    q_probs_rej = q_probs_step[rej_idx]
-
-                    q_on_p_rej = (
-                        q_probs_rej[:, None, :]
-                        * (q_ids_rej[:, None, :] == p_ids_rej[:, :, None])
-                    ).sum(dim=2)
-                    resid = (p_probs_rej - q_on_p_rej).clamp_min(0.0)
-                    resid = torch.where(
-                        torch.isfinite(resid), resid, torch.zeros_like(resid)
-                    ).clamp_min(0.0)
-                    resid_sum = resid.sum(dim=1, keepdim=True)
-                    resid = torch.where(
-                        resid_sum > 0,
-                        resid / resid_sum.clamp_min(1e-20),
-                        p_probs_rej,
-                    )
-                    resid = torch.where(
-                        torch.isfinite(resid), resid, torch.zeros_like(resid)
-                    ).clamp_min(0.0)
-                    resid_sum2 = resid.sum(dim=1, keepdim=True)
-                    resid = torch.where(
-                        resid_sum2 > 0,
-                        resid / resid_sum2.clamp_min(1e-20),
-                        p_probs_rej,
-                    )
-                    sampled_col = torch.multinomial(resid, num_samples=1).view(-1)
-                    sampled_tok = p_ids_rej.gather(
-                        1, sampled_col.to(torch.int64).view(-1, 1)
-                    ).view(-1)
-                    bonus[rej_idx] = sampled_tok
-                    alive[rej_idx] = False
-
-            if bool(alive.any()):
-                # If all proposed draft tokens were accepted, sample the bonus token from
-                # the next target distribution p_K (row = K).
-                row = req_rows + int(step_count)
-                p_ids_step = p_ids[row]
-                p_probs_step = p_probs[row]
-                p_probs_step = torch.where(
-                    torch.isfinite(p_probs_step),
-                    p_probs_step,
-                    torch.zeros_like(p_probs_step),
-                ).clamp_min(0.0)
-                denom = p_probs_step.sum(dim=1, keepdim=True)
-                p_probs_step = torch.where(
-                    denom > 0, p_probs_step / denom.clamp_min(1e-20), p_probs_step
+            if not sampled_helper_used:
+                # Target-only speculative sampling: sample target tokens for each verify position
+                # and accept draft tokens only while they match the sampled target tokens.
+                #
+                # This preserves the exact target distribution without requiring draft q bookkeeping.
+                logits = logits_output.next_token_logits
+                expanded_temperature = torch.repeat_interleave(
+                    sampling_info.temperatures, self.draft_token_num, dim=0
                 )
-                sampled_col = torch.multinomial(p_probs_step, num_samples=1).view(-1)
-                sampled_tok = p_ids_step.gather(
-                    1, sampled_col.to(torch.int64).view(-1, 1)
-                ).view(-1)
-                bonus[alive] = sampled_tok[alive]
-
-            # Log stats once per process (tp-rank 0 only), to keep logs readable.
-            global _DFLASH_PQ_STATS_LOGGED
-            if need_diag and not _DFLASH_PQ_STATS_LOGGED:
-                try:
-                    from sglang.srt.distributed import get_tp_group
-
-                    tp_rank = int(get_tp_group().rank)
-                except Exception:
-                    tp_rank = 0
-                if tp_rank == 0:
-                    denom = float(stat_count.detach().cpu().item()) + 1e-6
-                    logger.info(
-                        "DFLASH pq stats: count=%.0f mean_p_y=%.6f mean_q_y=%.6f mean_a=%.6f mean_tv=%.6f mean_match=%.6f mean_q_mass_in_p=%.6f mean_topk_overlap=%.2f frac_p_y_zero=%.4f frac_q_y_zero=%.4f",
-                        denom,
-                        float(p_y_sum.detach().cpu().item()) / denom,
-                        float(q_y_sum.detach().cpu().item()) / denom,
-                        float(a_sum.detach().cpu().item()) / denom,
-                        float(tv_sum.detach().cpu().item()) / denom,
-                        1.0 - (float(tv_sum.detach().cpu().item()) / denom),
-                        float(q_mass_in_p_sum.detach().cpu().item()) / denom,
-                        float(topk_overlap_sum.detach().cpu().item()) / denom,
-                        float(p_y_zero.detach().cpu().item()) / denom,
-                        float(q_y_zero.detach().cpu().item()) / denom,
-                    )
-                    _DFLASH_PQ_STATS_LOGGED = True
-
-            denom_global = float(stat_count.detach().cpu().item()) + 1e-6
-            if collect_scalar_stats and denom_global > 0:
-                sample_mode = (os.environ.get("SGLANG_DFLASH_DRAFT_SAMPLE_MODE") or "").strip().lower()
-                dflash_debug = {
-                    "verify_mode": "pq",
-                    "draft_topk": int(self.draft_topk),
-                    "draft_sample_mode": sample_mode or "multinomial",
-                    # When the draft uses argmax proposals, the verifier must treat q as a delta at argmax
-                    # for correctness (see DFlashWorker). This flag lets benchmarks detect that regime.
-                    "draft_q_is_delta": bool(sample_mode not in ("", "multinomial")),
-                    # Accept-ratio stats: per-step acceptance probability min(1, p(y)/q(y)).
-                    # NOTE: This is NOT the same as accept_length_mean (K), which is reported
-                    # separately by the benchmark harness as spec_accept_length_mean.
-                    "accept_ratio_mean": float(a_sum.detach().cpu().item()) / denom_global,
-                    "p_y_mean": float(p_y_sum.detach().cpu().item()) / denom_global,
-                    "q_y_mean": float(q_y_sum.detach().cpu().item()) / denom_global,
-                    "frac_p_y_zero": float(p_y_zero.detach().cpu().item()) / denom_global,
-                    "frac_q_y_zero": float(q_y_zero.detach().cpu().item()) / denom_global,
-                    # Backward-compat aliases.
-                    "a_mean": float(a_sum.detach().cpu().item()) / denom_global,
-                }
-                dflash_debug.update(dbg_base)
-                if collect_diag_stats:
-                    dflash_debug.update(
-                        {
-                            "tv_mean": float(tv_sum.detach().cpu().item()) / denom_global,
-                            "q_mass_in_p_mean": float(q_mass_in_p_sum.detach().cpu().item()) / denom_global,
-                            "topk_overlap_mean": float(topk_overlap_sum.detach().cpu().item()) / denom_global,
-                            "p_entropy_mean": float(p_ent_sum.detach().cpu().item()) / denom_global,
-                            "q_entropy_mean": float(q_ent_sum.detach().cpu().item()) / denom_global,
-                            "p_max_mean": float(p_max_sum.detach().cpu().item()) / denom_global,
-                            "q_max_mean": float(q_max_sum.detach().cpu().item()) / denom_global,
-                        }
-                    )
-            if collect_step_stats and step_stat_count is not None and dflash_debug is not None:
-                denom = step_stat_count.detach().cpu() + 1e-6
-                dflash_debug.update(
-                    {
-                        "step_count": int(step_count),
-                        "alive_frac_by_step": (step_stat_count.detach().cpu() / float(bs)).tolist(),
-                        "accept_ratio_mean_by_step": (step_a_sum.detach().cpu() / denom).tolist(),
-                        "tv_mean_by_step": (step_tv_sum.detach().cpu() / denom).tolist(),
-                        "frac_p_y_zero_by_step": (step_p_y_zero.detach().cpu() / denom).tolist(),
-                        "frac_q_y_zero_by_step": (step_q_y_zero.detach().cpu() / denom).tolist(),
-                        "p_entropy_mean_by_step": (step_p_ent_sum.detach().cpu() / denom).tolist(),
-                        "q_entropy_mean_by_step": (step_q_ent_sum.detach().cpu() / denom).tolist(),
-                        "p_max_mean_by_step": (step_p_max_sum.detach().cpu() / denom).tolist(),
-                        "q_max_mean_by_step": (step_q_max_sum.detach().cpu() / denom).tolist(),
-                        # Backward-compat alias.
-                        "a_mean_by_step": (step_a_sum.detach().cpu() / denom).tolist(),
-                    }
+                probs = torch.softmax(
+                    logits / expanded_temperature.view(-1, 1), dim=-1
                 )
 
-        if timing_detail and t_after_accept == 0.0:
+                expanded_top_ks = torch.repeat_interleave(
+                    sampling_info.top_ks, self.draft_token_num, dim=0
+                )
+                expanded_top_ps = torch.repeat_interleave(
+                    sampling_info.top_ps, self.draft_token_num, dim=0
+                )
+
+                if sampling_info.need_min_p_sampling:
+                    expanded_min_ps = torch.repeat_interleave(
+                        sampling_info.min_ps, self.draft_token_num, dim=0
+                    )
+                    probs = top_k_renorm_prob(probs, expanded_top_ks)
+                    if not _top_p_is_effectively_disabled(expanded_top_ps):
+                        probs = top_p_renorm_prob(probs, expanded_top_ps)
+                    sampled = min_p_sampling_from_probs(probs, expanded_min_ps)
+                else:
+                    sampled = top_k_top_p_sampling_from_probs(
+                        probs.contiguous(),
+                        expanded_top_ks,
+                        expanded_top_ps,
+                        filter_apply_order="joint",
+                        check_nan=False,
+                    )
+
+                target_predict = sampled.view(bs, self.draft_token_num)
+
+        dflash_debug = dict(dbg_base)
+        dflash_debug["targetonly_sampled_helper"] = (
+            0 if (sampling_info is None or sampling_info.is_all_greedy) else int(sampled_helper_used)
+        )
+        if targetonly_scalar_stats and int(self.draft_token_num) > 1:
+            try:
+                step_count = int(self.draft_token_num - 1)
+                target_logits = logits_output.next_token_logits.view(
+                    bs, self.draft_token_num, -1
+                )[:, :step_count, :].reshape(
+                    -1, logits_output.next_token_logits.shape[-1]
+                )
+                target_log_probs = torch.log_softmax(
+                    target_logits.to(torch.float32), dim=-1
+                )
+                target_probs = torch.exp(target_log_probs)
+                p_entropy = -(target_probs * target_log_probs).sum(dim=-1)
+                p_max = target_probs.max(dim=-1).values
+                dflash_debug["p_entropy_mean"] = float(p_entropy.mean().item())
+                dflash_debug["p_max_mean"] = float(p_max.mean().item())
+            except Exception:
+                pass
+
+        if sampling_info is None or sampling_info.is_all_greedy or not sampled_helper_used:
+            accept_len, bonus = compute_dflash_accept_len_and_bonus(
+                candidates=candidates,
+                target_predict=target_predict,
+                max_steps_per_req=self.max_steps_per_req,
+            )
+        if profile_timing:
+            _profile_sync()
+            t_after_accept = time.perf_counter()
+
+        if profile_timing and t_after_accept == 0.0:
             t_after_accept = time.perf_counter()
 
         # Single D2H transfer for CPU-side commit logic.
         #
-        # For `verify_mode=target_only`, the committed tokens must be exactly the same
-        # as baseline (target) decoding in greedy mode. Even though accepted draft
-        # tokens are definitionally equal to `target_predict` for the accepted prefix,
-        # pack the target-predicted tokens directly to make token-parity robust under
-        # paged-KV backends.
-        if use_pq:
-            # PQ needs candidates (draft proposals) + accept_len + bonus.
-            packed = torch.cat(
-                [candidates[:, 1:], accept_len.unsqueeze(1), bonus.unsqueeze(1)], dim=1
-            ).cpu()
-        else:
-            packed = torch.cat([target_predict, accept_len.unsqueeze(1)], dim=1).cpu()
-        if timing_detail:
+        # For `verify_mode=target_only`, only the committed prefix needs to cross the
+        # device boundary. Reuse the compact batch packer / committer already used by
+        # the indexed tree path so linear DFLASH does not ship the full verify block.
+        packed_target_only = pack_dflash_target_only_commits(
+            target_predict=target_predict.to(torch.int64),
+            accept_len=accept_len,
+        )
+        if profile_timing:
+            _profile_sync()
             t_after_pack = time.perf_counter()
 
-        max_acc = self.draft_token_num - 1
         accept_length_per_req_cpu: List[int] = []
         commit_lens_cpu: List[int] = []
-        new_verified_list: List[int] = []
-
-        for i, req in enumerate(batch.reqs):
-            if use_pq:
-                # Layout: [candidates[:, 1:], accept_len, bonus]
-                acc_len = int(packed[i, max_acc].item())
-                proposed = packed[i, :acc_len].tolist() + [
-                    int(packed[i, max_acc + 1].item())
-                ]
-            else:
-                # Layout: [target_predict (len=draft_token_num), accept_len]
-                acc_len = int(packed[i, self.draft_token_num].item())
-                proposed = packed[i, : acc_len + 1].tolist()
-
-            appended = 0
-            if (
-                req.grammar is None
-                and not req.sampling_params.stop_strs
-                and not req.sampling_params.stop_regex_strs
-            ):
-                remaining = int(req.sampling_params.max_new_tokens) - len(req.output_ids)
-                if remaining > 0:
-                    tokens = proposed[:remaining]
-                    if not req.sampling_params.ignore_eos:
-                        stop_token_ids = req.sampling_params.stop_token_ids
-                        eos_token_ids = req.eos_token_ids
-                        tokenizer = req.tokenizer
-                        tokenizer_eos = (
-                            tokenizer.eos_token_id if tokenizer is not None else None
-                        )
-                        additional_stop = (
-                            tokenizer.additional_stop_token_ids
-                            if tokenizer is not None
-                            else None
-                        )
-                        vocab_size = getattr(req, "vocab_size", None)
-
-                        for j, token_id in enumerate(tokens):
-                            if vocab_size is not None and (
-                                int(token_id) > int(vocab_size) or int(token_id) < 0
-                            ):
-                                tokens = tokens[: j + 1]
-                                break
-                            if stop_token_ids and token_id in stop_token_ids:
-                                tokens = tokens[: j + 1]
-                                break
-                            if eos_token_ids and token_id in eos_token_ids:
-                                tokens = tokens[: j + 1]
-                                break
-                            if tokenizer_eos is not None and int(token_id) == int(
-                                tokenizer_eos
-                            ):
-                                tokens = tokens[: j + 1]
-                                break
-                            if additional_stop and token_id in additional_stop:
-                                tokens = tokens[: j + 1]
-                                break
-
-                    req.output_ids.extend(int(tok) for tok in tokens)
-                    appended = len(tokens)
-                    if appended > 0:
-                        req.check_finished(new_accepted_len=appended)
-            else:
-                for tok in proposed:
-                    req.output_ids.append(int(tok))
-                    appended += 1
-                    req.check_finished()
-                    if req.finished():
-                        break
-                    if req.grammar is not None:
-                        req.grammar.accept_token(int(tok))
-
-            if req.output_ids:
-                new_verified_token = int(req.output_ids[-1])
-            elif req.origin_input_ids:
-                new_verified_token = int(req.origin_input_ids[-1])
-            else:
-                raise RuntimeError(
-                    "DFLASH verify cannot determine current token: both output_ids and "
-                    "origin_input_ids are empty."
-                )
-
-            commit_lens_cpu.append(appended)
-            new_verified_list.append(new_verified_token)
-            accept_length_per_req_cpu.append(max(0, appended - 1))
-            req.spec_verify_ct += 1
-            req.spec_accepted_tokens += accept_length_per_req_cpu[-1]
-            if hasattr(req, "update_spec_acceptance_histogram"):
-                req.update_spec_acceptance_histogram(accept_length_per_req_cpu[-1])
-
-        if timing_detail:
-            t_after_commit = time.perf_counter()
-
-        commit_lens = torch.tensor(commit_lens_cpu, dtype=torch.int32, device=device)
-        new_verified_id = torch.tensor(
-            new_verified_list, dtype=torch.int64, device=device
+        proposed_flat_cpu = packed_target_only.proposed_flat.cpu()
+        commit_offsets_cpu = packed_target_only.commit_offsets.cpu()
+        if profile_timing:
+            t_after_d2h = time.perf_counter()
+        commit_results = commit_dflash_target_only_batch(
+            reqs=batch.reqs,
+            proposed_flat_cpu=proposed_flat_cpu,
+            commit_offsets_cpu=commit_offsets_cpu,
+            empty_error_prefix="DFLASH verify",
         )
+        accept_length_per_req_cpu.extend(
+            result.accepted_draft_tokens for result in commit_results
+        )
+        commit_lens_cpu.extend(result.commit_len for result in commit_results)
+        commit_metadata = materialize_dflash_target_only_commit_metadata(
+            commit_results=commit_results,
+            device=device,
+            default_commit_lens=packed_target_only.commit_lens,
+            default_new_verified_id=packed_target_only.default_new_verified_id,
+        )
+        commit_lens = commit_metadata.commit_lens
+        new_verified_id = commit_metadata.new_verified_id
+
+        if profile_timing:
+            _profile_sync()
+            t_after_commit = time.perf_counter()
         cache_plan = build_dflash_target_only_cache_plan(
             out_cache_loc=batch.out_cache_loc,
             commit_lens=commit_lens,
@@ -1423,7 +923,8 @@ class DFlashVerifyInput(SpecInput):
             ),
         )
 
-        if timing_detail:
+        if profile_timing:
+            _profile_sync()
             t_after_kv_free = time.perf_counter()
 
         apply_dflash_target_only_req_kv_accounting(
@@ -1436,7 +937,8 @@ class DFlashVerifyInput(SpecInput):
             commit_lens_cpu=commit_lens_cpu,
             cache_plan=cache_plan,
         )
-        if timing_detail:
+        if profile_timing:
+            _profile_sync()
             t_after_mapping = time.perf_counter()
 
         next_target_hidden = None
@@ -1446,16 +948,34 @@ class DFlashVerifyInput(SpecInput):
                 raise RuntimeError(
                     "DFLASH verify requires target hidden states, but got None."
                 )
-            hidden = hidden.view(bs, self.draft_token_num, -1)
-            segments: List[torch.Tensor] = []
-            for i, ln in enumerate(commit_lens_cpu):
-                if ln > 0:
-                    segments.append(hidden[i, :ln, :])
-            next_target_hidden = torch.cat(segments, dim=0) if segments else hidden[:0]
-        if timing_detail:
+            keep_mask = torch.arange(
+                self.draft_token_num, device=device, dtype=torch.int32
+            )[None, :] < commit_lens.unsqueeze(1)
+            next_target_hidden = gather_dflash_committed_hidden(
+                hidden_states=hidden,
+                keep_mask=keep_mask,
+                draft_token_num=self.draft_token_num,
+            )
+        if profile_timing:
+            _profile_sync()
             t_after_hidden = time.perf_counter()
 
         logits_output.hidden_states = None
+
+        timing_stats = None
+        if profile_timing:
+            timing_stats = DFlashVerifyTimingStats(
+                tokens_committed=int(sum(commit_lens_cpu)),
+                logitsproc_s=float(t_after_logitproc - t0),
+                accept_s=float(t_after_accept - t_after_logitproc),
+                pack_gpu_s=float(t_after_pack - t_after_accept),
+                pack_d2h_s=float(t_after_d2h - t_after_pack),
+                commit_cpu_s=float(t_after_commit - t_after_d2h),
+                kv_free_s=float(t_after_kv_free - t_after_commit),
+                mapping_s=float(t_after_mapping - t_after_kv_free),
+                hidden_s=float(t_after_hidden - t_after_mapping),
+                total_s=float(t_after_hidden - t0),
+            )
 
         if timing_detail:
             global _DFLASH_VERIFY_TIMING_DETAIL_LOGGED
@@ -1486,4 +1006,5 @@ class DFlashVerifyInput(SpecInput):
             accept_length_per_req_cpu=accept_length_per_req_cpu,
             dflash_debug=dflash_debug,
             cache_plan=cache_plan,
+            timing_stats=timing_stats,
         )

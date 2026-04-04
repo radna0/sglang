@@ -2344,3 +2344,115 @@ def test_generation_batch_result_copy_to_cpu_skips_missing_tokens_for_dflash_ove
     result.copy_to_cpu(return_logprob=False)
 
     assert fake_event.recorded is True
+
+
+def test_compute_adaptive_max_steps_for_req_reacts_to_low_last_accept_early():
+    from sglang.srt.speculative.dflash_controller import (
+        DFlashReqDifficultyState,
+        compute_adaptive_max_steps_for_req,
+    )
+
+    req_state = DFlashReqDifficultyState(
+        accept_len_last=1.0,
+        accept_len_ema=4.5,
+        verify_ct_last=2,
+    )
+
+    got = compute_adaptive_max_steps_for_req(
+        req_state,
+        step_count=16,
+        verify_ct_ge=8,
+        last_verify_ct_ge=2,
+        accept_ema_hard_le=2.0,
+        accept_ema_medium_le=5.0,
+        accept_last_hard_le=1.0,
+        accept_last_medium_le=2.0,
+        hard_cap_steps=1,
+        medium_cap_steps=4,
+    )
+
+    assert got == 1
+
+
+def test_compute_adaptive_max_steps_for_req_uses_last_accept_medium_cap():
+    from sglang.srt.speculative.dflash_controller import (
+        DFlashReqDifficultyState,
+        compute_adaptive_max_steps_for_req,
+    )
+
+    req_state = DFlashReqDifficultyState(
+        accept_len_last=2.0,
+        accept_len_ema=6.0,
+        verify_ct_last=3,
+    )
+
+    got = compute_adaptive_max_steps_for_req(
+        req_state,
+        step_count=16,
+        verify_ct_ge=8,
+        last_verify_ct_ge=2,
+        accept_ema_hard_le=2.0,
+        accept_ema_medium_le=5.0,
+        accept_last_hard_le=1.0,
+        accept_last_medium_le=2.0,
+        hard_cap_steps=1,
+        medium_cap_steps=4,
+    )
+
+    assert got == 4
+
+
+def test_compute_adaptive_max_steps_for_req_does_not_hard_cap_from_last_accept_when_disabled():
+    from sglang.srt.speculative.dflash_controller import (
+        DFlashReqDifficultyState,
+        compute_adaptive_max_steps_for_req,
+    )
+
+    req_state = DFlashReqDifficultyState(
+        accept_len_last=1.0,
+        accept_len_ema=4.5,
+        verify_ct_last=2,
+    )
+
+    got = compute_adaptive_max_steps_for_req(
+        req_state,
+        step_count=16,
+        verify_ct_ge=8,
+        last_verify_ct_ge=2,
+        accept_ema_hard_le=2.0,
+        accept_ema_medium_le=4.0,
+        accept_last_hard_le=-1.0,
+        accept_last_medium_le=2.0,
+        hard_cap_steps=1,
+        medium_cap_steps=4,
+    )
+
+    assert got == 4
+
+
+def test_compute_adaptive_max_steps_for_req_keeps_full_width_without_enough_history():
+    from sglang.srt.speculative.dflash_controller import (
+        DFlashReqDifficultyState,
+        compute_adaptive_max_steps_for_req,
+    )
+
+    req_state = DFlashReqDifficultyState(
+        accept_len_last=1.0,
+        accept_len_ema=1.0,
+        verify_ct_last=1,
+    )
+
+    got = compute_adaptive_max_steps_for_req(
+        req_state,
+        step_count=16,
+        verify_ct_ge=8,
+        last_verify_ct_ge=2,
+        accept_ema_hard_le=2.0,
+        accept_ema_medium_le=5.0,
+        accept_last_hard_le=1.0,
+        accept_last_medium_le=2.0,
+        hard_cap_steps=1,
+        medium_cap_steps=4,
+    )
+
+    assert got == 16

@@ -132,6 +132,8 @@ class LogitsMetadata:
     forward_mode: ForwardMode
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.NULL
     next_token_logits_buffer: Optional[torch.Tensor] = None
+    dflash_draft_token_num: int = 0
+    dflash_default_draft_token_num: int = 0
 
     extend_return_logprob: bool = False
     extend_return_top_logprob: bool = False
@@ -172,6 +174,22 @@ class LogitsMetadata:
 
     @classmethod
     def from_forward_batch(cls, forward_batch: ForwardBatch):
+        dflash_draft_token_num = 0
+        dflash_default_draft_token_num = 0
+        if (
+            forward_batch.forward_mode.is_target_verify()
+            and forward_batch.spec_algorithm is not None
+            and forward_batch.spec_algorithm.is_dflash_family()
+            and forward_batch.spec_info is not None
+        ):
+            dflash_draft_token_num = int(
+                getattr(forward_batch.spec_info, "draft_token_num", 0) or 0
+            )
+            dflash_default_draft_token_num = int(
+                getattr(get_global_server_args(), "speculative_num_draft_tokens", 0)
+                or 0
+            )
+
         if (
             forward_batch.forward_mode.is_extend()
             and forward_batch.return_logprob
@@ -201,6 +219,8 @@ class LogitsMetadata:
             forward_mode=forward_batch.forward_mode,
             capture_hidden_mode=forward_batch.capture_hidden_mode,
             next_token_logits_buffer=forward_batch.next_token_logits_buffer,
+            dflash_draft_token_num=dflash_draft_token_num,
+            dflash_default_draft_token_num=dflash_default_draft_token_num,
             extend_return_logprob=extend_return_logprob,
             extend_return_top_logprob=extend_return_top_logprob,
             extend_token_ids_logprob=extend_token_ids_logprob,
@@ -302,6 +322,36 @@ class LogitsProcessor(nn.Module):
         self.enable_logprobs_chunk = envs.SGLANG_ENABLE_LOGITS_PROCESSER_CHUNK.get()
         # chunk size for logprobs processing
         self.logprobs_chunk_size = envs.SGLANG_LOGITS_PROCESSER_CHUNK_SIZE.get()
+        self._dflash_verify_lm_head_pad_buffers: dict[tuple, torch.Tensor] = {}
+
+    def reserve_dflash_target_verify_lm_head_pad_buffers(
+        self,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+        hidden_size: int,
+        actual_width: int,
+        default_width: int,
+        batch_sizes: List[int],
+    ) -> None:
+        actual_width = int(actual_width)
+        default_width = int(default_width)
+        if actual_width <= 0 or default_width <= 0 or actual_width >= default_width:
+            return
+
+        for bs in batch_sizes:
+            bs = int(bs)
+            if bs <= 0:
+                continue
+            padded_rows = bs * default_width
+            key = (str(device), dtype, int(hidden_size), int(padded_rows))
+            if key in self._dflash_verify_lm_head_pad_buffers:
+                continue
+            self._dflash_verify_lm_head_pad_buffers[key] = torch.empty(
+                (padded_rows, hidden_size),
+                dtype=dtype,
+                device=device,
+            )
 
     def forward(
         self,
@@ -873,8 +923,15 @@ class LogitsProcessor(nn.Module):
             hidden_states.dtype,
             None if local_hidden_states is None else tuple(local_hidden_states.shape),
         )
+        hidden_states, dflash_raw_rows = (
+            self._maybe_pad_dflash_target_verify_hidden_states(
+                hidden_states, logits_metadata
+            )
+        )
 
         logits = self._compute_lm_head(hidden_states, lm_head, embedding_bias)
+        if dflash_raw_rows is not None and logits.shape[0] != dflash_raw_rows:
+            logits = logits[:dflash_raw_rows]
         _fa4_trace_logits(
             "[FA4Logits] after_lm_head logits=%s dtype=%s",
             tuple(logits.shape),
@@ -920,6 +977,54 @@ class LogitsProcessor(nn.Module):
             )
 
         return logits
+
+    def _maybe_pad_dflash_target_verify_hidden_states(
+        self,
+        hidden_states: torch.Tensor,
+        logits_metadata: LogitsMetadata,
+    ) -> Tuple[torch.Tensor, Optional[int]]:
+        if not logits_metadata.forward_mode.is_target_verify():
+            return hidden_states, None
+
+        actual_width = int(logits_metadata.dflash_draft_token_num or 0)
+        default_width = int(logits_metadata.dflash_default_draft_token_num or 0)
+        if actual_width <= 0 or default_width <= 0 or actual_width >= default_width:
+            return hidden_states, None
+
+        raw_rows = int(hidden_states.shape[0])
+        if raw_rows <= 0 or raw_rows % actual_width != 0:
+            return hidden_states, None
+
+        batch_size = raw_rows // actual_width
+        padded_rows = batch_size * default_width
+        if padded_rows <= raw_rows:
+            return hidden_states, None
+
+        key = (
+            str(hidden_states.device),
+            hidden_states.dtype,
+            int(hidden_states.shape[1]),
+            padded_rows,
+        )
+        padded = self._dflash_verify_lm_head_pad_buffers.get(key)
+        if padded is None or padded.device != hidden_states.device:
+            padded = torch.empty(
+                (padded_rows, hidden_states.shape[1]),
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
+            self._dflash_verify_lm_head_pad_buffers[key] = padded
+
+        padded.zero_()
+        padded[:raw_rows].copy_(hidden_states)
+        _fa4_trace_logits(
+            "[FA4Logits] dflash_verify_lm_head_pad raw_rows=%s padded_rows=%s actual_width=%s default_width=%s",
+            raw_rows,
+            padded_rows,
+            actual_width,
+            default_width,
+        )
+        return padded, raw_rows
 
     def _compute_lm_head(
         self,

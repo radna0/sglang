@@ -1632,16 +1632,22 @@ class GptOssForCausalLM(nn.Module):
                 time.perf_counter() - phase_start,
             )
 
-        # Fallback for FP8 KV Cache: initialize k_scale and v_scale to 1.0 if not present
+        # Fallback for FP8 KV Cache: initialize no-scale metadata to 1.0.
+        # RadixAttention always defines these attributes as None, so hasattr()
+        # is not a valid initialization check here.
         device = next(self.parameters()).device
         for layer_idx in range(self.config.num_hidden_layers):
             layer = self.model.layers[layer_idx]
             attn = getattr(getattr(layer, "self_attn", None), "attn", None)
             if attn is not None:
-                if not hasattr(attn, "k_scale"):
+                if getattr(attn, "k_scale", None) is None:
                     attn.k_scale = torch.tensor(1.0, dtype=torch.float32, device=device)
-                if not hasattr(attn, "v_scale"):
+                if getattr(attn, "v_scale", None) is None:
                     attn.v_scale = torch.tensor(1.0, dtype=torch.float32, device=device)
+                if getattr(attn, "k_scale_float", None) is None:
+                    attn.k_scale_float = 1.0
+                if getattr(attn, "v_scale_float", None) is None:
+                    attn.v_scale_float = 1.0
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight

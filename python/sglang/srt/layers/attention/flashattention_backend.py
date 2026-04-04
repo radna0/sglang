@@ -544,6 +544,23 @@ class FlashAttentionBackend(AttentionBackend):
         # Useful when paged-KV multi-token verify has known kernel/semantic mismatches.
         self._dflash_verify_triton_backend = None
         self._logged_dflash_verify_triton_once = False
+        self._dflash_draft_fp8_keep_q_bf16 = (
+            bool(getattr(model_runner, "is_draft_worker", False))
+            and bool(getattr(model_runner, "spec_algorithm", None))
+            and model_runner.spec_algorithm.is_dflash_family()
+            and str(self.kv_cache_dtype_str).startswith("fp8_")
+        )
+        self._logged_dflash_draft_fp8_keep_q_once = False
+
+    def _should_keep_dflash_draft_q_bf16(self) -> bool:
+        if not self._dflash_draft_fp8_keep_q_bf16:
+            return False
+        flag = (
+            os.environ.get("SGLANG_DFLASH_DRAFT_FP8_KEEP_Q_BF16", "0")
+            .strip()
+            .lower()
+        )
+        return flag not in ("0", "false", "off", "no")
 
     def _should_use_triton_for_target_verify(self, forward_batch: ForwardBatch) -> bool:
         if not forward_batch.forward_mode.is_target_verify():
@@ -1270,9 +1287,16 @@ class FlashAttentionBackend(AttentionBackend):
                     v_scale = layer.v_scale
                 k_descale = k_scale.expand(descale_shape)
                 v_descale = v_scale.expand(descale_shape)
-            q = q.to(self.kv_cache_dtype)
-            q_rope = q_rope.to(self.kv_cache_dtype) if q_rope is not None else None
-            k_rope = k_rope.to(self.kv_cache_dtype) if k_rope is not None else None
+            if not self._should_keep_dflash_draft_q_bf16():
+                q = q.to(self.kv_cache_dtype)
+                q_rope = q_rope.to(self.kv_cache_dtype) if q_rope is not None else None
+                k_rope = k_rope.to(self.kv_cache_dtype) if k_rope is not None else None
+            elif not self._logged_dflash_draft_fp8_keep_q_once:
+                logger.info(
+                    "FlashAttentionBackend: keeping DFLASH draft Q in bf16 while storing KV in %s.",
+                    str(self.kv_cache_dtype),
+                )
+                self._logged_dflash_draft_fp8_keep_q_once = True
         causal = True
         if layer.is_cross_attention or layer.attn_type == AttentionType.ENCODER_ONLY:
             causal = False
@@ -1668,9 +1692,16 @@ class FlashAttentionBackend(AttentionBackend):
                     v_scale = layer.v_scale
                 k_descale = k_scale.expand(descale_shape)
                 v_descale = v_scale.expand(descale_shape)
-            q = q.to(self.kv_cache_dtype)
-            q_rope = q_rope.to(self.kv_cache_dtype) if q_rope is not None else None
-            k_rope = k_rope.to(self.kv_cache_dtype) if k_rope is not None else None
+            if not self._should_keep_dflash_draft_q_bf16():
+                q = q.to(self.kv_cache_dtype)
+                q_rope = q_rope.to(self.kv_cache_dtype) if q_rope is not None else None
+                k_rope = k_rope.to(self.kv_cache_dtype) if k_rope is not None else None
+            elif not self._logged_dflash_draft_fp8_keep_q_once:
+                logger.info(
+                    "FlashAttentionBackend: keeping DFLASH draft Q in bf16 while storing KV in %s.",
+                    str(self.kv_cache_dtype),
+                )
+                self._logged_dflash_draft_fp8_keep_q_once = True
         if not self.use_mla:
             # Do multi-head attention
 
@@ -2286,23 +2317,31 @@ class FlashAttentionBackend(AttentionBackend):
                 self._maybe_update_local_attn_metadata_for_capture(metadata, batch_size)
 
         elif forward_mode.is_target_verify():
+            verify_draft_token_num = int(
+                getattr(
+                    spec_info,
+                    "draft_token_num",
+                    self.speculative_num_draft_tokens,
+                )
+            )
+            verify_metadata_key = (verify_draft_token_num, int(bs))
             if self.topk <= 1:
                 metadata.cache_seqlens_int32 = self.target_verify_metadata[
                     "cache_seqlens"
                 ][:bs]
                 metadata.cache_seqlens_int32.copy_(
-                    (seq_lens + self.speculative_num_draft_tokens)
+                    (seq_lens + verify_draft_token_num)
                 )
 
-                metadata.max_seq_len_q = self.speculative_num_draft_tokens
+                metadata.max_seq_len_q = verify_draft_token_num
                 metadata.max_seq_len_k = (
-                    seq_lens.max().item() + self.speculative_num_draft_tokens
+                    seq_lens.max().item() + verify_draft_token_num
                 )
 
                 metadata.cu_seqlens_q = torch.arange(
                     0,
-                    bs * self.speculative_num_draft_tokens + 1,
-                    self.speculative_num_draft_tokens,
+                    bs * verify_draft_token_num + 1,
+                    verify_draft_token_num,
                     dtype=torch.int32,
                     device=device,
                 )
@@ -2317,14 +2356,14 @@ class FlashAttentionBackend(AttentionBackend):
                         "swa_page_table"
                     ][:bs, :]
 
-                self.target_verify_metadata[bs] = metadata
+                self.target_verify_metadata[verify_metadata_key] = metadata
             else:
                 # When topk > 1, we need two specific target verify metadata, and then merge states
                 # 1. The first half of metadata for prefix tokens
                 metadata.cache_seqlens_int32 = self.target_verify_metadata_topk_normal[
                     "cache_seqlens"
                 ][:bs]
-                metadata.max_seq_len_q = self.speculative_num_draft_tokens
+                metadata.max_seq_len_q = verify_draft_token_num
                 # metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item(), do this in replay
                 metadata.cu_seqlens_q = self.target_verify_metadata_topk_normal[
                     "cu_seqlens_q"
@@ -2339,43 +2378,47 @@ class FlashAttentionBackend(AttentionBackend):
                 # 2. The second half of metadata for draft tokens (per_batch_num_tokens = topk)
                 metadata_expand.cache_seqlens_int32 = (
                     self.target_verify_metadata_topk_expand["cache_seqlens"][
-                        : bs * self.speculative_num_draft_tokens
+                        : bs * verify_draft_token_num
                     ]
                 )
                 metadata_expand.max_seq_len_q = 1
                 metadata_expand.cu_seqlens_q = self.target_verify_metadata_topk_expand[
                     "cu_seqlens_q"
-                ][: bs * self.speculative_num_draft_tokens + 1]
+                ][: bs * verify_draft_token_num + 1]
                 metadata_expand.cu_seqlens_k = self.target_verify_metadata_topk_expand[
                     "cu_seqlens_k"
-                ][: bs * self.speculative_num_draft_tokens + 1]
+                ][: bs * verify_draft_token_num + 1]
 
                 metadata_expand.page_table = self.target_verify_metadata_topk_expand[
                     "page_table"
-                ][: bs * self.speculative_num_draft_tokens]
+                ][: bs * verify_draft_token_num]
 
-                self.target_verify_metadata_topk_normal[bs] = metadata
-                self.target_verify_metadata_topk_expand[bs] = metadata_expand
+                self.target_verify_metadata_topk_normal[verify_metadata_key] = metadata
+                self.target_verify_metadata_topk_expand[verify_metadata_key] = (
+                    metadata_expand
+                )
 
                 if self.has_swa:
                     metadata_swa = FlashAttentionMetadata()
                     metadata_swa.cache_seqlens_int32 = (
                         self.target_verify_metadata_topk_swa["cache_seqlens"][
-                            : bs * self.speculative_num_draft_tokens
+                            : bs * verify_draft_token_num
                         ]
                     )
                     metadata_swa.max_seq_len_q = 1
                     metadata_swa.cu_seqlens_q = self.target_verify_metadata_topk_swa[
                         "cu_seqlens_q"
-                    ][: bs * self.speculative_num_draft_tokens + 1]
+                    ][: bs * verify_draft_token_num + 1]
                     metadata_swa.cu_seqlens_k = self.target_verify_metadata_topk_swa[
                         "cu_seqlens_k"
-                    ][: bs * self.speculative_num_draft_tokens + 1]
+                    ][: bs * verify_draft_token_num + 1]
 
                     metadata_swa.page_table = self.target_verify_metadata_topk_swa[
                         "page_table"
-                    ][: bs * self.speculative_num_draft_tokens]
-                    self.target_verify_metadata_topk_swa[bs] = metadata_swa
+                    ][: bs * verify_draft_token_num]
+                    self.target_verify_metadata_topk_swa[verify_metadata_key] = (
+                        metadata_swa
+                    )
                     metadata.swa_spec_metadata = metadata_swa
 
         elif forward_mode.is_draft_extend(include_v2=True):
@@ -2543,14 +2586,22 @@ class FlashAttentionBackend(AttentionBackend):
                     bs,
                 )
         elif forward_mode.is_target_verify():
+            verify_draft_token_num = int(
+                getattr(
+                    spec_info,
+                    "draft_token_num",
+                    self.speculative_num_draft_tokens,
+                )
+            )
+            verify_metadata_key = (verify_draft_token_num, int(bs))
             if self.topk <= 1:
-                metadata = self.target_verify_metadata[bs]
+                metadata = self.target_verify_metadata[verify_metadata_key]
                 metadata.cache_seqlens_int32.copy_(
-                    (seq_lens + self.speculative_num_draft_tokens)
+                    (seq_lens + verify_draft_token_num)
                 )
 
                 metadata.max_seq_len_k = (
-                    seq_lens_cpu.max().item() + self.speculative_num_draft_tokens
+                    seq_lens_cpu.max().item() + verify_draft_token_num
                 )
                 metadata.cu_seqlens_k[1:].copy_(
                     torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
@@ -2582,9 +2633,9 @@ class FlashAttentionBackend(AttentionBackend):
             else:
                 # When topk > 1, we need two specific target verify metadata, and then merge states
                 # 1. The first half of metadata for prefix tokens
-                metadata = self.target_verify_metadata_topk_normal[bs]
+                metadata = self.target_verify_metadata_topk_normal[verify_metadata_key]
                 metadata.cache_seqlens_int32.copy_(seq_lens)
-                # metadata.max_seq_len_q = self.speculative_num_draft_tokens, already set in capture
+                # metadata.max_seq_len_q = verify_draft_token_num, already set in capture
                 metadata.max_seq_len_k = seq_lens_cpu.max().item()
                 # metadata.cu_seqlens_q already set in capture
                 metadata.cu_seqlens_k[1:].copy_(
@@ -2601,12 +2652,14 @@ class FlashAttentionBackend(AttentionBackend):
                 metadata.page_table[:, :max_seq_pages].copy_(page_indices)
 
                 # 2. The second half of metadata for draft tokens (per_batch_num_tokens = topk)
-                metadata_expand = self.target_verify_metadata_topk_expand[bs]
+                metadata_expand = self.target_verify_metadata_topk_expand[
+                    verify_metadata_key
+                ]
 
                 # metadata_expand.max_seq_len_q = 1, already set in capture
                 # metadata_expand.cu_seqlens_q already set in capture
                 offsets_cpu = torch.arange(
-                    self.speculative_num_draft_tokens,
+                    verify_draft_token_num,
                     device="cpu",
                     dtype=torch.int64,
                 ).unsqueeze(0)
@@ -2618,27 +2671,27 @@ class FlashAttentionBackend(AttentionBackend):
                         "Speculative replay produced out-of-range req_to_token column indices: "
                         f"max_col={cols_max_index} req_to_token_width={int(self.req_to_token.shape[1])} "
                         f"bs={int(bs)} seq_lens_cpu={seq_lens_cpu_i64.tolist()} "
-                        f"draft_token_num={int(self.speculative_num_draft_tokens)}"
+                        f"draft_token_num={verify_draft_token_num}"
                     )
                 cols = cols_cpu.to(device=device, non_blocking=True)
                 offsets = offsets_cpu.to(device=device, non_blocking=True)
                 cum_len_cpu = torch.nn.functional.pad(
                     torch.cumsum(
                         (
-                            seq_lens_cpu_i64 + self.speculative_num_draft_tokens
-                        ).repeat_interleave(self.speculative_num_draft_tokens),
+                            seq_lens_cpu_i64 + verify_draft_token_num
+                        ).repeat_interleave(verify_draft_token_num),
                         dim=0,
                     ),
                     (1, 0),
                 )[:-1]
                 mask_extraction_indices_cpu = (
-                    cols_cpu.repeat_interleave(self.speculative_num_draft_tokens, dim=0)
+                    cols_cpu.repeat_interleave(verify_draft_token_num, dim=0)
                     + cum_len_cpu[:, None]
                 ).view(1, -1)
                 # avoid extracting padded seq indices which will be out of boundary
                 mask_extraction_indices_cpu[
                     :,
-                    spec_info.positions.numel() * self.speculative_num_draft_tokens :,
+                    spec_info.positions.numel() * verify_draft_token_num :,
                 ].fill_(0)
                 mask_max_index = (
                     int(mask_extraction_indices_cpu.max().item())
@@ -2653,29 +2706,29 @@ class FlashAttentionBackend(AttentionBackend):
                         f"bs={int(bs)} seq_lens={seq_lens.detach().to('cpu', non_blocking=False).tolist()} "
                         f"seq_lens_sum={int(seq_lens.sum().item())} "
                         f"positions_numel={int(spec_info.positions.numel())} "
-                        f"draft_token_num={int(self.speculative_num_draft_tokens)}"
+                        f"draft_token_num={verify_draft_token_num}"
                     )
                 mask_extraction_indices = mask_extraction_indices_cpu.to(
                     device=device, non_blocking=True
                 )
                 mask = spec_info.custom_mask[mask_extraction_indices].view(
-                    -1, self.speculative_num_draft_tokens
+                    -1, verify_draft_token_num
                 )  # (bsz * draft_num, draft_num)
 
                 col_indices = offsets.expand(
-                    mask.shape[0], self.speculative_num_draft_tokens
+                    mask.shape[0], verify_draft_token_num
                 )
                 keys = torch.where(
                     mask,
                     col_indices,
-                    col_indices + self.speculative_num_draft_tokens,
+                    col_indices + verify_draft_token_num,
                 )
                 _, sort_order = torch.sort(keys, dim=1)
 
                 non_masked_page_table = (
                     self.req_to_token[req_pool_indices, :]
                     .gather(1, cols)
-                    .repeat_interleave(self.speculative_num_draft_tokens, dim=0)
+                    .repeat_interleave(verify_draft_token_num, dim=0)
                 )  # (bsz, draft_num)
 
                 metadata_expand.page_table.copy_(
@@ -2690,7 +2743,9 @@ class FlashAttentionBackend(AttentionBackend):
                     )
                 )
                 if self.has_swa:
-                    metadata_swa = self.target_verify_metadata_topk_swa[bs]
+                    metadata_swa = self.target_verify_metadata_topk_swa[
+                        verify_metadata_key
+                    ]
                     self._init_sliding_window_attn_spec_metadata(
                         metadata, metadata_expand, metadata_swa
                     )

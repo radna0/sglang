@@ -391,10 +391,33 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner, num_tokens_per_bs=1):
     server_args = model_runner.server_args
     capture_bs = server_args.cuda_graph_bs
 
+    dflash_decode_verify_enabled = (
+        model_runner.spec_algorithm.is_dflash_family()
+        and not model_runner.is_draft_worker
+        and num_tokens_per_bs == 1
+        and (os.environ.get("SGLANG_DFLASH_VERIFY_USE_DECODE_BATCH") or "").strip().lower()
+        in ("1", "true", "yes", "on")
+    )
+    dflash_decode_verify_width = max(
+        int(getattr(server_args, "speculative_dflash_block_size", 0) or 0),
+        int(getattr(server_args, "speculative_num_draft_tokens", 0) or 0),
+        1,
+    )
+    max_capture_bs_limit = int(model_runner.req_to_token_pool.size)
+
     if max(capture_bs) > model_runner.req_to_token_pool.size:
         # In some cases (e.g., with a small GPU or --max-running-requests), the #max-running-requests
         # is very small. We add more values here to make sure we capture the maximum bs.
         capture_bs += [model_runner.req_to_token_pool.size]
+
+    if dflash_decode_verify_enabled:
+        capture_bs = list(capture_bs) + [
+            int(bs) * int(dflash_decode_verify_width) for bs in capture_bs if int(bs) > 0
+        ]
+        max_capture_bs_limit = max(
+            max_capture_bs_limit,
+            int(model_runner.req_to_token_pool.size) * int(dflash_decode_verify_width),
+        )
 
     mul_base = 1
 
@@ -411,7 +434,7 @@ def get_batch_sizes_to_capture(model_runner: ModelRunner, num_tokens_per_bs=1):
     # Model input token count = bs * num_tokens_per_bs; must be a multiple of attn_tp_size.
     capture_bs = [bs for bs in capture_bs if bs * num_tokens_per_bs % mul_base == 0]
 
-    capture_bs = [bs for bs in capture_bs if bs <= model_runner.req_to_token_pool.size]
+    capture_bs = [bs for bs in capture_bs if bs <= max_capture_bs_limit]
     capture_bs = list(sorted(set(capture_bs)))
     assert len(capture_bs) > 0 and capture_bs[0] > 0, f"{capture_bs=}"
     compile_bs = (
@@ -438,11 +461,25 @@ def set_global_graph_memory_pool(val):
 class CudaGraphRunner:
     """A CudaGraphRunner runs the forward pass of a model with cuda graph and torch.compile."""
 
-    def __init__(self, model_runner: ModelRunner):
+    def __init__(
+        self,
+        model_runner: ModelRunner,
+        *,
+        dflash_num_tokens_per_bs_override: Optional[int] = None,
+        skip_attn_backend_cuda_graph_state_init: bool = False,
+    ):
         # Parse args
         self.model_runner = model_runner
         self.device = model_runner.device
         self.device_module = torch.get_device_module(self.device)
+        self._dflash_num_tokens_per_bs_override = (
+            int(dflash_num_tokens_per_bs_override)
+            if dflash_num_tokens_per_bs_override is not None
+            else None
+        )
+        self._skip_attn_backend_cuda_graph_state_init = bool(
+            skip_attn_backend_cuda_graph_state_init
+        )
         self.graphs = {}
         self.output_buffers = {}
         self.enable_torch_compile = model_runner.server_args.enable_torch_compile
@@ -476,6 +513,54 @@ class CudaGraphRunner:
         self.capture_forward_mode = ForwardMode.DECODE
         self.capture_hidden_mode = CaptureHiddenMode.NULL
         self.num_tokens_per_bs = 1
+        dflash_verify_use_decode_batch = (os.environ.get("SGLANG_DFLASH_VERIFY_USE_DECODE_BATCH") or "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        dflash_true_decode_verify = (os.environ.get("SGLANG_DFLASH_VERIFY_USE_TRUE_DECODE_LOOP") or "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        dflash_target_graph_mode_env = (
+            os.environ.get("SGLANG_DFLASH_TARGET_CUDA_GRAPH_MODE") or ""
+        ).strip().lower()
+        dflash_target_graph_mode = (
+            dflash_target_graph_mode_env
+            or (
+                "decode"
+                if (dflash_verify_use_decode_batch or dflash_true_decode_verify)
+                else "verify"
+            )
+        )
+        if dflash_target_graph_mode not in {"verify", "decode"}:
+            dflash_target_graph_mode = "verify"
+        dflash_draft_decode_graphs = False
+        if model_runner.spec_algorithm.is_dflash_family() and model_runner.is_draft_worker:
+            draft_decode_flag = (
+                os.environ.get("SGLANG_DFLASH_PROPOSAL_USE_DECODE") or ""
+            ).strip().lower()
+            if draft_decode_flag in ("1", "true", "yes", "on"):
+                dflash_draft_decode_graphs = True
+            elif draft_decode_flag not in ("0", "false", "no", "off"):
+                share_pools_flag = (
+                    os.environ.get("SGLANG_DFLASH_DRAFT_SHARE_POOLS", "1")
+                    .strip()
+                    .lower()
+                )
+                draft_share_pools = share_pools_flag not in ("0", "false", "no", "off")
+                draft_kv_dtype_str = str(
+                    getattr(model_runner, "kv_cache_dtype_str", "") or ""
+                )
+                # Auto-enable decode graphs on the stable BF16/shared/page1 draft lane.
+                dflash_draft_decode_graphs = (
+                    int(getattr(model_runner.server_args, "page_size", 1) or 1) == 1
+                    and draft_share_pools
+                    and not draft_kv_dtype_str.startswith("fp8_")
+                )
         if (
             model_runner.spec_algorithm.is_eagle()
             or model_runner.spec_algorithm.is_standalone()
@@ -484,14 +569,44 @@ class CudaGraphRunner:
         ):
             if self.model_runner.is_draft_worker:
                 # EAGLE/standalone/ngram draft workers use separate cuda-graph runners; do not
-                # capture TARGET_VERIFY graphs here. DFLASH draft uses a fixed-size block and
-                # reuses TARGET_VERIFY graphs for performance.
+                # capture TARGET_VERIFY graphs here. DFLASH can either reuse fixed-width
+                # TARGET_VERIFY graphs or, when decode-style draft proposal is enabled,
+                # capture normal DECODE graphs so the draft worker has a matching fast path.
                 if not self.model_runner.spec_algorithm.is_dflash_family():
                     raise RuntimeError("This should not happen")
-            self.capture_forward_mode = ForwardMode.TARGET_VERIFY
-            self.num_tokens_per_bs = (
-                self.model_runner.server_args.speculative_num_draft_tokens
-            )
+            if dflash_draft_decode_graphs:
+                self.capture_forward_mode = ForwardMode.DECODE
+                self.num_tokens_per_bs = 1
+                log_info_on_rank0(
+                    logger,
+                    "DFLASH draft cuda-graph mode overridden to DECODE to match decode-style draft proposal.",
+                )
+            elif (
+                self.model_runner.spec_algorithm.is_dflash_family()
+                and not self.model_runner.is_draft_worker
+                and dflash_target_graph_mode == "decode"
+            ):
+                self.capture_forward_mode = ForwardMode.DECODE
+                self.num_tokens_per_bs = 1
+                log_info_on_rank0(
+                    logger,
+                    "DFLASH target cuda-graph mode overridden to DECODE for decode-kernel verify.",
+                )
+            else:
+                self.capture_forward_mode = ForwardMode.TARGET_VERIFY
+                self.num_tokens_per_bs = int(
+                    self._dflash_num_tokens_per_bs_override
+                    or self.model_runner.server_args.speculative_num_draft_tokens
+                )
+                if (
+                    self._dflash_num_tokens_per_bs_override is not None
+                    and self._dflash_num_tokens_per_bs_override
+                    != int(self.model_runner.server_args.speculative_num_draft_tokens)
+                ):
+                    log_info_on_rank0(
+                        logger,
+                        f"DFLASH target cuda-graph width override enabled: draft_token_num={int(self.num_tokens_per_bs)}",
+                    )
         elif self.is_dllm:
             self.capture_forward_mode = ForwardMode.DLLM_EXTEND
             self.num_tokens_per_bs = self.dllm_config.block_size
@@ -511,9 +626,10 @@ class CudaGraphRunner:
         # Attention backend
         self.max_bs = max(self.capture_bs)
         self.max_num_token = self.max_bs * self.num_tokens_per_bs
-        self.model_runner.attn_backend.init_cuda_graph_state(
-            self.max_bs, self.max_num_token
-        )
+        if not self._skip_attn_backend_cuda_graph_state_init:
+            self.model_runner.attn_backend.init_cuda_graph_state(
+                self.max_bs, self.max_num_token
+            )
 
         # Init PDMux if needed
         self.maybe_init_pdmux()
@@ -559,6 +675,7 @@ class CudaGraphRunner:
             enable_mamba_track=enable_mamba_track,
         )
         self.buffers.share_buffers()
+        self._maybe_preallocate_dflash_verify_lm_head_padding()
 
         self.tbo_plugin = TboCudaGraphRunnerPlugin()
 
@@ -596,10 +713,66 @@ class CudaGraphRunner:
             for attn_backend in self.model_runner.decode_attn_backend_group:
                 attn_backend.init_cuda_graph_state(self.max_bs, self.max_num_token)
 
+    def _maybe_preallocate_dflash_verify_lm_head_padding(self):
+        if (
+            not self.model_runner.spec_algorithm.is_dflash_family()
+            or self.model_runner.is_draft_worker
+            or self.capture_forward_mode != ForwardMode.TARGET_VERIFY
+        ):
+            return
+
+        default_width = int(self.model_runner.server_args.speculative_num_draft_tokens)
+        actual_width = int(self.num_tokens_per_bs)
+        if actual_width >= default_width:
+            return
+
+        logits_processor = getattr(self.model_runner.model, "logits_processor", None)
+        if logits_processor is None or not hasattr(
+            logits_processor, "reserve_dflash_target_verify_lm_head_pad_buffers"
+        ):
+            return
+
+        logits_processor.reserve_dflash_target_verify_lm_head_pad_buffers(
+            device=self.device,
+            dtype=self.model_runner.model_config.dtype,
+            hidden_size=int(self.model_runner.model_config.hidden_size),
+            actual_width=actual_width,
+            default_width=default_width,
+            batch_sizes=self.capture_bs,
+        )
+
     def _cache_loc_dtype(self):
         return torch.int64
 
     def can_run(self, forward_batch: ForwardBatch):
+        if self.model_runner.spec_algorithm.is_dflash_family():
+            forward_mode_matches = (
+                forward_batch.forward_mode == self.capture_forward_mode
+                or (
+                    forward_batch.forward_mode.is_idle()
+                    and self.capture_forward_mode.is_decode()
+                )
+            )
+            if not forward_mode_matches:
+                return False
+            if self.capture_forward_mode.is_target_verify():
+                spec_info = getattr(forward_batch, "spec_info", None)
+                actual_draft_token_num = int(
+                    getattr(spec_info, "draft_token_num", self.num_tokens_per_bs)
+                )
+                expected_num_tokens = int(forward_batch.batch_size) * int(
+                    self.num_tokens_per_bs
+                )
+                actual_num_tokens = int(forward_batch.input_ids.numel())
+                # DFLASH failfast can reduce the logical verify width below the physical
+                # block size. Do not replay a full-width TARGET_VERIFY graph in that case;
+                # it defeats the cap and keeps target-forward cost artificially high.
+                if (
+                    actual_draft_token_num != int(self.num_tokens_per_bs)
+                    or actual_num_tokens != expected_num_tokens
+                ):
+                    return False
+
         if self.require_mlp_tp_gather:
             cuda_graph_bs = (
                 max(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs
@@ -1202,7 +1375,7 @@ class CudaGraphRunner:
             )
             spec_info = DFlashVerifyInput.create_idle_input(
                 device=self.device,
-                draft_token_num=self.model_runner.server_args.speculative_num_draft_tokens,
+                draft_token_num=self.num_tokens_per_bs,
                 custom_mask=(
                     None
                     if (self.model_runner.is_draft_worker or not build_custom_mask)
@@ -1230,6 +1403,102 @@ class CudaGraphRunner:
             spec_info.capture_hidden_mode = CaptureHiddenMode.NULL
 
         return spec_info
+
+
+class DFlashMultiWidthCudaGraphRunner:
+    """Route DFLASH TARGET_VERIFY replay to width-specific cuda-graph captures."""
+
+    def __init__(self, model_runner: "ModelRunner"):
+        self.model_runner = model_runner
+        self.default_width = int(
+            model_runner.server_args.speculative_num_draft_tokens
+        )
+        self.capture_widths = self._resolve_capture_widths(model_runner)
+        self.runners: Dict[int, CudaGraphRunner] = {}
+        self.bs = None
+
+        shared_max_bs = 0
+        shared_max_num_token = 0
+        for width in self.capture_widths:
+            capture_bs, _ = get_batch_sizes_to_capture(model_runner, int(width))
+            shared_max_bs = max(shared_max_bs, max(capture_bs))
+            shared_max_num_token = max(
+                shared_max_num_token, max(capture_bs) * int(width)
+            )
+
+        model_runner.attn_backend.init_cuda_graph_state(
+            shared_max_bs, shared_max_num_token
+        )
+
+        for width in self.capture_widths:
+            self.runners[int(width)] = CudaGraphRunner(
+                model_runner,
+                dflash_num_tokens_per_bs_override=int(width),
+                skip_attn_backend_cuda_graph_state_init=True,
+            )
+        self.default_runner = self.runners[int(self.default_width)]
+        log_info_on_rank0(
+            logger,
+            f"DFLASH multi-width TARGET_VERIFY cuda-graphs enabled for draft_token_num={self.capture_widths}",
+        )
+
+    @staticmethod
+    def _resolve_capture_widths(model_runner: "ModelRunner") -> list[int]:
+        default_width = int(model_runner.server_args.speculative_num_draft_tokens)
+        raw = (
+            os.environ.get("SGLANG_DFLASH_MULTIWIDTH_VERIFY_GRAPH_DRAFT_TOKENS") or ""
+        ).strip()
+        widths: set[int] = {default_width}
+        for item in raw.split(","):
+            item = item.strip()
+            if not item:
+                continue
+            try:
+                width = int(item)
+            except Exception:
+                continue
+            if width <= 0:
+                continue
+            widths.add(width)
+        return sorted(widths)
+
+    def _requested_width(self, forward_batch: ForwardBatch) -> int:
+        if forward_batch.forward_mode.is_target_verify():
+            spec_info = getattr(forward_batch, "spec_info", None)
+            return int(getattr(spec_info, "draft_token_num", self.default_width))
+        return int(self.default_width)
+
+    def _select_runner(self, forward_batch: ForwardBatch) -> Optional[CudaGraphRunner]:
+        requested_width = self._requested_width(forward_batch)
+        if requested_width in self.runners:
+            return self.runners[requested_width]
+        if requested_width == int(self.default_width):
+            return self.default_runner
+        return None
+
+    def can_run(self, forward_batch: ForwardBatch):
+        runner = self._select_runner(forward_batch)
+        return bool(runner is not None and runner.can_run(forward_batch))
+
+    def replay(
+        self,
+        forward_batch: ForwardBatch,
+        skip_attn_backend_init: bool = False,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
+        runner = self._select_runner(forward_batch)
+        if runner is None:
+            raise RuntimeError(
+                "DFLASH multi-width cuda-graph runner has no capture for "
+                f"draft_token_num={self._requested_width(forward_batch)}."
+            )
+        ret = runner.replay(
+            forward_batch,
+            skip_attn_backend_init=skip_attn_backend_init,
+            pp_proxy_tensors=pp_proxy_tensors,
+        )
+        self.bs = getattr(runner, "bs", None)
+        return ret
 
 
 CUDA_GRAPH_CAPTURE_FAILED_MSG = (

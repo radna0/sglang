@@ -12,6 +12,7 @@ python3 -m sglang.bench_serving --backend sglang --dataset-name random --num-pro
 
 import argparse
 import asyncio
+import contextlib
 import copy
 import importlib.util
 import io
@@ -2253,6 +2254,10 @@ def calculate_metrics(
                 print("tip: install termplotlib and gnuplot to plot the metrics")
 
     itls = retokenized_itls if use_retokenized_itl else itls
+    # Some benchmark modes intentionally continue collecting outputs even when every
+    # request failed. Keep metric aggregation total-order and JSON-emittable in that
+    # case instead of raising on empty latency arrays.
+    e2e_latencies_or_zero = e2e_latencies if e2e_latencies else [0.0]
     metrics = BenchmarkMetrics(
         completed=completed,
         total_input=total_input,
@@ -2282,12 +2287,12 @@ def calculate_metrics(
         p95_itl_ms=np.percentile(itls or 0, 95) * 1000,
         p99_itl_ms=np.percentile(itls or 0, 99) * 1000,
         max_itl_ms=np.max(itls or 0) * 1000,
-        mean_e2e_latency_ms=np.mean(e2e_latencies) * 1000,
-        median_e2e_latency_ms=np.median(e2e_latencies) * 1000,
-        std_e2e_latency_ms=np.std(e2e_latencies) * 1000,
-        p90_e2e_latency_ms=np.percentile(e2e_latencies, 90) * 1000,
-        p99_e2e_latency_ms=np.percentile(e2e_latencies, 99) * 1000,
-        concurrency=np.sum(e2e_latencies) / dur_s,
+        mean_e2e_latency_ms=np.mean(e2e_latencies_or_zero) * 1000,
+        median_e2e_latency_ms=np.median(e2e_latencies_or_zero) * 1000,
+        std_e2e_latency_ms=np.std(e2e_latencies_or_zero) * 1000,
+        p90_e2e_latency_ms=np.percentile(e2e_latencies_or_zero, 90) * 1000,
+        p99_e2e_latency_ms=np.percentile(e2e_latencies_or_zero, 99) * 1000,
+        concurrency=(np.sum(e2e_latencies) / dur_s) if e2e_latencies else 0.0,
         max_output_tokens_per_s=max_output_tokens_per_s,
         max_concurrent_requests=max_concurrent_requests,
     )
@@ -2569,24 +2574,22 @@ async def benchmark(
         pbar.close()
 
     if "sglang" in backend:
-        server_info = requests.get(
-            base_url + "/get_server_info", headers=get_auth_headers()
-        )
-        if server_info.status_code == 200:
-            server_info_json = server_info.json()
-            if "decode" in server_info_json:
-                server_info_json = server_info_json["decode"][0]
-            if (
-                "internal_states" in server_info_json
-                and server_info_json["internal_states"]
-            ):
-                accept_length = server_info_json["internal_states"][0].get(
-                    "avg_spec_accept_length", None
-                )
-            else:
-                accept_length = None
-        else:
-            accept_length = None
+        accept_length = None
+        with contextlib.suppress(Exception):
+            server_info = requests.get(
+                base_url + "/get_server_info", headers=get_auth_headers()
+            )
+            if server_info.status_code == 200:
+                server_info_json = server_info.json()
+                if "decode" in server_info_json:
+                    server_info_json = server_info_json["decode"][0]
+                if (
+                    "internal_states" in server_info_json
+                    and server_info_json["internal_states"]
+                ):
+                    accept_length = server_info_json["internal_states"][0].get(
+                        "avg_spec_accept_length", None
+                    )
     else:
         accept_length = None
 
@@ -2697,8 +2700,10 @@ async def benchmark(
     print("{:<40} {:<10.2f}".format("Max ITL (ms):", metrics.max_itl_ms))
     print("=" * 50)
 
-    resp = requests.get(base_url + "/get_server_info", headers=get_auth_headers())
-    server_info = resp.json() if resp.status_code == 200 else None
+    server_info = None
+    with contextlib.suppress(Exception):
+        resp = requests.get(base_url + "/get_server_info", headers=get_auth_headers())
+        server_info = resp.json() if resp.status_code == 200 else None
 
     if (
         metrics.median_ttft_ms is not None

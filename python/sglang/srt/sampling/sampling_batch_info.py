@@ -112,6 +112,8 @@ class SamplingBatchInfo:
                     for key, value in r.sampling_params.logit_bias.items():
                         logit_bias[i, int(key)] = value
 
+        custom_params = [r.sampling_params.custom_params for r in reqs]
+
         # Check if any request has custom logit processor
         has_custom_logit_processor = (
             global_server_args.enable_custom_logit_processor
@@ -140,10 +142,8 @@ class SamplingBatchInfo:
                 )
                 for processor_str, true_indices in processor_dict.items()
             }
-            custom_params = [r.sampling_params.custom_params for r in reqs]
         else:
             merged_custom_logit_processor = None
-            custom_params = None
 
         # Each penalizers will do nothing if they evaluate themselves as not required by looking at
         # the sampling_params of the requests (See {_is_required()} of each penalizers). So this

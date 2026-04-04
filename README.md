@@ -7,6 +7,25 @@ This branch is focused on making GPT-OSS DFlash correct and fast on the stable:
 - target KV cache: `fp8_e4m3`
 - draft KV cache: `bfloat16`
 
+## Locked Current-Branch Proof Contract
+
+For the current-branch `reference.csv` proof lane, the serving contract is locked to:
+
+- target `page_size=1`
+- draft `page_size=1`
+- `share_pools=False`
+- `block_size=4`
+- `speculative_num_draft_tokens=4`
+- `mem_fraction_static=0.90`
+- `speculative_draft_mem_fraction_static=0.97`
+- FA3 for target and draft
+- full decode CUDA graph + piecewise CUDA graph
+- overlap disabled
+
+This proof lane is intentionally `showtime.py`-style in runtime behavior, but we are not
+editing `showtime.py` itself. We are locking the SGLang-side serving contract and verifying
+that contract directly on `reference.csv`.
+
 The current best short-context regime is:
 
 - target `page_size=256`
@@ -18,7 +37,7 @@ The current best long-budget reference regime on the local 3-problem harness is:
 
 - target `page_size=1`
 - draft `page_size=1`
-- `share_pools=True`
+- `share_pools=False`
 - `block_size=16`
 - `mem_fraction_static=0.90` for most rows, `0.85` for `ctx=65536, concurrency=8`
 

@@ -74,6 +74,17 @@ class ChunkedPhaseRun:
     stop_round: int
 
 
+_TREE_SPEC_CONFIG_BY_BLOCK_SIZE: dict[int, tuple[int, int, int]] = {
+    4: (3, 4, 4),
+    8: (4, 2, 6),
+    16: (8, 1, 9),
+}
+
+
+def _resolve_tree_spec_config(block_size: int) -> tuple[int | None, int | None, int | None]:
+    return _TREE_SPEC_CONFIG_BY_BLOCK_SIZE.get(int(block_size), (None, None, None))
+
+
 def _bench_one_with_texts(
     *,
     base_url: str,
@@ -87,12 +98,19 @@ def _bench_one_with_texts(
     top_p: float,
     top_k: int,
     min_p: float,
+    sampling_strategy: str | None = None,
     disable_stream: bool = False,
 ) -> PhaseRun:
-    reqs = [
-        DatasetRow(prompt=p, prompt_len=0, output_len=int(out))
-        for p, out in zip(prompts, output_lens)
-    ]
+    reqs = []
+    for p, out in zip(prompts, output_lens):
+        prompt_ids = tokenizer.encode(p, add_special_tokens=False)
+        reqs.append(
+            DatasetRow(
+                prompt=prompt_ids,
+                prompt_len=len(prompt_ids),
+                output_len=int(out),
+            )
+        )
     args = argparse.Namespace(
         disable_ignore_eos=False,
         disable_stream=bool(disable_stream),
@@ -121,6 +139,7 @@ def _bench_one_with_texts(
             top_p=top_p,
             top_k=top_k,
             min_p=min_p,
+            sampling_strategy=sampling_strategy,
         )
     }
 
@@ -150,10 +169,16 @@ def _bench_one_with_texts(
             f"Benchmark incomplete: completed={results.get('completed')} expected={len(reqs)}"
         )
 
-    server_info = requests.get(base_url + "/get_server_info", timeout=60).json()
+    server_info = None
+    with contextlib.suppress(Exception):
+        resp = requests.get(base_url + "/get_server_info", timeout=60)
+        if resp.status_code == 200:
+            server_info = resp.json()
     step_time_p20_s: float | None = None
     output_tok_s_p20: float | None = None
     with contextlib.suppress(Exception):
+        if server_info is None:
+            raise RuntimeError("server_info unavailable")
         step_times = server_info["internal_states"][0]["step_time_dict"][
             str(int(concurrency))
         ]
@@ -242,9 +267,26 @@ def _server_session(
     prompt_expected_answers: list[str],
     mem_fraction_static: float,
     dflash_block_size: int,
+    draft_attention_backend: str,
+    draft_kv_cache_dtype: str,
+    speculative_algorithm: str = "DFLASH",
     speculative: bool = True,
     server_env: dict[str, str] | None = None,
 ):
+    speculative_num_steps: int | None = None
+    speculative_eagle_topk: int | None = None
+    speculative_num_draft_tokens: int | None = None
+    if str(speculative_algorithm) == "DFLASH_TREE":
+        (
+            speculative_num_steps,
+            speculative_eagle_topk,
+            speculative_num_draft_tokens,
+        ) = _resolve_tree_spec_config(int(dflash_block_size))
+        if speculative_num_steps is None or speculative_eagle_topk is None or speculative_num_draft_tokens is None:
+            raise ValueError(
+                "DFLASH_TREE route benchmark requires a known tree config for "
+                f"dflash_block_size={int(dflash_block_size)}."
+            )
     with _temporary_environ(server_env):
         proc = _launch_server(
             model_path=model_path,
@@ -260,14 +302,20 @@ def _server_session(
             piecewise_cuda_graph_max_tokens=8192,
             disable_cuda_graph=False,
             speculative=speculative,
-            speculative_algorithm="DFLASH",
+            speculative_algorithm=speculative_algorithm,
             draft_model_path=draft_model_path,
-            draft_attention_backend="fa3",
-            draft_kv_cache_dtype="bfloat16",
+            draft_attention_backend=str(draft_attention_backend),
+            draft_kv_cache_dtype=str(draft_kv_cache_dtype),
             draft_page_size=1,
             speculative_moe_runner_backend="triton_kernel",
             speculative_dflash_block_size=int(dflash_block_size),
+            speculative_num_steps=speculative_num_steps,
+            speculative_eagle_topk=speculative_eagle_topk,
+            speculative_num_draft_tokens=speculative_num_draft_tokens,
             mem_fraction_static=mem_fraction_static,
+            draft_mem_fraction_static=None,
+            sampling_backend="pytorch",
+            skip_tokenizer_init=True,
             disable_overlap_schedule=True,
         )
     base_url = f"http://127.0.0.1:{int(port)}"
@@ -291,10 +339,14 @@ def _run_phase(
     prompt_expected_answers: list[str],
     mem_fraction_static: float,
     dflash_block_size: int,
+    draft_attention_backend: str,
+    draft_kv_cache_dtype: str,
+    speculative_algorithm: str = "DFLASH",
     temperature: float,
     top_p: float,
     top_k: int,
     min_p: float,
+    sampling_strategy: str | None,
     speculative: bool = True,
     server_env: dict[str, str] | None = None,
     disable_stream: bool = False,
@@ -311,6 +363,9 @@ def _run_phase(
         prompt_expected_answers=prompt_expected_answers,
         mem_fraction_static=mem_fraction_static,
         dflash_block_size=dflash_block_size,
+        draft_attention_backend=draft_attention_backend,
+        draft_kv_cache_dtype=draft_kv_cache_dtype,
+        speculative_algorithm=speculative_algorithm,
         speculative=speculative,
         server_env=server_env,
     ) as (base_url, tokenizer):
@@ -326,6 +381,7 @@ def _run_phase(
             top_p=top_p,
             top_k=top_k,
             min_p=min_p,
+            sampling_strategy=sampling_strategy,
             disable_stream=bool(disable_stream),
         )
 
@@ -336,8 +392,12 @@ def _bench_total_generated_tokens(summary: BenchResult) -> float:
 
 def _server_internal_state(base_url: str) -> dict[str, Any]:
     try:
-        server_info = requests.get(base_url + "/get_server_info", timeout=60).json()
-        internal_states = server_info.get("internal_states") or []
+        server_info = None
+        with contextlib.suppress(Exception):
+            resp = requests.get(base_url + "/get_server_info", timeout=60)
+            if resp.status_code == 200:
+                server_info = resp.json()
+        internal_states = server_info.get("internal_states") if server_info else []
         if internal_states:
             return dict(internal_states[0])
     except Exception:
@@ -364,10 +424,14 @@ def _run_chunked_exploration(
     stop_selected_margin_ge: float,
     mem_fraction_static: float,
     dflash_block_size: int,
+    draft_attention_backend: str,
+    draft_kv_cache_dtype: str,
+    speculative_algorithm: str = "DFLASH",
     temperature: float,
     top_p: float,
     top_k: int,
     min_p: float,
+    sampling_strategy: str | None,
     policy: RoutePolicy,
     disable_stream: bool = False,
 ) -> tuple[ChunkedPhaseRun, list[dict[str, Any]], list[dict[str, Any]], list[str], list[int]]:
@@ -395,6 +459,9 @@ def _run_chunked_exploration(
         prompt_expected_answers=prompt_expected_answers,
         mem_fraction_static=mem_fraction_static,
         dflash_block_size=dflash_block_size,
+        draft_attention_backend=draft_attention_backend,
+        draft_kv_cache_dtype=draft_kv_cache_dtype,
+        speculative_algorithm=speculative_algorithm,
         speculative=True,
         server_env=None,
     ) as (base_url, tokenizer):
@@ -423,6 +490,7 @@ def _run_chunked_exploration(
                 top_p=top_p,
                 top_k=top_k,
                 min_p=min_p,
+                sampling_strategy=sampling_strategy,
                 disable_stream=bool(disable_stream),
             )
             total_wall_s += float(phase.summary.wall_s)
@@ -716,11 +784,20 @@ def _build_continuation_server_env(args: argparse.Namespace) -> dict[str, str]:
         env["SGLANG_DFLASH_ADAPTIVE_CAP_VERIFY_CT_GE"] = str(
             int(args.continuation_adaptive_cap_verify_ct_ge)
         )
+        env["SGLANG_DFLASH_ADAPTIVE_CAP_LAST_VERIFY_CT_GE"] = str(
+            int(args.continuation_adaptive_cap_last_verify_ct_ge)
+        )
         env["SGLANG_DFLASH_ADAPTIVE_CAP_ACCEPT_EMA_HARD_LE"] = str(
             float(args.continuation_adaptive_cap_accept_ema_hard_le)
         )
         env["SGLANG_DFLASH_ADAPTIVE_CAP_ACCEPT_EMA_MEDIUM_LE"] = str(
             float(args.continuation_adaptive_cap_accept_ema_medium_le)
+        )
+        env["SGLANG_DFLASH_ADAPTIVE_CAP_ACCEPT_LAST_HARD_LE"] = str(
+            float(args.continuation_adaptive_cap_accept_last_hard_le)
+        )
+        env["SGLANG_DFLASH_ADAPTIVE_CAP_ACCEPT_LAST_MEDIUM_LE"] = str(
+            float(args.continuation_adaptive_cap_accept_last_medium_le)
         )
         env["SGLANG_DFLASH_ADAPTIVE_CAP_HARD_STEPS"] = str(
             int(args.continuation_adaptive_cap_hard_steps)
@@ -736,6 +813,14 @@ def _build_continuation_server_env(args: argparse.Namespace) -> dict[str, str]:
         )
         env["SGLANG_DFLASH_ADAPTIVE_CAP_TV_HARD_GE"] = str(
             float(args.continuation_adaptive_cap_tv_hard_ge)
+        )
+    if bool(args.continuation_adaptive_cap_batch_enable):
+        env["SGLANG_DFLASH_ADAPTIVE_BATCH_CAP_ENABLE"] = "1"
+        env["SGLANG_DFLASH_ADAPTIVE_BATCH_CAP_HARD_FRACTION_GE"] = str(
+            float(args.continuation_adaptive_cap_batch_hard_fraction_ge)
+        )
+        env["SGLANG_DFLASH_ADAPTIVE_BATCH_CAP_MEDIUM_FRACTION_GE"] = str(
+            float(args.continuation_adaptive_cap_batch_medium_fraction_ge)
         )
     return env
 
@@ -758,12 +843,20 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--buffer-tokens", type=int, default=512)
     p.add_argument("--mem-fraction-static", type=float, default=0.90)
     p.add_argument("--dflash-block-size", type=int, default=16)
+    p.add_argument("--draft-attention-backend", default="fa3")
+    p.add_argument("--draft-kv-cache-dtype", default="bfloat16")
+    p.add_argument(
+        "--speculative-algorithm",
+        choices=("DFLASH", "DFLASH_TREE"),
+        default="DFLASH",
+    )
     p.add_argument("--exploration-dflash-block-size", type=int, default=None)
     p.add_argument("--continuation-dflash-block-size", type=int, default=None)
     p.add_argument("--temperature", type=float, default=0.0)
     p.add_argument("--top-p", type=float, default=1.0)
     p.add_argument("--top-k", type=int, default=1)
     p.add_argument("--min-p", type=float, default=0.0)
+    p.add_argument("--sampling-strategy", default=None)
     p.add_argument("--promotion-mode", choices=("strict", "throughput"), default="strict")
     p.add_argument("--promote-total-k", type=int, default=8)
     p.add_argument("--min-keep-per-qid", type=int, default=1)
@@ -780,13 +873,19 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--conflict-q-max-ge", type=float, default=0.85)
     p.add_argument("--continuation-adaptive-cap-enable", action="store_true", default=False)
     p.add_argument("--continuation-adaptive-cap-verify-ct-ge", type=int, default=8)
+    p.add_argument("--continuation-adaptive-cap-last-verify-ct-ge", type=int, default=2)
     p.add_argument("--continuation-adaptive-cap-accept-ema-hard-le", type=float, default=3.25)
     p.add_argument("--continuation-adaptive-cap-accept-ema-medium-le", type=float, default=5.0)
+    p.add_argument("--continuation-adaptive-cap-accept-last-hard-le", type=float, default=-1.0)
+    p.add_argument("--continuation-adaptive-cap-accept-last-medium-le", type=float, default=2.0)
     p.add_argument("--continuation-adaptive-cap-hard-steps", type=int, default=1)
     p.add_argument("--continuation-adaptive-cap-medium-steps", type=int, default=8)
     p.add_argument("--continuation-adaptive-cap-q-entropy-hard-le", type=float, default=-1.0)
     p.add_argument("--continuation-adaptive-cap-q-max-hard-ge", type=float, default=-1.0)
     p.add_argument("--continuation-adaptive-cap-tv-hard-ge", type=float, default=-1.0)
+    p.add_argument("--continuation-adaptive-cap-batch-enable", action="store_true", default=False)
+    p.add_argument("--continuation-adaptive-cap-batch-hard-fraction-ge", type=float, default=0.75)
+    p.add_argument("--continuation-adaptive-cap-batch-medium-fraction-ge", type=float, default=0.5)
     p.add_argument("--disable-stream", action="store_true", default=False)
     return p.parse_args()
 
@@ -854,10 +953,16 @@ def main() -> int:
         stop_selected_margin_ge=float(args.exploration_stop_selected_margin_ge),
         mem_fraction_static=float(args.mem_fraction_static),
         dflash_block_size=exploration_dflash_block_size,
+        draft_attention_backend=str(args.draft_attention_backend),
+        draft_kv_cache_dtype=str(args.draft_kv_cache_dtype),
+        speculative_algorithm=str(args.speculative_algorithm),
         temperature=float(args.temperature),
         top_p=float(args.top_p),
         top_k=int(args.top_k),
         min_p=float(args.min_p),
+        sampling_strategy=(
+            str(args.sampling_strategy) if args.sampling_strategy is not None else None
+        ),
         policy=policy,
         disable_stream=bool(args.disable_stream),
     )
@@ -881,10 +986,16 @@ def main() -> int:
         prompt_expected_answers=continuation_answers,
         mem_fraction_static=float(args.mem_fraction_static),
         dflash_block_size=continuation_dflash_block_size,
+        draft_attention_backend=str(args.draft_attention_backend),
+        draft_kv_cache_dtype=str(args.draft_kv_cache_dtype),
+        speculative_algorithm=str(args.speculative_algorithm),
         temperature=float(args.temperature),
         top_p=float(args.top_p),
         top_k=int(args.top_k),
         min_p=float(args.min_p),
+        sampling_strategy=(
+            str(args.sampling_strategy) if args.sampling_strategy is not None else None
+        ),
         speculative=True,
         server_env=continuation_server_env,
         disable_stream=bool(args.disable_stream),
@@ -925,10 +1036,31 @@ def main() -> int:
             "buffer_tokens": int(args.buffer_tokens),
             "exploration_dflash_block_size": exploration_dflash_block_size,
             "continuation_dflash_block_size": continuation_dflash_block_size,
+            "draft_kv_cache_dtype": str(args.draft_kv_cache_dtype),
+            "speculative_algorithm": str(args.speculative_algorithm),
+            "resolved_tree_config": (
+                {
+                    "exploration": {
+                        "num_steps": _resolve_tree_spec_config(exploration_dflash_block_size)[0],
+                        "topk": _resolve_tree_spec_config(exploration_dflash_block_size)[1],
+                        "num_draft_tokens": _resolve_tree_spec_config(exploration_dflash_block_size)[2],
+                    },
+                    "continuation": {
+                        "num_steps": _resolve_tree_spec_config(continuation_dflash_block_size)[0],
+                        "topk": _resolve_tree_spec_config(continuation_dflash_block_size)[1],
+                        "num_draft_tokens": _resolve_tree_spec_config(continuation_dflash_block_size)[2],
+                    },
+                }
+                if str(args.speculative_algorithm) == "DFLASH_TREE"
+                else None
+            ),
             "temperature": float(args.temperature),
             "top_p": float(args.top_p),
             "top_k": int(args.top_k),
             "min_p": float(args.min_p),
+            "sampling_strategy": (
+                str(args.sampling_strategy) if args.sampling_strategy is not None else None
+            ),
         },
         "exploration": {
             "summary": asdict(exploration.final_phase.summary),

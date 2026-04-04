@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -111,6 +112,39 @@ class DFlashAttention(nn.Module):
             layer_id=layer_id,
             attn_type=AttentionType.ENCODER_ONLY,
         )
+        self._dflash_kv_stats_logged = 0
+
+    def _maybe_log_kv_stats(self, *, tag: str, k: torch.Tensor, v: torch.Tensor) -> None:
+        enabled = (os.environ.get("SGLANG_DFLASH_LOG_ATTN_KV_STATS") or "").strip().lower() not in (
+            "",
+            "0",
+            "false",
+            "off",
+            "no",
+        )
+        if not enabled:
+            return
+        max_logs = int((os.environ.get("SGLANG_DFLASH_LOG_ATTN_KV_STATS_MAX") or "2").strip() or "2")
+        if self._dflash_kv_stats_logged >= max_logs:
+            return
+        if int(self.attn.layer_id) != 0:
+            return
+        try:
+            k_abs = k.abs()
+            v_abs = v.abs()
+            logger.warning(
+                "DFLASH draft KV stats tag=%s layer=%d k_absmax=%.6f k_meanabs=%.6f v_absmax=%.6f v_meanabs=%.6f tokens=%d",
+                str(tag),
+                int(self.attn.layer_id),
+                float(k_abs.max().item()) if k_abs.numel() > 0 else 0.0,
+                float(k_abs.mean().item()) if k_abs.numel() > 0 else 0.0,
+                float(v_abs.max().item()) if v_abs.numel() > 0 else 0.0,
+                float(v_abs.mean().item()) if v_abs.numel() > 0 else 0.0,
+                int(k.shape[0]),
+            )
+            self._dflash_kv_stats_logged += 1
+        except Exception:
+            logger.exception("DFLASH draft KV stats logging failed")
 
     def forward(
         self,
@@ -121,6 +155,7 @@ class DFlashAttention(nn.Module):
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = apply_qk_norm(q, k, self.q_norm, self.k_norm, self.head_dim)
+        self._maybe_log_kv_stats(tag="self_attn", k=k, v=v)
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v, forward_batch)
         output, _ = self.o_proj(attn_output)
@@ -144,11 +179,13 @@ class DFlashAttention(nn.Module):
             )
             kv = F.linear(hidden_states, weight, bias)
             k, v = kv.split([self.kv_size, self.kv_size], dim=-1)
+            self._maybe_log_kv_stats(tag="ctx_append", k=k, v=v)
             return k, v
 
         # Fallback: compute full QKV and discard Q (keeps compatibility with quantized weights).
         qkv, _ = self.qkv_proj(hidden_states)
         _, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        self._maybe_log_kv_stats(tag="ctx_append", k=k, v=v)
         return k, v
 
     def apply_k_norm(self, k: torch.Tensor) -> torch.Tensor:
@@ -439,6 +476,22 @@ class DFlashDraftModel(nn.Module):
                     )
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
+
+        # Match the GPT-OSS no-scale FP8 fallback contract. RadixAttention
+        # predefines scale attributes as None, so initialize them explicitly.
+        device = next(self.parameters()).device
+        for layer in self.layers:
+            attn = getattr(getattr(layer, "self_attn", None), "attn", None)
+            if attn is None:
+                continue
+            if getattr(attn, "k_scale", None) is None:
+                attn.k_scale = torch.tensor(1.0, dtype=torch.float32, device=device)
+            if getattr(attn, "v_scale", None) is None:
+                attn.v_scale = torch.tensor(1.0, dtype=torch.float32, device=device)
+            if getattr(attn, "k_scale_float", None) is None:
+                attn.k_scale_float = 1.0
+            if getattr(attn, "v_scale_float", None) is None:
+                attn.v_scale_float = 1.0
 
 
 EntryClass = DFlashDraftModel

@@ -1,34 +1,8 @@
 from __future__ import annotations
 
 import math
-import os
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple
-
-
-def _env_flag(name: str) -> bool:
-    v = (os.environ.get(name) or "").strip().lower()
-    return v not in ("", "0", "false", "off", "no")
-
-
-def _env_float(name: str, default: float) -> float:
-    v = (os.environ.get(name) or "").strip()
-    if not v:
-        return float(default)
-    try:
-        return float(v)
-    except Exception:
-        return float(default)
-
-
-def _env_int(name: str, default: int) -> int:
-    v = (os.environ.get(name) or "").strip()
-    if not v:
-        return int(default)
-    try:
-        return int(v)
-    except Exception:
-        return int(default)
+from typing import Any, Dict, Optional
 
 
 @dataclass
@@ -41,7 +15,7 @@ class DFlashDifficultySignals:
     """
 
     verify_mode: str
-    # Mean accept ratio: E[min(1, p(y)/q(y))] across proposed positions (pq mode).
+    # Mean accept ratio emitted by the verifier debug path.
     # NOTE: This is not accept_len / spec_accept_length_mean (K), which is a different metric.
     accept_mean: Optional[float]
     tv_mean: Optional[float]
@@ -89,135 +63,6 @@ class DFlashDifficultySignals:
             p_max_mean=_get(dflash_debug, "p_max_mean"),
             q_max_mean=q_max,
         )
-
-
-@dataclass
-class DFlashAdaptivePqConfig:
-    enabled: bool
-    # Temperature multiplier applied to the draft *proposal* distribution q.
-    temp_mul: float
-    temp_min: float
-    temp_max: float
-    # Controller gain for entropy matching.
-    ent_kp: float
-    # Optional "FailFast" fallback: disable pq when it is clearly pathological.
-    disable_pq_on_p_y_zero_ge: float
-    disable_pq_on_tv_ge: float
-    # EAFT-like "confident conflict" gate (draft is confident but acceptance is low).
-    eaft_q_ent_le: float
-    eaft_a_mean_le: float
-    eaft_disable_rounds: int
-
-    @staticmethod
-    def from_env(*, default_temp_mul: float) -> "DFlashAdaptivePqConfig":
-        enabled = _env_flag("SGLANG_DFLASH_ADAPTIVE_PQ")
-        temp_min = _env_float("SGLANG_DFLASH_ADAPTIVE_PQ_TEMP_MIN", 0.5)
-        temp_max = _env_float("SGLANG_DFLASH_ADAPTIVE_PQ_TEMP_MAX", 2.0)
-        ent_kp = _env_float("SGLANG_DFLASH_ADAPTIVE_PQ_ENT_KP", 0.25)
-        disable_p_y0 = _env_float("SGLANG_DFLASH_FAILFAST_PY0_GE", 0.35)
-        disable_tv = _env_float("SGLANG_DFLASH_FAILFAST_TV_GE", 0.85)
-        eaft_q_ent_le = _env_float("SGLANG_DFLASH_EAFT_QENT_LE", -1.0)
-        eaft_a_mean_le = _env_float("SGLANG_DFLASH_EAFT_AMEAN_LE", -1.0)
-        eaft_disable_rounds = _env_int("SGLANG_DFLASH_EAFT_DISABLE_ROUNDS", 2)
-        return DFlashAdaptivePqConfig(
-            enabled=bool(enabled),
-            temp_mul=float(default_temp_mul),
-            temp_min=float(temp_min),
-            temp_max=float(temp_max),
-            ent_kp=float(ent_kp),
-            disable_pq_on_p_y_zero_ge=float(disable_p_y0),
-            disable_pq_on_tv_ge=float(disable_tv),
-            eaft_q_ent_le=float(eaft_q_ent_le),
-            eaft_a_mean_le=float(eaft_a_mean_le),
-            eaft_disable_rounds=int(eaft_disable_rounds),
-        )
-
-
-class DFlashAdaptivePqController:
-    """FailFast/EAFT-inspired *policy layer* for pq verification.
-
-    Correctness guarantee: this controller never changes verifier math; it only
-    adjusts draft proposal shaping (q) and (optionally) turns pq off when it is
-    clearly counterproductive.
-    """
-
-    def __init__(self, cfg: DFlashAdaptivePqConfig):
-        self.cfg = cfg
-        self._disabled_pq_rounds_left = 0
-
-    def should_force_target_only(self) -> bool:
-        return self._disabled_pq_rounds_left > 0
-
-    def on_verify_end(self, sig: DFlashDifficultySignals) -> Tuple[float, Dict[str, Any]]:
-        """Update temp_mul (and maybe failfast-disable pq) from verify-side stats.
-
-        Returns: (new_temp_mul, debug_dict)
-        """
-        dbg: Dict[str, Any] = {"enabled": bool(self.cfg.enabled)}
-        if not self.cfg.enabled:
-            return float(self.cfg.temp_mul), dbg
-
-        disabled_before = int(self._disabled_pq_rounds_left)
-
-        # FailFast: if pq is clearly pathological, temporarily disable it.
-        py0 = sig.frac_p_y_zero
-        tv = sig.tv_mean
-        if py0 is not None and py0 >= self.cfg.disable_pq_on_p_y_zero_ge:
-            self._disabled_pq_rounds_left = max(self._disabled_pq_rounds_left, 2)
-        if tv is not None and tv >= self.cfg.disable_pq_on_tv_ge:
-            self._disabled_pq_rounds_left = max(self._disabled_pq_rounds_left, 2)
-
-        # EAFT-style "confident conflict" gating:
-        # if the draft is confident (low entropy) but acceptance is low, fail fast by
-        # disabling pq briefly (or you can use this as a trigger to raise draft_temp_mul).
-        if (
-            sig.q_entropy_mean is not None
-            and sig.accept_mean is not None
-            and self.cfg.eaft_q_ent_le >= 0.0
-            and self.cfg.eaft_a_mean_le >= 0.0
-        ):
-            if float(sig.q_entropy_mean) <= float(self.cfg.eaft_q_ent_le) and float(sig.accept_mean) <= float(self.cfg.eaft_a_mean_le):
-                self._disabled_pq_rounds_left = max(
-                    self._disabled_pq_rounds_left, int(self.cfg.eaft_disable_rounds)
-                )
-                dbg["eaft_conflict"] = True
-            else:
-                dbg["eaft_conflict"] = False
-
-        disabled_set = int(self._disabled_pq_rounds_left)
-        if self._disabled_pq_rounds_left > 0:
-            self._disabled_pq_rounds_left -= 1
-        disabled_after = int(self._disabled_pq_rounds_left)
-
-        # EAFT-style entropy matching: move draft entropy towards target entropy.
-        p_ent = sig.p_entropy_mean
-        q_ent = sig.q_entropy_mean
-        if p_ent is not None and q_ent is not None and math.isfinite(p_ent) and math.isfinite(q_ent):
-            # If q entropy < p entropy => draft is over-confident => increase temp.
-            # If q entropy > p entropy => draft is too diffuse => decrease temp.
-            delta = float(p_ent - q_ent)
-            scale = math.exp(self.cfg.ent_kp * delta)
-            new_temp = float(self.cfg.temp_mul) * float(scale)
-            new_temp = max(self.cfg.temp_min, min(self.cfg.temp_max, new_temp))
-            self.cfg.temp_mul = float(new_temp)
-            dbg.update(
-                {
-                    "p_ent": float(p_ent),
-                    "q_ent": float(q_ent),
-                    "delta_ent": float(delta),
-                    "temp_mul": float(self.cfg.temp_mul),
-                    "scale": float(scale),
-                }
-            )
-        else:
-            dbg.update({"temp_mul": float(self.cfg.temp_mul)})
-
-        dbg["pq_disabled_rounds_left"] = int(self._disabled_pq_rounds_left)
-        dbg["pq_disabled_before"] = int(disabled_before)
-        dbg["pq_disabled_set"] = int(disabled_set)
-        dbg["pq_disabled_after"] = int(disabled_after)
-        dbg["pq_disabled_triggered"] = bool(disabled_set > disabled_before)
-        return float(self.cfg.temp_mul), dbg
 
 
 @dataclass
@@ -327,8 +172,11 @@ def compute_adaptive_max_steps_for_req(
     *,
     step_count: int,
     verify_ct_ge: int,
+    last_verify_ct_ge: int,
     accept_ema_hard_le: float,
     accept_ema_medium_le: float,
+    accept_last_hard_le: float,
+    accept_last_medium_le: float,
     hard_cap_steps: int,
     medium_cap_steps: int,
     q_entropy_hard_le: float = -1.0,
@@ -350,16 +198,26 @@ def compute_adaptive_max_steps_for_req(
     hard_cap_steps = max(1, min(step_count, int(hard_cap_steps)))
     medium_cap_steps = max(hard_cap_steps, min(step_count, int(medium_cap_steps)))
     verify_ct_ge = max(0, int(verify_ct_ge))
+    last_verify_ct_ge = max(0, int(last_verify_ct_ge))
 
     if req_state is None:
         return step_count
-    if int(getattr(req_state, "verify_ct_last", 0)) < verify_ct_ge:
+    verify_ct = int(getattr(req_state, "verify_ct_last", 0))
+    if verify_ct < min(verify_ct_ge, last_verify_ct_ge):
         return step_count
 
     accept_ema = float(getattr(req_state, "accept_len_ema", 0.0))
+    accept_last = float(getattr(req_state, "accept_len_last", 0.0))
     q_entropy = getattr(req_state, "q_entropy_mean_last", None)
     q_max = getattr(req_state, "q_max_mean_last", None)
     tv_mean = getattr(req_state, "tv_mean_last", None)
+
+    if (
+        accept_last_hard_le >= 0.0
+        and verify_ct >= last_verify_ct_ge
+        and accept_last <= float(accept_last_hard_le)
+    ):
+        return hard_cap_steps
     if (
         q_entropy_hard_le >= 0.0
         and q_entropy is not None
@@ -403,6 +261,12 @@ def compute_adaptive_max_steps_for_req(
 
     if accept_ema <= float(accept_ema_hard_le):
         return hard_cap_steps
+    if (
+        accept_last_medium_le >= 0.0
+        and verify_ct >= last_verify_ct_ge
+        and accept_last <= float(accept_last_medium_le)
+    ):
+        return medium_cap_steps
     if accept_ema <= float(accept_ema_medium_le):
         return medium_cap_steps
     return step_count

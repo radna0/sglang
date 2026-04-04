@@ -156,15 +156,25 @@ def _extract_fallback_answer(text: str) -> str | None:
 
 
 def _build_sampling_params(
-    *, temperature: float, top_p: float, top_k: int, min_p: float
+    *,
+    temperature: float,
+    top_p: float,
+    top_k: int,
+    min_p: float,
+    sampling_strategy: str | None = None,
 ) -> dict[str, Any]:
-    return {
+    sampling_params = {
         "temperature": float(temperature),
         "top_p": float(top_p),
         "top_k": int(top_k),
         "min_p": float(min_p),
         "ignore_eos": True,
     }
+    if sampling_strategy:
+        sampling_params["custom_params"] = {
+            "sampling_strategy": str(sampling_strategy),
+        }
+    return sampling_params
 
 
 def _compute_output_lens(
@@ -228,6 +238,9 @@ def _launch_server(
     speculative_eagle_topk: int | None,
     speculative_num_draft_tokens: int | None,
     mem_fraction_static: float | None,
+    draft_mem_fraction_static: float | None,
+    sampling_backend: str | None,
+    skip_tokenizer_init: bool,
     disable_overlap_schedule: bool,
     tool_server: str | None = None,
 ) -> object:
@@ -245,6 +258,8 @@ def _launch_server(
         "1",
         "--attention-backend",
         str(attention_backend),
+        "--sampling-backend",
+        str(sampling_backend or "flashinfer"),
         "--moe-runner-backend",
         str(moe_runner_backend),
         "--kv-cache-dtype",
@@ -265,6 +280,8 @@ def _launch_server(
         "--port",
         str(int(port)),
     ]
+    if skip_tokenizer_init:
+        cmd.append("--skip-tokenizer-init")
     if mem_fraction_static is not None:
         cmd += ["--mem-fraction-static", str(float(mem_fraction_static))]
     if tool_server:
@@ -296,6 +313,11 @@ def _launch_server(
             ]
         if draft_kv_cache_dtype:
             cmd += ["--speculative-draft-kv-cache-dtype", str(draft_kv_cache_dtype)]
+        if draft_mem_fraction_static is not None:
+            cmd += [
+                "--speculative-draft-mem-fraction-static",
+                str(float(draft_mem_fraction_static)),
+            ]
         if draft_page_size is not None:
             cmd += ["--speculative-draft-page-size", str(int(draft_page_size))]
         if speculative_moe_runner_backend:
@@ -570,14 +592,22 @@ def _bench_one(
     top_p: float,
     top_k: int,
     min_p: float,
+    sampling_strategy: str | None,
     disable_stream: bool = False,
+    use_input_ids: bool = False,
 ) -> BenchRun:
     if len(prompts) != len(output_lens):
         raise ValueError("prompts and output_lens must have the same length")
-    reqs = [
-        DatasetRow(prompt=p, prompt_len=0, output_len=int(out))
-        for p, out in zip(prompts, output_lens)
-    ]
+    reqs = []
+    for p, out in zip(prompts, output_lens):
+        prompt_payload: str | list[int]
+        prompt_len = 0
+        if use_input_ids:
+            prompt_payload = tokenizer.encode(p, add_special_tokens=False)
+            prompt_len = len(prompt_payload)
+        else:
+            prompt_payload = p
+        reqs.append(DatasetRow(prompt=prompt_payload, prompt_len=prompt_len, output_len=int(out)))
 
     args = argparse.Namespace(
         disable_ignore_eos=False,
@@ -607,6 +637,7 @@ def _bench_one(
             top_p=top_p,
             top_k=top_k,
             min_p=min_p,
+            sampling_strategy=sampling_strategy,
         )
     }
 
@@ -740,6 +771,9 @@ def _run_single(
     speculative_eagle_topk: int | None,
     speculative_num_draft_tokens: int | None,
     mem_fraction_static: float | None,
+    draft_mem_fraction_static: float | None,
+    sampling_backend: str | None,
+    skip_tokenizer_init: bool,
     disable_overlap_schedule: bool,
     prompts: list[str],
     prompt_question_ids: list[str],
@@ -750,7 +784,9 @@ def _run_single(
     top_p: float,
     top_k: int,
     min_p: float,
+    sampling_strategy: str | None,
     disable_stream: bool,
+    use_input_ids: bool,
 ) -> BenchRun:
     proc = _launch_server(
         model_path=model_path,
@@ -777,6 +813,9 @@ def _run_single(
         speculative_eagle_topk=speculative_eagle_topk,
         speculative_num_draft_tokens=speculative_num_draft_tokens,
         mem_fraction_static=mem_fraction_static,
+        draft_mem_fraction_static=draft_mem_fraction_static,
+        sampling_backend=sampling_backend,
+        skip_tokenizer_init=skip_tokenizer_init,
         disable_overlap_schedule=disable_overlap_schedule,
     )
     base_url = f"http://127.0.0.1:{int(port)}"
@@ -794,7 +833,9 @@ def _run_single(
             top_p=top_p,
             top_k=top_k,
             min_p=min_p,
+            sampling_strategy=sampling_strategy,
             disable_stream=disable_stream,
+            use_input_ids=use_input_ids,
         )
     finally:
         kill_process_tree(proc.pid)
@@ -835,10 +876,13 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--speculative-eagle-topk", type=int, default=None)
     p.add_argument("--speculative-num-draft-tokens", type=int, default=None)
     p.add_argument("--mem-fraction-static", type=float, default=None)
+    p.add_argument("--draft-mem-fraction-static", type=float, default=None)
+    p.add_argument("--sampling-backend", default="flashinfer")
     p.add_argument("--temperature", type=float, default=0.0)
     p.add_argument("--top-p", type=float, default=1.0)
     p.add_argument("--top-k", type=int, default=1)
     p.add_argument("--min-p", type=float, default=0.0)
+    p.add_argument("--sampling-strategy", default=None)
     p.add_argument("--disable-cuda-graph", action="store_true")
     p.add_argument("--disable-overlap-schedule", action="store_true")
     p.add_argument(
@@ -848,6 +892,8 @@ def _parse_args() -> argparse.Namespace:
         default="DFLASH",
     )
     p.add_argument("--disable-stream", action="store_true")
+    p.add_argument("--skip-tokenizer-init", action="store_true")
+    p.add_argument("--use-input-ids", action="store_true")
     return p.parse_args()
 
 
@@ -910,6 +956,9 @@ def main() -> int:
             speculative_eagle_topk=None,
             speculative_num_draft_tokens=None,
             mem_fraction_static=args.mem_fraction_static,
+            draft_mem_fraction_static=args.draft_mem_fraction_static,
+            sampling_backend=args.sampling_backend,
+            skip_tokenizer_init=bool(args.skip_tokenizer_init),
             disable_overlap_schedule=bool(args.disable_overlap_schedule),
             prompts=prompts,
             prompt_question_ids=prompt_question_ids,
@@ -920,7 +969,11 @@ def main() -> int:
             top_p=args.top_p,
             top_k=args.top_k,
             min_p=args.min_p,
+            sampling_strategy=(
+                str(args.sampling_strategy) if args.sampling_strategy is not None else None
+            ),
             disable_stream=bool(args.disable_stream),
+            use_input_ids=bool(args.use_input_ids),
         )
 
     dflash = _run_single(
@@ -948,6 +1001,9 @@ def main() -> int:
         speculative_eagle_topk=args.speculative_eagle_topk,
         speculative_num_draft_tokens=args.speculative_num_draft_tokens,
         mem_fraction_static=args.mem_fraction_static,
+        draft_mem_fraction_static=args.draft_mem_fraction_static,
+        sampling_backend=args.sampling_backend,
+        skip_tokenizer_init=bool(args.skip_tokenizer_init),
         disable_overlap_schedule=bool(args.disable_overlap_schedule),
         prompts=prompts,
         prompt_question_ids=prompt_question_ids,
@@ -958,7 +1014,11 @@ def main() -> int:
         top_p=args.top_p,
         top_k=args.top_k,
         min_p=args.min_p,
+        sampling_strategy=(
+            str(args.sampling_strategy) if args.sampling_strategy is not None else None
+        ),
         disable_stream=bool(args.disable_stream),
+        use_input_ids=bool(args.use_input_ids),
     )
 
     report = {
@@ -1002,11 +1062,18 @@ def main() -> int:
             "max_running_requests": args.max_running_requests,
             "piecewise_cuda_graph_max_tokens": args.piecewise_cuda_graph_max_tokens,
             "mem_fraction_static": args.mem_fraction_static,
+            "draft_mem_fraction_static": args.draft_mem_fraction_static,
+            "sampling_backend": args.sampling_backend,
+            "skip_tokenizer_init": bool(args.skip_tokenizer_init),
+            "use_input_ids": bool(args.use_input_ids),
             "disable_overlap_schedule": bool(args.disable_overlap_schedule),
             "temperature": args.temperature,
             "top_p": args.top_p,
             "top_k": args.top_k,
             "min_p": args.min_p,
+            "sampling_strategy": (
+                str(args.sampling_strategy) if args.sampling_strategy is not None else None
+            ),
             "disable_stream": bool(args.disable_stream),
             "skip_baseline": bool(args.skip_baseline),
         },

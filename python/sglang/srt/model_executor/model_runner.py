@@ -126,6 +126,7 @@ from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
 from sglang.srt.model_executor.cuda_graph_runner import (
     CudaGraphRunner,
     DecodeInputBuffers,
+    DFlashMultiWidthCudaGraphRunner,
     set_torch_compile_config,
 )
 from sglang.srt.model_executor.forward_batch_info import (
@@ -2092,6 +2093,23 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             capture_forward_mode = ForwardMode.EXTEND
         capture_hidden_mode = CaptureHiddenMode.NULL
         num_tokens_per_bs = 1
+        dflash_target_graph_mode_env = (
+            os.environ.get("SGLANG_DFLASH_TARGET_CUDA_GRAPH_MODE") or ""
+        ).strip().lower()
+        dflash_true_decode_verify = (
+            os.environ.get("SGLANG_DFLASH_VERIFY_USE_TRUE_DECODE_LOOP") or ""
+        ).strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        dflash_target_graph_mode = (
+            dflash_target_graph_mode_env
+            or ("decode" if dflash_true_decode_verify else "verify")
+        )
+        if dflash_target_graph_mode not in {"verify", "decode"}:
+            dflash_target_graph_mode = "verify"
         if (
             self.spec_algorithm.is_eagle()
             or self.spec_algorithm.is_standalone()
@@ -2100,7 +2118,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         ):
             # Speculative algorithms use a dedicated draft worker. That worker still
             # needs a normal warmup pass, so do not special-case it into TARGET_VERIFY.
-            if not self.is_draft_worker:
+            if (
+                not self.is_draft_worker
+                and not (
+                    self.spec_algorithm.is_dflash_family()
+                    and dflash_target_graph_mode == "decode"
+                )
+            ):
                 capture_forward_mode = ForwardMode.TARGET_VERIFY
                 num_tokens_per_bs = self.server_args.speculative_num_draft_tokens
 
@@ -2423,7 +2447,19 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 "npu": NPUGraphRunner,
             },
         )
-        self.graph_runner = graph_runners[self.device](self)
+        use_dflash_multiwidth_verify_graphs = bool(
+            self.device == "cuda"
+            and self.spec_algorithm.is_dflash_family()
+            and not self.is_draft_worker
+            and (
+                os.environ.get("SGLANG_DFLASH_MULTIWIDTH_VERIFY_GRAPH_DRAFT_TOKENS")
+                or ""
+            ).strip()
+        )
+        if use_dflash_multiwidth_verify_graphs:
+            self.graph_runner = DFlashMultiWidthCudaGraphRunner(self)
+        else:
+            self.graph_runner = graph_runners[self.device](self)
 
         after_mem = get_available_gpu_memory(self.device, self.gpu_id)
         self.graph_mem_usage = before_mem - after_mem
