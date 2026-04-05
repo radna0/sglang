@@ -572,6 +572,14 @@ class CudaGraphRunner:
 
         # Graph inputs
         input_ids = buffers.input_ids[:num_tokens]
+        input_embeds = (
+            buffers.input_embeds[:num_tokens]
+            if (
+                self.model_runner.spec_algorithm.is_dflash()
+                and self.model_runner.is_draft_worker
+            )
+            else None
+        )
         req_pool_indices = buffers.req_pool_indices[:bs]
         seq_lens = buffers.seq_lens[:bs]
         seq_lens_cpu = buffers.seq_lens_cpu[:bs]
@@ -688,6 +696,7 @@ class CudaGraphRunner:
             num_token_non_padded=buffers.num_token_non_padded,
             global_forward_mode=self.capture_forward_mode,
             lora_ids=lora_ids,
+            input_embeds=input_embeds,
         )
         self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
 
@@ -724,6 +733,8 @@ class CudaGraphRunner:
                 kwargs["pp_proxy_tensors"] = PPProxyTensors(
                     {k: v.clone() for k, v in pp_proxy_tensors.tensors.items()}
                 )
+            if input_embeds is not None and "input_embeds" in inspect.signature(forward).parameters:
+                kwargs["input_embeds"] = input_embeds
 
             logits_output_or_pp_proxy_tensors = forward(
                 input_ids,
@@ -822,6 +833,12 @@ class CudaGraphRunner:
             ),
             pp_proxy_tensors=pp_proxy_tensors,
         )
+        if (
+            self.model_runner.spec_algorithm.is_dflash()
+            and self.model_runner.is_draft_worker
+            and forward_batch.input_embeds is not None
+        ):
+            buffers.input_embeds[:raw_num_token].copy_(forward_batch.input_embeds)
         if self.enable_two_batch_overlap:
             self.tbo_plugin.replay_prepare(
                 forward_mode=self.capture_forward_mode,
@@ -867,6 +884,14 @@ class CudaGraphRunner:
             # In speculative decoding, these two fields are still needed.
             self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
             self.buffers.positions[: self.raw_num_token].copy_(forward_batch.positions)
+            if (
+                self.model_runner.spec_algorithm.is_dflash()
+                and self.model_runner.is_draft_worker
+                and forward_batch.input_embeds is not None
+            ):
+                self.buffers.input_embeds[: self.raw_num_token].copy_(
+                    forward_batch.input_embeds
+                )
 
         # Replay
         if self.enable_pdmux:
@@ -946,6 +971,31 @@ class CudaGraphRunner:
                 draft_token_num=self.num_tokens_per_bs,
             )
             spec_info.capture_hidden_mode = CaptureHiddenMode.NULL
+
+        elif self.model_runner.spec_algorithm.is_dflash():
+            from sglang.srt.speculative.dflash_info import DFlashVerifyInput
+            from sglang.srt.speculative.dflash_utils import (
+                resolve_dflash_verify_mask_policy,
+            )
+
+            _, build_custom_mask = resolve_dflash_verify_mask_policy(
+                self.model_runner.attn_backend
+            )
+            spec_info = DFlashVerifyInput(
+                draft_token=None,
+                positions=None,
+                draft_token_num=self.model_runner.server_args.speculative_num_draft_tokens,
+                custom_mask=(
+                    None
+                    if (self.model_runner.is_draft_worker or not build_custom_mask)
+                    else self.buffers.custom_mask
+                ),
+                capture_hidden_mode=(
+                    CaptureHiddenMode.NULL
+                    if self.model_runner.is_draft_worker
+                    else CaptureHiddenMode.FULL
+                ),
+            )
 
         return spec_info
 
