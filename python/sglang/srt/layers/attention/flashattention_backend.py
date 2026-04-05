@@ -1170,42 +1170,44 @@ class FlashAttentionBackend(AttentionBackend):
                 if topk_indices.shape[0] != bs:
                     topk_indices = topk_indices[:bs]
 
-                loc_ids_list = []
-                seqlens_k = []
-                for i in range(bs):
-                    seq_len = int(forward_batch.seq_lens_cpu[i].item())
-                    if seq_len <= 0:
-                        loc_ids_list.append(
-                            torch.empty((0,), dtype=torch.int32, device=q.device)
-                        )
-                        seqlens_k.append(0)
-                        continue
-                    page_table_1 = req_to_token[req_pool_indices[i], :seq_len]
-                    idx = topk_indices[i].to(torch.int64)
-                    valid = (idx >= 0) & (idx < seq_len)
-                    if valid.any():
-                        idx = idx[valid]
-                    else:
-                        idx = idx.new_tensor([seq_len - 1])
-                    loc = page_table_1[idx]
-                    loc_ids_list.append(loc)
-                    seqlens_k.append(int(loc.shape[0]))
+                # Vectorized mapping: per-request topk indices (relative positions) -> token pool loc ids.
+                seq_lens = forward_batch.seq_lens_cpu.to(torch.int64)[:bs]  # (bs,)
+                valid_rows = seq_lens > 0
+                if not torch.any(valid_rows):
+                    return q.new_zeros((bs, layer.tp_q_head_num * layer.v_head_dim))
 
-                total_k = int(sum(seqlens_k))
+                max_seq_len = int(seq_lens.max().item())
+                page_table_1 = req_to_token[req_pool_indices, :max_seq_len]
+
+                idx = topk_indices.to(torch.int64)
+                if idx.dim() == 1:
+                    idx = idx.view(bs, 1)
+                topk = int(idx.shape[1])
+
+                # Clamp invalid/negative indices and cap to each row's seq_len - 1.
+                idx = torch.clamp(idx, min=0)
+                row_max = (seq_lens - 1).clamp(min=0).view(bs, 1)
+                idx = torch.minimum(idx, row_max)
+                idx = idx.clamp(max=max_seq_len - 1)
+
+                loc = page_table_1.gather(dim=1, index=idx)  # (bs, topk)
+                # For rows with seq_len==0, seqlens_k is 0 so they contribute no keys/values.
+                seqlens_k_t = torch.where(
+                    valid_rows, torch.full_like(seq_lens, topk), torch.zeros_like(seq_lens)
+                ).to(torch.int32)
+                loc_ids = loc[valid_rows].reshape(-1).to(torch.int64)
+
+                total_k = int(seqlens_k_t.sum().item())
                 if total_k == 0:
                     return q.new_zeros((bs, layer.tp_q_head_num * layer.v_head_dim))
 
-                loc_ids = torch.cat(loc_ids_list, dim=0).to(torch.int64)
                 cu_seqlens_q = torch.arange(
                     0, bs + 1, dtype=torch.int32, device=q.device
-                )
-                seqlens_k_t = torch.tensor(
-                    seqlens_k, dtype=torch.int32, device=q.device
                 )
                 cu_seqlens_k = torch.nn.functional.pad(
                     torch.cumsum(seqlens_k_t, dim=0, dtype=torch.int32), (1, 0)
                 )
-                max_seqlen_k = int(max(seqlens_k))
+                max_seqlen_k = topk
 
                 key_buf = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
                 value_buf = forward_batch.token_to_kv_pool.get_value_buffer(
