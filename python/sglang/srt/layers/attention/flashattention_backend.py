@@ -1153,6 +1153,10 @@ class FlashAttentionBackend(AttentionBackend):
             # Do multi-head attention
             if topk_indices is not None:
                 # Sparse decode: attend to per-token top-k indices only (GPT-OSS GQA DSA).
+                assert forward_batch.forward_mode.is_decode_or_idle(), (
+                    "GPT-OSS GQA DSA topk_indices are decode-only; "
+                    f"got forward_mode={forward_batch.forward_mode}"
+                )
                 assert (
                     forward_batch.seq_lens_cpu is not None
                 ), "topk_indices requires seq_lens_cpu"
