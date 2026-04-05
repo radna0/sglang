@@ -87,3 +87,9 @@ def test_transform_index_uses_fast_cuda_path_when_available():
     assert "transform_index_page_table_prefill_fast(**kwargs)" in text
     assert "page_table.is_cuda" in text
     assert "topk_indices.shape[1] == 2048" in text
+
+
+def test_flash_attention_v4_wrapper_exposes_block_sparse_tensors():
+    text = _read_repo_file("python/sglang/jit_kernel/flash_attention_v4.py")
+    assert "block_sparse_tensors: Optional[object] = None" in text
+    assert "block_sparse_tensors=block_sparse_tensors" in text
