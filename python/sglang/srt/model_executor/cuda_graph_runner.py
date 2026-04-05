@@ -360,6 +360,17 @@ class CudaGraphRunner:
             and model_runner.eagle_use_aux_hidden_state
         ):
             self.model_runner.model.set_eagle3_layers_to_capture()
+        if model_runner.spec_algorithm.is_dflash() and getattr(
+            model_runner, "dflash_use_aux_hidden_state", False
+        ):
+            if not hasattr(self.model_runner.model, "set_dflash_layers_to_capture"):
+                raise ValueError(
+                    f"Model {self.model_runner.model.__class__.__name__} does not implement set_dflash_layers_to_capture, "
+                    "which is required for DFLASH aux hidden capture."
+                )
+            self.model_runner.model.set_dflash_layers_to_capture(
+                self.model_runner.dflash_target_layer_ids
+            )
 
         # Capture
         try:
@@ -385,6 +396,7 @@ class CudaGraphRunner:
                 max(forward_batch.global_num_tokens_cpu) // self.num_tokens_per_bs
                 if self.model_runner.spec_algorithm.is_eagle()
                 or self.model_runner.spec_algorithm.is_standalone()
+                or self.model_runner.spec_algorithm.is_dflash()
                 else max(forward_batch.global_num_tokens_cpu)
             )
         else:
@@ -785,11 +797,12 @@ class CudaGraphRunner:
         if self.require_mlp_tp_gather:
             max_num_tokens = max(forward_batch.global_num_tokens_cpu)
             max_batch_size = (
-                max_num_tokens / self.num_tokens_per_bs
-                if self.model_runner.spec_algorithm.is_eagle()
-                or self.model_runner.spec_algorithm.is_standalone()
-                else max_num_tokens
-            )
+            max_num_tokens / self.num_tokens_per_bs
+            if self.model_runner.spec_algorithm.is_eagle()
+            or self.model_runner.spec_algorithm.is_standalone()
+            or self.model_runner.spec_algorithm.is_dflash()
+            else max_num_tokens
+        )
             index = bisect.bisect_left(self.capture_bs, max_batch_size)
         else:
             index = bisect.bisect_left(self.capture_bs, raw_bs)
