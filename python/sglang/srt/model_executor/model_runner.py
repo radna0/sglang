@@ -1951,11 +1951,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             capture_forward_mode = ForwardMode.EXTEND
         capture_hidden_mode = CaptureHiddenMode.NULL
         num_tokens_per_bs = 1
-        if (
+        if self.spec_algorithm.is_dflash():
+            capture_forward_mode = ForwardMode.TARGET_VERIFY
+            num_tokens_per_bs = self.server_args.speculative_num_draft_tokens
+        elif (
             self.spec_algorithm.is_eagle()
             or self.spec_algorithm.is_standalone()
             or self.spec_algorithm.is_ngram()
-            or self.spec_algorithm.is_dflash_family()
         ):
             if not self.is_draft_worker:
                 capture_forward_mode = ForwardMode.TARGET_VERIFY

@@ -78,14 +78,14 @@ The upstream DFlash PR lineage (`#16818`, later `#22077`) makes the intended des
 clear:
 
 - DFlash uses a fixed-size block proposal
-- DFlash verify can reuse target TARGET_VERIFY graphs
+- DFlash verify reuses the target `ForwardMode.TARGET_VERIFY` path (and therefore the target-side capture machinery)
 - EAGLE / STANDALONE / NGRAM draft workers should keep their own draft graph paths
 
 The key upstream comment is:
 
 > EAGLE/standalone/ngram draft workers use separate cuda-graph runners; do not
 > capture TARGET_VERIFY graphs here. DFLASH draft uses a fixed-size block and
-> reuses TARGET_VERIFY graphs for performance.
+> reuses the TARGET_VERIFY mode for performance.
 
 That is the design center of this branch.
 

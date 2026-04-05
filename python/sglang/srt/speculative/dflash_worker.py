@@ -124,15 +124,6 @@ class DFlashWorker:
         draft_server_args.prefill_attention_backend = None
         draft_server_args.decode_attention_backend = None
         draft_server_args.attention_backend = draft_backend
-        # DFlash draft graphs need the target embedding bound first. We temporarily
-        # suppress graph capture during worker construction, then re-capture after
-        # wiring the shared embedding module.
-        draft_disable_cuda_graph = bool(draft_server_args.disable_cuda_graph)
-        draft_enable_piecewise_cuda_graph = bool(
-            getattr(draft_server_args, "enable_piecewise_cuda_graph", False)
-        )
-        draft_server_args.disable_cuda_graph = True
-        draft_server_args.enable_piecewise_cuda_graph = False
         # Keep draft context length aligned with the target.
         draft_server_args.context_length = (
             target_worker.model_runner.model_config.context_len
@@ -155,19 +146,6 @@ class DFlashWorker:
         set_global_server_args_for_scheduler(saved_server_args)
         self.draft_model_runner = self.draft_worker.model_runner
         self.draft_model = self.draft_model_runner.model
-        embed_module = self._resolve_target_embed_module(
-            target_worker.model_runner.model
-        )
-        if hasattr(self.draft_model, "set_embed"):
-            self.draft_model.set_embed(embed_module)
-        self.draft_model_runner.server_args.disable_cuda_graph = draft_disable_cuda_graph
-        self.draft_model_runner.server_args.enable_piecewise_cuda_graph = (
-            draft_enable_piecewise_cuda_graph
-        )
-        if (self.device == "cuda" or self.device == "musa") and not draft_disable_cuda_graph:
-            self.draft_model_runner.init_device_graphs()
-        if draft_enable_piecewise_cuda_graph:
-            self.draft_model_runner.init_piecewise_cuda_graphs()
         draft_config = parse_dflash_draft_config(
             draft_hf_config=self.draft_model_runner.model_config.hf_config
         )
@@ -241,21 +219,6 @@ class DFlashWorker:
         self._fused_kv_helper: Optional[object] = None
         if self._use_fused_kv_materialize:
             self._init_fused_kv_helper()
-
-    @staticmethod
-    def _resolve_target_embed_module(target_model: object) -> object:
-        embed_module = getattr(target_model, "embed_tokens", None)
-        if embed_module is not None:
-            return embed_module
-        get_input_embeddings = getattr(target_model, "get_input_embeddings", None)
-        if callable(get_input_embeddings):
-            embed_module = get_input_embeddings()
-            if embed_module is not None:
-                return embed_module
-        raise RuntimeError(
-            "DFLASH requires the target model to expose an embedding module "
-            "via `.embed_tokens` or `.get_input_embeddings()`."
-        )
 
     def _init_fused_kv_helper(self) -> None:
         """Initialize the fused KV materialization helper with pre-stacked weights."""
@@ -573,7 +536,7 @@ class DFlashWorker:
         self._append_target_hidden_to_draft_kv(batch, draft_input)
 
         target_model = self.target_worker.model_runner.model
-        embed_module = self._resolve_target_embed_module(target_model)
+        embed_module = target_model.get_input_embeddings()
         lm_head = getattr(target_model, "lm_head", None)
         if (
             lm_head is None
