@@ -6,10 +6,30 @@ import triton.language as tl
 
 
 def transform_index_page_table_prefill(**kwargs):
+    page_table = kwargs["page_table"]
+    topk_indices = kwargs["topk_indices"]
+    page_size = kwargs.get("page_size", 1)
+    if (
+        page_size == 1
+        and page_table.is_cuda
+        and topk_indices.is_cuda
+        and topk_indices.shape[1] == 2048
+    ):
+        return transform_index_page_table_prefill_fast(**kwargs)
     return transform_index_page_table_prefill_ref(**kwargs)
 
 
 def transform_index_page_table_decode(**kwargs):
+    page_table = kwargs["page_table"]
+    topk_indices = kwargs["topk_indices"]
+    page_size = kwargs.get("page_size", 1)
+    if (
+        page_size == 1
+        and page_table.is_cuda
+        and topk_indices.is_cuda
+        and topk_indices.shape[1] == 2048
+    ):
+        return transform_index_page_table_decode_fast(**kwargs)
     return transform_index_page_table_decode_ref(**kwargs)
 
 

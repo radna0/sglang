@@ -34,10 +34,20 @@ def test_flashattention_sparse_path_masks_padded_topk_entries():
     text = _read_repo_file(
         "python/sglang/srt/layers/attention/flashattention_backend.py"
     )
-    assert "valid_topk_mask = idx >= 0" in text
-    assert "seqlens_k_t = valid_topk_mask.sum(dim=1).to(torch.int32)" in text
-    assert "loc_ids = loc[valid_topk_mask].reshape(-1).to(torch.int64)" in text
-    assert "max_seqlen_k = int(seqlens_k_t.max().item())" in text
+    assert "valid_topk_mask = (idx >= 0) & (idx <= row_max)" in text
+    assert "torch.full_like(idx, -1)" in text
+    assert "seqlens_k_t = (sparse_page_table != -1).sum(dim=1).to(" in text
+
+
+def test_flashattention_sparse_path_uses_sparse_page_table_decode():
+    text = _read_repo_file(
+        "python/sglang/srt/layers/attention/flashattention_backend.py"
+    )
+    assert "transform_index_page_table_decode(" in text
+    assert "page_size=1" in text
+    assert "key_cache_sparse = key_buf.view(" in text
+    assert "value_cache_sparse = value_buf.view(" in text
+    assert "page_table=sparse_page_table" in text
 
 
 def test_flashattention_disables_dsa_when_seq_len_fits_topk_budget():
@@ -69,3 +79,11 @@ def test_gpt_oss_attention_keeps_sink_forwarding():
         "python/sglang/srt/layers/attention/flashattention_backend.py"
     )
     assert 'kwargs["sinks"] = sinks' in backend_text
+
+
+def test_transform_index_uses_fast_cuda_path_when_available():
+    text = _read_repo_file("python/sglang/srt/layers/attention/nsa/transform_index.py")
+    assert "transform_index_page_table_decode_fast(**kwargs)" in text
+    assert "transform_index_page_table_prefill_fast(**kwargs)" in text
+    assert "page_table.is_cuda" in text
+    assert "topk_indices.shape[1] == 2048" in text
