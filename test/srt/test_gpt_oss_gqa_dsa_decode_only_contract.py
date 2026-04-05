@@ -36,6 +36,16 @@ def test_flashattention_sparse_path_masks_padded_topk_entries():
     assert "max_seqlen_k = int(seqlens_k_t.max().item())" in text
 
 
+def test_flashattention_disables_dsa_when_seq_len_fits_topk_budget():
+    text = _read_repo_file(
+        "python/sglang/srt/layers/attention/flashattention_backend.py"
+    )
+    assert "sparse_rows = valid_rows & (seq_lens > topk)" in text
+    assert "if not torch.any(sparse_rows):" in text
+    assert "topk_indices = None" in text
+    assert "dense_rows = valid_rows & ~sparse_rows" in text
+
+
 def test_gpt_oss_dsa_is_gated_to_full_attention_layers_only():
     text = _read_repo_file("python/sglang/srt/models/gpt_oss.py")
     assert (

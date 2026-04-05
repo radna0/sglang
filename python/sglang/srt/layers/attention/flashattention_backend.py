@@ -1177,65 +1177,151 @@ class FlashAttentionBackend(AttentionBackend):
                 # Vectorized mapping: per-request topk indices (relative positions) -> token pool loc ids.
                 seq_lens = forward_batch.seq_lens.to(dtype=torch.int64)[:bs]  # (bs,)
                 valid_rows = seq_lens > 0
-                if not torch.any(valid_rows):
-                    return q.new_zeros((bs, layer.tp_q_head_num * layer.v_head_dim))
-
-                max_seq_len = int(seq_lens.max().item())
-                page_table_1 = req_to_token[req_pool_indices, :max_seq_len]
-
+                # Do not use DSA when the request already fits entirely inside the sparse budget.
+                # In that regime, dense full attention is the correct/faster path.
                 idx = topk_indices.to(torch.int64)
                 if idx.dim() == 1:
                     idx = idx.view(bs, 1)
                 topk = int(idx.shape[1])
+                sparse_rows = valid_rows & (seq_lens > topk)
+                if not torch.any(sparse_rows):
+                    topk_indices = None
+                else:
+                    dense_rows = valid_rows & ~sparse_rows
+                    q_reshaped = q.contiguous().view(
+                        -1, layer.tp_q_head_num, layer.head_dim
+                    )
+                    output = q.new_zeros(
+                        (bs, layer.tp_q_head_num, layer.v_head_dim)
+                    )
 
-                # Track valid top-k entries explicitly so padded -1 slots do not get
-                # turned into duplicated token-0 attends. This preserves dense-equivalence
-                # when the sparse path covers the full token set for a request.
-                valid_topk_mask = idx >= 0
-                idx = torch.clamp(idx, min=0)
-                row_max = (seq_lens - 1).clamp(min=0).view(bs, 1)
-                valid_topk_mask = valid_topk_mask & (idx <= row_max)
-                idx = torch.minimum(idx, row_max)
-                idx = idx.clamp(max=max_seq_len - 1)
+                    if torch.any(sparse_rows):
+                        seq_lens_sparse = seq_lens[sparse_rows]
+                        req_pool_indices_sparse = req_pool_indices[sparse_rows]
+                        idx = idx[sparse_rows]
 
-                loc = page_table_1.gather(dim=1, index=idx)  # (bs, topk)
-                valid_topk_mask = valid_topk_mask & valid_rows.view(bs, 1)
-                # For rows with seq_len==0 or padded top-k entries, contribute no keys/values.
-                seqlens_k_t = valid_topk_mask.sum(dim=1).to(torch.int32)
-                loc_ids = loc[valid_topk_mask].reshape(-1).to(torch.int64)
+                        max_seq_len = int(seq_lens_sparse.max().item())
+                        page_table_1 = req_to_token[
+                            req_pool_indices_sparse, :max_seq_len
+                        ]
 
-                total_k = int(seqlens_k_t.sum().item())
-                if total_k == 0:
+                        # Track valid top-k entries explicitly so padded -1 slots do not get
+                        # turned into duplicated token-0 attends. This preserves dense-equivalence
+                        # when the sparse path covers the full token set for a request.
+                        valid_topk_mask = idx >= 0
+                        idx = torch.clamp(idx, min=0)
+                        row_max = (seq_lens_sparse - 1).clamp(min=0).view(
+                            seq_lens_sparse.shape[0], 1
+                        )
+                        valid_topk_mask = valid_topk_mask & (idx <= row_max)
+                        idx = torch.minimum(idx, row_max)
+                        idx = idx.clamp(max=max_seq_len - 1)
+
+                        loc = page_table_1.gather(dim=1, index=idx)
+                        valid_topk_mask = valid_topk_mask & (
+                            seq_lens_sparse > 0
+                        ).view(seq_lens_sparse.shape[0], 1)
+                        seqlens_k_t = valid_topk_mask.sum(dim=1).to(torch.int32)
+                        loc_ids = loc[valid_topk_mask].reshape(-1).to(torch.int64)
+
+                        total_k = int(seqlens_k_t.sum().item())
+                        if total_k > 0:
+                            cu_seqlens_q = torch.arange(
+                                0,
+                                int(sparse_rows.sum().item()) + 1,
+                                dtype=torch.int32,
+                                device=q.device,
+                            )
+                            cu_seqlens_k = torch.nn.functional.pad(
+                                torch.cumsum(seqlens_k_t, dim=0, dtype=torch.int32),
+                                (1, 0),
+                            )
+                            max_seqlen_k = int(seqlens_k_t.max().item())
+
+                            key_buf = forward_batch.token_to_kv_pool.get_key_buffer(
+                                layer.layer_id
+                            )
+                            value_buf = (
+                                forward_batch.token_to_kv_pool.get_value_buffer(
+                                    layer.layer_id
+                                )
+                            )
+                            k_sel = key_buf[loc_ids].to(q.dtype)
+                            v_sel = value_buf[loc_ids].to(q.dtype)
+
+                            output_sparse = flash_attn_varlen_func(
+                                q=q_reshaped[sparse_rows],
+                                k=k_sel,
+                                v=v_sel,
+                                cu_seqlens_q=cu_seqlens_q,
+                                cu_seqlens_k=cu_seqlens_k,
+                                max_seqlen_q=1,
+                                max_seqlen_k=max_seqlen_k,
+                                softmax_scale=layer.scaling,
+                                causal=True,
+                                **kwargs,
+                            )
+                            output[sparse_rows] = output_sparse
+
+                    if torch.any(dense_rows):
+                        key_cache, value_cache = (
+                            forward_batch.token_to_kv_pool.get_kv_buffer(
+                                layer.layer_id
+                            )
+                        )
+                        key_cache = key_cache.view(
+                            -1, self.page_size, layer.tp_k_head_num, layer.head_dim
+                        )
+                        value_cache = value_cache.view(
+                            -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
+                        )
+                        page_table = metadata.page_table
+                        if is_swa_layer and self.use_sliding_window_kv_pool:
+                            if metadata.swa_page_table is not None:
+                                page_table = metadata.swa_page_table
+                            else:
+                                page_table = (
+                                    self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                                        metadata.page_table
+                                    )
+                                )
+
+                        dense_count = int(dense_rows.sum().item())
+                        dense_result = flash_attn_with_kvcache(
+                            q=q_reshaped[dense_rows],
+                            k_cache=key_cache,
+                            v_cache=value_cache,
+                            page_table=page_table[dense_rows],
+                            cache_seqlens=metadata.cache_seqlens_int32[dense_rows],
+                            cu_seqlens_q=torch.arange(
+                                0,
+                                dense_count + 1,
+                                dtype=torch.int32,
+                                device=q.device,
+                            ),
+                            max_seqlen_q=1,
+                            softmax_scale=layer.scaling,
+                            causal=False if use_cascade_attn else causal,
+                            window_size=window_size,
+                            softcap=layer.logit_cap,
+                            k_descale=(
+                                k_descale[dense_rows] if k_descale is not None else None
+                            ),
+                            v_descale=(
+                                v_descale[dense_rows] if v_descale is not None else None
+                            ),
+                            return_softmax_lse=use_cascade_attn,
+                            num_splits=self.num_splits,
+                            **kwargs,
+                        )
+                        if use_cascade_attn:
+                            dense_result = dense_result[0]
+                        output[dense_rows] = dense_result
+
+                    return output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
+                if not torch.any(valid_rows):
                     return q.new_zeros((bs, layer.tp_q_head_num * layer.v_head_dim))
-
-                cu_seqlens_q = torch.arange(
-                    0, bs + 1, dtype=torch.int32, device=q.device
-                )
-                cu_seqlens_k = torch.nn.functional.pad(
-                    torch.cumsum(seqlens_k_t, dim=0, dtype=torch.int32), (1, 0)
-                )
-                max_seqlen_k = int(seqlens_k_t.max().item())
-
-                key_buf = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
-                value_buf = forward_batch.token_to_kv_pool.get_value_buffer(
-                    layer.layer_id
-                )
-                k_sel = key_buf[loc_ids].to(q.dtype)
-                v_sel = value_buf[loc_ids].to(q.dtype)
-
-                output = flash_attn_varlen_func(
-                    q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-                    k=k_sel,
-                    v=v_sel,
-                    cu_seqlens_q=cu_seqlens_q,
-                    cu_seqlens_k=cu_seqlens_k,
-                    max_seqlen_q=1,
-                    max_seqlen_k=max_seqlen_k,
-                    softmax_scale=layer.scaling,
-                    causal=True,
-                    **kwargs,
-                )
-                return output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
             key_cache, value_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
                 layer.layer_id
