@@ -1914,6 +1914,9 @@ class NSAMHATokenToKVPool(MHATokenToKVPool):
     ):
         self.index_head_dim = index_head_dim
         self.nsa_kv_cache_store_fp8 = False
+        # The parent KV pool constructor calls get_kv_size_bytes() while finishing allocation logs.
+        # Seed the attribute up front so the override is safe before the real index-K buffers exist.
+        self.index_k_with_scale_buffer = []
 
         super().__init__(
             size=size,
