@@ -1171,7 +1171,9 @@ class FlashAttentionBackend(AttentionBackend):
                     topk_indices = topk_indices[:bs]
 
                 # Vectorized mapping: per-request topk indices (relative positions) -> token pool loc ids.
-                seq_lens = forward_batch.seq_lens_cpu.to(torch.int64)[:bs]  # (bs,)
+                seq_lens = forward_batch.seq_lens_cpu.to(
+                    device=q.device, dtype=torch.int64
+                )[:bs]  # (bs,)
                 valid_rows = seq_lens > 0
                 if not torch.any(valid_rows):
                     return q.new_zeros((bs, layer.tp_q_head_num * layer.v_head_dim))
