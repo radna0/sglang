@@ -24,3 +24,24 @@ def test_flashattention_sparse_path_is_guarded_to_decode_only():
     )
     assert "GPT-OSS GQA DSA topk_indices are decode-only" in text
     assert "forward_batch.forward_mode.is_decode_or_idle()" in text
+
+
+def test_gpt_oss_dsa_is_gated_to_full_attention_layers_only():
+    text = _read_repo_file("python/sglang/srt/models/gpt_oss.py")
+    assert (
+        'server_args.enable_gpt_oss_gqa_dsa and layer_type == "full_attention"' in text
+    )
+    assert 'use_sliding_window = layer_type == "sliding_attention"' in text
+    assert (
+        "sliding_window_size=(sliding_window_size if use_sliding_window else -1)"
+        in text
+    )
+
+
+def test_gpt_oss_attention_keeps_sink_forwarding():
+    text = _read_repo_file("python/sglang/srt/models/gpt_oss.py")
+    assert "sinks=self.sinks" in text
+    backend_text = _read_repo_file(
+        "python/sglang/srt/layers/attention/flashattention_backend.py"
+    )
+    assert 'kwargs["sinks"] = sinks' in backend_text
