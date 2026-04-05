@@ -11,11 +11,15 @@ def test_gpt_oss_prefill_populates_index_cache_without_sparse_attention():
     text = _read_repo_file("python/sglang/srt/models/gpt_oss.py")
     assert "if forward_batch.forward_mode.is_extend_without_speculative():" in text
     assert "return_indices=False" in text
-    assert re.search(
-        r"elif\s+forward_batch\.forward_mode\.is_decode_or_idle\(\):\s+topk_indices\s*=\s*self\.indexer",
-        text,
-        flags=re.DOTALL,
-    )
+    assert "elif forward_batch.forward_mode.is_decode_or_idle():" in text
+    assert "topk_indices = self.indexer(" in text
+
+
+def test_gpt_oss_decode_skips_indexer_for_all_short_batches():
+    text = _read_repo_file("python/sglang/srt/models/gpt_oss.py")
+    assert 'get_global_server_args().gpt_oss_dsa_index_topk' in text
+    assert 'and not torch.any(' in text
+    assert "topk_indices = None" in text
 
 
 def test_flashattention_sparse_path_is_guarded_to_decode_only():

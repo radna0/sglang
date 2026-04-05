@@ -377,13 +377,26 @@ class GptOssAttention(nn.Module):
                     return_indices=False,
                 )
             elif forward_batch.forward_mode.is_decode_or_idle():
-                topk_indices = self.indexer(
-                    x=hidden_states,
-                    q_lora=q,
-                    positions=positions,
-                    forward_batch=forward_batch,
-                    layer_id=self.layer_id,
-                )
+                seq_lens = getattr(forward_batch, "seq_lens", None)
+                if seq_lens is not None:
+                    seq_lens = seq_lens[: q.shape[0]]
+                if (
+                    seq_lens is not None
+                    and seq_lens.numel() > 0
+                    and not torch.any(
+                        seq_lens.to(dtype=torch.int64)
+                        > get_global_server_args().gpt_oss_dsa_index_topk
+                    )
+                ):
+                    topk_indices = None
+                else:
+                    topk_indices = self.indexer(
+                        x=hidden_states,
+                        q_lora=q,
+                        positions=positions,
+                        forward_batch=forward_batch,
+                        layer_id=self.layer_id,
+                    )
 
         extra_args = {}
         if not _is_npu:
