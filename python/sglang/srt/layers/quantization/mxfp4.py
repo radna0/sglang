@@ -57,13 +57,24 @@ _is_sm90_supported = is_cuda() and is_sm90_supported()
 has_triton_kernels = is_triton_kernels_available()
 
 
+_flashinfer_mxfp4_available = False
 if is_flashinfer_available():
-    from flashinfer import (
-        mxfp8_quantize,
-        nvfp4_block_scale_interleave,
-        trtllm_fp4_block_scale_moe,
-    )
-    from flashinfer.fused_moe.core import get_w2_permute_indices_with_cache
+    try:
+        from flashinfer import (  # type: ignore[import-not-found]
+            mxfp8_quantize,
+            nvfp4_block_scale_interleave,
+            trtllm_fp4_block_scale_moe,
+        )
+        from flashinfer.fused_moe.core import (  # type: ignore[import-not-found]
+            get_w2_permute_indices_with_cache,
+        )
+
+        _flashinfer_mxfp4_available = True
+    except Exception:
+        mxfp8_quantize = None  # type: ignore[assignment]
+        nvfp4_block_scale_interleave = None  # type: ignore[assignment]
+        trtllm_fp4_block_scale_moe = None  # type: ignore[assignment]
+        get_w2_permute_indices_with_cache = None  # type: ignore[assignment]
 
 _flashinfer_mxfp4_permute_indices_cache: dict[torch.Size, torch.Tensor] = {}
 _flashinfer_mxfp4_permute_indices_device_cache: dict[
@@ -76,6 +87,8 @@ def _get_flashinfer_mxfp4_device_permute_indices(
     epilogue_tile_m: int,
     num_elts_per_sf: Optional[int] = None,
 ) -> torch.Tensor:
+    if not _flashinfer_mxfp4_available or get_w2_permute_indices_with_cache is None:
+        raise RuntimeError("flashinfer is not available for MXFP4 permutation indices.")
     extra_args = {} if num_elts_per_sf is None else {"num_elts_per_sf": num_elts_per_sf}
     permute_indices = get_w2_permute_indices_with_cache(
         _flashinfer_mxfp4_permute_indices_cache,
