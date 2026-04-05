@@ -463,6 +463,7 @@ class ServerArgs:
     # GPT-OSS native GQA DSA (DeepSeek-style Lightning Indexer + sparse top-k attention)
     enable_gpt_oss_gqa_dsa: bool = False
     gpt_oss_dsa_index_topk: int = 2048
+    gpt_oss_dsa_use_blocksparse_cute: bool = False
     gpt_oss_dsa_index_head_dim: int = 128
     gpt_oss_dsa_index_n_heads: Optional[int] = None  # None = auto (use model num heads)
     gpt_oss_dsa_q_lora_rank: Optional[int] = None  # None = auto (use model hidden size)
@@ -3940,6 +3941,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.gpt_oss_dsa_index_topk,
             help="Top-k tokens to attend for GPT-OSS DSA full-attention layers.",
+        )
+        parser.add_argument(
+            "--gpt-oss-dsa-use-blocksparse-cute",
+            default=ServerArgs.gpt_oss_dsa_use_blocksparse_cute,
+            action="store_true",
+            help="Experimental: route GPT-OSS DSA sparse rows through the vendored CUTE block-sparse attention path (requires extra deps; currently not paged-KV native on SM90).",
         )
         parser.add_argument(
             "--gpt-oss-dsa-index-head-dim",

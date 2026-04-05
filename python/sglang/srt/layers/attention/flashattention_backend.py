@@ -1199,83 +1199,135 @@ class FlashAttentionBackend(AttentionBackend):
                     )
 
                     if torch.any(sparse_rows):
+                        server_args = get_global_server_args()
                         seq_lens_sparse = seq_lens[sparse_rows]
                         req_pool_indices_sparse = req_pool_indices[sparse_rows]
                         idx = idx[sparse_rows]
 
-                        max_seq_len = int(seq_lens_sparse.max().item())
-                        page_table_1 = req_to_token[
-                            req_pool_indices_sparse, :max_seq_len
-                        ]
-
-                        # Keep invalid/padded entries as -1 so we can transform directly
-                        # into sparse token-location page tables without materializing K/V.
-                        row_max = (seq_lens_sparse - 1).clamp(min=0).view(
-                            seq_lens_sparse.shape[0], 1
-                        )
-                        valid_topk_mask = (idx >= 0) & (idx <= row_max)
-                        idx = torch.where(
-                            valid_topk_mask,
-                            idx,
-                            torch.full_like(idx, -1),
-                        ).to(torch.int32)
-
-                        sparse_page_table = transform_index_page_table_decode(
-                            page_table=page_table_1,
-                            topk_indices=idx,
-                            page_size=1,
-                        )
-                        seqlens_k_t = (sparse_page_table != -1).sum(dim=1).to(
-                            torch.int32
-                        )
-
-                        total_k = int(seqlens_k_t.sum().item())
-                        if total_k > 0:
-                            key_buf, value_buf = (
-                                forward_batch.token_to_kv_pool.get_kv_buffer(
-                                    layer.layer_id
-                                )
+                        if server_args.gpt_oss_dsa_use_blocksparse_cute:
+                            # Experimental blocksparse path: approximate token-topk by selecting whole KV blocks,
+                            # then run vendored CUTE blocksparse attention on the compacted K/V.
+                            # (CUTE blocksparse does not support paged KV on SM90 yet.)
+                            from sglang.srt.layers.attention.nsa.gpt_oss_blocksparse import (
+                                build_blocksparse_kv_from_topk,
                             )
-                            key_cache_sparse = key_buf.view(
-                                -1, 1, layer.tp_k_head_num, layer.head_dim
+
+                            # Lazy import; requires extra deps (cutlass-dsl, cuda-python).
+                            from sglang.jit_kernel.flash_attention_v4 import (
+                                flash_attn_varlen_func as cute_flash_attn_varlen_func,
                             )
-                            value_cache_sparse = value_buf.view(
-                                -1, 1, layer.tp_v_head_num, layer.v_head_dim
+
+                            key_buf = forward_batch.token_to_kv_pool.get_key_buffer(
+                                layer.layer_id
                             )
-                            sparse_result = flash_attn_with_kvcache(
-                                q=q_reshaped[sparse_rows],
-                                k_cache=key_cache_sparse,
-                                v_cache=value_cache_sparse,
-                                page_table=sparse_page_table,
-                                cache_seqlens=seqlens_k_t,
-                                cu_seqlens_q=torch.arange(
-                                    0,
-                                    int(sparse_rows.sum().item()) + 1,
-                                    dtype=torch.int32,
-                                    device=q.device,
-                                ),
+                            value_buf = forward_batch.token_to_kv_pool.get_value_buffer(
+                                layer.layer_id
+                            )
+
+                            blocksparse_kv = build_blocksparse_kv_from_topk(
+                                req_to_token=req_to_token,
+                                req_pool_indices=req_pool_indices_sparse,
+                                key_buf=key_buf,
+                                value_buf=value_buf,
+                                topk_indices=idx,
+                                seq_lens=seq_lens_sparse,
+                                n_block_size=128,
+                                num_heads_for_blocksparse=1,
+                                device=q.device,
+                            )
+
+                            # CUTE expects (B, S, H, D) when cu_seqlens_q is None.
+                            sparse_out = cute_flash_attn_varlen_func(
+                                q=q_reshaped[sparse_rows].unsqueeze(1),
+                                k=blocksparse_kv.k,
+                                v=blocksparse_kv.v,
+                                seqused_k=blocksparse_kv.seqused_k,
                                 max_seqlen_q=1,
+                                max_seqlen_k=int(blocksparse_kv.k.shape[1]),
                                 softmax_scale=layer.scaling,
                                 causal=True,
-                                window_size=(-1, -1),
                                 softcap=layer.logit_cap,
-                                k_descale=(
-                                    k_descale[sparse_rows]
-                                    if k_descale is not None
-                                    else None
-                                ),
-                                v_descale=(
-                                    v_descale[sparse_rows]
-                                    if v_descale is not None
-                                    else None
-                                ),
+                                sinks=kwargs.get("sinks"),
+                                block_sparse_tensors=blocksparse_kv.block_sparse,
                                 return_softmax_lse=use_cascade_attn,
-                                num_splits=self.num_splits,
-                                **kwargs,
                             )
                             if use_cascade_attn:
-                                sparse_result = sparse_result[0]
-                            output[sparse_rows] = sparse_result
+                                sparse_out = sparse_out[0]
+                            output[sparse_rows] = sparse_out.squeeze(1)
+                        else:
+                            max_seq_len = int(seq_lens_sparse.max().item())
+                            page_table_1 = req_to_token[
+                                req_pool_indices_sparse, :max_seq_len
+                            ]
+
+                            # Keep invalid/padded entries as -1 so we can transform directly
+                            # into sparse token-location page tables without materializing K/V.
+                            row_max = (seq_lens_sparse - 1).clamp(min=0).view(
+                                seq_lens_sparse.shape[0], 1
+                            )
+                            valid_topk_mask = (idx >= 0) & (idx <= row_max)
+                            idx = torch.where(
+                                valid_topk_mask,
+                                idx,
+                                torch.full_like(idx, -1),
+                            ).to(torch.int32)
+
+                            sparse_page_table = transform_index_page_table_decode(
+                                page_table=page_table_1,
+                                topk_indices=idx,
+                                page_size=1,
+                            )
+                            seqlens_k_t = (sparse_page_table != -1).sum(dim=1).to(
+                                torch.int32
+                            )
+
+                            total_k = int(seqlens_k_t.sum().item())
+                            if total_k > 0:
+                                key_buf, value_buf = (
+                                    forward_batch.token_to_kv_pool.get_kv_buffer(
+                                        layer.layer_id
+                                    )
+                                )
+                                key_cache_sparse = key_buf.view(
+                                    -1, 1, layer.tp_k_head_num, layer.head_dim
+                                )
+                                value_cache_sparse = value_buf.view(
+                                    -1, 1, layer.tp_v_head_num, layer.v_head_dim
+                                )
+                                sparse_result = flash_attn_with_kvcache(
+                                    q=q_reshaped[sparse_rows],
+                                    k_cache=key_cache_sparse,
+                                    v_cache=value_cache_sparse,
+                                    page_table=sparse_page_table,
+                                    cache_seqlens=seqlens_k_t,
+                                    cu_seqlens_q=torch.arange(
+                                        0,
+                                        int(sparse_rows.sum().item()) + 1,
+                                        dtype=torch.int32,
+                                        device=q.device,
+                                    ),
+                                    max_seqlen_q=1,
+                                    softmax_scale=layer.scaling,
+                                    causal=True,
+                                    window_size=(-1, -1),
+                                    softcap=layer.logit_cap,
+                                    k_descale=(
+                                        k_descale[sparse_rows]
+                                        if k_descale is not None
+                                        else None
+                                    ),
+                                    v_descale=(
+                                        v_descale[sparse_rows]
+                                        if v_descale is not None
+                                        else None
+                                    ),
+                                    return_softmax_lse=use_cascade_attn,
+                                    num_splits=self.num_splits,
+                                    **kwargs,
+                                )
+                                if use_cascade_attn:
+                                    sparse_result = sparse_result[0]
+                                output[sparse_rows] = sparse_result
 
                     if torch.any(dense_rows):
                         key_cache, value_cache = (

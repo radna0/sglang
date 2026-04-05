@@ -93,3 +93,9 @@ def test_flash_attention_v4_wrapper_exposes_block_sparse_tensors():
     text = _read_repo_file("python/sglang/jit_kernel/flash_attention_v4.py")
     assert "block_sparse_tensors: Optional[object] = None" in text
     assert "block_sparse_tensors=block_sparse_tensors" in text
+
+
+def test_server_args_exposes_blocksparse_flag():
+    text = _read_repo_file("python/sglang/srt/server_args.py")
+    assert "gpt_oss_dsa_use_blocksparse_cute" in text
+    assert "--gpt-oss-dsa-use-blocksparse-cute" in text
