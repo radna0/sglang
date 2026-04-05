@@ -67,6 +67,14 @@ def is_deepseek_nsa(config: PretrainedConfig) -> bool:
     )
 
 
+def is_gpt_oss(config: PretrainedConfig) -> bool:
+    return (
+        config.architectures is not None
+        and len(config.architectures) > 0
+        and config.architectures[0] == "GptOssForCausalLM"
+    )
+
+
 def get_nsa_index_head_dim(config: PretrainedConfig) -> int:
     assert is_deepseek_nsa(config)
     return config.index_head_dim

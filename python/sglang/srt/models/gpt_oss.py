@@ -62,6 +62,7 @@ from sglang.srt.layers.moe.utils import filter_moe_weight_param_global_expert
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8_utils import dequant_mxfp4
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.layers.attention.nsa.nsa_indexer import Indexer
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -300,6 +301,45 @@ class GptOssAttention(nn.Module):
             rope_scaling=rope_scaling,
         )
 
+        server_args = get_global_server_args()
+        self.enable_gqa_dsa = (
+            server_args.enable_gpt_oss_gqa_dsa and layer_type == "full_attention"
+        )
+        self.indexer = None
+        if self.enable_gqa_dsa:
+            index_n_heads = (
+                server_args.gpt_oss_dsa_index_n_heads
+                if server_args.gpt_oss_dsa_index_n_heads is not None
+                else self.num_heads
+            )
+            q_lora_rank = (
+                server_args.gpt_oss_dsa_q_lora_rank
+                if server_args.gpt_oss_dsa_q_lora_rank is not None
+                else self.q_size
+            )
+            rope_head_dim = (
+                server_args.gpt_oss_dsa_rope_head_dim
+                if server_args.gpt_oss_dsa_rope_head_dim is not None
+                else self.head_dim
+            )
+            self.indexer = Indexer(
+                hidden_size=hidden_size,
+                index_n_heads=index_n_heads,
+                index_head_dim=server_args.gpt_oss_dsa_index_head_dim,
+                rope_head_dim=rope_head_dim,
+                index_topk=server_args.gpt_oss_dsa_index_topk,
+                q_lora_rank=q_lora_rank,
+                max_position_embeddings=max_position_embeddings,
+                rope_theta=rope_theta,
+                layer_id=layer_id,
+                scale_fmt=server_args.gpt_oss_dsa_scale_fmt,
+                block_size=server_args.gpt_oss_dsa_index_block_size,
+                rope_scaling=rope_scaling,
+                is_neox_style=True,
+                prefix=add_prefix("indexer", prefix),
+                quant_config=None,
+            )
+
         assert layer_type in {"sliding_attention", "full_attention"}
         use_sliding_window = layer_type == "sliding_attention"
         self.attn = RadixAttention(
@@ -324,6 +364,20 @@ class GptOssAttention(nn.Module):
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
+        topk_indices = None
+        if (
+            self.indexer is not None
+            and forward_batch.forward_mode.is_decode_or_idle()
+            and q.shape[0] > 0
+        ):
+            topk_indices = self.indexer(
+                x=hidden_states,
+                q_lora=q,
+                positions=positions,
+                forward_batch=forward_batch,
+                layer_id=self.layer_id,
+            )
+
         extra_args = {}
         if not _is_npu:
             extra_args = {
@@ -338,17 +392,22 @@ class GptOssAttention(nn.Module):
                 ),
             }
         q, k = self.rotary_emb(positions, q, k, **extra_args)
-        inner_state = q, k, v, forward_batch
+        inner_state = q, k, v, forward_batch, topk_indices
         return None, forward_batch, inner_state
 
     def forward_core(self, intermediate_state):
         hidden_states, forward_batch, inner_state = intermediate_state
         if inner_state is None:
             return hidden_states
+        q, k, v, forward_batch, topk_indices = inner_state
         attn_output = self.attn(
-            *inner_state,
+            q,
+            k,
+            v,
+            forward_batch,
             sinks=self.sinks,
             save_kv_cache=not enable_fused_set_kv_buffer(forward_batch),
+            **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
         )
         output, _ = self.o_proj(attn_output)
         return output

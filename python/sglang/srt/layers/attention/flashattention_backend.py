@@ -1084,6 +1084,7 @@ class FlashAttentionBackend(AttentionBackend):
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
+        topk_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if k is not None:
             assert v is not None
@@ -1150,6 +1151,82 @@ class FlashAttentionBackend(AttentionBackend):
             k_rope = k_rope.to(self.kv_cache_dtype) if k_rope is not None else None
         if not self.use_mla:
             # Do multi-head attention
+            if topk_indices is not None:
+                # Sparse decode: attend to per-token top-k indices only (GPT-OSS GQA DSA).
+                assert (
+                    forward_batch.seq_lens_cpu is not None
+                ), "topk_indices requires seq_lens_cpu"
+                assert (
+                    not layer.is_cross_attention
+                ), "topk_indices is only supported for self-attention"
+
+                bs = forward_batch.batch_size
+                if bs == 0:
+                    return q.new_empty((0, layer.tp_q_head_num * layer.v_head_dim))
+
+                req_to_token = forward_batch.req_to_token_pool.req_to_token
+                req_pool_indices = forward_batch.req_pool_indices
+
+                if topk_indices.shape[0] != bs:
+                    topk_indices = topk_indices[:bs]
+
+                loc_ids_list = []
+                seqlens_k = []
+                for i in range(bs):
+                    seq_len = int(forward_batch.seq_lens_cpu[i].item())
+                    if seq_len <= 0:
+                        loc_ids_list.append(
+                            torch.empty((0,), dtype=torch.int32, device=q.device)
+                        )
+                        seqlens_k.append(0)
+                        continue
+                    page_table_1 = req_to_token[req_pool_indices[i], :seq_len]
+                    idx = topk_indices[i].to(torch.int64)
+                    valid = (idx >= 0) & (idx < seq_len)
+                    if valid.any():
+                        idx = idx[valid]
+                    else:
+                        idx = idx.new_tensor([seq_len - 1])
+                    loc = page_table_1[idx]
+                    loc_ids_list.append(loc)
+                    seqlens_k.append(int(loc.shape[0]))
+
+                total_k = int(sum(seqlens_k))
+                if total_k == 0:
+                    return q.new_zeros((bs, layer.tp_q_head_num * layer.v_head_dim))
+
+                loc_ids = torch.cat(loc_ids_list, dim=0).to(torch.int64)
+                cu_seqlens_q = torch.arange(
+                    0, bs + 1, dtype=torch.int32, device=q.device
+                )
+                seqlens_k_t = torch.tensor(
+                    seqlens_k, dtype=torch.int32, device=q.device
+                )
+                cu_seqlens_k = torch.nn.functional.pad(
+                    torch.cumsum(seqlens_k_t, dim=0, dtype=torch.int32), (1, 0)
+                )
+                max_seqlen_k = int(max(seqlens_k))
+
+                key_buf = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+                value_buf = forward_batch.token_to_kv_pool.get_value_buffer(
+                    layer.layer_id
+                )
+                k_sel = key_buf[loc_ids].to(q.dtype)
+                v_sel = value_buf[loc_ids].to(q.dtype)
+
+                output = flash_attn_varlen_func(
+                    q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                    k=k_sel,
+                    v=v_sel,
+                    cu_seqlens_q=cu_seqlens_q,
+                    cu_seqlens_k=cu_seqlens_k,
+                    max_seqlen_q=1,
+                    max_seqlen_k=max_seqlen_k,
+                    softmax_scale=layer.scaling,
+                    causal=True,
+                    **kwargs,
+                )
+                return output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
             key_cache, value_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
                 layer.layer_id
@@ -2190,6 +2267,87 @@ class FlashAttentionBackend(AttentionBackend):
     def get_cuda_graph_seq_len_fill_value(self):
         """Get the fill value for sequence length in CUDA graph."""
         return 1
+
+    def get_indexer_metadata(self, layer_id: int, forward_batch: ForwardBatch):
+        server_args = get_global_server_args()
+        if not server_args.enable_gpt_oss_gqa_dsa:
+            return None
+        # Start with decode-only support for GPT-OSS GQA DSA.
+        if not forward_batch.forward_mode.is_decode_or_idle():
+            return None
+
+        from sglang.srt.layers.attention.nsa.nsa_backend_mtp_precompute import (
+            compute_cu_seqlens,
+        )
+        from sglang.srt.layers.attention.nsa.utils import (
+            compute_nsa_seqlens,
+            pad_nsa_cache_seqlens,
+        )
+        from sglang.srt.layers.attention.nsa_backend import (
+            NSAIndexerMetadata,
+            NSAMetadata,
+            TopkTransformMethod,
+        )
+
+        assert forward_batch.seq_lens_cpu is not None
+        device = forward_batch.seq_lens.device
+        batch_size = forward_batch.batch_size
+
+        cache_seqlens_int32 = forward_batch.seq_lens.to(torch.int32)
+        cu_seqlens_k = compute_cu_seqlens(cache_seqlens_int32)
+
+        max_seqlen_k = int(forward_batch.seq_lens_cpu.max().item()) if batch_size else 0
+        page_table_1 = forward_batch.req_to_token_pool.req_to_token[
+            forward_batch.req_pool_indices, :max_seqlen_k
+        ]
+
+        if self.page_size == 1 or max_seqlen_k == 0:
+            real_page_table = page_table_1
+        else:
+            strided_indices = torch.arange(
+                0, max_seqlen_k, self.page_size, device=device, dtype=torch.int32
+            )
+            real_page_table = page_table_1[:, strided_indices] // self.page_size
+
+        nsa_cache_seqlens_int32 = compute_nsa_seqlens(
+            original_seq_lens=cache_seqlens_int32,
+            nsa_index_topk=server_args.gpt_oss_dsa_index_topk,
+        )
+        nsa_cache_seqlens_int32 = pad_nsa_cache_seqlens(
+            forward_batch, nsa_cache_seqlens_int32
+        )
+        nsa_cu_seqlens_k = compute_cu_seqlens(nsa_cache_seqlens_int32)
+        nsa_cu_seqlens_q = torch.arange(
+            0, len(nsa_cu_seqlens_k), dtype=torch.int32, device=device
+        )
+        cu_seqlens_q = torch.arange(0, batch_size + 1, dtype=torch.int32, device=device)
+
+        attn_metadata = NSAMetadata(
+            page_size=self.page_size,
+            cache_seqlens_int32=cache_seqlens_int32,
+            max_seq_len_q=1,
+            max_seq_len_k=max_seqlen_k,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            page_table_1=page_table_1,
+            real_page_table=real_page_table,
+            nsa_cache_seqlens_int32=nsa_cache_seqlens_int32,
+            nsa_cu_seqlens_q=nsa_cu_seqlens_q,
+            nsa_cu_seqlens_k=nsa_cu_seqlens_k,
+            nsa_extend_seq_lens_list=[1] * batch_size,
+            nsa_seqlens_expanded=cache_seqlens_int32,
+            seq_lens_sum=forward_batch.seq_lens_sum,
+            indexer_seq_lens_cpu=forward_batch.seq_lens_cpu.to(torch.int32),
+            token_to_batch_idx=torch.arange(
+                0, batch_size, dtype=torch.int32, device=device
+            ),
+        )
+
+        return NSAIndexerMetadata(
+            attn_metadata=attn_metadata,
+            topk_transform_method=TopkTransformMethod.PAGED,
+            paged_mqa_schedule_metadata=None,
+        )
 
     def _maybe_init_local_attn_metadata(
         self, forwardbatch: ForwardBatch, metadata: FlashAttentionMetadata, device

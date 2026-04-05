@@ -20,6 +20,7 @@ from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPoolFP4,
     MLATokenToKVPool,
     MLATokenToKVPoolFP4,
+    NSAMHATokenToKVPool,
     NSATokenToKVPool,
     ReqToTokenPool,
 )
@@ -111,6 +112,22 @@ class ModelRunnerKVCacheMixin:
                 cell_size = (cell_size // 2) + (
                     (n * k * num_layers * 2 * kv_size) // scale_block_size
                 )
+
+            # Add indexer KV cache overhead for GPT-OSS GQA DSA (MHA/GQA mode)
+            if (
+                self.server_args.enable_gpt_oss_gqa_dsa
+                and self.model_config.hf_config.architectures is not None
+                and self.model_config.hf_config.architectures[0] == "GptOssForCausalLM"
+            ):
+                index_head_dim = self.server_args.gpt_oss_dsa_index_head_dim
+                indexer_size_per_token = (
+                    index_head_dim
+                    + index_head_dim // NSATokenToKVPool.quant_block_size * 4
+                )
+                element_size = torch._utils._element_size(
+                    NSATokenToKVPool.index_k_with_scale_buffer_dtype
+                )
+                cell_size += indexer_size_per_token * num_layers * element_size
         return cell_size
 
     def profile_max_num_token(self: ModelRunner, total_gpu_memory: int):
@@ -537,6 +554,26 @@ class ModelRunnerKVCacheMixin:
                 start_layer=self.start_layer,
                 end_layer=self.end_layer,
                 index_head_dim=get_nsa_index_head_dim(self.model_config.hf_config),
+            )
+        elif (
+            (not self.use_mla_backend)
+            and self.server_args.enable_gpt_oss_gqa_dsa
+            and self.model_config.hf_config.architectures is not None
+            and self.model_config.hf_config.architectures[0] == "GptOssForCausalLM"
+        ):
+            self.token_to_kv_pool = NSAMHATokenToKVPool(
+                self.max_total_num_tokens,
+                page_size=self.page_size,
+                dtype=self.kv_cache_dtype,
+                head_num=self.model_config.get_num_kv_heads(get_attention_tp_size()),
+                head_dim=self.model_config.head_dim,
+                v_head_dim=self.model_config.v_head_dim,
+                layer_num=self.num_effective_layers,
+                device=self.device,
+                enable_memory_saver=self.server_args.enable_memory_saver,
+                start_layer=self.start_layer,
+                end_layer=self.end_layer,
+                index_head_dim=self.server_args.gpt_oss_dsa_index_head_dim,
             )
         elif self.use_mla_backend and not self.mambaish_config:
             assert not is_nsa_model
