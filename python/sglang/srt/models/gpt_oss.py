@@ -83,7 +83,10 @@ _is_npu = is_npu()
 
 
 if _is_cuda:
-    from sgl_kernel import FusedSetKVBufferArg  # noqa: F401
+    try:
+        from sgl_kernel import FusedSetKVBufferArg  # noqa: F401
+    except Exception:
+        FusedSetKVBufferArg = None  # type: ignore[assignment]
 
 
 class GptOssConfig(PretrainedConfig):
