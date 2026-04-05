@@ -411,20 +411,7 @@ class DFlashVerifyInput(SpecInput):
                 int(packed[i, max_acc + 1].item())
             ]
 
-<<<<<<< HEAD
-            appended = 0
-            for token_id in proposed:
-                token_id = int(token_id)
-                req.output_ids.append(token_id)
-                appended += 1
-                req.check_finished()
-                if req.finished():
-                    break
-                if req.grammar is not None:
-                    req.grammar.accept_token(token_id)
-=======
             appended = _append_verified_tokens(req, proposed)
->>>>>>> 6231c4b7d (clean up stop string handling)
 
             if req.output_ids:
                 new_verified_token = int(req.output_ids[-1])
