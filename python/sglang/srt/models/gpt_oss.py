@@ -365,18 +365,25 @@ class GptOssAttention(nn.Module):
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
         topk_indices = None
-        if (
-            self.indexer is not None
-            and forward_batch.forward_mode.is_decode_or_idle()
-            and q.shape[0] > 0
-        ):
-            topk_indices = self.indexer(
-                x=hidden_states,
-                q_lora=q,
-                positions=positions,
-                forward_batch=forward_batch,
-                layer_id=self.layer_id,
-            )
+        if self.indexer is not None and q.shape[0] > 0:
+            if forward_batch.forward_mode.is_extend_without_speculative():
+                # Prefill/extend: populate index-K cache only (no top-k indices needed).
+                _ = self.indexer(
+                    x=hidden_states,
+                    q_lora=q,
+                    positions=positions,
+                    forward_batch=forward_batch,
+                    layer_id=self.layer_id,
+                    return_indices=False,
+                )
+            elif forward_batch.forward_mode.is_decode_or_idle():
+                topk_indices = self.indexer(
+                    x=hidden_states,
+                    q_lora=q,
+                    positions=positions,
+                    forward_batch=forward_batch,
+                    layer_id=self.layer_id,
+                )
 
         extra_args = {}
         if not _is_npu:

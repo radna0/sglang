@@ -12,7 +12,7 @@ This repo adds an **experimental** DeepSeek-style *Lightning Indexer* ("DSA/NSA-
 - **Attention sinks:** forwarded via the existing `sinks=...` kwarg.
 - **Indexer contract:** uses `sglang.srt.layers.attention.nsa.nsa_indexer.Indexer` and passes
   `topk_indices` into `RadixAttention`.
-- **Sparse mode:** decode-only (prefill/extend is still dense).
+- **Sparse mode:** decode-only; prefill/extend remains dense but populates the index-K cache for later decode steps.
 
 ## Server flags
 
@@ -45,4 +45,3 @@ python -m sglang.launch_server \
   randomly initialized unless you load a checkpoint that includes them.
 - Because prefill is still dense, the main speed win is expected on **long-context decode**
   (generation) rather than initial prompt ingestion.
-

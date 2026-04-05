@@ -2274,8 +2274,11 @@ class FlashAttentionBackend(AttentionBackend):
         server_args = get_global_server_args()
         if not server_args.enable_gpt_oss_gqa_dsa:
             return None
-        # Start with decode-only support for GPT-OSS GQA DSA.
-        if not forward_batch.forward_mode.is_decode_or_idle():
+        # Enable indexer metadata for decode (top-k) and extend/prefill (index-K cache only).
+        if not (
+            forward_batch.forward_mode.is_decode_or_idle()
+            or forward_batch.forward_mode.is_extend_without_speculative()
+        ):
             return None
 
         from sglang.srt.layers.attention.nsa.nsa_backend_mtp_precompute import (
