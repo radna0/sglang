@@ -2476,11 +2476,11 @@ class ServerArgs:
                 "Overlap scheduler is disabled when using DFLASH speculative decoding (spec v2 is not supported yet)."
             )
 
-                if self.enable_mixed_chunk:
-                    self.enable_mixed_chunk = False
-                    logger.warning(
-                        "Mixed chunked prefill is disabled because of using dflash speculative decoding."
-                    )
+            if self.enable_mixed_chunk:
+                self.enable_mixed_chunk = False
+                logger.warning(
+                    "Mixed chunked prefill is disabled because of using dflash speculative decoding."
+                )
         if self.speculative_algorithm in ("EAGLE", "EAGLE3", "STANDALONE"):
             if self.speculative_algorithm == "STANDALONE" and self.enable_dp_attention:
                 # TODO: support dp attention for standalone speculative decoding
