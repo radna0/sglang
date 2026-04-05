@@ -26,6 +26,16 @@ def test_flashattention_sparse_path_is_guarded_to_decode_only():
     assert "forward_batch.forward_mode.is_decode_or_idle()" in text
 
 
+def test_flashattention_sparse_path_masks_padded_topk_entries():
+    text = _read_repo_file(
+        "python/sglang/srt/layers/attention/flashattention_backend.py"
+    )
+    assert "valid_topk_mask = idx >= 0" in text
+    assert "seqlens_k_t = valid_topk_mask.sum(dim=1).to(torch.int32)" in text
+    assert "loc_ids = loc[valid_topk_mask].reshape(-1).to(torch.int64)" in text
+    assert "max_seqlen_k = int(seqlens_k_t.max().item())" in text
+
+
 def test_gpt_oss_dsa_is_gated_to_full_attention_layers_only():
     text = _read_repo_file("python/sglang/srt/models/gpt_oss.py")
     assert (

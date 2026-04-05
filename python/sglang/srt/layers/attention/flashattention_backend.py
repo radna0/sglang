@@ -1188,18 +1188,21 @@ class FlashAttentionBackend(AttentionBackend):
                     idx = idx.view(bs, 1)
                 topk = int(idx.shape[1])
 
-                # Clamp invalid/negative indices and cap to each row's seq_len - 1.
+                # Track valid top-k entries explicitly so padded -1 slots do not get
+                # turned into duplicated token-0 attends. This preserves dense-equivalence
+                # when the sparse path covers the full token set for a request.
+                valid_topk_mask = idx >= 0
                 idx = torch.clamp(idx, min=0)
                 row_max = (seq_lens - 1).clamp(min=0).view(bs, 1)
+                valid_topk_mask = valid_topk_mask & (idx <= row_max)
                 idx = torch.minimum(idx, row_max)
                 idx = idx.clamp(max=max_seq_len - 1)
 
                 loc = page_table_1.gather(dim=1, index=idx)  # (bs, topk)
-                # For rows with seq_len==0, seqlens_k is 0 so they contribute no keys/values.
-                seqlens_k_t = torch.where(
-                    valid_rows, torch.full_like(seq_lens, topk), torch.zeros_like(seq_lens)
-                ).to(torch.int32)
-                loc_ids = loc[valid_rows].reshape(-1).to(torch.int64)
+                valid_topk_mask = valid_topk_mask & valid_rows.view(bs, 1)
+                # For rows with seq_len==0 or padded top-k entries, contribute no keys/values.
+                seqlens_k_t = valid_topk_mask.sum(dim=1).to(torch.int32)
+                loc_ids = loc[valid_topk_mask].reshape(-1).to(torch.int64)
 
                 total_k = int(seqlens_k_t.sum().item())
                 if total_k == 0:
@@ -1211,7 +1214,7 @@ class FlashAttentionBackend(AttentionBackend):
                 cu_seqlens_k = torch.nn.functional.pad(
                     torch.cumsum(seqlens_k_t, dim=0, dtype=torch.int32), (1, 0)
                 )
-                max_seqlen_k = topk
+                max_seqlen_k = int(seqlens_k_t.max().item())
 
                 key_buf = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
                 value_buf = forward_batch.token_to_kv_pool.get_value_buffer(
