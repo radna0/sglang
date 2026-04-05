@@ -1051,6 +1051,11 @@ class Indexer(MultiPlatformOp):
             index_k_scale=k_scale,
         )
 
+        # GPT-OSS extend/prefill uses the indexer to populate index-K cache only.
+        # Respect return_indices=False for the full CUDA path too, not just the short-sequence fast path.
+        if not return_indices:
+            return None
+
         if _is_cuda or _is_hip:
             assert forward_batch.seq_lens_cpu is not None
             if len(forward_batch.seq_lens_cpu) == 0:
