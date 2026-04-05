@@ -60,7 +60,7 @@ from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.moe.utils import filter_moe_weight_param_global_expert
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.quantization.fp8_utils import dequant_mxfp4
+from sglang.srt.layers.quantization.mxfp4 import dequant_mxfp4
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
@@ -83,7 +83,10 @@ _is_npu = is_npu()
 
 
 if _is_cuda:
-    from sgl_kernel import FusedSetKVBufferArg  # noqa: F401
+    try:
+        from sgl_kernel import FusedSetKVBufferArg  # noqa: F401
+    except Exception:
+        FusedSetKVBufferArg = None  # type: ignore[assignment]
 
 
 class GptOssConfig(PretrainedConfig):
@@ -1130,6 +1133,16 @@ class GptOssForCausalLM(nn.Module):
             # we plus 1 here because in sglang, for the ith layer, it takes the output
             # of the (i-1)th layer as aux hidden state
             self.model.layers_to_capture = [val + 1 for val in layer_ids]
+
+    def set_dflash_layers_to_capture(self, layer_ids: List[int]):
+        if not self.pp_group.is_last_rank:
+            return
+
+        if layer_ids is None:
+            raise ValueError("DFLASH requires explicit layer_ids for aux hidden capture.")
+
+        self.capture_aux_hidden_states = True
+        self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):

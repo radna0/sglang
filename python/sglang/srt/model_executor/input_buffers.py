@@ -154,6 +154,8 @@ class GraphInputBuffers:
 
         # Common inputs
         self.input_ids[:raw_num_token].copy_(forward_batch.input_ids)
+        if forward_batch.input_embeds is not None:
+            self.input_embeds[:raw_num_token].copy_(forward_batch.input_embeds)
         self.req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices)
         self.seq_lens[:raw_bs].copy_(forward_batch.seq_lens)
         self.out_cache_loc[:raw_num_token].copy_(forward_batch.out_cache_loc)
