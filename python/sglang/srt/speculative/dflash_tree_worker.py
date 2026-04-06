@@ -214,6 +214,16 @@ class DFlashTreeWorker:
         self.token_to_kv_pool_allocator = shared_token_to_kv_pool_allocator
         draft_server_args = deepcopy(server_args)
         draft_server_args.skip_tokenizer_init = True
+        if draft_server_args.speculative_draft_kv_cache_dtype is not None:
+            draft_server_args.kv_cache_dtype = (
+                draft_server_args.speculative_draft_kv_cache_dtype
+            )
+        if draft_server_args.speculative_draft_mem_fraction_static is not None:
+            draft_server_args.mem_fraction_static = (
+                draft_server_args.speculative_draft_mem_fraction_static
+            )
+        if draft_server_args.speculative_draft_page_size is not None:
+            draft_server_args.page_size = draft_server_args.speculative_draft_page_size
         draft_backend = draft_server_args.speculative_draft_attention_backend
         if draft_backend is None:
             draft_backend, _ = draft_server_args.get_attention_backends()

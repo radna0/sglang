@@ -312,6 +312,7 @@ class ServerArgs:
     quantization: Optional[str] = None
     quantization_param_path: Optional[str] = None
     kv_cache_dtype: str = "auto"
+    speculative_draft_kv_cache_dtype: Optional[str] = None
     enable_fp32_lm_head: bool = False
     modelopt_quant: Optional[Union[str, Dict]] = None
     modelopt_checkpoint_restore_path: Optional[str] = None
@@ -322,6 +323,7 @@ class ServerArgs:
 
     # Memory and scheduling
     mem_fraction_static: Optional[float] = None
+    speculative_draft_mem_fraction_static: Optional[float] = None
     max_running_requests: Optional[int] = None
     max_queued_requests: Optional[int] = None
     max_total_tokens: Optional[int] = None
@@ -336,6 +338,7 @@ class ServerArgs:
     priority_scheduling_preemption_threshold: int = 10
     schedule_conservativeness: float = 1.0
     page_size: Optional[int] = None
+    speculative_draft_page_size: Optional[int] = None
     swa_full_tokens_ratio: float = 0.8
     disable_hybrid_swa_memory: bool = False
     radix_eviction_policy: str = "lru"
@@ -3259,6 +3262,14 @@ class ServerArgs:
             help='Data type for kv cache storage. "auto" will use model data type. "bf16" or "bfloat16" for BF16 KV cache. "fp8_e5m2" and "fp8_e4m3" are supported for CUDA 11.8+. "fp4_e2m1" (only mxfp4) is supported for CUDA 12.8+ and PyTorch 2.8.0+',
         )
         parser.add_argument(
+            "--speculative-draft-kv-cache-dtype",
+            type=nullable_str,
+            default=ServerArgs.speculative_draft_kv_cache_dtype,
+            choices=["auto", "fp8_e5m2", "fp8_e4m3", "bf16", "bfloat16", "fp4_e2m1"],
+            help="Optional KV cache dtype override for the speculative draft worker. "
+            "If unset, the draft worker inherits --kv-cache-dtype.",
+        )
+        parser.add_argument(
             "--enable-fp32-lm-head",
             action="store_true",
             help="If set, the LM head outputs (logits) are in FP32.",
@@ -3315,6 +3326,13 @@ class ServerArgs:
             type=float,
             default=ServerArgs.mem_fraction_static,
             help="The fraction of the memory used for static allocation (model weights and KV cache memory pool). Use a smaller value if you see out-of-memory errors.",
+        )
+        parser.add_argument(
+            "--speculative-draft-mem-fraction-static",
+            type=float,
+            default=ServerArgs.speculative_draft_mem_fraction_static,
+            help="Optional static-memory fraction override for the speculative draft worker. "
+            "If unset, the draft worker inherits --mem-fraction-static.",
         )
         parser.add_argument(
             "--max-running-requests",
@@ -3409,6 +3427,13 @@ class ServerArgs:
             type=int,
             default=ServerArgs.page_size,
             help="The number of tokens in a page.",
+        )
+        parser.add_argument(
+            "--speculative-draft-page-size",
+            type=int,
+            default=ServerArgs.speculative_draft_page_size,
+            help="Optional page-size override for the speculative draft worker. "
+            "If unset, the draft worker inherits --page-size.",
         )
         parser.add_argument(
             "--hybrid-kvcache-ratio",

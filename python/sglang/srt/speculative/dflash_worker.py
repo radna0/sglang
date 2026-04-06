@@ -1,11 +1,13 @@
 import logging
 import math
+import os
 from copy import deepcopy
 from typing import Optional, Union
 
 import torch
 
 from sglang.srt.distributed import get_tp_group
+from sglang.srt.layers.sampler import sample_from_probs_default_torch
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -22,10 +24,14 @@ from sglang.srt.server_args import (
 )
 from sglang.srt.speculative.dflash_info import DFlashDraftInput, DFlashVerifyInput
 from sglang.srt.speculative.dflash_utils import (
+    apply_dflash_shared_pool_verify_append,
     can_dflash_use_fused_qkv_proj,
+    gather_dflash_committed_hidden,
     is_dflash_sampling_verify_available,
     parse_dflash_draft_config,
     resolve_dflash_verify_mask_policy,
+    resolve_dflash_verify_append_path,
+    update_dflash_req_verify_bookkeeping,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
@@ -99,6 +105,16 @@ class DFlashWorker:
         )
         draft_server_args = deepcopy(server_args)
         draft_server_args.skip_tokenizer_init = True
+        if draft_server_args.speculative_draft_kv_cache_dtype is not None:
+            draft_server_args.kv_cache_dtype = (
+                draft_server_args.speculative_draft_kv_cache_dtype
+            )
+        if draft_server_args.speculative_draft_mem_fraction_static is not None:
+            draft_server_args.mem_fraction_static = (
+                draft_server_args.speculative_draft_mem_fraction_static
+            )
+        if draft_server_args.speculative_draft_page_size is not None:
+            draft_server_args.page_size = draft_server_args.speculative_draft_page_size
         draft_backend = draft_server_args.speculative_draft_attention_backend
         supported_draft_backends = ("flashinfer", "fa3", "fa4")
         if draft_backend is None:
@@ -220,6 +236,37 @@ class DFlashWorker:
         self._fused_kv_helper: Optional[object] = None
         if self._use_fused_kv_materialize:
             self._init_fused_kv_helper()
+
+        draft_mode = (
+            os.environ.get("SGLANG_DFLASH_LINEAR_DRAFT_MODE") or "auto"
+        ).strip().lower()
+        if draft_mode not in ("auto", "greedy", "sample"):
+            raise ValueError(
+                "SGLANG_DFLASH_LINEAR_DRAFT_MODE must be one of {'auto','greedy','sample'}, "
+                f"got {draft_mode!r}."
+            )
+        self._linear_draft_mode = draft_mode
+        self._logged_linear_mode = False
+
+    def _resolve_linear_sampling_mode(self, batch: ScheduleBatch) -> str:
+        sampling_info = getattr(batch, "sampling_info", None)
+        if sampling_info is None or sampling_info.is_all_greedy:
+            return "draft=greedy,target=greedy"
+
+        if self._linear_draft_mode == "greedy":
+            return "draft=greedy,target=sampled"
+
+        tp_size = int(get_tp_group().world_size)
+        if self._linear_draft_mode == "sample":
+            if tp_size != 1:
+                raise RuntimeError(
+                    "DFLASH linear sampled-draft mode currently requires tp_size == 1."
+                )
+            return "draft=sampled,target=sampled"
+
+        if tp_size == 1:
+            return "draft=sampled,target=sampled"
+        return "draft=greedy,target=sampled"
 
     def _init_fused_kv_helper(self) -> None:
         """Initialize the fused KV materialization helper with pre-stacked weights."""
@@ -520,18 +567,19 @@ class DFlashWorker:
                 "Invariant broken: DFLASH batch has grammar constraints, but scheduler should have rejected this request."
             )
         if batch.sampling_info is not None and not batch.sampling_info.is_all_greedy:
-            if (
-                not is_dflash_sampling_verify_available()
-                and not self._warned_sampling_fallback
-                and self.tp_rank == 0
-            ):
-                logger.warning(
-                    "DFLASH non-greedy verification is unavailable on this build/device; "
-                    "falling back to greedy argmax verification."
+            if not is_dflash_sampling_verify_available():
+                raise RuntimeError(
+                    "DFLASH sampled target-only verification was requested, but "
+                    "the required sampled verify kernels are unavailable on this build/device."
                 )
-                self._warned_sampling_fallback = True
 
         bs = batch.batch_size()
+        linear_mode = self._resolve_linear_sampling_mode(batch)
+        if not self._logged_linear_mode and self.tp_rank == 0:
+            logger.info(
+                "DFLASH linear sampling mode active: %s", linear_mode
+            )
+            self._logged_linear_mode = True
 
         # --- 1) Append any newly committed tokens into the draft KV cache.
         self._append_target_hidden_to_draft_kv(batch, draft_input)
@@ -657,10 +705,53 @@ class DFlashWorker:
         if draft_hidden is None:
             raise RuntimeError("DFLASH draft model returned no hidden states.")
         draft_hidden = draft_hidden.view(bs, self.block_size, -1)
-        draft_next = self._greedy_sample_from_vocab_parallel_head(
-            hidden_states=draft_hidden[:, 1:, :].reshape(-1, draft_hidden.shape[-1]),
-            lm_head=lm_head,
-        ).view(bs, self.block_size - 1)
+        draft_hidden_tail = draft_hidden[:, 1:, :].reshape(-1, draft_hidden.shape[-1])
+        if linear_mode == "draft=sampled,target=sampled":
+            sampling_info = batch.sampling_info
+            assert sampling_info is not None
+            row_count = int(bs * max(0, self.block_size - 1))
+            temperatures = torch.repeat_interleave(
+                sampling_info.temperatures.view(-1),
+                self.block_size - 1,
+                dim=0,
+            )
+            top_ps = torch.repeat_interleave(
+                sampling_info.top_ps.view(-1),
+                self.block_size - 1,
+                dim=0,
+            )
+            top_ks = torch.repeat_interleave(
+                sampling_info.top_ks.view(-1),
+                self.block_size - 1,
+                dim=0,
+            )
+            min_ps = torch.repeat_interleave(
+                sampling_info.min_ps.view(-1),
+                self.block_size - 1,
+                dim=0,
+            )
+            sampling_seed = getattr(sampling_info, "sampling_seed", None)
+            if sampling_seed is not None:
+                sampling_seed = torch.repeat_interleave(
+                    sampling_seed.view(-1),
+                    self.block_size - 1,
+                    dim=0,
+                )
+            draft_next = self._sample_from_vocab_parallel_head_tp1(
+                hidden_states=draft_hidden_tail,
+                lm_head=lm_head,
+                temperatures=temperatures[:row_count],
+                top_ps=top_ps[:row_count],
+                top_ks=top_ks[:row_count],
+                min_ps=min_ps[:row_count],
+                positions=positions_2d[:, 1:].reshape(-1),
+                sampling_seed=sampling_seed[:row_count] if sampling_seed is not None else None,
+            ).view(bs, self.block_size - 1)
+        else:
+            draft_next = self._greedy_sample_from_vocab_parallel_head(
+                hidden_states=draft_hidden_tail,
+                lm_head=lm_head,
+            ).view(bs, self.block_size - 1)
         draft_tokens = self._draft_block_tokens_buf[:bs]
         draft_tokens[:, 0].copy_(block_ids[:, 0])
         draft_tokens[:, 1:].copy_(draft_next)
@@ -687,6 +778,7 @@ class DFlashWorker:
         )
         batch.spec_info = verify_input
         batch.return_hidden_states = False
+        draft_input.linear_mode = linear_mode
 
     def _greedy_sample_from_vocab_parallel_head(
         self,
@@ -859,6 +951,124 @@ class DFlashWorker:
             selected_ids = self._draft_greedy_selected_ids_buf[:, :chunk_len]
             torch.gather(gathered_ids, 0, rank_index, out=selected_ids)
             out_token_ids[start:end].copy_(selected_ids.view(-1))
+
+        return out_token_ids
+
+    def _sample_from_vocab_parallel_head_tp1(
+        self,
+        *,
+        hidden_states: torch.Tensor,
+        lm_head,
+        temperatures: torch.Tensor,
+        top_ps: torch.Tensor,
+        top_ks: torch.Tensor,
+        min_ps: torch.Tensor,
+        positions: torch.Tensor,
+        sampling_seed: Optional[torch.Tensor],
+        chunk_size: int = 128,
+    ) -> torch.Tensor:
+        if hidden_states.numel() == 0:
+            return torch.empty((0,), dtype=torch.long, device=hidden_states.device)
+
+        tp_group = get_tp_group()
+        if int(tp_group.world_size) != 1:
+            raise RuntimeError(
+                "DFLASH linear sampled draft currently requires tp_size == 1."
+            )
+
+        if not hasattr(lm_head, "weight") or not hasattr(lm_head, "shard_indices"):
+            raise RuntimeError(
+                "DFLASH sampled draft requires a vocab-parallel head with `weight` and `shard_indices`."
+            )
+
+        shard = lm_head.shard_indices
+        weight = lm_head.weight
+        weight_dtype = weight.dtype
+        num_org = int(shard.num_org_elements)
+        num_org_padded = int(shard.num_org_elements_padded)
+        num_added = int(shard.num_added_elements)
+        org_vocab_start = int(shard.org_vocab_start_index)
+        added_vocab_start = int(shard.added_vocab_start_index)
+
+        weight_parts = []
+        token_id_parts = []
+        if num_org > 0:
+            weight_parts.append(weight[:num_org])
+            token_id_parts.append(
+                torch.arange(
+                    org_vocab_start,
+                    org_vocab_start + num_org,
+                    dtype=torch.long,
+                    device=hidden_states.device,
+                )
+            )
+        if num_added > 0:
+            added_slice_start = num_org_padded
+            added_slice_end = num_org_padded + num_added
+            weight_parts.append(weight[added_slice_start:added_slice_end])
+            token_id_parts.append(
+                torch.arange(
+                    added_vocab_start,
+                    added_vocab_start + num_added,
+                    dtype=torch.long,
+                    device=hidden_states.device,
+                )
+            )
+        if not weight_parts:
+            return torch.zeros(
+                (int(hidden_states.shape[0]),),
+                dtype=torch.long,
+                device=hidden_states.device,
+            )
+
+        valid_weight = (
+            weight_parts[0]
+            if len(weight_parts) == 1
+            else torch.cat(weight_parts, dim=0)
+        )
+        valid_token_ids = (
+            token_id_parts[0]
+            if len(token_id_parts) == 1
+            else torch.cat(token_id_parts, dim=0)
+        )
+
+        def _cast_hs(x: torch.Tensor) -> torch.Tensor:
+            return x if x.dtype == weight_dtype else x.to(weight_dtype)
+
+        num_tokens = int(hidden_states.shape[0])
+        out_token_ids = torch.empty(
+            (num_tokens,), dtype=torch.long, device=hidden_states.device
+        )
+        need_min_p_sampling = bool(torch.any(min_ps > 0).item())
+        simple_sampling_case = not (
+            bool(torch.any(top_ps != 1.0).item())
+            or bool(torch.any(top_ks != 1).item())
+            or need_min_p_sampling
+        )
+
+        for start in range(0, num_tokens, int(chunk_size)):
+            end = min(num_tokens, start + int(chunk_size))
+            hs = _cast_hs(hidden_states[start:end])
+            logits = torch.matmul(hs, valid_weight.T).float()
+            logits.div_(temperatures[start:end].view(-1, 1))
+            probs = torch.softmax(logits, dim=-1)
+            sampled_local = sample_from_probs_default_torch(
+                probs=probs,
+                top_ks=top_ks[start:end].to(dtype=torch.int32, device=probs.device),
+                top_ps=top_ps[start:end].to(dtype=probs.dtype, device=probs.device),
+                min_ps=min_ps[start:end].to(dtype=probs.dtype, device=probs.device),
+                need_min_p_sampling=need_min_p_sampling,
+                sampling_seed=(
+                    None
+                    if sampling_seed is None
+                    else sampling_seed[start:end].to(device=probs.device)
+                ),
+                positions=positions[start:end].to(device=probs.device),
+                simple_sampling_case=simple_sampling_case,
+            )
+            out_token_ids[start:end] = valid_token_ids.index_select(
+                0, sampled_local.to(torch.long)
+            )
 
         return out_token_ids
 
@@ -1052,6 +1262,108 @@ class DFlashWorker:
             write_layer_kv=_write_layer_kv,
         )
 
+    def _append_verified_hidden_selected_fused(
+        self,
+        *,
+        hidden_states: torch.Tensor,
+        accepted_indices: torch.Tensor,
+        ctx_positions: torch.Tensor,
+        ctx_cache_loc: torch.Tensor,
+    ) -> None:
+        if self._fused_kv_helper is None:
+            raise RuntimeError(
+                "DFLASH fused selected verify append requires fused helper."
+            )
+
+        token_to_kv_pool = self.draft_model_runner.token_to_kv_pool
+        layers = self.draft_model.layers
+
+        def _write_layer_kv(
+            layer_idx: int, cache_k: torch.Tensor, cache_v: torch.Tensor
+        ) -> None:
+            attn = layers[layer_idx].self_attn.attn
+            token_to_kv_pool.set_kv_buffer(
+                attn,
+                ctx_cache_loc,
+                cache_k,
+                cache_v,
+                attn.k_scale,
+                attn.v_scale,
+            )
+
+        self._fused_kv_helper.materialize_from_target_hidden_selected(
+            target_hidden=hidden_states,
+            accepted_indices=accepted_indices,
+            positions=ctx_positions,
+            write_layer_kv=_write_layer_kv,
+        )
+
+    def _project_and_write_verified_hidden_selected_to_draft_kv(
+        self,
+        *,
+        hidden_states: torch.Tensor,
+        accepted_indices: torch.Tensor,
+        ctx_positions: torch.Tensor,
+        ctx_cache_loc: torch.Tensor,
+    ) -> None:
+        with torch.inference_mode():
+            if self._use_fused_kv_materialize and self._fused_kv_helper is not None:
+                try:
+                    self._append_verified_hidden_selected_fused(
+                        hidden_states=hidden_states,
+                        accepted_indices=accepted_indices,
+                        ctx_positions=ctx_positions,
+                        ctx_cache_loc=ctx_cache_loc,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "DFLASH fused selected verify append failed; falling back to sequential path: %s",
+                        e,
+                    )
+                    self._use_fused_kv_materialize = False
+                    self._fused_kv_helper = None
+                if self._use_fused_kv_materialize:
+                    return
+
+            if hasattr(self.draft_model, "project_target_hidden_selected"):
+                ctx_hidden = self.draft_model.project_target_hidden_selected(
+                    hidden_states, accepted_indices
+                )
+            else:
+                selected_hidden = gather_dflash_committed_hidden(
+                    hidden_states=hidden_states,
+                    accepted_indices=accepted_indices,
+                )
+                ctx_hidden = self.draft_model.project_target_hidden(selected_hidden)
+
+            if ctx_hidden.shape[0] != ctx_cache_loc.numel():
+                raise RuntimeError(
+                    "DFLASH selected verify hidden/cache_loc mismatch: "
+                    f"{ctx_hidden.shape[0]} vs {ctx_cache_loc.numel()}."
+                )
+            self._append_target_hidden_sequential(
+                ctx_hidden, ctx_positions, ctx_cache_loc
+            )
+
+    def _append_verified_hidden_from_cache_plan(
+        self,
+        *,
+        draft_input: DFlashDraftInput,
+        verify_positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        cache_plan,
+        commit_lens: torch.Tensor,
+    ) -> bool:
+        apply_dflash_shared_pool_verify_append(
+            draft_input=draft_input,
+            verify_positions=verify_positions,
+            hidden_states=hidden_states,
+            cache_plan=cache_plan,
+            commit_lens=commit_lens,
+            write_selected_hidden=self._project_and_write_verified_hidden_selected_to_draft_kv,
+        )
+        return True
+
     def _update_target_mamba_state_after_verify(
         self,
         *,
@@ -1204,6 +1516,7 @@ class DFlashWorker:
         (
             new_verified_id,
             commit_lens,
+            cache_plan,
             next_target_hidden,
             accept_length_per_req_cpu,
         ) = verify_input.verify(
@@ -1222,9 +1535,44 @@ class DFlashWorker:
         # Update draft state for the next iteration. Also materialize the committed verify tokens
         # into the draft KV cache immediately so radix cache entries are safe to reuse.
         draft_input.verified_id = new_verified_id
-        draft_input.target_hidden = next_target_hidden
-        draft_input.ctx_lens = commit_lens
-        self._append_target_hidden_to_draft_kv(batch, draft_input)
+        append_path = "staged"
+        appended_from_verify = False
+        if cache_plan is not None:
+            try:
+                appended_from_verify = self._append_verified_hidden_from_cache_plan(
+                    draft_input=draft_input,
+                    verify_positions=verify_input.positions,
+                    hidden_states=logits_output.hidden_states,
+                    cache_plan=cache_plan,
+                    commit_lens=commit_lens,
+                )
+            except Exception as e:
+                logger.warning(
+                    "DFLASH direct verify append failed; falling back to staged path: %s",
+                    e,
+                )
+
+        if not appended_from_verify:
+            draft_input.target_hidden = next_target_hidden
+            draft_input.ctx_lens = commit_lens
+            self._append_target_hidden_to_draft_kv(batch, draft_input)
+
+        append_path = resolve_dflash_verify_append_path(
+            appended_from_verify=appended_from_verify,
+            fused_helper_active=bool(
+                self._use_fused_kv_materialize and self._fused_kv_helper is not None
+            ),
+        )
+        update_dflash_req_verify_bookkeeping(
+            reqs=list(batch.reqs),
+            accept_length_per_req_cpu=accept_length_per_req_cpu,
+            verify_mode=str(getattr(draft_input, "linear_mode", "target_only")),
+            append_path=append_path,
+            default_max_steps=int(self.block_size - 1),
+            default_effective_draft_token_num=int(self.block_size),
+            default_effective_step_count=int(self.block_size - 1),
+        )
+        logits_output.hidden_states = None
         batch.spec_info = draft_input
         batch.forward_mode = ForwardMode.DECODE
 
