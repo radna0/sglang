@@ -151,15 +151,9 @@ ENCODER_TRANSFER_BACKEND_CHOICES = ["zmq_to_scheduler", "zmq_to_tokenizer", "moo
 
 GRAMMAR_BACKEND_CHOICES = ["xgrammar", "outlines", "llguidance", "none"]
 
-DETERMINISTIC_ATTENTION_BACKEND_CHOICES = [
-    "flashinfer",
-    "fa3",
-    "fa4",
-    "flex_flash4",
-    "triton",
-]
+DETERMINISTIC_ATTENTION_BACKEND_CHOICES = ["flashinfer", "fa3", "triton"]
 
-RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND = ["fa3", "fa4", "flex_flash4", "triton"]
+RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND = ["fa3", "triton"]
 
 NSA_PREFILL_CP_SPLIT_CHOICES = ["in-seq-split", "round-robin-split"]
 
@@ -170,8 +164,6 @@ NSA_CHOICES = [
     "flashmla_kv",
     "flashmla_auto",
     "fa3",
-    "fa4",
-    "flex_flash4",
     "tilelang",
     "aiter",
     "trtllm",
@@ -224,7 +216,6 @@ MAMBA_SSM_DTYPE_CHOICES = ["float32", "bfloat16", "float16"]
 MAMBA_SCHEDULER_STRATEGY_CHOICES = ["auto", "no_buffer", "extra_buffer"]
 
 MAMBA_BACKEND_CHOICES = ["triton", "flashinfer"]
-LINEAR_ATTN_KERNEL_BACKEND_CHOICES = ["triton", "cutedsl"]
 
 
 # Allow external code to add more choices
@@ -362,7 +353,6 @@ class ServerArgs:
     pp_async_batch_depth: int = 0
     stream_interval: int = 1
     stream_output: bool = False
-    enable_streaming_session: bool = False
     random_seed: Optional[int] = None
     constrained_json_whitespace_pattern: Optional[str] = None
     constrained_json_disable_any_whitespace: bool = False
@@ -482,14 +472,12 @@ class ServerArgs:
     speculative_eagle_topk: Optional[int] = None
     speculative_num_draft_tokens: Optional[int] = None
     speculative_dflash_block_size: Optional[int] = None
-    speculative_draft_mem_fraction_static: Optional[float] = None
+    speculative_dflash_draft_window_size: Optional[int] = None
     speculative_accept_threshold_single: float = 1.0
     speculative_accept_threshold_acc: float = 1.0
     speculative_token_map: Optional[str] = None
     speculative_attention_mode: str = "prefill"
     speculative_draft_attention_backend: Optional[str] = None
-    speculative_draft_kv_cache_dtype: Optional[str] = None
-    speculative_draft_page_size: Optional[int] = None
     speculative_moe_runner_backend: Optional[str] = None
     speculative_moe_a2a_backend: Optional[str] = None
     speculative_draft_model_quantization: Optional[str] = None
@@ -512,7 +500,6 @@ class ServerArgs:
     moe_runner_backend: str = "auto"
     flashinfer_mxfp4_moe_precision: Literal["default", "bf16"] = "default"
     enable_flashinfer_allreduce_fusion: bool = False
-    enable_aiter_allreduce_fusion: bool = False
     deepep_mode: Literal["auto", "normal", "low_latency"] = "auto"
     ep_num_redundant_experts: int = 0
     ep_dispatch_algorithm: Optional[Literal["static", "dynamic", "fake"]] = None
@@ -530,7 +517,6 @@ class ServerArgs:
     deepep_config: Optional[str] = None
     moe_dense_tp_size: Optional[int] = None
     elastic_ep_backend: Literal[None, "mooncake"] = None
-    enable_elastic_expert_backup: bool = False
     mooncake_ib_device: Optional[str] = None
 
     # Mamba cache
@@ -539,9 +525,6 @@ class ServerArgs:
     mamba_full_memory_ratio: float = 0.9
     mamba_scheduler_strategy: str = "auto"
     mamba_track_interval: int = 256
-    linear_attn_backend: str = "triton"
-    linear_attn_decode_backend: Optional[str] = None
-    linear_attn_prefill_backend: Optional[str] = None
 
     # Hierarchical cache
     enable_hierarchical_cache: bool = False
@@ -674,6 +657,9 @@ class ServerArgs:
     disaggregation_mode: Literal["null", "prefill", "decode"] = "null"
     disaggregation_transfer_backend: str = "mooncake"
     disaggregation_bootstrap_port: int = 8998
+    disaggregation_decode_tp: Optional[int] = None
+    disaggregation_decode_dp: Optional[int] = None
+    disaggregation_prefill_pp: Optional[int] = 1
     disaggregation_ib_device: Optional[str] = None
     disaggregation_decode_enable_offload_kvcache: bool = False
     num_reserved_decode_tokens: int = 512  # used for decode kv cache offload in PD
@@ -708,7 +694,6 @@ class ServerArgs:
     mm_enable_dp_encoder: bool = False
     mm_process_config: Optional[Dict[str, Any]] = None
     limit_mm_data_per_request: Optional[Union[str, Dict[str, int]]] = None
-    enable_mm_global_cache: bool = False
 
     # For checkpoint decryption
     decrypted_config_file: Optional[str] = None
@@ -745,15 +730,12 @@ class ServerArgs:
 
         # Get GPU memory capacity, which is a common dependency for several configuration steps.
         gpu_mem = get_device_memory_capacity(self.device)
-        print("[dbg-server-args] post_init gpu_mem_ready", flush=True)
 
         # Handle memory-related, chunked prefill, and CUDA graph batch size configurations.
         self._handle_gpu_memory_settings(gpu_mem)
-        print("[dbg-server-args] post_init gpu_memory_settings_done", flush=True)
 
         # Apply model-specific adjustments.
         self._handle_model_specific_adjustments()
-        print("[dbg-server-args] post_init model_specific_done", flush=True)
 
         # Set kernel backends.
         self._handle_sampling_backend()
@@ -763,7 +745,6 @@ class ServerArgs:
         self._handle_page_size()
         self._handle_amd_specifics()
         self._handle_grammar_backend()
-        print("[dbg-server-args] post_init backend_compat_done", flush=True)
 
         # Handle Hicache settings.
         self._handle_hicache()
@@ -780,7 +761,6 @@ class ServerArgs:
         self._handle_eplb_and_dispatch()
         self._handle_expert_distribution_metrics()
         self._handle_elastic_ep()
-        print("[dbg-server-args] post_init moe_done", flush=True)
 
         # Handle pipeline parallelism.
         self._handle_pipeline_parallelism()
@@ -817,7 +797,6 @@ class ServerArgs:
 
         # Handle any other necessary validations.
         self._handle_other_validations()
-        print("[dbg-server-args] post_init complete", flush=True)
 
     def _handle_load_balance_method(self):
         if self.disaggregation_mode not in ("null", "prefill", "decode"):
@@ -836,6 +815,18 @@ class ServerArgs:
                 else "round_robin"
             )
             return
+
+        # Backward compat: in PD prefill, legacy "round_robin" means `bootstrap_room` routing.
+        if (
+            self.disaggregation_mode == "prefill"
+            and self.load_balance_method == "round_robin"
+        ):
+            logger.warning(
+                "In PD-disaggregation prefill mode, the 'round_robin' load balancing method "
+                "means `bootstrap_room` routing (use 'follow_bootstrap_room' instead). "
+                "Falling back to 'follow_bootstrap_room' for backward compatibility."
+            )
+            self.load_balance_method = "follow_bootstrap_room"
 
     def _handle_deprecated_args(self):
         # Handle deprecated tool call parsers
@@ -1014,43 +1005,6 @@ class ServerArgs:
         else:
             self.cuda_graph_max_bs = max(self.cuda_graph_bs)
 
-        # Safety: never capture CUDA graphs for batch sizes larger than the maximum number
-        # of concurrently running requests. Capturing bs >> concurrency can explode graph
-        # buffer sizes (e.g. DFLASH draft logits buffers where num_tokens_per_bs > 1) and
-        # OOM during startup, while providing no runtime benefit.
-        #
-        # This applies regardless of attention backend.
-        max_running = getattr(self, "max_running_requests", None)
-        allow_oversized_cuda_graph_bs = get_bool_env_var(
-            "SGLANG_ALLOW_OVERSIZED_CUDA_GRAPH_BS"
-        )
-        if max_running is not None:
-            try:
-                max_running_i = int(max_running)
-            except Exception:
-                max_running_i = 0
-            if max_running_i > 0 and self.cuda_graph_bs:
-                if (
-                    allow_oversized_cuda_graph_bs
-                    and max(self.cuda_graph_bs) > max_running_i
-                ):
-                    logger.warning(
-                        "Keeping oversized CUDA graph batch sizes %s above "
-                        "max_running_requests=%s because "
-                        "SGLANG_ALLOW_OVERSIZED_CUDA_GRAPH_BS=1.",
-                        self.cuda_graph_bs,
-                        max_running_i,
-                    )
-                    self.cuda_graph_max_bs = max(self.cuda_graph_bs)
-                elif max(self.cuda_graph_bs) > max_running_i:
-                    self.cuda_graph_bs = [
-                        b for b in self.cuda_graph_bs if int(b) <= max_running_i
-                    ]
-                    if max_running_i not in self.cuda_graph_bs:
-                        self.cuda_graph_bs.append(max_running_i)
-                    self.cuda_graph_bs = sorted(set(int(b) for b in self.cuda_graph_bs))
-                    self.cuda_graph_max_bs = max(self.cuda_graph_bs)
-
         if self.piecewise_cuda_graph_max_tokens is None:
             # Refer to pr #15927, by default we set the piecewise cuda graph max tokens to the chunked prefill size by default.
             # For MLA backend, the introduction of piecewise cuda graph will influence the kernel dispatch difference compared to the original mode.
@@ -1102,7 +1056,7 @@ class ServerArgs:
                     reserved_mem += 6 * 1024
                 elif self.speculative_algorithm != "NGRAM":
                     # eagle draft models and cuda graphs
-                    reserved_mem += 4 * 1024
+                    reserved_mem += 2 * 1024
 
             self.mem_fraction_static = (
                 round((gpu_mem - reserved_mem) / gpu_mem, 3)
@@ -1203,10 +1157,7 @@ class ServerArgs:
         user_set_prefill = self.nsa_prefill_backend is not None
         user_set_decode = self.nsa_decode_backend is not None
 
-        if not user_set_prefill and not user_set_decode and is_hip():
-            self.nsa_prefill_backend = "tilelang"
-            self.nsa_decode_backend = "tilelang"
-        elif kv_cache_dtype == "fp8_e4m3":
+        if kv_cache_dtype == "fp8_e4m3":
             # flashmla_auto dispatches to flashmla_sparse/flashmla_kv based on hardware and heuristics
             if not user_set_prefill:
                 self.nsa_prefill_backend = "flashmla_auto"
@@ -1224,17 +1175,7 @@ class ServerArgs:
                 if not user_set_prefill:
                     self.nsa_prefill_backend = "flashmla_sparse"
                 if not user_set_decode:
-                    prefer_hopper_fa4 = (
-                        str(
-                            os.environ.get(
-                                "SGLANG_FA4_PREFER_HOPPER_FLASH_ATTN", ""
-                            )
-                        ).strip().lower()
-                        in {"1", "true", "yes", "on"}
-                    )
-                    self.nsa_decode_backend = (
-                        "fa4" if prefer_hopper_fa4 else "fa3"
-                    )
+                    self.nsa_decode_backend = "fa3"
 
         logger.warning(
             f"Set NSA backends for {self.kv_cache_dtype} KV Cache: prefill={self.nsa_prefill_backend}, decode={self.nsa_decode_backend}."
@@ -1349,20 +1290,6 @@ class ServerArgs:
             # Set moe backend for DeepSeek
             if is_sm100_supported():
                 quant_method = get_quantization_config(hf_config)
-                quant_cfg = getattr(hf_config, "quantization_config", None) or {}
-                config_groups = quant_cfg.get("config_groups", {})
-                group0 = config_groups.get("group_0", {})
-                weights_cfg = group0.get("weights", {})
-                # this also apply to kimi k2.5
-                # since it follow the compressed tensor int4 recipe
-                # but not kimi k2 instruct or 0905 instruct.
-                is_kimi_k2_k25_thinking_int4 = (
-                    quant_method == "compressed-tensors"
-                    and weights_cfg.get("num_bits") == 4
-                    and weights_cfg.get("group_size") == 32
-                    and weights_cfg.get("strategy") == "group"
-                    and weights_cfg.get("type") == "int"
-                )
                 if self.quantization is None:
                     # Default DeepSeek V3/R1 native FP8 when not explicitly set,
                     # Because we need this condition for an assertion in
@@ -1377,26 +1304,11 @@ class ServerArgs:
                 if (
                     self.moe_a2a_backend == "none"
                     and self.moe_runner_backend == "auto"
-                    and (
-                        self.quantization in ["fp8", "modelopt_fp8", "modelopt_fp4"]
-                        or is_kimi_k2_k25_thinking_int4
-                    )
+                    and self.quantization in ["fp8", "modelopt_fp8", "modelopt_fp4"]
                 ):
                     self.moe_runner_backend = "flashinfer_trtllm"
-                    if is_kimi_k2_k25_thinking_int4:
-                        logger.info(
-                            "Use flashinfer_trtllm as MoE runner backend on Blackwell for Kimi K2 / K2.5 thinking int4"
-                        )
-                    else:
-                        logger.info(
-                            "Use flashinfer_trtllm as MoE runner backend on sm100 for DeepseekV3ForCausalLM"
-                        )
-            elif is_hip():
-                if not self.enable_dp_attention and self.nnodes == 1:
-                    # TODO (Hubert): Put this back later
-                    # self.enable_aiter_allreduce_fusion = True
                     logger.info(
-                        "Enable Aiter AllReduce Fusion for DeepseekV3ForCausalLM"
+                        "Use flashinfer_trtllm as MoE runner backend on sm100 for DeepseekV3ForCausalLM"
                     )
 
                 if (
@@ -1422,58 +1334,15 @@ class ServerArgs:
 
         elif model_arch in ["GptOssForCausalLM"]:
             # Set attention backend for GPT-OSS
-            force_fa3 = os.environ.get("SGLANG_GPTOSS_FORCE_FA3", "")
-            if str(force_fa3).strip().lower() in {"1", "true", "yes", "y", "on"}:
-                if not is_sm90_supported():
-                    raise ValueError(
-                        "SGLANG_GPTOSS_FORCE_FA3=1 requires an sm90-capable GPU (H100). "
-                        "FA3 is not available on this device."
-                    )
-                # Force FA3 for both prefill + decode when unset. If the user explicitly
-                # set a different backend, keep their choice (but error if it is triton).
-                if self.is_attention_backend_not_set():
-                    self.attention_backend = "fa3"
-                prefill_attn_backend, decode_attn_backend = self.get_attention_backends()
-                if prefill_attn_backend == "triton" or decode_attn_backend == "triton":
-                    raise ValueError(
-                        "SGLANG_GPTOSS_FORCE_FA3=1 forbids the 'triton' attention backend for GPT-OSS. "
-                        "Set --attention-backend fa3 (and do not override prefill/decode backends)."
-                    )
-
             if self.is_attention_backend_not_set():
                 if is_sm100_supported():
                     self.attention_backend = "trtllm_mha"
                 elif is_sm90_supported():
-                    prefer_hopper_fa4 = (
-                        os.environ.get("SGLANG_FA4_PREFER_HOPPER_FLASH_ATTN", "")
-                        .strip()
-                        .lower()
-                        in {"1", "true", "yes", "on"}
-                    )
-                    self.attention_backend = "fa4" if prefer_hopper_fa4 else "fa3"
+                    self.attention_backend = "fa3"
                 else:
                     self.attention_backend = "triton"
 
-            # GPT-OSS uses attention sinks; allow FlexAttention backends that implement sinks correctly.
-            supported_backends = [
-                "triton",
-                "trtllm_mha",
-                "fa3",
-                "fa4",
-                "ascend",
-                "flex_attention",
-                "flex_attention2",
-                "flex_flash",
-                "flex_flash2",
-                "flex_flash2_delegate_fa3",
-                "flex_flash4",
-            ]
-            # Optional: enable DeepSeek-MLA-style shared-down latent cKV path for GPT-OSS.
-            # This is only valid when the model is patched into MLA mode (see gpt_oss.py),
-            # otherwise FlashMLA kernels will not match the cache layout.
-            gptoss_mla = os.environ.get("SGLANG_GPTOSS_DEEPSEEK_LATENT_KV_MLA", "")
-            if str(gptoss_mla).strip().lower() in {"1", "true", "yes", "y", "on"}:
-                supported_backends.append("flashmla")
+            supported_backends = ["triton", "trtllm_mha", "fa3", "fa4", "ascend"]
             prefill_attn_backend, decode_attn_backend = self.get_attention_backends()
             assert (
                 prefill_attn_backend in supported_backends
@@ -1484,24 +1353,18 @@ class ServerArgs:
                 f"- Decode: {decode_attn_backend}\n"
             )
 
+            if (
+                prefill_attn_backend == "trtllm_mha"
+                or decode_attn_backend == "trtllm_mha"
+            ):
+                # TODO: support swa kv indices translation for trtllm_mha attention backend
+                self.disable_hybrid_swa_memory = True
+                logger.warning(
+                    "Disable hybrid SWA memory for GPT-OSS model with trtllm_mha attention backend."
+                )
+
             quant_method = get_quantization_config(hf_config)
             is_mxfp4_quant_format = quant_method == "mxfp4"
-            if is_blackwell_supported():
-                # workaround for https://github.com/flashinfer-ai/flashinfer/issues/2006
-                if not self.enable_dp_attention and self.nnodes == 1:
-                    self.enable_flashinfer_allreduce_fusion = True
-                    logger.info(
-                        "Enable FlashInfer AllReduce Fusion on sm100 for GptOssForCausalLM"
-                    )
-            if not self.enable_dp_attention and self.nnodes == 1 and is_hip():
-                # TODO (Hubert): Put this back later
-                # self.enable_aiter_allreduce_fusion = True
-                logger.info("Enable Aiter AllReduce Fusion for GptOssForCausalLM")
-            quantization_config = getattr(hf_config, "quantization_config", None)
-            is_mxfp4_quant_format = (
-                quantization_config is not None
-                and quantization_config.get("quant_method") == "mxfp4"
-            )
             if is_mxfp4_quant_format:
                 # use bf16 for mxfp4 triton kernels
                 self.dtype = "bfloat16"
@@ -1588,16 +1451,7 @@ class ServerArgs:
                 if is_sm100_supported():
                     self.attention_backend, platform = "trtllm_mha", "sm100"
                 elif is_sm90_supported():
-                    prefer_hopper_fa4 = (
-                        os.environ.get("SGLANG_FA4_PREFER_HOPPER_FLASH_ATTN", "")
-                        .strip()
-                        .lower()
-                        in {"1", "true", "yes", "on"}
-                    )
-                    self.attention_backend, platform = (
-                        "fa4" if prefer_hopper_fa4 else "fa3",
-                        "sm90",
-                    )
+                    self.attention_backend, platform = "fa3", "sm90"
                 elif is_hip():
                     self.attention_backend, platform = "aiter", "hip"
                 elif self.device == "xpu":
@@ -1609,17 +1463,11 @@ class ServerArgs:
                 )
             assert self.attention_backend in {
                 "fa3",
-                "fa4",
-                "flex_flash4",
                 "aiter",
                 "triton",
-                "ascend",
                 "trtllm_mha",
                 "intel_xpu",
-            }, (
-                "fa3, fa4, flex_flash4, aiter, triton, trtllm_mha or intel_xpu "
-                f"is required for Llama4 model but got {self.attention_backend}"
-            )
+            }, f"fa3, aiter, triton, trtllm_mha or intel_xpu is required for Llama4 model but got {self.attention_backend}"
             if is_sm100_supported() and self.moe_runner_backend == "auto":
                 if self.quantization in {"fp8", "modelopt_fp8"}:
                     self.moe_runner_backend = "flashinfer_trtllm"
@@ -1646,13 +1494,7 @@ class ServerArgs:
                 )
                 self.disable_hybrid_swa_memory = True
                 # https://docs.sglang.ai/advanced_features/attention_backend.html
-                accepted_backends = [
-                    "fa3",
-                    "fa4",
-                    "flex_flash4",
-                    "triton",
-                    "trtllm_mha",
-                ]
+                accepted_backends = ["fa3", "triton", "trtllm_mha"]
                 assert (
                     self.attention_backend in accepted_backends
                 ), f"One of the attention backends in {accepted_backends} is required for {model_arch}, but got {self.attention_backend}"
@@ -1667,17 +1509,7 @@ class ServerArgs:
                 if is_cuda() and is_sm100_supported():
                     self.attention_backend = "trtllm_mha"
                 elif is_cuda() and get_device_sm() >= 80:
-                    self.attention_backend = (
-                        "fa4"
-                        if (
-                            is_sm90_supported()
-                            and get_bool_env_var(
-                                "SGLANG_FA4_PREFER_HOPPER_FLASH_ATTN",
-                                default="false",
-                            )
-                        )
-                        else "fa3"
-                    )
+                    self.attention_backend = "fa3"
                 else:
                     self.attention_backend = "triton"
 
@@ -1896,13 +1728,6 @@ class ServerArgs:
             ), f"mamba extra_buffer is not supported for {model_arch} model"
 
         if self.enable_mamba_extra_buffer():  # extra_buffer
-            if self.disable_radix_cache:
-                raise ValueError(
-                    "mamba extra_buffer is not compatible with --disable-radix-cache "
-                    "Overlap scheduling is already supported with no_buffer + disable_radix_cache. "
-                    "Please use --mamba-scheduler-strategy no_buffer instead."
-                )
-
             assert (
                 is_cuda()
             ), "Mamba extra_buffer is only supported on CUDA devices with FLA backend"
@@ -1974,15 +1799,10 @@ class ServerArgs:
             if not use_mla_backend:
                 # MHA architecture
                 if is_hopper_with_cuda_12_3() and is_no_spec_infer_or_topk_one(self):
-                    prefer_hopper_fa4 = (
-                        os.environ.get("SGLANG_FA4_PREFER_HOPPER_FLASH_ATTN", "")
-                        .strip()
-                        .lower()
-                        in {"1", "true", "yes", "on"}
-                    )
-                    # Hopper MHA defaults to FA3 for the historically stable path, but allow
-                    # opting into the newer official Hopper FA4 path when explicitly requested.
-                    self.attention_backend = "fa4" if prefer_hopper_fa4 else "fa3"
+                    # Note: flashinfer 0.6.1 caused performance regression on Hopper attention kernel
+                    # Before the kernel is fixed, we choose fa3 as the default backend on Hopper MHA
+                    # ref: https://github.com/sgl-project/sglang/issues/17411
+                    self.attention_backend = "fa3"
                 elif (
                     is_sm100_supported()
                     and is_no_spec_infer_or_topk_one(self)
@@ -2001,13 +1821,7 @@ class ServerArgs:
             else:
                 # MLA architecture
                 if is_hopper_with_cuda_12_3():
-                    prefer_hopper_fa4 = (
-                        os.environ.get("SGLANG_FA4_PREFER_HOPPER_FLASH_ATTN", "")
-                        .strip()
-                        .lower()
-                        in {"1", "true", "yes", "on"}
-                    )
-                    self.attention_backend = "fa4" if prefer_hopper_fa4 else "fa3"
+                    self.attention_backend = "fa3"
                 elif is_sm100_supported():
                     self.attention_backend = "flashinfer"
                 elif is_hip():
@@ -2039,13 +1853,6 @@ class ServerArgs:
             assert (
                 self.speculative_algorithm is None
             ), "Speculative decoding is currently not supported with Flex Attention backend"
-
-        # Encoder-decoder models (e.g., Whisper)
-        if model_config.is_encoder_decoder:
-            logger.warning(
-                "Cuda graph is disabled for encoder-decoder models (e.g., Whisper)"
-            )
-            self.disable_cuda_graph = True
 
         # Major NVIDIA platforms backends
         if (
@@ -2109,76 +1916,7 @@ class ServerArgs:
             )
             self.attention_backend = "triton"
 
-        # FlexAttention backends (torch/flex2/hybrid flex_flash*) have limited support for
-        # quantized KV cache:
-        # - FP8: supported via a compatibility path (upcast K/V to query dtype inside FlexAttention),
-        #        which preserves the *stored* KV memory savings but can be slower due to casts.
-        # - FP4: not supported (no float4 K/V upcast path).
-        #
-        # Quality-first default: fail fast unless the user explicitly opts in.
-        # NOTE: Any backend starting with "flex_" is considered a FlexAttention-family backend.
-        # Keep this set explicit (instead of prefix-matching) to avoid accidentally gating
-        # unrelated future backends that might share the prefix.
-        flex_backends = {
-            "flex_attention",
-            "flex_attention2",
-            "flex_flash",
-            "flex_flash2",
-            "flex_flash2_delegate_fa3",
-            "flex_flash4",
-        }
-        if self.attention_backend in flex_backends and self.kv_cache_dtype in {
-            "fp8_e4m3",
-            "fp8_e5m2",
-            "fp4_e2m1",
-        }:
-            allow_fp8 = (os.environ.get("SGLANG_FLEX_ALLOW_FP8_KV") or "").strip() in {
-                "1",
-                "true",
-                "True",
-                "yes",
-                "YES",
-            }
-            allow_fallback_bf16 = (os.environ.get("SGLANG_FLEX_ALLOW_QUANT_KV") or "").strip() in {
-                "1",
-                "true",
-                "True",
-                "yes",
-                "YES",
-            }
-            if self.kv_cache_dtype.startswith("fp8_") and allow_fp8:
-                logger.warning(
-                    "FlexAttention backend %s will run with kv_cache_dtype=%s via an upcast compatibility path. "
-                    "This preserves KV memory savings but can be slower than the native flash kernels. "
-                    "For best performance on force-flash Flex backends, use the delegate fastpath "
-                    "(e.g. flex_flash2/flex_flash4) so FP8-KV routes to FA3/FA4 instead of gather fallback.",
-                    self.attention_backend,
-                    self.kv_cache_dtype,
-                )
-            elif allow_fallback_bf16:
-                logger.warning(
-                    "FlexAttention backend %s does not support kv_cache_dtype=%s natively; "
-                    "falling back to kv_cache_dtype=bfloat16 due to SGLANG_FLEX_ALLOW_QUANT_KV=1.",
-                    self.attention_backend,
-                    self.kv_cache_dtype,
-                )
-                self.kv_cache_dtype = "bfloat16"
-            else:
-                raise ValueError(
-                    "FlexAttention backends have limited support for quantized KV cache. "
-                    f"Got attention_backend={self.attention_backend!r}, kv_cache_dtype={self.kv_cache_dtype!r}. "
-                    "Options:\n"
-                    "  - Set SGLANG_FLEX_ALLOW_FP8_KV=1 to allow FP8 KV via upcast compatibility.\n"
-                    "  - Or set SGLANG_FLEX_ALLOW_QUANT_KV=1 to fall back to kv_cache_dtype=bfloat16.\n"
-                    "Best practice for speed: keep the target on FA3 with FP8 KV, and set the draft to bf16 via "
-                    "--speculative-draft-kv-cache-dtype bfloat16."
-                )
-
-        if (
-            self.prefill_attention_backend == "fa4"
-            and not self.use_mla_backend()
-            and is_sm100_supported()
-        ):
+        if self.prefill_attention_backend == "fa4" and not self.use_mla_backend():
             logger.warning(
                 f"FA4 backend only supports page size 128 for non-MLA model architectures, changing page_size from {self.page_size} to 128."
             )
@@ -2279,14 +2017,6 @@ class ServerArgs:
                             "torch_native",
                             "flex_attention",
                         ]
-                        prefer_hopper_fa4 = (
-                            os.environ.get("SGLANG_FA4_PREFER_HOPPER_FLASH_ATTN", "")
-                            .strip()
-                            .lower()
-                            in {"1", "true", "yes", "on"}
-                        )
-                        if prefer_hopper_fa4:
-                            KV4_FA4_MHA_BACKEND_CHOICES.append("fa4")
                         assert (
                             self.decode_attention_backend_str
                             in KV4_FA4_MHA_BACKEND_CHOICES
@@ -2489,20 +2219,15 @@ class ServerArgs:
 
         if self.moe_a2a_backend == "mori":
             self.ep_size = self.tp_size
-            if self.deepep_mode == "auto":
-                self.deepep_mode = "normal"
-                logger.warning("auto set deepep_mode=`normal` for MORI EP")
+            self.deepep_mode = "normal"
+            logger.warning("auto set deepep_mode=`normal` for MORI EP")
             logger.warning(
                 f"MoRI MoE is enabled. The expert parallel size is adjusted to be the same as the tensor parallel size[{self.tp_size}]."
             )
 
-            # Check chunked prefill for mori
-            # Skip validation if chunked prefill is disabled (i.e., size <= 0).
-            # Skip validation if disaggregation mode is decode.
-            if self.chunked_prefill_size > 0 and self.disaggregation_mode != "decode":
-                assert (self.chunked_prefill_size) <= get_int_env_var(
-                    "SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK", 4096
-                ), "SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK (default 4096) must be larger or equal to chunked_prefill_size"
+            assert (self.chunked_prefill_size) <= get_int_env_var(
+                "SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK", 4096
+            ), "SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK (default 4096) must be larger or equal to chunked_prefill_size"
 
     def _handle_eplb_and_dispatch(self):
         if self.enable_eplb and (self.expert_distribution_recorder_mode is None):
@@ -2611,9 +2336,8 @@ class ServerArgs:
         ):
             self.speculative_draft_model_revision = "main"
 
-        # FlashInfer trtllm moe bf16 only support RenormalizeNaive routing method and Deepseek routing method
-        # It is hard to tell the routing method in draft model, and the moe layer in draft model is not the bottleneck among
-        # end to end, so we just avoid using trtllm_moe for speculative decoding.
+        # Avoid using flashinfer_trtllm for speculative MoE runner backend by default
+        # TODO: Remove this block after verifying no accuracy regression with flashinfer_trtllm speculative backend
         from sglang.srt.layers.moe.utils import MoeRunnerBackend
 
         if self.speculative_moe_runner_backend is None:
@@ -2625,7 +2349,7 @@ class ServerArgs:
         else:
             assert not MoeRunnerBackend(
                 self.speculative_moe_runner_backend
-            ).is_flashinfer_trtllm(), "Currently speculative MoE runner backend doesn't support flashinfer_trtllm, please use triton or auto backend for speculative moe runner instead."
+            ).is_flashinfer_trtllm(), "Currently speculative MoE runner backend cannot be flashinfer_trtllm for risk in some draft models."
 
         if self.speculative_algorithm == "NEXTN":
             self.speculative_algorithm = "EAGLE"
@@ -2641,21 +2365,9 @@ class ServerArgs:
                     "Currently DFLASH speculative decoding only supports pp_size == 1."
                 )
 
-            # DFlash supports both paged (`page_size>1`) and non-paged (`page_size==1`) KV caches.
-            # Paged KV is preferred for long-context decode; the verify path must only free full
-            # pages and keep the last partial page when commit lengths are not page-aligned.
-
             if self.speculative_draft_model_path is None:
                 raise ValueError(
                     "DFLASH speculative decoding requires setting --speculative-draft-model-path."
-                )
-
-            if self.speculative_draft_page_size is not None and int(
-                self.speculative_draft_page_size
-            ) <= 0:
-                raise ValueError(
-                    "DFLASH requires --speculative-draft-page-size to be positive, "
-                    f"got {self.speculative_draft_page_size}."
                 )
 
             # DFLASH does not use EAGLE-style `num_steps`/`topk`, but those fields still
@@ -2700,125 +2412,58 @@ class ServerArgs:
                     self.speculative_dflash_block_size
                 )
 
-            draft_model_type = None
-            draft_hf_config = None
-            model_override_args = json.loads(self.json_model_override_args)
-            try:
-                from sglang.srt.utils.hf_transformers_utils import get_config
-
-                draft_hf_config = get_config(
-                    self.speculative_draft_model_path,
-                    trust_remote_code=self.trust_remote_code,
-                    revision=self.speculative_draft_model_revision,
-                    model_override_args=model_override_args,
-                )
-                draft_model_type = getattr(draft_hf_config, "model_type", None)
-            except Exception:
-                draft_hf_config = None
-                draft_model_type = None
+            window_size = None
+            if self.speculative_dflash_draft_window_size is not None:
+                window_size = int(self.speculative_dflash_draft_window_size)
+                if window_size <= 0:
+                    raise ValueError(
+                        "DFLASH requires --speculative-dflash-draft-window-size "
+                        f"to be positive, got {window_size}."
+                    )
+                self.speculative_dflash_draft_window_size = window_size
 
             if self.speculative_num_draft_tokens is None:
                 from sglang.srt.speculative.dflash_utils import (
                     parse_dflash_draft_config,
                 )
 
+                model_override_args = json.loads(self.json_model_override_args)
                 inferred_block_size = None
-                if draft_hf_config is not None:
-                    try:
-                        inferred_block_size = parse_dflash_draft_config(
-                            draft_hf_config=draft_hf_config
-                        ).resolve_block_size(default=None)
-                    except Exception as e:
-                        logger.warning(
-                            "Failed to infer DFLASH block_size from draft model config; "
-                            "defaulting speculative_num_draft_tokens to 16. Error: %s",
-                            e,
-                        )
+                try:
+                    from sglang.srt.utils.hf_transformers_utils import get_config
+
+                    draft_hf_config = get_config(
+                        self.speculative_draft_model_path,
+                        trust_remote_code=self.trust_remote_code,
+                        revision=self.speculative_draft_model_revision,
+                        model_override_args=model_override_args,
+                    )
+                    inferred_block_size = parse_dflash_draft_config(
+                        draft_hf_config=draft_hf_config
+                    ).resolve_block_size(default=None)
+                except Exception as e:
+                    logger.warning(
+                        "Failed to infer DFLASH block_size from draft model config; "
+                        "defaulting speculative_num_draft_tokens to 16. Error: %s",
+                        e,
+                    )
 
                 if inferred_block_size is None:
-                    try:
-                        if draft_hf_config is None:
-                            from sglang.srt.utils.hf_transformers_utils import get_config
-
-                            draft_hf_config = get_config(
-                                self.speculative_draft_model_path,
-                                trust_remote_code=self.trust_remote_code,
-                                revision=self.speculative_draft_model_revision,
-                                model_override_args=model_override_args,
-                            )
-                            draft_model_type = getattr(draft_hf_config, "model_type", None)
-                        inferred_block_size = resolve_dflash_block_size(
-                            draft_hf_config=draft_hf_config,
-                            default=None,
-                        )
-                    except Exception as e:
-                        logger.warning(
-                            "Failed to infer DFLASH block_size from transformers config loader; "
-                            "defaulting speculative_num_draft_tokens to 16. Error: %s",
-                            e,
-                        )
-                        draft_model_type = None
-
-                # GPT-OSS requires attention sink behavior. Historically we enforced FA3,
-                # but FlexAttention backends can also implement sinks correctly.
-                if draft_model_type == "gpt_oss":
-                    allowed = {
-                        "fa3",
-                        "fa4",
-                        "flex_attention",
-                        "flex_attention2",
-                        "flex_flash",
-                        "flex_flash2",
-                        "flex_flash2_delegate_fa3",
-                        "flex_flash4",
-                    }
-                    if self.attention_backend not in allowed:
-                        raise ValueError(
-                            "GPT-OSS DFLASH requires an attention backend that supports attention sinks. "
-                            f"Supported: {sorted(allowed)}. "
-                            f"Got attention_backend={self.attention_backend!r}."
-                        )
-                    if self.speculative_draft_attention_backend is None:
-                        # Default draft backend to target backend (keeps semantics aligned).
-                        self.speculative_draft_attention_backend = self.attention_backend
-                    elif self.speculative_draft_attention_backend not in allowed:
-                        raise ValueError(
-                            "GPT-OSS DFLASH requires a sinks-capable speculative draft attention backend. "
-                            f"Supported: {sorted(allowed)}. "
-                            f"Got speculative_draft_attention_backend={self.speculative_draft_attention_backend!r}."
-                        )
-
-                if inferred_block_size is None:
-                    if draft_model_type == "gpt_oss":
-                        inferred_block_size = 8
-                        logger.warning(
-                            "GPT-OSS DFLASH defaulting speculative_num_draft_tokens/block_size to %d. "
-                            "This is the current best-performing default on the local reference benchmark. "
-                            "Override with --speculative-dflash-block-size if needed.",
-                            inferred_block_size,
-                        )
-                    else:
-                        inferred_block_size = 16
-                        logger.warning(
-                            "speculative_num_draft_tokens is not set; defaulting to %d for DFLASH.",
-                            inferred_block_size,
-                        )
+                    inferred_block_size = 16
+                    logger.warning(
+                        "speculative_num_draft_tokens is not set; defaulting to %d for DFLASH.",
+                        inferred_block_size,
+                    )
                 self.speculative_num_draft_tokens = inferred_block_size
-                if self.speculative_dflash_block_size is None:
-                    self.speculative_dflash_block_size = inferred_block_size
 
-            if (
-                draft_model_type == "gpt_oss"
-                and self.page_size is not None
-                and int(self.page_size) > 1
-                and self.speculative_draft_page_size is None
-            ):
-                self.speculative_draft_page_size = 1
-                logger.warning(
-                    "GPT-OSS DFLASH defaulting speculative_draft_page_size=1 for paged target page_size=%s "
-                    "to improve draft acceptance. Override with --speculative-draft-page-size.",
-                    int(self.page_size),
-                )
+            if window_size is not None:
+                draft_tokens = int(self.speculative_num_draft_tokens)
+                if window_size < draft_tokens:
+                    raise ValueError(
+                        "DFLASH --speculative-dflash-draft-window-size must be >= "
+                        "--speculative-num-draft-tokens (block_size). "
+                        f"window_size={window_size}, block_size={draft_tokens}."
+                    )
 
             if self.max_running_requests is None:
                 self.max_running_requests = 48
@@ -2826,278 +2471,16 @@ class ServerArgs:
                     "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
                 )
 
-            if not self.disable_overlap_schedule:
-                logger.warning(
-                    "DFLASH overlap scheduler (spec v2) is enabled. This path is experimental and should be validated on the target workload."
-                )
+            self.disable_overlap_schedule = True
+            logger.warning(
+                "Overlap scheduler is disabled when using DFLASH speculative decoding (spec v2 is not supported yet)."
+            )
 
             if self.enable_mixed_chunk:
                 self.enable_mixed_chunk = False
                 logger.warning(
                     "Mixed chunked prefill is disabled because of using dflash speculative decoding."
                 )
-
-            # Draft KV dtype defaulting:
-            # If the target KV cache is quantized (FP8/FP4) but the draft attention backend is Flex*,
-            # the draft worker must not inherit the quantized dtype (Flex* does not natively support it).
-            flex_backends = {
-                "flex_attention",
-                "flex_attention2",
-                "flex_flash",
-                "flex_flash2",
-                "flex_flash2_delegate_fa3",
-                "flex_flash4",
-            }
-            quant_kv = {"fp8_e4m3", "fp8_e5m2", "fp4_e2m1"}
-            draft_attn = (self.speculative_draft_attention_backend or self.attention_backend or "").strip()
-            if draft_attn in flex_backends:
-                if self.speculative_draft_kv_cache_dtype is None and self.kv_cache_dtype in quant_kv:
-                    logger.warning(
-                        "DFLASH draft backend=%s does not support kv_cache_dtype=%s; "
-                        "defaulting draft KV to bfloat16. You can override with "
-                        "--speculative-draft-kv-cache-dtype.",
-                        draft_attn,
-                        self.kv_cache_dtype,
-                    )
-                    self.speculative_draft_kv_cache_dtype = "bfloat16"
-                elif self.speculative_draft_kv_cache_dtype in quant_kv:
-                    allow_fp8 = (os.environ.get("SGLANG_FLEX_ALLOW_FP8_KV") or "").strip() in {
-                        "1",
-                        "true",
-                        "True",
-                        "yes",
-                        "YES",
-                    }
-                    if str(self.speculative_draft_kv_cache_dtype).startswith("fp8_") and allow_fp8:
-                        logger.warning(
-                            "DFLASH draft FlexAttention backend=%s will run with kv_cache_dtype=%s via an upcast "
-                            "compatibility path (SGLANG_FLEX_ALLOW_FP8_KV=1).",
-                            draft_attn,
-                            self.speculative_draft_kv_cache_dtype,
-                        )
-                    else:
-                        raise ValueError(
-                            "DFLASH draft FlexAttention backend has limited support for quantized KV cache. "
-                            f"Got speculative_draft_attention_backend={draft_attn!r}, "
-                            f"speculative_draft_kv_cache_dtype={self.speculative_draft_kv_cache_dtype!r}. "
-                            "Set SGLANG_FLEX_ALLOW_FP8_KV=1 to allow FP8 KV via upcast compatibility, "
-                            "or keep draft KV at bfloat16."
-                        )
-
-        elif self.speculative_algorithm == "DFLASH_TREE":
-            if self.enable_dp_attention:
-                raise ValueError(
-                    "Currently DFLASH_TREE speculative decoding does not support dp attention."
-                )
-
-            if self.pp_size != 1:
-                raise ValueError(
-                    "Currently DFLASH_TREE speculative decoding only supports pp_size == 1."
-                )
-
-            if self.speculative_draft_model_path is None:
-                raise ValueError(
-                    "DFLASH_TREE speculative decoding requires setting --speculative-draft-model-path."
-                )
-
-            if self.speculative_eagle_topk is None:
-                self.speculative_eagle_topk = 4
-
-            if self.speculative_dflash_block_size is not None and int(
-                self.speculative_dflash_block_size
-            ) <= 0:
-                raise ValueError(
-                    "DFLASH_TREE requires --speculative-dflash-block-size to be positive, "
-                    f"got {self.speculative_dflash_block_size}."
-                )
-
-            if self.speculative_dflash_block_size is None:
-                from sglang.srt.speculative.dflash_utils import (
-                    resolve_dflash_block_size,
-                )
-
-                model_override_args = json.loads(self.json_model_override_args)
-                inferred_block_size = None
-                draft_model_type = None
-                try:
-                    from sglang.srt.utils.hf_transformers_utils import download_from_hf
-
-                    config_root = (
-                        self.speculative_draft_model_path
-                        if os.path.isdir(self.speculative_draft_model_path)
-                        else download_from_hf(
-                            self.speculative_draft_model_path,
-                            revision=self.speculative_draft_model_revision,
-                            filename="",
-                            tokens={"token": os.environ.get("HF_TOKEN")},
-                        )
-                    )
-                    config_path = os.path.join(config_root, "config.json")
-                    with open(config_path, "r", encoding="utf-8") as f:
-                        draft_config_json = json.load(f)
-                    inferred_block_size = resolve_dflash_block_size(
-                        draft_config_json=draft_config_json,
-                        draft_hf_config=None,
-                        default=None,
-                    )
-                    draft_model_type = (draft_config_json or {}).get("model_type")
-                except Exception as e:
-                    logger.warning(
-                        "Failed to infer DFLASH block_size from draft config.json; "
-                        "falling back to transformers config loader. Error: %s",
-                        e,
-                    )
-
-                if inferred_block_size is None:
-                    try:
-                        from sglang.srt.utils.hf_transformers_utils import get_config
-
-                        draft_hf_config = get_config(
-                            self.speculative_draft_model_path,
-                            trust_remote_code=self.trust_remote_code,
-                            revision=self.speculative_draft_model_revision,
-                            model_override_args=model_override_args,
-                        )
-                        inferred_block_size = resolve_dflash_block_size(
-                            draft_hf_config=draft_hf_config,
-                            default=None,
-                        )
-                        draft_model_type = getattr(draft_hf_config, "model_type", None)
-                    except Exception as e:
-                        logger.warning(
-                            "Failed to infer DFLASH block_size from transformers config loader; "
-                            "defaulting speculative_dflash_block_size to 16. Error: %s",
-                            e,
-                        )
-
-                # GPT-OSS requires attention sink behavior. Historically we enforced FA3,
-                # but FlexAttention backends can also implement sinks correctly.
-                if draft_model_type == "gpt_oss":
-                    allowed = {
-                        "fa3",
-                        "fa4",
-                        "flex_attention",
-                        "flex_attention2",
-                        "flex_flash",
-                        "flex_flash2",
-                        "flex_flash2_delegate_fa3",
-                        "flex_flash4",
-                    }
-                    if self.attention_backend not in allowed:
-                        raise ValueError(
-                            "GPT-OSS DFLASH_TREE requires an attention backend that supports attention sinks. "
-                            f"Supported: {sorted(allowed)}. "
-                            f"Got attention_backend={self.attention_backend!r}."
-                        )
-                    if self.speculative_draft_attention_backend is None:
-                        self.speculative_draft_attention_backend = self.attention_backend
-                    elif self.speculative_draft_attention_backend not in allowed:
-                        raise ValueError(
-                            "GPT-OSS DFLASH_TREE requires a sinks-capable speculative draft attention backend. "
-                            f"Supported: {sorted(allowed)}. "
-                            f"Got speculative_draft_attention_backend={self.speculative_draft_attention_backend!r}."
-                        )
-
-                if inferred_block_size is None:
-                    inferred_block_size = 16
-                    logger.warning(
-                        "speculative_dflash_block_size is not set; defaulting to %d for DFLASH_TREE.",
-                        inferred_block_size,
-                    )
-                self.speculative_dflash_block_size = inferred_block_size
-
-            if self.speculative_num_steps is None:
-                self.speculative_num_steps = int(self.speculative_dflash_block_size) - 1
-            if int(self.speculative_num_steps) <= 0:
-                raise ValueError(
-                    "DFLASH_TREE requires speculative_num_steps to be positive. "
-                    f"Got speculative_num_steps={self.speculative_num_steps}."
-                )
-            if int(self.speculative_num_steps) >= int(self.speculative_dflash_block_size):
-                raise ValueError(
-                    "DFLASH_TREE requires speculative_num_steps <= speculative_dflash_block_size - 1. "
-                    f"Got speculative_num_steps={self.speculative_num_steps}, "
-                    f"speculative_dflash_block_size={self.speculative_dflash_block_size}."
-                )
-
-            if self.speculative_num_draft_tokens is None:
-                # Verify-node budget defaults to the draft window length.
-                self.speculative_num_draft_tokens = int(self.speculative_dflash_block_size)
-
-            if self.max_running_requests is None:
-                self.max_running_requests = 48
-                logger.warning(
-                    "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
-                )
-
-            tree_overlap_experimental = (
-                (os.environ.get("SGLANG_ENABLE_DFLASH_TREE_OVERLAP_EXPERIMENTAL") or "")
-                .strip()
-                .lower()
-                not in ("", "0", "false", "off", "no")
-            )
-            if tree_overlap_experimental:
-                logger.warning(
-                    "DFLASH_TREE overlap scheduler is enabled in experimental mode. "
-                    "This path is not production-ready yet and must be validated under CUDA graph replay."
-                )
-            else:
-                self.disable_overlap_schedule = True
-                logger.warning(
-                    "Overlap scheduler is disabled when using DFLASH_TREE speculative decoding. "
-                    "Set SGLANG_ENABLE_DFLASH_TREE_OVERLAP_EXPERIMENTAL=1 to enable the experimental spec-v2 path."
-                )
-
-            if self.enable_mixed_chunk:
-                self.enable_mixed_chunk = False
-                logger.warning(
-                    "Mixed chunked prefill is disabled because of using DFLASH_TREE speculative decoding."
-                )
-
-            # Draft KV dtype defaulting for Flex* draft backends under a quantized target KV.
-            flex_backends = {
-                "flex_attention",
-                "flex_attention2",
-                "flex_flash",
-                "flex_flash2",
-                "flex_flash2_delegate_fa3",
-                "flex_flash4",
-            }
-            quant_kv = {"fp8_e4m3", "fp8_e5m2", "fp4_e2m1"}
-            draft_attn = (self.speculative_draft_attention_backend or self.attention_backend or "").strip()
-            if draft_attn in flex_backends:
-                if self.speculative_draft_kv_cache_dtype is None and self.kv_cache_dtype in quant_kv:
-                    logger.warning(
-                        "DFLASH_TREE draft backend=%s does not support kv_cache_dtype=%s; "
-                        "defaulting draft KV to bfloat16. You can override with "
-                        "--speculative-draft-kv-cache-dtype.",
-                        draft_attn,
-                        self.kv_cache_dtype,
-                    )
-                    self.speculative_draft_kv_cache_dtype = "bfloat16"
-                elif self.speculative_draft_kv_cache_dtype in quant_kv:
-                    allow_fp8 = (os.environ.get("SGLANG_FLEX_ALLOW_FP8_KV") or "").strip() in {
-                        "1",
-                        "true",
-                        "True",
-                        "yes",
-                        "YES",
-                    }
-                    if str(self.speculative_draft_kv_cache_dtype).startswith("fp8_") and allow_fp8:
-                        logger.warning(
-                            "DFLASH_TREE draft FlexAttention backend=%s will run with kv_cache_dtype=%s via an "
-                            "upcast compatibility path (SGLANG_FLEX_ALLOW_FP8_KV=1).",
-                            draft_attn,
-                            self.speculative_draft_kv_cache_dtype,
-                        )
-                    else:
-                        raise ValueError(
-                            "DFLASH_TREE draft FlexAttention backend has limited support for quantized KV cache. "
-                            f"Got speculative_draft_attention_backend={draft_attn!r}, "
-                            f"speculative_draft_kv_cache_dtype={self.speculative_draft_kv_cache_dtype!r}. "
-                            "Set SGLANG_FLEX_ALLOW_FP8_KV=1 to allow FP8 KV via upcast compatibility, "
-                            "or keep draft KV at bfloat16."
-                        )
 
         if self.speculative_algorithm in ("EAGLE", "EAGLE3", "STANDALONE"):
             if self.speculative_algorithm == "STANDALONE" and self.enable_dp_attention:
@@ -3199,10 +2582,10 @@ class ServerArgs:
             if (
                 self.speculative_eagle_topk > 1
                 and self.page_size > 1
-                and self.attention_backend not in ["flashinfer", "fa3", "fa4", "flex_flash4"]
+                and self.attention_backend not in ["flashinfer", "fa3"]
             ):
                 raise ValueError(
-                    "speculative_eagle_topk > 1 with page_size > 1 is unstable and produces incorrect results for paged attention backends. This combination is only supported for the 'flashinfer', 'fa3', 'fa4', and 'flex_flash4' backends."
+                    "speculative_eagle_topk > 1 with page_size > 1 is unstable and produces incorrect results for paged attention backends. This combination is only supported for the 'flashinfer' backend."
                 )
 
         if self.speculative_algorithm == "NGRAM":
@@ -3232,15 +2615,13 @@ class ServerArgs:
             if (
                 self.speculative_eagle_topk > 1
                 and self.page_size > 1
-                and self.attention_backend
-                not in ["flashinfer", "fa3", "fa4", "flex_flash4"]
+                and self.attention_backend != "flashinfer"
             ):
                 raise ValueError(
                     f"speculative_eagle_topk({self.speculative_eagle_topk}) > 1 "
                     f"with page_size({self.page_size}) > 1 is unstable "
                     "and produces incorrect results for paged attention backends. "
-                    "This combination is only supported for the 'flashinfer', "
-                    "'fa3', 'fa4', and 'flex_flash4' backends."
+                    "This combination is only supported for the 'flashinfer' backend."
                 )
             if self.enable_dp_attention:
                 # TODO: support dp attention for ngram speculative decoding
@@ -3278,8 +2659,8 @@ class ServerArgs:
                 )
                 self.load_format = "auto"
             elif (
-                self.remote_instance_weight_loader_backend == "transfer_engine"
-                and not self.validate_transfer_engine()
+                not self.validate_transfer_engine()
+                and self.remote_instance_weight_loader_backend == "transfer_engine"
             ):
                 logger.warning(
                     "Fallback load_format to 'auto' due to 'transfer_engine' backend is not supported."
@@ -3294,13 +2675,24 @@ class ServerArgs:
 
     def _handle_pd_disaggregation(self):
         if self.disaggregation_mode == "decode":
+            assert (
+                self.disaggregation_decode_tp is None
+            ), "Cannot set --disaggregation-decode-tp for the decode engine."
+            assert (
+                self.disaggregation_decode_dp is None
+            ), "Cannot set --disaggregation-decode-dp for the decode engine."
+
             self.disable_radix_cache = True
             logger.warning("KV cache is forced as chunk cache for decode server")
 
         elif self.disaggregation_mode == "prefill":
-            assert (
-                self.disaggregation_transfer_backend != "fake"
-            ), "Prefill server does not support 'fake' as the transfer backend"
+            if self.disaggregation_decode_tp is None:
+                self.disaggregation_decode_tp = self.tp_size
+            if self.disaggregation_decode_dp is None:
+                self.disaggregation_decode_dp = self.dp_size
+
+            self.disaggregation_prefill_pp = self.pp_size
+            self.validate_disagg_tp_size(self.tp_size, self.disaggregation_decode_tp)
 
             if not self.enable_piecewise_cuda_graph:
                 self.disable_cuda_graph = True
@@ -3431,6 +2823,13 @@ class ServerArgs:
                 raise ValueError(
                     "The argument disaggregation-decode-enable-offload-kvcache is only supported for decode side."
                 )
+            if (
+                self.disaggregation_mode == "decode"
+                and envs.SGLANG_ENABLE_SPEC_V2.get()
+            ):
+                raise ValueError(
+                    "Spec v2 and decode offload kv cache are incompatible and cannot be enabled together."
+                )
         if not (0 < self.swa_full_tokens_ratio <= 1.0):
             raise ValueError("--swa-full-tokens-ratio should be in range (0, 1.0].")
 
@@ -3447,12 +2846,6 @@ class ServerArgs:
             os.environ["SGLANG_ENABLE_DETERMINISTIC_INFERENCE"] = "1"
 
         if self.enable_deterministic_inference:
-            if self.enable_aiter_allreduce_fusion:
-                logger.warning(
-                    "Disable --enable-aiter-allreduce-fusion because deterministic inference is enabled."
-                )
-                self.enable_aiter_allreduce_fusion = False
-
             # Check sampling backend
             self.sampling_backend = "pytorch"
             logger.warning(
@@ -3487,16 +2880,7 @@ class ServerArgs:
                         self.attention_backend = "flashinfer"
                 else:
                     # Hopper (SM90) and older architectures
-                    self.attention_backend = (
-                        "fa4"
-                        if (
-                            is_sm90_supported()
-                            and get_bool_env_var(
-                                "SGLANG_FA4_PREFER_HOPPER_FLASH_ATTN", default="false"
-                            )
-                        )
-                        else "fa3"
-                    )
+                    self.attention_backend = "fa3"
                 logger.warning(
                     f"Attention backend not specified. Falling back to '{self.attention_backend}' for deterministic inference. "
                     f"You can explicitly set --attention-backend to one of {DETERMINISTIC_ATTENTION_BACKEND_CHOICES}."
@@ -3509,7 +2893,7 @@ class ServerArgs:
                 )
 
             if is_deepseek_model:
-                if self.attention_backend not in RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND:
+                if self.attention_backend not in ["fa3", "triton"]:
                     raise ValueError(
                         f"Currently only {RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND} attention backends are supported for deterministic inference with DeepSeek models. But you're using {self.attention_backend}."
                     )
@@ -4096,12 +3480,6 @@ class ServerArgs:
             help="Whether to output as a sequence of disjoint segments.",
         )
         parser.add_argument(
-            "--enable-streaming-session",
-            action="store_true",
-            default=ServerArgs.enable_streaming_session,
-            help="Enable streaming session mode and SessionAwareCache wrapper.",
-        )
-        parser.add_argument(
             "--random-seed",
             type=int,
             default=ServerArgs.random_seed,
@@ -4616,16 +3994,7 @@ class ServerArgs:
         parser.add_argument(
             "--mm-attention-backend",
             type=str,
-            choices=[
-                "sdpa",
-                "fa3",
-                "fa4",
-                "flex_flash4",
-                "triton_attn",
-                "ascend_attn",
-                "aiter_attn",
-                "flashinfer_cudnn",
-            ],
+            choices=["sdpa", "fa3", "fa4", "triton_attn", "ascend_attn", "aiter_attn"],
             default=ServerArgs.mm_attention_backend,
             help="Set multimodal attention backend.",
         )
@@ -4685,15 +4054,7 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-algorithm",
             type=str,
-            choices=[
-                "DFLASH",
-                "DFLASH_TREE",
-                "EAGLE",
-                "EAGLE3",
-                "NEXTN",
-                "STANDALONE",
-                "NGRAM",
-            ],
+            choices=["DFLASH", "EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "NGRAM"],
             help="Speculative algorithm.",
         )
         parser.add_argument(
@@ -4744,16 +4105,13 @@ class ServerArgs:
             default=ServerArgs.speculative_dflash_block_size,
         )
         parser.add_argument(
-            "--speculative-draft-mem-fraction-static",
-            "--mem-frac-dflash",
-            dest="speculative_draft_mem_fraction_static",
-            type=float,
-            default=ServerArgs.speculative_draft_mem_fraction_static,
-            help=(
-                "DFLASH only. Override the draft worker mem_fraction_static used to "
-                "preallocate draft KV cache. If unset, the draft worker inherits "
-                "--mem-fraction-static from the target server args."
-            ),
+            "--speculative-dflash-draft-window-size",
+            type=int,
+            help="DFLASH only. Sliding window size for the draft-model KV cache. "
+            "When set, the draft worker keeps a recent target-token window in its "
+            "local cache (paged backends may retain up to one extra page on the left "
+            "for alignment). Default is full context.",
+            default=ServerArgs.speculative_dflash_draft_window_size,
         )
         parser.add_argument(
             "--speculative-accept-threshold-single",
@@ -4785,23 +4143,6 @@ class ServerArgs:
             type=str,
             help="Attention backend for speculative decoding drafting.",
             default=ServerArgs.speculative_draft_attention_backend,
-        )
-        parser.add_argument(
-            "--speculative-draft-kv-cache-dtype",
-            type=str,
-            default=ServerArgs.speculative_draft_kv_cache_dtype,
-            choices=["auto", "fp8_e5m2", "fp8_e4m3", "bf16", "bfloat16", "fp4_e2m1"],
-            help='Override the KV cache dtype for the draft worker. If unset, uses --kv-cache-dtype.',
-        )
-        parser.add_argument(
-            "--speculative-draft-page-size",
-            type=int,
-            default=ServerArgs.speculative_draft_page_size,
-            help=(
-                "Override the page size for the DFLASH draft worker. "
-                "If unset, the draft inherits the target page size unless a model-specific "
-                "auto override applies."
-            ),
         )
         parser.add_argument(
             "--speculative-moe-runner-backend",
@@ -4913,11 +4254,6 @@ class ServerArgs:
             help="Enable FlashInfer allreduce fusion with Residual RMSNorm.",
         )
         parser.add_argument(
-            "--enable-aiter-allreduce-fusion",
-            action="store_true",
-            help="Enable Aiter AllReduce Fusion.",
-        )
-        parser.add_argument(
             "--deepep-mode",
             type=str,
             choices=["normal", "low_latency", "auto"],
@@ -5008,12 +4344,6 @@ class ServerArgs:
             help="Specify the collective communication backend for elastic EP. Currently supports 'mooncake'.",
         )
         parser.add_argument(
-            "--enable-elastic-expert-backup",
-            action="store_true",
-            default=ServerArgs.enable_elastic_expert_backup,
-            help="Enable elastic expert backup feature.",
-        )
-        parser.add_argument(
             "--mooncake-ib-device",
             type=str,
             default=ServerArgs.mooncake_ib_device,
@@ -5063,31 +4393,6 @@ class ServerArgs:
             default=ServerArgs.mamba_backend,
             help="Choose the kernel backend for Mamba SSM operations. Default is 'triton'. "
             "Options: 'triton' (default), 'flashinfer' (requires FlashInfer with Mamba support).",
-        )
-        parser.add_argument(
-            "--linear-attn-backend",
-            type=str,
-            choices=LINEAR_ATTN_KERNEL_BACKEND_CHOICES,
-            default=ServerArgs.linear_attn_backend,
-            help="The default kernel backend for linear attention (GDN/KDA). "
-            "Can be overridden per-mode by --linear-attn-decode-backend "
-            "and --linear-attn-prefill-backend.",
-        )
-        parser.add_argument(
-            "--linear-attn-decode-backend",
-            type=str,
-            choices=LINEAR_ATTN_KERNEL_BACKEND_CHOICES,
-            default=ServerArgs.linear_attn_decode_backend,
-            help="Override the kernel backend for linear attention decode. "
-            "If not set, uses --linear-attn-backend.",
-        )
-        parser.add_argument(
-            "--linear-attn-prefill-backend",
-            type=str,
-            choices=LINEAR_ATTN_KERNEL_BACKEND_CHOICES,
-            default=ServerArgs.linear_attn_prefill_backend,
-            help="Override the kernel backend for linear attention prefill/extend. "
-            "If not set, uses --linear-attn-backend.",
         )
 
         # Hierarchical cache
@@ -5699,6 +5004,24 @@ class ServerArgs:
             help="Bootstrap server port on the prefill server. Default is 8998.",
         )
         parser.add_argument(
+            "--disaggregation-decode-tp",
+            type=int,
+            default=ServerArgs.disaggregation_decode_tp,
+            help="Decode tp size. If not set, it matches the tp size of the current engine. This is only set on the prefill server.",
+        )
+        parser.add_argument(
+            "--disaggregation-decode-dp",
+            type=int,
+            default=ServerArgs.disaggregation_decode_dp,
+            help="Decode dp size. If not set, it matches the dp size of the current engine. This is only set on the prefill server.",
+        )
+        parser.add_argument(
+            "--disaggregation-prefill-pp",
+            type=int,
+            default=ServerArgs.disaggregation_prefill_pp,
+            help="Prefill pp size. If not set, it is default to 1. This is only set on the decode server.",
+        )
+        parser.add_argument(
             "--disaggregation-ib-device",
             type=str,
             default=ServerArgs.disaggregation_ib_device,
@@ -5877,13 +5200,6 @@ class ServerArgs:
             action="store_true",
             default=ServerArgs.enable_prefix_mm_cache,
             help="Enable prefix multimodal cache. Currently only supports mm-only.",
-        )
-
-        parser.add_argument(
-            "--enable-mm-global-cache",
-            action="store_true",
-            default=ServerArgs.enable_mm_global_cache,
-            help="Enable global multimodal embedding cache to skip redundant ViT inference.",
         )
 
         # For registering hooks
@@ -6252,6 +5568,14 @@ class ServerArgs:
                     16 <= self.max_lora_chunk_size <= 128
                     and (self.max_lora_chunk_size & (self.max_lora_chunk_size - 1)) == 0
                 ), "--max-lora-chunk-size must be a power of 2 between 16 and 128."
+
+    def validate_disagg_tp_size(self, prefill_tp: int, decode_tp: int):
+        larger_tp = max(decode_tp, prefill_tp)
+        smaller_tp = min(decode_tp, prefill_tp)
+        assert larger_tp % smaller_tp == 0, (
+            "Different tp size is supported only when one tp is multiple of the other. "
+            f"decode_tp={decode_tp}, prefill_tp={prefill_tp}"
+        )
 
     def validate_buckets_rule(self, arg_name: str, buckets_rule: List[str]):
         if not buckets_rule:

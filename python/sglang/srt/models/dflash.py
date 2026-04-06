@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 import logging
-import os
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -21,6 +20,7 @@ from sglang.srt.layers.linear import (
     QKVParallelLinear,
     RowParallelLinear,
 )
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -28,8 +28,7 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.speculative.dflash_utils import (
     can_dflash_slice_qkv_weight,
-    resolve_dflash_block_size,
-    resolve_dflash_target_layer_ids,
+    parse_dflash_draft_config,
 )
 
 logger = logging.getLogger(__name__)
@@ -93,6 +92,11 @@ class DFlashAttention(nn.Module):
 
         rope_theta = float(getattr(config, "rope_theta", 1000000))
         rope_scaling = getattr(config, "rope_scaling", None)
+        rope_is_neox_style = bool(
+            getattr(
+                config, "rope_is_neox_style", getattr(config, "is_neox_style", True)
+            )
+        )
         max_position_embeddings = int(getattr(config, "max_position_embeddings", 32768))
         self.rotary_emb = get_rope(
             head_dim,
@@ -100,6 +104,7 @@ class DFlashAttention(nn.Module):
             max_position=max_position_embeddings,
             base=rope_theta,
             rope_scaling=rope_scaling,
+            is_neox_style=rope_is_neox_style,
         )
 
         self.scaling = head_dim**-0.5
@@ -112,39 +117,6 @@ class DFlashAttention(nn.Module):
             layer_id=layer_id,
             attn_type=AttentionType.ENCODER_ONLY,
         )
-        self._dflash_kv_stats_logged = 0
-
-    def _maybe_log_kv_stats(self, *, tag: str, k: torch.Tensor, v: torch.Tensor) -> None:
-        enabled = (os.environ.get("SGLANG_DFLASH_LOG_ATTN_KV_STATS") or "").strip().lower() not in (
-            "",
-            "0",
-            "false",
-            "off",
-            "no",
-        )
-        if not enabled:
-            return
-        max_logs = int((os.environ.get("SGLANG_DFLASH_LOG_ATTN_KV_STATS_MAX") or "2").strip() or "2")
-        if self._dflash_kv_stats_logged >= max_logs:
-            return
-        if int(self.attn.layer_id) != 0:
-            return
-        try:
-            k_abs = k.abs()
-            v_abs = v.abs()
-            logger.warning(
-                "DFLASH draft KV stats tag=%s layer=%d k_absmax=%.6f k_meanabs=%.6f v_absmax=%.6f v_meanabs=%.6f tokens=%d",
-                str(tag),
-                int(self.attn.layer_id),
-                float(k_abs.max().item()) if k_abs.numel() > 0 else 0.0,
-                float(k_abs.mean().item()) if k_abs.numel() > 0 else 0.0,
-                float(v_abs.max().item()) if v_abs.numel() > 0 else 0.0,
-                float(v_abs.mean().item()) if v_abs.numel() > 0 else 0.0,
-                int(k.shape[0]),
-            )
-            self._dflash_kv_stats_logged += 1
-        except Exception:
-            logger.exception("DFLASH draft KV stats logging failed")
 
     def forward(
         self,
@@ -155,7 +127,6 @@ class DFlashAttention(nn.Module):
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = apply_qk_norm(q, k, self.q_norm, self.k_norm, self.head_dim)
-        self._maybe_log_kv_stats(tag="self_attn", k=k, v=v)
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v, forward_batch)
         output, _ = self.o_proj(attn_output)
@@ -179,13 +150,11 @@ class DFlashAttention(nn.Module):
             )
             kv = F.linear(hidden_states, weight, bias)
             k, v = kv.split([self.kv_size, self.kv_size], dim=-1)
-            self._maybe_log_kv_stats(tag="ctx_append", k=k, v=v)
             return k, v
 
         # Fallback: compute full QKV and discard Q (keeps compatibility with quantized weights).
         qkv, _ = self.qkv_proj(hidden_states)
         _, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        self._maybe_log_kv_stats(tag="ctx_append", k=k, v=v)
         return k, v
 
     def apply_k_norm(self, k: torch.Tensor) -> torch.Tensor:
@@ -291,10 +260,6 @@ class DFlashDraftModel(nn.Module):
     def __init__(self, config, quant_config=None, prefix: str = "") -> None:
         super().__init__()
         self.config = config
-        # The draft model consumes caller-provided input_embeds instead of token embeddings.
-        # Piecewise CUDA graph can still work as long as the runner preserves those embeds.
-        self.requires_input_embeds = True
-        self.embed_tokens = None
 
         hidden_size = int(config.hidden_size)
         num_layers = int(config.num_hidden_layers)
@@ -308,11 +273,14 @@ class DFlashDraftModel(nn.Module):
         # Project per-token target context features:
         # concat(K * hidden_size) -> hidden_size, where K is the number of target-layer
         # feature tensors concatenated per token (not necessarily equal to num_layers).
-        target_num_layers = int(getattr(config, "num_target_layers", num_layers))
-        target_layer_ids = resolve_dflash_target_layer_ids(
-            draft_hf_config=config,
-            target_num_layers=target_num_layers,
-            draft_num_layers=num_layers,
+        draft_config = parse_dflash_draft_config(draft_hf_config=config)
+        target_num_layers = (
+            int(draft_config.num_target_layers)
+            if draft_config.num_target_layers is not None
+            else num_layers
+        )
+        target_layer_ids = draft_config.resolve_target_layer_ids(
+            target_num_layers=target_num_layers, draft_num_layers=num_layers
         )
         num_context_features = len(target_layer_ids)
 
@@ -322,13 +290,7 @@ class DFlashDraftModel(nn.Module):
         )
         self.hidden_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
 
-        self.block_size = resolve_dflash_block_size(draft_hf_config=config, default=16)
-
-    def set_embed(self, embed) -> None:
-        self.embed_tokens = embed
-        # Once the target embedding is shared in, the draft model no longer needs
-        # caller-provided input_embeds on the hot path.
-        self.requires_input_embeds = False
+        self.block_size = draft_config.resolve_block_size(default=16)
 
     def project_target_hidden(self, target_hidden: torch.Tensor) -> torch.Tensor:
         """Project concatenated target-layer hidden states into draft hidden_size."""
@@ -344,43 +306,6 @@ class DFlashDraftModel(nn.Module):
             )
         return self.hidden_norm(self.fc(target_hidden))
 
-    def project_target_hidden_selected(
-        self,
-        target_hidden: torch.Tensor,
-        accepted_indices: torch.Tensor,
-    ) -> torch.Tensor:
-        """Project only the accepted verify rows into draft hidden_size.
-
-        This is the DFlash-owned seam for the future fused mixed-precision append
-        path: selected target hidden -> projected draft hidden. It keeps accepted-row
-        selection colocated with the target->draft projection contract instead of
-        performing a generic hidden gather in the worker first.
-        """
-        expected = int(self.fc.in_features)
-        if target_hidden.ndim == 3:
-            flat_target_hidden = target_hidden.reshape(-1, target_hidden.shape[-1])
-        elif target_hidden.ndim == 2:
-            flat_target_hidden = target_hidden
-        else:
-            raise ValueError(
-                f"DFLASH target_hidden must be 2D or 3D, got shape={tuple(target_hidden.shape)}."
-            )
-        if int(flat_target_hidden.shape[-1]) != expected:
-            raise ValueError(
-                "DFLASH target_hidden feature dim mismatch. "
-                f"Expected last dim {expected}, got shape={tuple(target_hidden.shape)}."
-            )
-
-        accepted_indices = accepted_indices.to(
-            dtype=torch.int64, device=flat_target_hidden.device
-        )
-        selected_hidden = (
-            flat_target_hidden.index_select(0, accepted_indices)
-            if accepted_indices.numel() > 0
-            else flat_target_hidden[:0]
-        )
-        return self.hidden_norm(self.fc(selected_hidden))
-
     @torch.no_grad()
     def forward(
         self,
@@ -390,13 +315,11 @@ class DFlashDraftModel(nn.Module):
         input_embeds: Optional[torch.Tensor] = None,
         get_embedding: bool = False,
         pp_proxy_tensors=None,
-    ) -> torch.Tensor:
+    ) -> LogitsProcessorOutput:
         if input_embeds is None:
-            if self.embed_tokens is None:
-                raise ValueError(
-                    "DFlashDraftModel requires `input_embeds` unless a shared target embedding has been set."
-                )
-            input_embeds = self.embed_tokens(input_ids)
+            raise ValueError(
+                "DFlashDraftModel requires `input_embeds` (use the target embedding)."
+            )
         hidden_states = input_embeds
         residual: Optional[torch.Tensor] = None
 
@@ -405,21 +328,16 @@ class DFlashDraftModel(nn.Module):
                 positions, hidden_states, forward_batch, residual
             )
 
-        if hidden_states.numel() == 0:
-            return hidden_states
-        if residual is None:
-            return self.norm(hidden_states)
-        hidden_states, _ = self.norm(hidden_states, residual)
-        return hidden_states
+        if hidden_states.numel() != 0:
+            if residual is None:
+                hidden_states = self.norm(hidden_states)
+            else:
+                hidden_states, _ = self.norm(hidden_states, residual)
 
-    def load_kv_cache_scales(self, quantization_param_path: str) -> None:
-        logger.warning(
-            "Ignoring KV scale file for DFlash draft FP8 path: %s. "
-            "The validated production path keeps draft KV in BF16 and does not "
-            "use GPT-OSS KV-scale files for the draft model.",
-            quantization_param_path,
+        return LogitsProcessorOutput(
+            next_token_logits=None,
+            hidden_states=hidden_states,
         )
-        return
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
@@ -476,22 +394,6 @@ class DFlashDraftModel(nn.Module):
                     )
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
-
-        # Match the GPT-OSS no-scale FP8 fallback contract. RadixAttention
-        # predefines scale attributes as None, so initialize them explicitly.
-        device = next(self.parameters()).device
-        for layer in self.layers:
-            attn = getattr(getattr(layer, "self_attn", None), "attn", None)
-            if attn is None:
-                continue
-            if getattr(attn, "k_scale", None) is None:
-                attn.k_scale = torch.tensor(1.0, dtype=torch.float32, device=device)
-            if getattr(attn, "v_scale", None) is None:
-                attn.v_scale = torch.tensor(1.0, dtype=torch.float32, device=device)
-            if getattr(attn, "k_scale_float", None) is None:
-                attn.k_scale_float = 1.0
-            if getattr(attn, "v_scale_float", None) is None:
-                attn.v_scale_float = 1.0
 
 
 EntryClass = DFlashDraftModel

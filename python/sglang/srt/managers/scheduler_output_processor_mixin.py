@@ -126,6 +126,14 @@ class SchedulerOutputProcessorMixin:
                 details["storage_backend"] = self._get_storage_backend_type()
             return details
         return None
+    def _release_kv_cache_and_draft(
+        self: Scheduler, req: Req, *, is_insert: bool = True
+    ):
+        release_kv_cache(req, self.tree_cache, is_insert=is_insert)
+        draft_worker = getattr(self, "draft_worker", None)
+        hook = getattr(draft_worker, "on_req_finished", None) if draft_worker else None
+        if hook is not None:
+            hook(req)
 
     def process_batch_result_prebuilt(self: Scheduler, batch: ScheduleBatch):
         assert self.disaggregation_mode == DisaggregationMode.DECODE
