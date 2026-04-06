@@ -1192,17 +1192,13 @@ class FlashAttentionBackend(AttentionBackend):
                 descale_shape = (forward_batch.batch_size, layer.tp_k_head_num)
                 k_descale = layer.k_scale.expand(descale_shape)
                 v_descale = layer.v_scale.expand(descale_shape)
-            # NOTE: `kv_cache_dtype` is a storage dtype. For FP8 KV cache, FA3 expects
-            # BF16/FP16 queries (and uses scaling factors to descale FP8 K/V). Casting
-            # Q into FP8 is unnecessary and can hurt performance.
-            if self.kv_cache_dtype in (torch.bfloat16, torch.float16):
+            # sgl_kernel FA3 path requires query/key dtypes to match.
+            if q.dtype != self.kv_cache_dtype:
                 q = q.to(self.kv_cache_dtype)
-                q_rope = (
-                    q_rope.to(self.kv_cache_dtype) if q_rope is not None else None
-                )
-                k_rope = (
-                    k_rope.to(self.kv_cache_dtype) if k_rope is not None else None
-                )
+            if q_rope is not None and q_rope.dtype != self.kv_cache_dtype:
+                q_rope = q_rope.to(self.kv_cache_dtype)
+            if k_rope is not None and k_rope.dtype != self.kv_cache_dtype:
+                k_rope = k_rope.to(self.kv_cache_dtype)
         if not self.use_mla:
             # Do multi-head attention
             if topk_indices is not None:
