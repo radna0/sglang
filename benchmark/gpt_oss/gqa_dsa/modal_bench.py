@@ -402,7 +402,7 @@ def _bench_once(
 
 
 @app.function(
-    gpu=modal.gpu.H100(count=1),
+    gpu="H100",
     image=image,
     timeout=60 * 60 * 6,
     cpu=16,
