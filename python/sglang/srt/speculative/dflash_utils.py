@@ -310,6 +310,36 @@ class DFlashDraftConfig:
         return resolved
 
 
+@dataclass(frozen=True)
+class DFlashCaptureContract:
+    runtime_target_num_layers: int
+    draft_num_layers: int
+    trained_target_num_layers: Optional[int]
+    block_size: Optional[int]
+    mask_token: str
+    mask_token_id: Optional[int]
+    target_layer_ids: List[int]
+    capture_layer_ids: List[int]
+
+    def to_log_dict(self) -> dict[str, Any]:
+        return {
+            "runtime_target_num_layers": int(self.runtime_target_num_layers),
+            "draft_num_layers": int(self.draft_num_layers),
+            "trained_target_num_layers": (
+                None
+                if self.trained_target_num_layers is None
+                else int(self.trained_target_num_layers)
+            ),
+            "block_size": None if self.block_size is None else int(self.block_size),
+            "mask_token": self.mask_token,
+            "mask_token_id": (
+                None if self.mask_token_id is None else int(self.mask_token_id)
+            ),
+            "target_layer_ids": [int(x) for x in self.target_layer_ids],
+            "capture_layer_ids": [int(x) for x in self.capture_layer_ids],
+        }
+
+
 def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
     """Parse and validate DFLASH draft config fields from HF config/dict."""
     dflash_cfg = _get_dflash_config(draft_hf_config)
@@ -394,6 +424,36 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
     )
 
 
+def resolve_dflash_capture_contract(
+    *,
+    draft_hf_config: Any,
+    runtime_target_num_layers: int,
+) -> DFlashCaptureContract:
+    runtime_target_num_layers = int(runtime_target_num_layers)
+    if runtime_target_num_layers <= 0:
+        raise ValueError(
+            "runtime_target_num_layers must be positive, "
+            f"got {runtime_target_num_layers}."
+        )
+
+    draft_config = parse_dflash_draft_config(draft_hf_config=draft_hf_config)
+    draft_num_layers = draft_config.require_num_layers()
+    target_layer_ids = draft_config.resolve_target_layer_ids(
+        target_num_layers=runtime_target_num_layers,
+        draft_num_layers=draft_num_layers,
+    )
+    return DFlashCaptureContract(
+        runtime_target_num_layers=runtime_target_num_layers,
+        draft_num_layers=draft_num_layers,
+        trained_target_num_layers=draft_config.num_target_layers,
+        block_size=draft_config.block_size,
+        mask_token=draft_config.mask_token,
+        mask_token_id=draft_config.mask_token_id,
+        target_layer_ids=target_layer_ids,
+        capture_layer_ids=[int(x) + 1 for x in target_layer_ids],
+    )
+
+
 def can_dflash_slice_qkv_weight(qkv_proj: Any) -> Tuple[bool, str]:
     """Validate whether DFlash can slice KV weights from a fused QKV linear layer."""
     quant_method = getattr(qkv_proj, "quant_method", None)
@@ -457,6 +517,47 @@ def compute_dflash_accept_len_and_bonus(
     accept_len = matches.to(torch.int32).cumprod(dim=1).sum(dim=1)
     bonus = target_predict[torch.arange(bs, device=target_predict.device), accept_len]
     return accept_len, bonus.to(torch.int64)
+
+
+def resolve_dflash_overlap_token_ids(
+    *,
+    flat_token_ids: torch.Tensor,
+    accept_lens: torch.Tensor,
+) -> list[list[int]]:
+    if flat_token_ids.ndim != 1:
+        raise ValueError(
+            f"flat_token_ids must be 1D, got shape={tuple(flat_token_ids.shape)}."
+        )
+    if accept_lens.ndim != 1:
+        raise ValueError(
+            f"accept_lens must be 1D, got shape={tuple(accept_lens.shape)}."
+        )
+
+    flat_ids_cpu = flat_token_ids.detach().to(device="cpu", dtype=torch.int64)
+    accept_lens_cpu = accept_lens.detach().to(device="cpu", dtype=torch.int32)
+
+    out: list[list[int]] = []
+    offset = 0
+    total = int(flat_ids_cpu.numel())
+    for length_val in accept_lens_cpu.tolist():
+        length = int(length_val)
+        if length < 0:
+            raise ValueError(f"accept_lens contains negative length {length}.")
+        next_offset = offset + length
+        if next_offset > total:
+            raise ValueError(
+                "accept_lens sum exceeds flat_token_ids length. "
+                f"offset={offset}, length={length}, total={total}."
+            )
+        out.append([int(x) for x in flat_ids_cpu[offset:next_offset].tolist()])
+        offset = next_offset
+
+    if offset != total:
+        raise ValueError(
+            "accept_lens sum does not match flat_token_ids length. "
+            f"consumed={offset}, total={total}."
+        )
+    return out
 
 
 def compute_dflash_sampling_accept_len_and_bonus(

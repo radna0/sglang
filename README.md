@@ -1,45 +1,44 @@
-# GPT-OSS DFlash Status on `dflash`
+# GPT-OSS DFlash Status on `showtime`
 
-This branch is focused on making GPT-OSS DFlash correct and fast on the stable:
+`showtime` is the integration branch for GPT-OSS DFlash production work.
+
+## Shipping Now
 
 - target attention backend: `fa3`
+- draft attention backend: `fa3`
 - target MoE backend: `triton_kernel`
-- target KV cache: `fp8_e4m3`
-- draft KV cache: `bfloat16`
+- sampling backend: `pytorch`
+- target KV cache target lane: `fp8_e4m3`
+- draft KV cache target lane: `bfloat16`
+- baseline proof contract: `showtime.py` Harmony + tools + `reference.csv`
+- first DFlash proof contract:
+  - `DFLASH_LINEAR`
+  - `page_size=1`
+  - `draft_page_size=1`
+  - `share_pools=False`
+  - fixed `block_size=16`
+  - overlap disabled
+  - decode CUDA graph first, piecewise only after separate proof
 
-## Locked Current-Branch Proof Contract
+## Experimental
 
-For the current-branch `reference.csv` proof lane, the serving contract is locked to:
+- `DFLASH_TREE`
+- DFlash overlap/spec-v2 workers
+- piecewise CUDA graph for DFlash proof lanes
+- page-size optimization lanes (`256/1`, `256/256`)
+- shared-pool mixed-precision verify
 
-- target `page_size=1`
-- draft `page_size=1`
-- `share_pools=False`
-- `block_size=4`
-- `speculative_num_draft_tokens=4`
-- `mem_fraction_static=0.90`
-- `speculative_draft_mem_fraction_static=0.97`
-- FA3 for target and draft
-- full decode CUDA graph + piecewise CUDA graph
-- overlap disabled
+## Deferred
 
-This proof lane is intentionally `showtime.py`-style in runtime behavior, but we are not
-editing `showtime.py` itself. We are locking the SGLang-side serving contract and verifying
-that contract directly on `reference.csv`.
+- adaptive logical block-size selection (`16 -> 8 -> 4`)
+- route / PaCoRe as part of the first production proof lane
+- draft-FP8 production serving
 
-The current best short-context regime is:
+## Branch Audit Docs
 
-- target `page_size=256`
-- draft `page_size=1`
-- `share_pools=False`
-- `block_size=8`
-
-The current best long-budget reference regime on the local 3-problem harness is:
-
-- target `page_size=1`
-- draft `page_size=1`
-- `share_pools=False`
-- `block_size=16`
-- `mem_fraction_static=0.90` for most rows, `0.85` for `ctx=65536, concurrency=8`
+- `docs/dflash_showtime_branch_inventory.md`
+- `docs/dflash_target_drift_audit.md`
+- `docs/dflash_fused_tree_design.md`
 
 This is a greedy benchmark setup:
 

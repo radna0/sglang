@@ -2354,75 +2354,34 @@ class ServerArgs:
         if self.speculative_algorithm == "NEXTN":
             self.speculative_algorithm = "EAGLE"
 
-        if self.speculative_algorithm == "DFLASH":
+        if self.speculative_algorithm in ("DFLASH", "DFLASH_TREE"):
+            is_dflash_tree = self.speculative_algorithm == "DFLASH_TREE"
             if self.enable_dp_attention:
                 raise ValueError(
-                    "Currently DFLASH speculative decoding does not support dp attention."
+                    f"Currently {self.speculative_algorithm} speculative decoding does not support dp attention."
                 )
 
             if self.pp_size != 1:
                 raise ValueError(
-                    "Currently DFLASH speculative decoding only supports pp_size == 1."
+                    f"Currently {self.speculative_algorithm} speculative decoding only supports pp_size == 1."
                 )
 
             if self.speculative_draft_model_path is None:
                 raise ValueError(
-                    "DFLASH speculative decoding requires setting --speculative-draft-model-path."
+                    f"{self.speculative_algorithm} speculative decoding requires setting --speculative-draft-model-path."
                 )
-
-            # DFLASH does not use EAGLE-style `num_steps`/`topk`, but those fields still
-            # affect generic scheduler/KV-cache accounting (buffer sizing, KV freeing,
-            # RoPE reservation). Force them to 1 to avoid surprising memory behavior.
-            #
-            # For DFlash, the natural unit is `block_size` (verify window length).
-            if self.speculative_num_steps is None:
-                self.speculative_num_steps = 1
-            elif int(self.speculative_num_steps) != 1:
-                logger.warning(
-                    "DFLASH only supports speculative_num_steps == 1; overriding speculative_num_steps=%s to 1.",
-                    self.speculative_num_steps,
-                )
-                self.speculative_num_steps = 1
-
-            if self.speculative_eagle_topk is None:
-                self.speculative_eagle_topk = 1
-            elif int(self.speculative_eagle_topk) != 1:
-                logger.warning(
-                    "DFLASH only supports speculative_eagle_topk == 1; overriding speculative_eagle_topk=%s to 1.",
-                    self.speculative_eagle_topk,
-                )
-                self.speculative_eagle_topk = 1
 
             if self.speculative_dflash_block_size is not None:
                 if int(self.speculative_dflash_block_size) <= 0:
                     raise ValueError(
-                        "DFLASH requires --speculative-dflash-block-size to be positive, "
+                        f"{self.speculative_algorithm} requires --speculative-dflash-block-size to be positive, "
                         f"got {self.speculative_dflash_block_size}."
                     )
-                if self.speculative_num_draft_tokens is not None and int(
-                    self.speculative_num_draft_tokens
-                ) != int(self.speculative_dflash_block_size):
-                    raise ValueError(
-                        "Both --speculative-num-draft-tokens and --speculative-dflash-block-size are set "
-                        "but they differ. For DFLASH they must match. "
-                        f"speculative_num_draft_tokens={self.speculative_num_draft_tokens}, "
-                        f"speculative_dflash_block_size={self.speculative_dflash_block_size}."
-                    )
-                self.speculative_num_draft_tokens = int(
+                self.speculative_dflash_block_size = int(
                     self.speculative_dflash_block_size
                 )
 
-            window_size = None
-            if self.speculative_dflash_draft_window_size is not None:
-                window_size = int(self.speculative_dflash_draft_window_size)
-                if window_size <= 0:
-                    raise ValueError(
-                        "DFLASH requires --speculative-dflash-draft-window-size "
-                        f"to be positive, got {window_size}."
-                    )
-                self.speculative_dflash_draft_window_size = window_size
-
-            if self.speculative_num_draft_tokens is None:
+            if self.speculative_dflash_block_size is None:
                 from sglang.srt.speculative.dflash_utils import (
                     parse_dflash_draft_config,
                 )
@@ -2444,25 +2403,104 @@ class ServerArgs:
                 except Exception as e:
                     logger.warning(
                         "Failed to infer DFLASH block_size from draft model config; "
-                        "defaulting speculative_num_draft_tokens to 16. Error: %s",
+                        "defaulting speculative_dflash_block_size to 16. Error: %s",
                         e,
                     )
 
                 if inferred_block_size is None:
                     inferred_block_size = 16
                     logger.warning(
-                        "speculative_num_draft_tokens is not set; defaulting to %d for DFLASH.",
+                        "speculative_dflash_block_size is not set; defaulting to %d for %s.",
                         inferred_block_size,
+                        self.speculative_algorithm,
                     )
-                self.speculative_num_draft_tokens = inferred_block_size
+                self.speculative_dflash_block_size = int(inferred_block_size)
 
-            if window_size is not None:
-                draft_tokens = int(self.speculative_num_draft_tokens)
-                if window_size < draft_tokens:
+            block_size = int(self.speculative_dflash_block_size)
+            window_size = None
+            if self.speculative_dflash_draft_window_size is not None:
+                window_size = int(self.speculative_dflash_draft_window_size)
+                if window_size <= 0:
+                    raise ValueError(
+                        f"{self.speculative_algorithm} requires --speculative-dflash-draft-window-size "
+                        f"to be positive, got {window_size}."
+                    )
+                self.speculative_dflash_draft_window_size = window_size
+
+            if is_dflash_tree:
+                if self.speculative_num_steps is None:
+                    self.speculative_num_steps = block_size - 1
+                else:
+                    self.speculative_num_steps = int(self.speculative_num_steps)
+                if self.speculative_num_steps <= 0 or self.speculative_num_steps >= block_size:
+                    raise ValueError(
+                        "DFLASH_TREE requires 0 < speculative_num_steps < speculative_dflash_block_size. "
+                        f"speculative_num_steps={self.speculative_num_steps}, block_size={block_size}."
+                    )
+
+                if self.speculative_eagle_topk is None:
+                    self.speculative_eagle_topk = 4
+                else:
+                    self.speculative_eagle_topk = int(self.speculative_eagle_topk)
+                if self.speculative_eagle_topk <= 0:
+                    raise ValueError(
+                        "DFLASH_TREE requires speculative_eagle_topk to be positive, "
+                        f"got {self.speculative_eagle_topk}."
+                    )
+
+                if self.speculative_num_draft_tokens is None:
+                    self.speculative_num_draft_tokens = block_size
+                else:
+                    self.speculative_num_draft_tokens = int(
+                        self.speculative_num_draft_tokens
+                    )
+                if self.speculative_num_draft_tokens <= 0:
+                    raise ValueError(
+                        "DFLASH_TREE requires speculative_num_draft_tokens to be positive, "
+                        f"got {self.speculative_num_draft_tokens}."
+                    )
+                if window_size is not None:
+                    logger.warning(
+                        "DFLASH_TREE currently ignores --speculative-dflash-draft-window-size; "
+                        "the value will be kept for visibility but not applied by the tree worker."
+                    )
+            else:
+                # Linear DFLASH uses fixed-width target-only verify.
+                if self.speculative_num_steps is None:
+                    self.speculative_num_steps = 1
+                elif int(self.speculative_num_steps) != 1:
+                    logger.warning(
+                        "DFLASH only supports speculative_num_steps == 1; overriding speculative_num_steps=%s to 1.",
+                        self.speculative_num_steps,
+                    )
+                    self.speculative_num_steps = 1
+
+                if self.speculative_eagle_topk is None:
+                    self.speculative_eagle_topk = 1
+                elif int(self.speculative_eagle_topk) != 1:
+                    logger.warning(
+                        "DFLASH only supports speculative_eagle_topk == 1; overriding speculative_eagle_topk=%s to 1.",
+                        self.speculative_eagle_topk,
+                    )
+                    self.speculative_eagle_topk = 1
+
+                if (
+                    self.speculative_num_draft_tokens is not None
+                    and int(self.speculative_num_draft_tokens) != block_size
+                ):
+                    raise ValueError(
+                        "Both --speculative-num-draft-tokens and --speculative-dflash-block-size are set "
+                        "but they differ. For DFLASH they must match. "
+                        f"speculative_num_draft_tokens={self.speculative_num_draft_tokens}, "
+                        f"speculative_dflash_block_size={block_size}."
+                    )
+                self.speculative_num_draft_tokens = block_size
+
+                if window_size is not None and window_size < block_size:
                     raise ValueError(
                         "DFLASH --speculative-dflash-draft-window-size must be >= "
                         "--speculative-num-draft-tokens (block_size). "
-                        f"window_size={window_size}, block_size={draft_tokens}."
+                        f"window_size={window_size}, block_size={block_size}."
                     )
 
             if self.max_running_requests is None:
@@ -2471,15 +2509,22 @@ class ServerArgs:
                     "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
                 )
 
-            self.disable_overlap_schedule = True
-            logger.warning(
-                "Overlap scheduler is disabled when using DFLASH speculative decoding (spec v2 is not supported yet)."
-            )
+            if self.disable_overlap_schedule:
+                logger.warning(
+                    "Overlap scheduler is disabled for %s speculative decoding.",
+                    self.speculative_algorithm,
+                )
+            else:
+                logger.warning(
+                    "Overlap scheduler is enabled for %s speculative decoding. This path is experimental.",
+                    self.speculative_algorithm,
+                )
 
             if self.enable_mixed_chunk:
                 self.enable_mixed_chunk = False
                 logger.warning(
-                    "Mixed chunked prefill is disabled because of using dflash speculative decoding."
+                    "Mixed chunked prefill is disabled because of using %s speculative decoding.",
+                    self.speculative_algorithm.lower(),
                 )
 
         if self.speculative_algorithm in ("EAGLE", "EAGLE3", "STANDALONE"):
@@ -4054,7 +4099,15 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-algorithm",
             type=str,
-            choices=["DFLASH", "EAGLE", "EAGLE3", "NEXTN", "STANDALONE", "NGRAM"],
+            choices=[
+                "DFLASH",
+                "DFLASH_TREE",
+                "EAGLE",
+                "EAGLE3",
+                "NEXTN",
+                "STANDALONE",
+                "NGRAM",
+            ],
             help="Speculative algorithm.",
         )
         parser.add_argument(

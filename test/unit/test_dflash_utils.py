@@ -195,6 +195,32 @@ def test_parse_dflash_draft_config_basic():
     assert parsed.mask_token == "<|MASK|>"
 
 
+def test_resolve_dflash_capture_contract_reports_plus_one_capture_mapping():
+    from sglang.srt.speculative.dflash_utils import resolve_dflash_capture_contract
+
+    cfg = {
+        "num_hidden_layers": 5,
+        "dflash_config": {
+            "block_size": 16,
+            "target_layer_ids": [1, 9, 17, 25, 33],
+            "mask_token": "<|MASK|>",
+            "mask_token_id": 200019,
+        },
+    }
+
+    contract = resolve_dflash_capture_contract(
+        draft_hf_config=cfg,
+        runtime_target_num_layers=36,
+    )
+
+    assert contract.runtime_target_num_layers == 36
+    assert contract.draft_num_layers == 5
+    assert contract.block_size == 16
+    assert contract.mask_token_id == 200019
+    assert contract.target_layer_ids == [1, 9, 17, 25, 33]
+    assert contract.capture_layer_ids == [2, 10, 18, 26, 34]
+
+
 def test_compute_dflash_accept_len_and_bonus():
     from sglang.srt.speculative.dflash_utils import compute_dflash_accept_len_and_bonus
 

@@ -148,7 +148,7 @@ from sglang.srt.server_args import (
     set_global_server_args_for_scheduler,
 )
 from sglang.srt.speculative.dflash_utils import (
-    parse_dflash_draft_config,
+    resolve_dflash_capture_contract,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
@@ -347,6 +347,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.eagle_use_aux_hidden_state = False
         self.dflash_use_aux_hidden_state = False
         self.dflash_target_layer_ids = None
+        self.dflash_capture_layer_ids = None
         self.dflash_draft_num_layers = None
         if self.spec_algorithm.is_eagle3() and not self.is_draft_worker:
             # load draft config
@@ -373,7 +374,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 # if there is no aux layer, set to None
                 self.eagle_aux_hidden_state_layer_ids = None
 
-        if self.spec_algorithm.is_dflash() and not self.is_draft_worker:
+        if self.spec_algorithm.is_dflash_family() and not self.is_draft_worker:
             # Select target layers to capture for building DFlash context features.
             draft_model_config = ModelConfig.from_server_args(
                 server_args,
@@ -381,11 +382,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 model_revision=server_args.speculative_draft_model_revision,
                 is_draft_model=True,
             )
-            dflash_draft_config = parse_dflash_draft_config(
-                draft_hf_config=draft_model_config.hf_config
-            )
-            draft_num_layers = dflash_draft_config.require_num_layers()
-            trained_target_layers = dflash_draft_config.num_target_layers
 
             target_num_layers = getattr(
                 self.model_config.hf_text_config, "num_hidden_layers", None
@@ -396,6 +392,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     f"Got target={target_num_layers}."
                 )
             target_num_layers = int(target_num_layers)
+            capture_contract = resolve_dflash_capture_contract(
+                draft_hf_config=draft_model_config.hf_config,
+                runtime_target_num_layers=target_num_layers,
+            )
+            trained_target_layers = capture_contract.trained_target_num_layers
 
             if (
                 trained_target_layers is not None
@@ -409,11 +410,21 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 )
 
             self.dflash_use_aux_hidden_state = True
-            self.dflash_draft_num_layers = int(draft_num_layers)
-            self.dflash_target_layer_ids = dflash_draft_config.resolve_target_layer_ids(
-                target_num_layers=int(target_num_layers),
-                draft_num_layers=int(draft_num_layers),
-            )
+            self.dflash_draft_num_layers = int(capture_contract.draft_num_layers)
+            self.dflash_target_layer_ids = list(capture_contract.target_layer_ids)
+            self.dflash_capture_layer_ids = list(capture_contract.capture_layer_ids)
+            if self.tp_rank == 0:
+                logger.info(
+                    "DFLASH capture contract resolved: algorithm=%s block_size=%s runtime_target_layers=%s trained_target_layers=%s draft_layers=%s target_layer_ids=%s capture_layer_ids=%s mask_token_id=%s",
+                    self.spec_algorithm.name,
+                    capture_contract.block_size,
+                    capture_contract.runtime_target_num_layers,
+                    capture_contract.trained_target_num_layers,
+                    capture_contract.draft_num_layers,
+                    capture_contract.target_layer_ids,
+                    capture_contract.capture_layer_ids,
+                    capture_contract.mask_token_id,
+                )
 
         # Apply the rank zero filter to logger
         if server_args.show_time_cost:
@@ -1935,7 +1946,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         num_tokens_per_bs = 1
         if self.spec_algorithm.is_speculative():
             if self.is_draft_worker:
-                if not self.spec_algorithm.is_dflash():
+                if not self.spec_algorithm.is_dflash_family():
                     raise RuntimeError("This should not happen")
             capture_forward_mode = ForwardMode.TARGET_VERIFY
             num_tokens_per_bs = self.server_args.speculative_num_draft_tokens
@@ -2063,7 +2074,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         seq_lens_sum=None,
                         seq_lens_cpu=None,
                     )
-            elif self.spec_algorithm.is_dflash():
+            elif self.spec_algorithm.is_dflash_family():
                 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 
                 # Dummy warmup only needs shape metadata; avoid forcing custom-mask mode.

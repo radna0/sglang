@@ -1580,7 +1580,7 @@ class Scheduler(
                 self._add_request_to_queue(req)
                 return
 
-        if self.spec_algorithm.is_dflash():
+        if self.spec_algorithm.is_dflash_family():
             error_msg = validate_dflash_request(req)
             if error_msg is not None:
                 req.set_finish_with_abort(error_msg)

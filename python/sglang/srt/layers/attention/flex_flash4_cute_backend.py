@@ -195,7 +195,9 @@ class FlexFlash4CuteBackend(FlashAttentionBackend):
 
     def _is_dflash_speculative(self, forward_batch: ForwardBatch) -> bool:
         spec_info = getattr(forward_batch, "spec_info", None)
-        if getattr(forward_batch, "spec_algorithm", SpeculativeAlgorithm.NONE) == SpeculativeAlgorithm.DFLASH:
+        if getattr(
+            forward_batch, "spec_algorithm", SpeculativeAlgorithm.NONE
+        ) in (SpeculativeAlgorithm.DFLASH, SpeculativeAlgorithm.DFLASH_TREE):
             return True
         spec_type = getattr(spec_info, "spec_input_type", None)
         return spec_type in (SpecInputType.DFLASH_VERIFY, SpecInputType.DFLASH_DRAFT)
