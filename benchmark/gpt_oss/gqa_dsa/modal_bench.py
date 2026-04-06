@@ -71,7 +71,7 @@ image = (
         [
             # Install SGLang from the fork/branch that contains the GPT-OSS GQA DSA work.
             "rm -rf /root/sglang && git clone --depth 1 --branch gpt-oss-dsa https://github.com/radna0/sglang.git /root/sglang",
-            "python -m pip install -e /root/sglang[all]",
+            "python -m pip install -e /root/sglang/python",
         ]
     )
 )
