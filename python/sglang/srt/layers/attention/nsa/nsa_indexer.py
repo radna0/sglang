@@ -185,6 +185,18 @@ class Indexer(MultiPlatformOp):
             quant_config=quant_config,
             prefix=add_prefix("wq_b", prefix),
         )
+        # Optional q-lora projection for architectures that do not natively expose a
+        # low-rank Q path (e.g. GPT-OSS GQA). When q_lora is provided with the correct
+        # dimension, this projection is unused.
+        self.wq_a = None
+        if self.q_lora_rank != self.hidden_size:
+            self.wq_a = ReplicatedLinear(
+                self.hidden_size,
+                self.q_lora_rank,
+                bias=False,
+                quant_config=quant_config,
+                prefix=add_prefix("wq_a", prefix),
+            )
 
         self.wk = ReplicatedLinear(
             self.hidden_size,
@@ -213,6 +225,29 @@ class Indexer(MultiPlatformOp):
         self.block_size = block_size
         self.scale_fmt = scale_fmt
         self.softmax_scale = self.head_dim**-0.5
+
+        # This module is often created without checkpoint weights (e.g. GPT-OSS DSA
+        # bring-up / random-init). Ensure parameters are initialized deterministically
+        # instead of leaving torch.empty() garbage.
+        self._init_parameters()
+
+    def _init_parameters(self) -> None:
+        for name, param in self.named_parameters(recurse=True):
+            if param is None:
+                continue
+            if name.endswith(("k_norm.weight", "k_norm.bias")):
+                continue
+            with torch.no_grad():
+                if "scale_inv" in name:
+                    param.fill_(1.0)
+                else:
+                    param.zero_()
+        # LayerNorm defaults: weight=1, bias=0.
+        with torch.no_grad():
+            if hasattr(self.k_norm, "weight") and self.k_norm.weight is not None:
+                self.k_norm.weight.fill_(1.0)
+            if hasattr(self.k_norm, "bias") and self.k_norm.bias is not None:
+                self.k_norm.bias.zero_()
 
     @contextlib.contextmanager
     def _with_real_sm_count(self):
@@ -250,12 +285,23 @@ class Indexer(MultiPlatformOp):
 
     def _get_q_k_bf16(
         self,
-        q_lora: torch.Tensor,
+        q_lora: Optional[torch.Tensor],
         x: torch.Tensor,
         positions: torch.Tensor,
         enable_dual_stream: bool,
         forward_batch: ForwardBatch,
     ):
+        if q_lora is None or q_lora.shape[-1] != self.q_lora_rank:
+            if isinstance(x, tuple):
+                raise NotImplementedError(
+                    "Indexer wq_a projection does not currently support tuple (FP8) activations; "
+                    "pass a precomputed q_lora tensor instead."
+                )
+            assert (
+                self.wq_a is not None
+            ), "q_lora is required when indexer has no wq_a projection"
+            q_lora, _ = self.wq_a(x)
+
         if enable_dual_stream:
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
@@ -921,7 +967,7 @@ class Indexer(MultiPlatformOp):
     def forward_cuda(
         self,
         x: torch.Tensor,
-        q_lora: torch.Tensor,
+        q_lora: Optional[torch.Tensor],
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         layer_id: int,
@@ -946,8 +992,8 @@ class Indexer(MultiPlatformOp):
         enable_dual_stream = (
             self.alt_stream is not None
             and get_is_capture_mode()
-            and q_lora.shape[0] > 0
-            and q_lora.shape[0] <= DUAL_STREAM_TOKEN_THRESHOLD
+            and x_meta.shape[0] > 0
+            and x_meta.shape[0] <= DUAL_STREAM_TOKEN_THRESHOLD
         )
 
         # skip NSA if attention backend choose to skip this batch

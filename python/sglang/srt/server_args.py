@@ -463,7 +463,7 @@ class ServerArgs:
     # GPT-OSS native GQA DSA (DeepSeek-style Lightning Indexer + sparse top-k attention)
     enable_gpt_oss_gqa_dsa: bool = False
     gpt_oss_dsa_index_topk: int = 2048
-    gpt_oss_dsa_use_blocksparse_cute: bool = False
+    gpt_oss_dsa_topk_source: str = "indexer"  # indexer | recent
     gpt_oss_dsa_index_head_dim: int = 128
     gpt_oss_dsa_index_n_heads: Optional[int] = None  # None = auto (use model num heads)
     gpt_oss_dsa_q_lora_rank: Optional[int] = None  # None = auto (use model hidden size)
@@ -1438,7 +1438,7 @@ class ServerArgs:
                 elif (
                     self.ep_size == 1
                     and is_triton_kernels_available()
-                    and self.quantization is None
+                    and (self.quantization is None or self.quantization == "mxfp4")
                 ):
                     self.moe_runner_backend = "triton_kernel"
                     logger.warning(
@@ -3943,10 +3943,15 @@ class ServerArgs:
             help="Top-k tokens to attend for GPT-OSS DSA full-attention layers.",
         )
         parser.add_argument(
-            "--gpt-oss-dsa-use-blocksparse-cute",
-            default=ServerArgs.gpt_oss_dsa_use_blocksparse_cute,
-            action="store_true",
-            help="Experimental: route GPT-OSS DSA sparse rows through the vendored CUTE block-sparse attention path (requires extra deps; currently not paged-KV native on SM90).",
+            "--gpt-oss-dsa-topk-source",
+            type=str,
+            default=ServerArgs.gpt_oss_dsa_topk_source,
+            choices=["indexer", "recent"],
+            help=(
+                "How GPT-OSS DSA produces topk indices. "
+                "'indexer' uses the DeepSeek-style Lightning Indexer; "
+                "'recent' uses a deterministic recent-window topk (speed debugging only)."
+            ),
         )
         parser.add_argument(
             "--gpt-oss-dsa-index-head-dim",

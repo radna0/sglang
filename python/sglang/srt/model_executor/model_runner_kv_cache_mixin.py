@@ -558,6 +558,7 @@ class ModelRunnerKVCacheMixin:
         elif (
             (not self.use_mla_backend)
             and self.server_args.enable_gpt_oss_gqa_dsa
+            and self.server_args.gpt_oss_dsa_topk_source == "indexer"
             and self.model_config.hf_config.architectures is not None
             and self.model_config.hf_config.architectures[0] == "GptOssForCausalLM"
         ):

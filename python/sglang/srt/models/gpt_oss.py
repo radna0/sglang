@@ -60,6 +60,7 @@ from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.moe.utils import filter_moe_weight_param_global_expert
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.fp8_utils import dequant_mxfp4
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.attention.nsa.nsa_indexer import Indexer
@@ -306,7 +307,7 @@ class GptOssAttention(nn.Module):
             server_args.enable_gpt_oss_gqa_dsa and layer_type == "full_attention"
         )
         self.indexer = None
-        if self.enable_gqa_dsa:
+        if self.enable_gqa_dsa and server_args.gpt_oss_dsa_topk_source == "indexer":
             index_n_heads = (
                 server_args.gpt_oss_dsa_index_n_heads
                 if server_args.gpt_oss_dsa_index_n_heads is not None
@@ -315,7 +316,7 @@ class GptOssAttention(nn.Module):
             q_lora_rank = (
                 server_args.gpt_oss_dsa_q_lora_rank
                 if server_args.gpt_oss_dsa_q_lora_rank is not None
-                else self.q_size
+                else min(self.q_size, 1536)
             )
             rope_head_dim = (
                 server_args.gpt_oss_dsa_rope_head_dim
@@ -337,7 +338,9 @@ class GptOssAttention(nn.Module):
                 rope_scaling=rope_scaling,
                 is_neox_style=True,
                 prefix=add_prefix("indexer", prefix),
-                quant_config=None,
+                quant_config=Fp8Config(
+                    is_checkpoint_fp8_serialized=True, activation_scheme="dynamic"
+                ),
             )
 
         assert layer_type in {"sliding_attention", "full_attention"}
@@ -365,12 +368,28 @@ class GptOssAttention(nn.Module):
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
         topk_indices = None
-        if self.indexer is not None and q.shape[0] > 0:
+        if (
+            self.enable_gqa_dsa
+            and get_global_server_args().gpt_oss_dsa_topk_source == "recent"
+            and forward_batch.forward_mode.is_decode_or_idle()
+            and q.shape[0] > 0
+        ):
+            topk = int(get_global_server_args().gpt_oss_dsa_index_topk)
+            seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
+            if seq_lens_cpu is not None:
+                # Enforce: disable DSA when the context length is <= topk.
+                if int(seq_lens_cpu.max().item()) > topk:
+                    # IMPORTANT: `recent` is a capture-friendly debug lane; the FlashAttention
+                    # backend does not actually require token-level topk indices. We pass a
+                    # tiny sentinel tensor to activate sparse decode and let the backend
+                    # build the suffix page table directly from `seq_lens`.
+                    topk_indices = q.new_empty((q.shape[0], 1), dtype=torch.int32)
+        elif self.indexer is not None and q.shape[0] > 0:
             if forward_batch.forward_mode.is_extend_without_speculative():
                 # Prefill/extend: populate index-K cache only (no top-k indices needed).
                 _ = self.indexer(
                     x=hidden_states,
-                    q_lora=q,
+                    q_lora=None,
                     positions=positions,
                     forward_batch=forward_batch,
                     layer_id=self.layer_id,
@@ -392,7 +411,7 @@ class GptOssAttention(nn.Module):
                 else:
                     topk_indices = self.indexer(
                         x=hidden_states,
-                        q_lora=q,
+                        q_lora=None,
                         positions=positions,
                         forward_batch=forward_batch,
                         layer_id=self.layer_id,

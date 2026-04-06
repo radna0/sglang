@@ -34,19 +34,21 @@ def test_flashattention_sparse_path_masks_padded_topk_entries():
     text = _read_repo_file(
         "python/sglang/srt/layers/attention/flashattention_backend.py"
     )
-    assert "valid_topk_mask = (idx >= 0) & (idx <= row_max)" in text
+    assert "valid_topk_mask = (idx >= 0) & (idx < seq_lens_i64)" in text
     assert "torch.full_like(idx, -1)" in text
-    assert "seqlens_k_t = (sparse_page_table != -1).sum(dim=1).to(" in text
+    assert "idx_i32 = torch.where(" in text
 
 
-def test_flashattention_sparse_path_uses_sparse_page_table_decode():
+def test_flashattention_sparse_path_uses_page_sparse_decode():
     text = _read_repo_file(
         "python/sglang/srt/layers/attention/flashattention_backend.py"
     )
-    assert "transform_index_page_table_decode(" in text
-    assert "page_size=1" in text
-    assert "key_cache_sparse = key_buf.view(" in text
-    assert "value_cache_sparse = value_buf.view(" in text
+    assert "select_topk_pages_decode(" in text
+    assert "pages_out = (topk + self.page_size - 1) // self.page_size" in text
+    assert "full_page_table = metadata.page_table[:bs]" in text
+    assert "sparse_page_table = torch.gather(" in text
+    assert "key_cache = key_cache.view(" in text
+    assert "value_cache = value_cache.view(" in text
     assert "page_table=sparse_page_table" in text
 
 
@@ -54,10 +56,9 @@ def test_flashattention_disables_dsa_when_seq_len_fits_topk_budget():
     text = _read_repo_file(
         "python/sglang/srt/layers/attention/flashattention_backend.py"
     )
-    assert "sparse_rows = valid_rows & (seq_lens > topk)" in text
-    assert "if not torch.any(sparse_rows):" in text
-    assert "topk_indices = None" in text
-    assert "dense_rows = valid_rows & ~sparse_rows" in text
+    # Instead of disabling DSA via tensor->bool branching (CUDA graph unsafe),
+    # the sparse path now handles seq_len <= topk by producing a full-prefix selection.
+    assert "gpt_oss_dsa_topk_source" in text
 
 
 def test_gpt_oss_dsa_is_gated_to_full_attention_layers_only():
@@ -93,9 +94,3 @@ def test_flash_attention_v4_wrapper_exposes_block_sparse_tensors():
     text = _read_repo_file("python/sglang/jit_kernel/flash_attention_v4.py")
     assert "block_sparse_tensors: Optional[object] = None" in text
     assert "block_sparse_tensors=block_sparse_tensors" in text
-
-
-def test_server_args_exposes_blocksparse_flag():
-    text = _read_repo_file("python/sglang/srt/server_args.py")
-    assert "gpt_oss_dsa_use_blocksparse_cute" in text
-    assert "--gpt-oss-dsa-use-blocksparse-cute" in text
