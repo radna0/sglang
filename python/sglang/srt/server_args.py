@@ -1391,13 +1391,32 @@ class ServerArgs:
                     self.page_size = 64
                     logger.warning("Setting page size to 64 for GPT-OSS GQA DSA.")
 
-                if self.kv_cache_dtype in ["auto", "fp16", "float16"]:
+                # KV cache dtype constraints:
+                # - never use fp16 for KV cache (quality/perf issues).
+                # - `topk_source=indexer` requires bf16 KV cache for the index-K buffer path.
+                # - `topk_source=recent` is a debug lane and can optionally run with fp8 KV
+                #   cache to test throughput; keep user choice if explicitly set.
+                if self.kv_cache_dtype in ["fp16", "float16"]:
                     self.kv_cache_dtype = "bfloat16"
                     logger.warning(
-                        "GPT-OSS GQA DSA requires bfloat16 KV cache; setting --kv-cache-dtype=bfloat16."
+                        "GPT-OSS GQA DSA does not support fp16 KV cache; setting --kv-cache-dtype=bfloat16."
                     )
                 if self.kv_cache_dtype == "bf16":
                     self.kv_cache_dtype = "bfloat16"
+
+                if self.gpt_oss_dsa_topk_source == "indexer":
+                    if self.kv_cache_dtype in ["auto"]:
+                        self.kv_cache_dtype = "bfloat16"
+                        logger.warning(
+                            "GPT-OSS GQA DSA (topk_source=indexer) requires bfloat16 KV cache; setting --kv-cache-dtype=bfloat16."
+                        )
+                    assert self.kv_cache_dtype in [
+                        "bfloat16",
+                        "bf16",
+                    ], (
+                        "GPT-OSS GQA DSA (topk_source=indexer) currently requires bf16/bfloat16 KV cache "
+                        f"but got {self.kv_cache_dtype!r}."
+                    )
 
             if (
                 prefill_attn_backend == "trtllm_mha"
