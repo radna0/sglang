@@ -301,3 +301,37 @@ class FusedKVMaterializeHelper:
                 self.eps_values[layer_id],
             )
             write_layer_kv(layer_id, cache_k, cache_v)
+
+    def materialize_from_target_hidden_selected(
+        self,
+        *,
+        target_hidden: torch.Tensor,
+        accepted_indices: torch.Tensor,
+        positions: torch.Tensor,
+        write_layer_kv: Callable[[int, torch.Tensor, torch.Tensor], None],
+    ) -> None:
+        """Materialize only the accepted subset of verify hidden states.
+
+        Linear/tree DFlash verify append already computes the accepted token index
+        set. Reuse the fused batched KV projection path instead of falling back to
+        sequential per-layer projection.
+        """
+        if accepted_indices.ndim != 1:
+            accepted_indices = accepted_indices.reshape(-1)
+        if accepted_indices.numel() == 0:
+            return
+
+        accepted_indices = accepted_indices.to(
+            device=target_hidden.device, dtype=torch.int64
+        )
+        if positions.ndim != 1:
+            positions = positions.reshape(-1)
+        selected_hidden = target_hidden.index_select(0, accepted_indices)
+        selected_positions = positions.index_select(
+            0, accepted_indices.to(device=positions.device, dtype=torch.int64)
+        )
+        self.materialize(
+            ctx_hidden=selected_hidden,
+            positions=selected_positions,
+            write_layer_kv=write_layer_kv,
+        )

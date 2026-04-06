@@ -1289,11 +1289,26 @@ class DFlashTreeWorker:
                     ctx_hidden, ctx_positions, ctx_cache_loc
                 )
 
-    def _append_verified_hidden_selected_fused(
+    def _project_verified_hidden_selected(
         self,
         *,
         hidden_states: torch.Tensor,
         accepted_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        if hasattr(self.draft_model, "project_target_hidden_selected"):
+            return self.draft_model.project_target_hidden_selected(
+                hidden_states, accepted_indices
+            )
+        selected_hidden = gather_dflash_committed_hidden(
+            hidden_states=hidden_states,
+            accepted_indices=accepted_indices,
+        )
+        return self.draft_model.project_target_hidden(selected_hidden)
+
+    def _append_verified_hidden_selected_fused(
+        self,
+        *,
+        ctx_hidden: torch.Tensor,
         ctx_positions: torch.Tensor,
         ctx_cache_loc: torch.Tensor,
     ) -> None:
@@ -1316,9 +1331,8 @@ class DFlashTreeWorker:
                 cache_v,
             )
 
-        self._fused_kv_helper.materialize_from_target_hidden_selected(
-            target_hidden=hidden_states,
-            accepted_indices=accepted_indices,
+        self._fused_kv_helper.materialize(
+            ctx_hidden=ctx_hidden,
             positions=ctx_positions,
             write_layer_kv=_write_layer_kv,
         )
@@ -1332,11 +1346,19 @@ class DFlashTreeWorker:
         ctx_cache_loc: torch.Tensor,
     ) -> None:
         with torch.inference_mode():
+            ctx_hidden = self._project_verified_hidden_selected(
+                hidden_states=hidden_states,
+                accepted_indices=accepted_indices,
+            )
+            if ctx_hidden.shape[0] != ctx_cache_loc.numel():
+                raise RuntimeError(
+                    "DFLASH_TREE selected verify hidden/cache_loc mismatch: "
+                    f"{ctx_hidden.shape[0]} vs {ctx_cache_loc.numel()}."
+                )
             if self._use_fused_kv_materialize and self._fused_kv_helper is not None:
                 try:
                     self._append_verified_hidden_selected_fused(
-                        hidden_states=hidden_states,
-                        accepted_indices=accepted_indices,
+                        ctx_hidden=ctx_hidden,
                         ctx_positions=ctx_positions,
                         ctx_cache_loc=ctx_cache_loc,
                     )
@@ -1350,14 +1372,6 @@ class DFlashTreeWorker:
                 if self._use_fused_kv_materialize:
                     return
 
-            ctx_hidden = self.draft_model.project_target_hidden_selected(
-                hidden_states, accepted_indices
-            )
-            if ctx_hidden.shape[0] != ctx_cache_loc.numel():
-                raise RuntimeError(
-                    "DFLASH_TREE selected verify hidden/cache_loc mismatch: "
-                    f"{ctx_hidden.shape[0]} vs {ctx_cache_loc.numel()}."
-                )
             self._append_target_hidden_sequential(
                 ctx_hidden, ctx_positions, ctx_cache_loc
             )

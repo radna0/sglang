@@ -306,6 +306,22 @@ class DFlashDraftModel(nn.Module):
             )
         return self.hidden_norm(self.fc(target_hidden))
 
+    def project_target_hidden_selected(
+        self, target_hidden: torch.Tensor, accepted_indices: torch.Tensor
+    ) -> torch.Tensor:
+        """Project only the accepted subset of concatenated target hidden states."""
+        if accepted_indices.ndim != 1:
+            accepted_indices = accepted_indices.reshape(-1)
+        accepted_indices = accepted_indices.to(
+            device=target_hidden.device, dtype=torch.int64
+        )
+        selected_hidden = (
+            target_hidden.index_select(0, accepted_indices)
+            if accepted_indices.numel() > 0
+            else target_hidden[:0]
+        )
+        return self.project_target_hidden(selected_hidden)
+
     @torch.no_grad()
     def forward(
         self,

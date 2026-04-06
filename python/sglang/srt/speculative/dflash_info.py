@@ -23,6 +23,7 @@ from sglang.srt.speculative.dflash_utils import (
     compute_dflash_accept_len_and_bonus,
     compute_dflash_sampling_accept_len_and_bonus,
     commit_dflash_target_only_batch,
+    dflash_sampling_info_uses_sampled_target,
     gather_dflash_committed_hidden,
     is_dflash_sampling_verify_available,
     materialize_dflash_target_only_commit_metadata,
@@ -56,6 +57,58 @@ def _compute_paged_keep_slots(
     keep_slots = (keep_lens - prefix_lens).to(torch.int64)
     keep_slots.clamp_(min=0, max=int(draft_token_num))
     return keep_slots
+
+
+def _ensure_dflash_cpu_stage_buffer(
+    batch: ScheduleBatch,
+    *,
+    attr_name: str,
+    needed: int,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    needed = int(needed)
+    if needed < 0:
+        raise ValueError(f"needed must be non-negative, got {needed}.")
+    existing = getattr(batch, attr_name, None)
+    cap = int(existing.numel()) if isinstance(existing, torch.Tensor) else 0
+    if (
+        not isinstance(existing, torch.Tensor)
+        or existing.device.type != "cpu"
+        or existing.dtype != dtype
+        or cap < needed
+    ):
+        new_cap = max(needed, cap * 2 if cap > 0 else needed)
+        existing = torch.empty(
+            (new_cap,),
+            dtype=dtype,
+            device="cpu",
+            pin_memory=bool(torch.cuda.is_available()),
+        )
+        setattr(batch, attr_name, existing)
+    return existing[:needed]
+
+
+def _assign_fixed_width_req_to_token_direct(
+    *,
+    req_pool_indices: torch.Tensor,
+    req_to_token: torch.Tensor,
+    positions_2d: torch.Tensor,
+    out_cache_loc: torch.Tensor,
+) -> None:
+    if positions_2d.ndim != 2:
+        raise ValueError(
+            f"positions_2d must be 2D, got shape={tuple(positions_2d.shape)}."
+        )
+    bs, width = positions_2d.shape
+    if int(out_cache_loc.numel()) != int(bs * width):
+        raise ValueError(
+            "Fixed-width req_to_token write size mismatch: "
+            f"expected {bs * width} values, got {int(out_cache_loc.numel())}."
+        )
+    row_ids = req_pool_indices.to(torch.int64).unsqueeze(1).expand(-1, width)
+    req_to_token[row_ids, positions_2d.to(torch.int64)] = out_cache_loc.view(
+        bs, width
+    ).to(dtype=req_to_token.dtype)
 
 
 @dataclass
@@ -171,6 +224,10 @@ class DFlashVerifyInput(SpecInput):
     # Semantics follow SGLang speculative conventions: True means the (q, k) pair is allowed.
     custom_mask: torch.Tensor | None = None
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.FULL
+    linear_mode: str = "draft=greedy,target=greedy"
+    draft_selected_probs: torch.Tensor | None = None
+    draft_proposal_indices: torch.Tensor | None = None
+    draft_proposal_probs: torch.Tensor | None = None
 
     # Shape info for padding (e.g., DP attention / CUDA graph).
     num_tokens_per_batch: int = -1
@@ -222,14 +279,23 @@ class DFlashVerifyInput(SpecInput):
             self.last_loc = last_loc
 
         bs = batch.batch_size()
-        assign_req_to_token_pool_func(
-            batch.req_pool_indices,
-            batch.req_to_token_pool.req_to_token,
-            batch.seq_lens,
-            end_offset,
-            batch.out_cache_loc,
-            bs,
-        )
+        if int(page_size) == 1:
+            positions_2d = self.positions.view(bs, self.draft_token_num)
+            _assign_fixed_width_req_to_token_direct(
+                req_pool_indices=batch.req_pool_indices,
+                req_to_token=batch.req_to_token_pool.req_to_token,
+                positions_2d=positions_2d,
+                out_cache_loc=batch.out_cache_loc,
+            )
+        else:
+            assign_req_to_token_pool_func(
+                batch.req_pool_indices,
+                batch.req_to_token_pool.req_to_token,
+                batch.seq_lens,
+                end_offset,
+                batch.out_cache_loc,
+                bs,
+            )
 
         if not build_custom_mask:
             self.custom_mask = None
@@ -370,16 +436,22 @@ class DFlashVerifyInput(SpecInput):
                 )
 
         candidates = self.draft_token.view(bs, self.draft_token_num)
-        if sampling_info is not None and not sampling_info.is_all_greedy:
+        if dflash_sampling_info_uses_sampled_target(
+            sampling_info, reqs=batch.reqs
+        ):
             if not is_dflash_sampling_verify_available():
                 raise RuntimeError(
-                    "DFLASH sampled target-only verification was requested, but "
-                    "the required sampled verify kernels are unavailable on this build/device."
+                    "DFLASH sampled verification was requested, but the exact sampled verify "
+                    "path is unavailable on this build/device."
                 )
             accept_len, bonus, proposed_tokens = compute_dflash_sampling_accept_len_and_bonus(
                 candidates=candidates,
                 next_token_logits=logits_output.next_token_logits,
                 sampling_info=sampling_info,
+                linear_mode=self.linear_mode,
+                draft_selected_probs=self.draft_selected_probs,
+                draft_proposal_indices=self.draft_proposal_indices,
+                draft_proposal_probs=self.draft_proposal_probs,
                 return_proposed_tokens=True,
             )
         else:
@@ -413,10 +485,36 @@ class DFlashVerifyInput(SpecInput):
             target_predict=proposed_tokens,
             accept_len=accept_len,
         )
+        proposed_flat_cpu = _ensure_dflash_cpu_stage_buffer(
+            batch,
+            attr_name="_dflash_proposed_flat_cpu_stage",
+            needed=int(packed_commits.proposed_flat.numel()),
+            dtype=torch.int64,
+        )
+        commit_lens_cpu_t = _ensure_dflash_cpu_stage_buffer(
+            batch,
+            attr_name="_dflash_commit_lens_cpu_stage",
+            needed=int(packed_commits.commit_lens.numel()),
+            dtype=torch.int32,
+        )
+        proposed_flat_cpu.copy_(
+            packed_commits.proposed_flat.to(dtype=torch.int64),
+            non_blocking=bool(
+                packed_commits.proposed_flat.is_cuda and proposed_flat_cpu.is_pinned()
+            ),
+        )
+        commit_lens_cpu_t.copy_(
+            packed_commits.commit_lens.to(dtype=torch.int32),
+            non_blocking=bool(
+                packed_commits.commit_lens.is_cuda and commit_lens_cpu_t.is_pinned()
+            ),
+        )
+        if packed_commits.proposed_flat.is_cuda:
+            torch.cuda.current_stream(device=device).synchronize()
         commit_results = commit_dflash_target_only_batch(
             reqs=batch.reqs,
-            proposed_flat_cpu=packed_commits.proposed_flat.cpu(),
-            commit_offsets_cpu=packed_commits.commit_offsets.cpu(),
+            proposed_flat_cpu=proposed_flat_cpu,
+            commit_lens_cpu=commit_lens_cpu_t,
             empty_error_prefix="DFLASH verify",
         )
         accept_length_per_req_cpu = [
@@ -452,6 +550,7 @@ class DFlashVerifyInput(SpecInput):
             batch=batch,
             commit_lens=commit_lens,
             commit_lens_cpu=commit_lens_cpu,
+            commit_lens_cpu_tensor=commit_lens_cpu_t,
             cache_plan=cache_plan,
         )
 

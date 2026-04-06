@@ -8,6 +8,11 @@ from typing import Any, Callable, List, Optional, Tuple
 import os
 import torch
 import torch.nn.functional as F
+from sglang.srt.layers.sampler import (
+    _sanitize_sampling_probs_for_multinomial_,
+    multinomial_with_seed,
+    prepare_top_k_top_p_min_p_sorted_probs_torch,
+)
 from sglang.srt.speculative.dflash_controller import (
     DFlashDifficultySignals,
     DFlashReqDifficultyState,
@@ -16,7 +21,7 @@ from sglang.srt.utils import is_cuda
 
 DEFAULT_DFLASH_MASK_TOKEN = "<|MASK|>"
 
-_DFLASH_SAMPLING_VERIFY_AVAILABLE = False
+_DFLASH_SAMPLING_VERIFY_AVAILABLE = is_cuda()
 _DFLASH_CHAIN_VERIFY_BUFFERS: dict[tuple[Optional[int], int], dict[str, Any]] = {}
 _DFLASH_VERIFY_SKIP_CUSTOM_MASK_BACKENDS = frozenset(
     {
@@ -37,24 +42,158 @@ def _env_truthy(name: str) -> bool:
 if is_cuda():
     try:
         from sgl_kernel import (  # type: ignore[import-not-found]
-            top_k_renorm_prob,
-            top_p_renorm_prob,
             tree_speculative_sampling_target_only,
         )
-
-        _DFLASH_SAMPLING_VERIFY_AVAILABLE = True
     except Exception:
-        top_k_renorm_prob = None
-        top_p_renorm_prob = None
         tree_speculative_sampling_target_only = None
 else:
-    top_k_renorm_prob = None
-    top_p_renorm_prob = None
     tree_speculative_sampling_target_only = None
 
 
 def is_dflash_sampling_verify_available() -> bool:
     return _DFLASH_SAMPLING_VERIFY_AVAILABLE
+
+
+def build_dflash_filtered_sampling_distribution_from_probs(
+    probs: torch.Tensor,
+    top_ks: torch.Tensor,
+    top_ps: torch.Tensor,
+    min_ps: torch.Tensor,
+    need_min_p_sampling: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    probs_sort, probs_idx = prepare_top_k_top_p_min_p_sorted_probs_torch(
+        probs,
+        top_ks,
+        top_ps,
+        min_ps,
+        need_min_p_sampling,
+    )
+    _sanitize_sampling_probs_for_multinomial_(probs_sort)
+    return probs_sort, probs_idx.to(torch.long)
+
+
+def build_dflash_filtered_sampling_distribution_from_logits(
+    logits: torch.Tensor,
+    top_ks: torch.Tensor,
+    top_ps: torch.Tensor,
+    min_ps: torch.Tensor,
+    need_min_p_sampling: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if logits.ndim != 2:
+        raise ValueError(f"logits must be 2D, got shape={tuple(logits.shape)}.")
+    if int(logits.shape[0]) == 0:
+        empty_idx = torch.empty_like(logits, dtype=torch.long)
+        return logits, empty_idx
+
+    vocab_size = int(logits.shape[-1])
+    top_ks_view = top_ks.view(-1).to(device=logits.device, dtype=torch.int64)
+    use_bounded_topk = top_ks_view.numel() > 0 and not torch.any(
+        top_ks_view >= vocab_size
+    )
+    if not use_bounded_topk:
+        probs = F.softmax(logits, dim=-1)
+        return build_dflash_filtered_sampling_distribution_from_probs(
+            probs,
+            top_ks.to(device=logits.device, dtype=torch.int32),
+            top_ps.to(device=logits.device, dtype=torch.float32),
+            min_ps.to(device=logits.device, dtype=torch.float32),
+            need_min_p_sampling,
+        )
+
+    max_top_k = int(top_ks_view.max().item())
+    max_top_k = max(1, min(max_top_k, vocab_size))
+    topk_logits, topk_indices = torch.topk(
+        logits,
+        k=max_top_k,
+        dim=-1,
+        largest=True,
+        sorted=True,
+    )
+    if not torch.all(top_ks_view == max_top_k):
+        ranks = torch.arange(max_top_k, device=logits.device, dtype=torch.int64)[None, :]
+        valid = ranks < top_ks_view.unsqueeze(1)
+        topk_logits = topk_logits.masked_fill(~valid, float("-inf"))
+
+    probs_sort = F.softmax(topk_logits, dim=-1)
+    probs_sort.nan_to_num_(nan=0.0, posinf=0.0, neginf=0.0)
+    cumulative = torch.cumsum(probs_sort, dim=-1)
+    probs_sort[(cumulative - probs_sort) > top_ps.view(-1, 1)] = 0.0
+    if need_min_p_sampling:
+        min_thresholds = probs_sort[:, :1] * min_ps.to(
+            device=logits.device, dtype=probs_sort.dtype
+        ).view(-1, 1)
+        probs_sort[probs_sort < min_thresholds] = 0.0
+    _sanitize_sampling_probs_for_multinomial_(probs_sort)
+    return probs_sort, topk_indices.to(torch.long)
+
+
+def sample_dflash_filtered_distribution(
+    *,
+    probs_sort: torch.Tensor,
+    probs_idx: torch.Tensor,
+    sampling_seed: Optional[torch.Tensor],
+    positions: Optional[torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if sampling_seed is None:
+        sampled_index = torch.multinomial(probs_sort, num_samples=1)
+    else:
+        sampled_index = multinomial_with_seed(
+            torch.log(probs_sort.to(torch.float64)),
+            sampling_seed,
+            positions,
+        )
+    sampled_prob = torch.gather(probs_sort, dim=1, index=sampled_index).view(-1)
+    sampled_token = torch.gather(
+        probs_idx.to(torch.long), dim=1, index=sampled_index
+    ).view(-1)
+    return sampled_token, sampled_prob
+
+
+def scatter_dflash_filtered_distribution_to_dense(
+    probs_sort: torch.Tensor,
+    probs_idx: torch.Tensor,
+    *,
+    vocab_size: int,
+) -> torch.Tensor:
+    dense = torch.zeros(
+        (int(probs_sort.shape[0]), int(vocab_size)),
+        dtype=probs_sort.dtype,
+        device=probs_sort.device,
+    )
+    dense.scatter_(1, probs_idx.to(torch.long), probs_sort)
+    return dense
+
+
+def _sample_dflash_dense_probs_with_uniform(
+    probs: torch.Tensor,
+    uniform: torch.Tensor,
+) -> torch.Tensor:
+    probs = probs.clone()
+    _sanitize_sampling_probs_for_multinomial_(probs)
+    cdf = probs.cumsum(dim=-1)
+    sampled = torch.sum(
+        cdf < uniform.to(device=probs.device, dtype=probs.dtype).unsqueeze(1),
+        dim=-1,
+        dtype=torch.int64,
+    )
+    sampled.clamp_(max=int(probs.shape[-1] - 1))
+    return sampled
+
+
+def _sample_dflash_sparse_probs_with_uniform(
+    probs_sort: torch.Tensor,
+    uniform: torch.Tensor,
+) -> torch.Tensor:
+    probs_sort = probs_sort.clone()
+    _sanitize_sampling_probs_for_multinomial_(probs_sort)
+    cdf = probs_sort.cumsum(dim=-1)
+    sampled = torch.sum(
+        cdf < uniform.to(device=probs_sort.device, dtype=probs_sort.dtype).unsqueeze(1),
+        dim=-1,
+        dtype=torch.int64,
+    )
+    sampled.clamp_(max=int(probs_sort.shape[-1] - 1))
+    return sampled
 
 
 def snapshot_dflash_request_sampling_params(
@@ -146,6 +285,76 @@ def resolve_dflash_verify_mask_policy(attn_backend: Any) -> tuple[str, bool]:
         backend = full_backend
     backend_name = type(backend).__name__
     return backend_name, (backend_name not in _DFLASH_VERIFY_SKIP_CUSTOM_MASK_BACKENDS)
+
+
+def dflash_sampling_info_uses_sampled_target(
+    sampling_info: Any | None,
+    *,
+    reqs: Optional[List[Any]] = None,
+) -> bool:
+    """Return True when the active batch should use sampled target verification.
+
+    Some call-sites historically relied only on ``sampling_info.is_all_greedy``.
+    That flag can be misleading for prewarm / merged batches if it gets carried
+    forward before the tensor fields are fully updated. The DFlash worker should
+    resolve sampled-vs-greedy from the actual batched sampling tensors.
+    """
+    if sampling_info is None:
+        return False
+
+    if not bool(getattr(sampling_info, "is_all_greedy", True)):
+        return True
+
+    top_ks = getattr(sampling_info, "top_ks", None)
+    if isinstance(top_ks, torch.Tensor) and top_ks.numel() > 0:
+        with torch.no_grad():
+            if bool(torch.any(top_ks.to(torch.int64) > 1).item()):
+                return True
+
+    top_ps = getattr(sampling_info, "top_ps", None)
+    if isinstance(top_ps, torch.Tensor) and top_ps.numel() > 0:
+        with torch.no_grad():
+            if bool(torch.any(top_ps.to(torch.float32) < 0.999999).item()):
+                return True
+
+    min_ps = getattr(sampling_info, "min_ps", None)
+    if isinstance(min_ps, torch.Tensor) and min_ps.numel() > 0:
+        with torch.no_grad():
+            if bool(torch.any(min_ps.to(torch.float32) > 0).item()):
+                return True
+
+    if reqs:
+        for req in reqs:
+            sampling_params = getattr(req, "sampling_params", None)
+            if sampling_params is None:
+                continue
+            try:
+                top_k = int(getattr(sampling_params, "top_k", 1))
+            except Exception:
+                top_k = 1
+            try:
+                top_p = float(getattr(sampling_params, "top_p", 1.0))
+            except Exception:
+                top_p = 1.0
+            try:
+                min_p = float(getattr(sampling_params, "min_p", 0.0))
+            except Exception:
+                min_p = 0.0
+            try:
+                temperature = float(getattr(sampling_params, "temperature", 1.0))
+            except Exception:
+                temperature = 1.0
+
+            if min_p > 0.0:
+                return True
+            if top_p < 0.999999:
+                return True
+            if top_k <= 0 or top_k > 1:
+                return True
+            if temperature > 0.0 and top_k <= 0:
+                return True
+
+    return False
 
 
 def _get_or_create_chain_verify_buffers(
@@ -746,7 +955,7 @@ def commit_dflash_target_only_batch(
     *,
     reqs: List[Any],
     proposed_flat_cpu: torch.Tensor,
-    commit_offsets_cpu: torch.Tensor,
+    commit_lens_cpu: torch.Tensor,
     empty_error_prefix: str = "DFLASH verify",
 ) -> List[DFlashTargetOnlyCommitResult]:
     """Batch the common plain-request target_only commit path.
@@ -767,18 +976,23 @@ def commit_dflash_target_only_batch(
             "commit_dflash_target_only_batch expects proposed_flat_cpu on CPU, "
             f"got device={proposed_flat_cpu.device}."
         )
-    if commit_offsets_cpu.device.type != "cpu":
+    if commit_lens_cpu.device.type != "cpu":
         raise ValueError(
-            "commit_dflash_target_only_batch expects commit_offsets_cpu on CPU, "
-            f"got device={commit_offsets_cpu.device}."
+            "commit_dflash_target_only_batch expects commit_lens_cpu on CPU, "
+            f"got device={commit_lens_cpu.device}."
         )
 
     num_reqs = len(reqs)
-    if int(commit_offsets_cpu.numel()) != num_reqs + 1:
+    if int(commit_lens_cpu.numel()) != num_reqs:
         raise ValueError(
-            "commit_offsets_cpu size mismatch: "
-            f"expected {num_reqs + 1}, got {int(commit_offsets_cpu.numel())}."
+            "commit_lens_cpu size mismatch: "
+            f"expected {num_reqs}, got {int(commit_lens_cpu.numel())}."
         )
+    commit_lens_list = [int(x) for x in commit_lens_cpu.tolist()]
+    proposed_flat_list = [int(x) for x in proposed_flat_cpu.tolist()]
+    commit_offsets_list = [0] * (num_reqs + 1)
+    for i, width in enumerate(commit_lens_list):
+        commit_offsets_list[i + 1] = commit_offsets_list[i] + int(width)
 
     results: list[DFlashTargetOnlyCommitResult | None] = [None] * num_reqs
     grouped_fast_indices: dict[_DFlashFastFinishPolicy, list[int]] = {}
@@ -786,9 +1000,9 @@ def commit_dflash_target_only_batch(
     for i, req in enumerate(reqs):
         policy = _build_dflash_fast_finish_policy(req)
         if policy is None:
-            start_offset = int(commit_offsets_cpu[i].item())
-            end_offset = int(commit_offsets_cpu[i + 1].item())
-            proposed = proposed_flat_cpu[start_offset:end_offset].tolist()
+            start_offset = int(commit_offsets_list[i])
+            end_offset = int(commit_offsets_list[i + 1])
+            proposed = proposed_flat_list[start_offset:end_offset]
             results[i] = commit_dflash_proposed_tokens_to_req(
                 req=req,
                 proposed=proposed,
@@ -798,196 +1012,67 @@ def commit_dflash_target_only_batch(
         grouped_fast_indices.setdefault(policy, []).append(i)
 
     for policy, group_indices in grouped_fast_indices.items():
-        group_tokens = []
-        default_commit_lens = []
-        remaining_lens = []
-        old_output_lens = []
-        for i in group_indices:
-            start_offset = int(commit_offsets_cpu[i].item())
-            end_offset = int(commit_offsets_cpu[i + 1].item())
-            group_tokens.append(proposed_flat_cpu[start_offset:end_offset].to(torch.int64))
-            default_commit_lens.append(end_offset - start_offset)
-            old_output_lens.append(len(reqs[i].output_ids))
-            remaining_lens.append(
-                int(reqs[i].sampling_params.max_new_tokens) - len(reqs[i].output_ids)
-            )
-
-        if not group_tokens:
-            continue
-
-        max_width = max((int(t.numel()) for t in group_tokens), default=0)
-        group_size = len(group_tokens)
-        if max_width > 0:
-            token_rows = torch.full(
-                (group_size, max_width),
-                -1,
-                dtype=torch.int64,
-                device=proposed_flat_cpu.device,
-            )
-            for row_idx, tokens in enumerate(group_tokens):
-                width = int(tokens.numel())
-                if width > 0:
-                    token_rows[row_idx, :width] = tokens
-        else:
-            token_rows = torch.empty(
-                (group_size, 0), dtype=torch.int64, device=proposed_flat_cpu.device
-            )
-
-        default_commit_lens_t = torch.tensor(
-            default_commit_lens, dtype=torch.int64, device=proposed_flat_cpu.device
+        stop_ids = set(int(tok) for tok in policy.stop_ids)
+        vocab_hi = int(policy.vocab_size) if policy.vocab_size is not None else None
+        replacement_token = (
+            int(policy.nan_replacement_token)
+            if policy.nan_replacement_token is not None
+            else None
         )
-        remaining_lens_t = torch.tensor(
-            remaining_lens, dtype=torch.int64, device=proposed_flat_cpu.device
-        )
-        effective_lens = torch.minimum(
-            default_commit_lens_t, remaining_lens_t.clamp_min(0)
-        )
-
-        no_stop_fast_path = len(policy.stop_ids) == 0
-        no_invalid_fast_path = True
-        if policy.vocab_size is not None:
-            vocab_hi = int(policy.vocab_size)
-            for tokens in group_tokens:
-                if int(tokens.numel()) <= 0:
-                    continue
-                if bool(torch.any((tokens < 0) | (tokens > vocab_hi))):
-                    no_invalid_fast_path = False
-                    break
-
-        if (
-            no_stop_fast_path
-            and no_invalid_fast_path
-            and bool(torch.all(remaining_lens_t >= default_commit_lens_t))
-        ):
-            for row_idx, req_index in enumerate(group_indices):
-                req = reqs[req_index]
-                tokens = group_tokens[row_idx].tolist()
-                if tokens:
-                    req.output_ids.extend(tokens)
-                if int(remaining_lens_t[row_idx].item()) == len(tokens) and len(tokens) > 0:
-                    req.finished_reason = FINISH_LENGTH(
-                        length=req.sampling_params.max_new_tokens
-                    )
-                    req.finished_len = req.sampling_params.max_new_tokens
-
-                if req.output_ids:
-                    new_verified_token = int(req.output_ids[-1])
-                elif req.origin_input_ids:
-                    new_verified_token = int(req.origin_input_ids[-1])
-                else:
-                    raise RuntimeError(
-                        f"{empty_error_prefix} cannot determine current token: both output_ids and "
-                        "origin_input_ids are empty."
-                    )
-
-                accepted_draft_tokens = max(0, len(tokens) - 1)
-                req.spec_verify_ct += 1
-                req.spec_accepted_tokens += accepted_draft_tokens
-                if hasattr(req, "update_spec_acceptance_histogram"):
-                    req.update_spec_acceptance_histogram(accepted_draft_tokens)
-
-                results[req_index] = DFlashTargetOnlyCommitResult(
-                    commit_len=len(tokens),
-                    new_verified_token=new_verified_token,
-                    accepted_draft_tokens=accepted_draft_tokens,
-                    used_device_defaults=True,
-                )
-            continue
-
-        finish_kind = ["none"] * group_size
-        finish_pos = [-1] * group_size
-        final_commit_lens = effective_lens.clone()
-
-        if max_width > 0:
-            cols = torch.arange(max_width, dtype=torch.int64, device=proposed_flat_cpu.device)[
-                None, :
-            ]
-            valid_mask = cols < effective_lens[:, None]
-
-            if policy.stop_ids:
-                stop_ids = torch.tensor(
-                    policy.stop_ids, dtype=torch.int64, device=proposed_flat_cpu.device
-                )
-                stop_match = valid_mask & (
-                    token_rows[:, :, None] == stop_ids[None, None, :]
-                ).any(dim=-1)
-                stop_pos_t = torch.where(
-                    stop_match,
-                    cols,
-                    torch.full_like(cols, max_width),
-                ).min(dim=1).values
-            else:
-                stop_pos_t = torch.full(
-                    (group_size,),
-                    max_width,
-                    dtype=torch.int64,
-                    device=proposed_flat_cpu.device,
-                )
-
-            if policy.vocab_size is not None:
-                invalid_match = valid_mask & (
-                    (token_rows < 0) | (token_rows > int(policy.vocab_size))
-                )
-                invalid_pos_t = torch.where(
-                    invalid_match,
-                    cols,
-                    torch.full_like(cols, max_width),
-                ).min(dim=1).values
-            else:
-                invalid_pos_t = torch.full(
-                    (group_size,),
-                    max_width,
-                    dtype=torch.int64,
-                    device=proposed_flat_cpu.device,
-                )
-
-            for row_idx in range(group_size):
-                stop_pos = int(stop_pos_t[row_idx].item())
-                invalid_pos = int(invalid_pos_t[row_idx].item())
-                effective_len = int(effective_lens[row_idx].item())
-                default_len = int(default_commit_lens_t[row_idx].item())
-                remaining = int(remaining_lens_t[row_idx].item())
-
-                if stop_pos < max_width and stop_pos < effective_len:
-                    final_commit_lens[row_idx] = stop_pos + 1
-                    finish_kind[row_idx] = "token"
-                    finish_pos[row_idx] = stop_pos
-                elif invalid_pos < max_width and invalid_pos < effective_len:
-                    final_commit_lens[row_idx] = invalid_pos + 1
-                    finish_kind[row_idx] = "vocab"
-                    finish_pos[row_idx] = invalid_pos
-                elif (
-                    effective_len > 0
-                    and remaining > 0
-                    and effective_len == remaining
-                ):
-                    finish_kind[row_idx] = "length"
-                    finish_pos[row_idx] = effective_len - 1
-
-        for row_idx, req_index in enumerate(group_indices):
+        for req_index in group_indices:
             req = reqs[req_index]
-            commit_len = int(final_commit_lens[row_idx].item())
-            if commit_len > 0:
-                tokens = token_rows[row_idx, :commit_len].tolist()
-            else:
-                tokens = []
+            start_offset = int(commit_offsets_list[req_index])
+            default_len = int(commit_lens_list[req_index])
+            old_output_len = len(req.output_ids)
+            remaining = int(req.sampling_params.max_new_tokens) - old_output_len
+            effective_len = min(default_len, max(remaining, 0))
+            tokens = (
+                list(proposed_flat_list[start_offset : start_offset + effective_len])
+                if effective_len > 0
+                else []
+            )
+            finish_kind = "none"
+            finish_pos = -1
 
-            if finish_kind[row_idx] == "vocab" and tokens:
-                replacement_token = policy.nan_replacement_token
-                if replacement_token is not None:
-                    tokens[-1] = int(replacement_token)
+            if stop_ids and tokens:
+                for pos, tok in enumerate(tokens):
+                    if int(tok) in stop_ids:
+                        tokens = tokens[: pos + 1]
+                        finish_kind = "token"
+                        finish_pos = pos
+                        break
+
+            if finish_kind == "none" and vocab_hi is not None and tokens:
+                for pos, tok in enumerate(tokens):
+                    if int(tok) < 0 or int(tok) > vocab_hi:
+                        tokens = tokens[: pos + 1]
+                        if replacement_token is not None:
+                            tokens[-1] = replacement_token
+                        finish_kind = "vocab"
+                        finish_pos = pos
+                        break
+
+            commit_len = len(tokens)
+            if (
+                finish_kind == "none"
+                and commit_len > 0
+                and remaining > 0
+                and commit_len == remaining
+            ):
+                finish_kind = "length"
+                finish_pos = commit_len - 1
 
             if tokens:
                 req.output_ids.extend(int(tok) for tok in tokens)
 
-            if finish_kind[row_idx] == "token" and tokens:
+            if finish_kind == "token" and tokens:
                 matched_token = int(tokens[-1])
                 req.finished_reason = FINISH_MATCHED_TOKEN(matched=matched_token)
-                req.finished_len = old_output_lens[row_idx] + finish_pos[row_idx] + 1
-            elif finish_kind[row_idx] == "vocab":
+                req.finished_len = old_output_len + finish_pos + 1
+            elif finish_kind == "vocab":
                 req.finished_reason = FINISH_MATCHED_STR(matched="NaN happened")
-                req.finished_len = old_output_lens[row_idx] + finish_pos[row_idx] + 1
-            elif finish_kind[row_idx] == "length":
+                req.finished_len = old_output_len + finish_pos + 1
+            elif finish_kind == "length":
                 req.finished_reason = FINISH_LENGTH(
                     length=req.sampling_params.max_new_tokens
                 )
@@ -1013,7 +1098,9 @@ def commit_dflash_target_only_batch(
                 commit_len=commit_len,
                 new_verified_token=new_verified_token,
                 accepted_draft_tokens=accepted_draft_tokens,
-                used_device_defaults=(commit_len == int(default_commit_lens_t[row_idx].item())),
+                used_device_defaults=bool(
+                    commit_len == default_len and finish_kind != "vocab"
+                ),
             )
 
     assert all(result is not None for result in results)
@@ -1634,11 +1721,44 @@ def apply_dflash_target_only_req_kv_accounting(
             req.kv_allocated_len = req.kv_committed_len
 
 
+def _assign_dflash_req_to_token_packed_direct(
+    *,
+    req_pool_indices: torch.Tensor,
+    req_to_token: torch.Tensor,
+    start_offset: torch.Tensor,
+    lengths: torch.Tensor,
+    out_cache_loc: torch.Tensor,
+) -> None:
+    if int(lengths.numel()) == 0 or int(out_cache_loc.numel()) == 0:
+        return
+    lengths_i64 = lengths.to(device=req_pool_indices.device, dtype=torch.int64)
+    max_len = int(lengths_i64.max().item())
+    if max_len <= 0:
+        return
+    offs = torch.arange(max_len, device=req_pool_indices.device, dtype=torch.int64)
+    mask = offs.unsqueeze(0) < lengths_i64.unsqueeze(1)
+    row_ids = req_pool_indices.to(torch.int64).unsqueeze(1).expand(-1, max_len)[mask]
+    col_ids = (
+        start_offset.to(device=req_pool_indices.device, dtype=torch.int64)
+        .unsqueeze(1)
+        .add(offs.unsqueeze(0))
+    )[mask]
+    if int(row_ids.numel()) != int(out_cache_loc.numel()):
+        raise RuntimeError(
+            "DFLASH packed req_to_token write size mismatch: "
+            f"rows={int(row_ids.numel())} values={int(out_cache_loc.numel())}."
+        )
+    req_to_token[row_ids, col_ids] = out_cache_loc.to(
+        device=req_to_token.device, dtype=req_to_token.dtype
+    )
+
+
 def apply_dflash_commit_mapping_updates(
     *,
     batch: Any,
     commit_lens: torch.Tensor,
     commit_lens_cpu: List[int],
+    commit_lens_cpu_tensor: torch.Tensor | None = None,
     clear_start: torch.Tensor | None = None,
     clear_end: torch.Tensor | None = None,
     clear_token_count: int = 0,
@@ -1647,14 +1767,26 @@ def apply_dflash_commit_mapping_updates(
 
     bs = int(commit_lens.shape[0])
     end_offset = batch.seq_lens + commit_lens.to(batch.seq_lens.dtype)
-    assign_req_to_token_pool_func(
-        batch.req_pool_indices,
-        batch.req_to_token_pool.req_to_token,
-        batch.seq_lens,
-        end_offset,
-        batch.out_cache_loc,
-        bs,
+    use_direct_packed_write = (
+        bs <= 16 and int(batch.out_cache_loc.numel()) <= 512
     )
+    if use_direct_packed_write:
+        _assign_dflash_req_to_token_packed_direct(
+            req_pool_indices=batch.req_pool_indices,
+            req_to_token=batch.req_to_token_pool.req_to_token,
+            start_offset=batch.seq_lens,
+            lengths=commit_lens.to(batch.seq_lens.dtype),
+            out_cache_loc=batch.out_cache_loc,
+        )
+    else:
+        assign_req_to_token_pool_func(
+            batch.req_pool_indices,
+            batch.req_to_token_pool.req_to_token,
+            batch.seq_lens,
+            end_offset,
+            batch.out_cache_loc,
+            bs,
+        )
     if int(clear_token_count) > 0:
         if clear_start is None or clear_end is None:
             raise ValueError(
@@ -1665,20 +1797,36 @@ def apply_dflash_commit_mapping_updates(
             dtype=torch.int64,
             device=commit_lens.device,
         )
-        assign_req_to_token_pool_func(
-            batch.req_pool_indices,
-            batch.req_to_token_pool.req_to_token,
-            clear_start,
-            clear_end,
-            pad_locs,
-            bs,
-        )
+        clear_lengths = clear_end - clear_start
+        if use_direct_packed_write:
+            _assign_dflash_req_to_token_packed_direct(
+                req_pool_indices=batch.req_pool_indices,
+                req_to_token=batch.req_to_token_pool.req_to_token,
+                start_offset=clear_start,
+                lengths=clear_lengths,
+                out_cache_loc=pad_locs,
+            )
+        else:
+            assign_req_to_token_pool_func(
+                batch.req_pool_indices,
+                batch.req_to_token_pool.req_to_token,
+                clear_start,
+                clear_end,
+                pad_locs,
+                bs,
+            )
 
     batch.seq_lens.add_(commit_lens.to(batch.seq_lens.dtype))
-    batch.seq_lens_cpu.add_(
-        torch.tensor(commit_lens_cpu, dtype=batch.seq_lens_cpu.dtype)
-    )
-    batch.seq_lens_sum += sum(commit_lens_cpu)
+    if commit_lens_cpu_tensor is not None:
+        batch.seq_lens_cpu.add_(
+            commit_lens_cpu_tensor.to(dtype=batch.seq_lens_cpu.dtype)
+        )
+        batch.seq_lens_sum += int(commit_lens_cpu_tensor.sum().item())
+    else:
+        batch.seq_lens_cpu.add_(
+            torch.tensor(commit_lens_cpu, dtype=batch.seq_lens_cpu.dtype)
+        )
+        batch.seq_lens_sum += sum(commit_lens_cpu)
 
 
 def apply_dflash_target_only_mapping_updates(
@@ -1686,12 +1834,14 @@ def apply_dflash_target_only_mapping_updates(
     batch: Any,
     commit_lens: torch.Tensor,
     commit_lens_cpu: List[int],
+    commit_lens_cpu_tensor: torch.Tensor | None = None,
     cache_plan: DFlashTargetOnlyCachePlan,
 ) -> None:
     apply_dflash_commit_mapping_updates(
         batch=batch,
         commit_lens=commit_lens,
         commit_lens_cpu=commit_lens_cpu,
+        commit_lens_cpu_tensor=commit_lens_cpu_tensor,
         clear_start=cache_plan.clear_start,
         clear_end=cache_plan.clear_end,
         clear_token_count=cache_plan.clear_token_count,
@@ -2576,6 +2726,10 @@ def compute_dflash_sampling_accept_len_and_bonus(
     candidates: torch.Tensor,
     next_token_logits: torch.Tensor,
     sampling_info: Any,
+    linear_mode: str = "draft=greedy,target=sampled",
+    draft_selected_probs: Optional[torch.Tensor] = None,
+    draft_proposal_indices: Optional[torch.Tensor] = None,
+    draft_proposal_probs: Optional[torch.Tensor] = None,
     max_steps_per_req: Optional[torch.Tensor] = None,
     threshold_single: Optional[float] = None,
     threshold_acc: Optional[float] = None,
@@ -2584,12 +2738,13 @@ def compute_dflash_sampling_accept_len_and_bonus(
     use_sparse_topk: bool = True,
     return_proposed_tokens: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor] | Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Compute DFlash accept lengths and bonus tokens for non-greedy sampling.
+    """Compute exact DFlash accept lengths and bonus tokens for sampled verification.
 
-    This is a chain-specialized variant of speculative target-only verification:
-      - DFlash proposals are linear (topk == 1), so each verify level has at most one candidate.
-      - When a candidate is rejected at a level, the final token is sampled from
-        `relu(q - p)` where `p` has only the rejected candidate mass.
+    Production linear DFlash uses exact proposal correction:
+      - `draft=greedy,target=sampled`: accept with probability `p(x)` and on rejection
+        sample from `p` with the greedy draft token removed.
+      - `draft=sampled,target=sampled`: accept with probability `min(1, p(x) / q(x))`
+        and on rejection sample from normalized `max(0, p - q)`.
     """
     if not _DFLASH_SAMPLING_VERIFY_AVAILABLE:
         raise RuntimeError(
@@ -2618,17 +2773,6 @@ def compute_dflash_sampling_accept_len_and_bonus(
             "candidates and next_token_logits must be on the same device, "
             f"got {candidates.device} and {next_token_logits.device}."
         )
-
-    if threshold_single is None:
-        from sglang.srt.server_args import get_global_server_args
-
-        threshold_single = get_global_server_args().speculative_accept_threshold_single
-    if threshold_acc is None:
-        from sglang.srt.server_args import get_global_server_args
-
-        threshold_acc = get_global_server_args().speculative_accept_threshold_acc
-    threshold_single = float(threshold_single)
-    threshold_acc = max(float(threshold_acc), 1e-9)
 
     device = next_token_logits.device
 
@@ -2670,173 +2814,167 @@ def compute_dflash_sampling_accept_len_and_bonus(
 
     need_top_k = bool(getattr(sampling_info, "need_top_k_sampling", True))
     need_top_p = bool(getattr(sampling_info, "need_top_p_sampling", False))
-    # Build target distribution once over all verify rows.
+    need_min_p_sampling = bool(getattr(sampling_info, "need_min_p_sampling", False))
+
+    if linear_mode not in (
+        "draft=greedy,target=sampled",
+        "draft=sampled,target=sampled",
+    ):
+        raise ValueError(f"Unsupported DFLASH sampled linear mode: {linear_mode!r}")
+
     expanded_temperature = torch.repeat_interleave(
         sampling_info.temperatures, draft_token_num, dim=0
     )
     scaled_logits = next_token_logits / expanded_temperature.view(-1, 1)
-    sparse_topk_applied = False
+    repeated_top_ks = torch.repeat_interleave(
+        sampling_info.top_ks, draft_token_num, dim=0
+    ).to(device=device, dtype=torch.int32)
+    repeated_top_ps = torch.repeat_interleave(
+        sampling_info.top_ps, draft_token_num, dim=0
+    ).to(device=device, dtype=torch.float32)
+    repeated_min_ps = torch.repeat_interleave(
+        sampling_info.min_ps, draft_token_num, dim=0
+    ).to(device=device, dtype=torch.float32)
 
-    if use_sparse_topk and need_top_k:
-        repeated_top_ks = torch.repeat_interleave(
-            sampling_info.top_ks, draft_token_num, dim=0
-        ).to(dtype=torch.int64)
-        vocab_size = int(scaled_logits.shape[-1])
-        repeated_top_ks.clamp_(min=1, max=vocab_size)
-        max_top_k = int(repeated_top_ks.max().item())
-
-        # Sparse exact path for top-k/top-p (top-k-first semantics), then scatter to dense.
-        if 0 < max_top_k < vocab_size:
-            topk_logits, topk_indices = torch.topk(scaled_logits, k=max_top_k, dim=-1)
-            if not torch.all(repeated_top_ks == max_top_k):
-                ranks = torch.arange(max_top_k, device=device, dtype=torch.int64)[
-                    None, :
-                ]
-                valid = ranks < repeated_top_ks.unsqueeze(1)
-                topk_logits = topk_logits.masked_fill(~valid, float("-inf"))
-
-            topk_probs = F.softmax(topk_logits, dim=-1)
-            if need_top_p:
-                repeated_top_ps = torch.repeat_interleave(
-                    sampling_info.top_ps, draft_token_num, dim=0
-                )
-                topk_probs = top_p_renorm_prob(topk_probs, repeated_top_ps)
-            if bool(getattr(sampling_info, "need_min_p_sampling", False)):
-                repeated_min_ps = torch.repeat_interleave(
-                    sampling_info.min_ps, draft_token_num, dim=0
-                ).to(device=device, dtype=topk_probs.dtype)
-                base_probs = topk_probs
-                min_p_thresholds = (
-                    topk_probs.max(dim=-1, keepdim=True).values
-                    * repeated_min_ps.view(-1, 1)
-                )
-                topk_probs = topk_probs.masked_fill(topk_probs < min_p_thresholds, 0.0)
-                denom = topk_probs.sum(dim=-1, keepdim=True)
-                topk_probs = torch.where(
-                    denom > 0,
-                    topk_probs / denom.clamp_min(1e-20),
-                    base_probs,
-                )
-
-            target_probs = torch.zeros_like(scaled_logits, dtype=topk_probs.dtype)
-            target_probs.scatter_(1, topk_indices, topk_probs)
-            sparse_topk_applied = True
-
-    if not sparse_topk_applied:
-        target_probs = F.softmax(scaled_logits, dim=-1)
-        if need_top_k:
-            target_probs = top_k_renorm_prob(
-                target_probs,
-                torch.repeat_interleave(sampling_info.top_ks, draft_token_num, dim=0),
-            )
-        if need_top_p:
-            target_probs = top_p_renorm_prob(
-                target_probs,
-                torch.repeat_interleave(sampling_info.top_ps, draft_token_num, dim=0),
-            )
-        if bool(getattr(sampling_info, "need_min_p_sampling", False)):
-            expanded_min_ps = torch.repeat_interleave(
-                sampling_info.min_ps, draft_token_num, dim=0
-            ).to(device=device, dtype=target_probs.dtype)
-            base_probs = target_probs
-            min_p_thresholds = (
-                target_probs.max(dim=-1, keepdim=True).values
-                * expanded_min_ps.view(-1, 1)
-            )
-            target_probs = target_probs.masked_fill(
-                target_probs < min_p_thresholds, 0.0
-            )
-            denom = target_probs.sum(dim=-1, keepdim=True)
-            target_probs = torch.where(
-                denom > 0,
-                target_probs / denom.clamp_min(1e-20),
-                base_probs,
-            )
-    target_probs = target_probs.view(bs, draft_token_num, -1).contiguous()
-    draft_probs = torch.zeros_like(target_probs)
-
-    (
-        retrieve_index,
-        retrieve_next_token,
-        retrieve_next_sibling,
-        predicts,
-        accept_index,
-        accept_token_num,
-    ) = _get_or_create_chain_verify_buffers(
-        bs=bs,
-        draft_token_num=draft_token_num,
-        device=device,
+    target_probs_sort, target_probs_idx = build_dflash_filtered_sampling_distribution_from_logits(
+        scaled_logits,
+        repeated_top_ks,
+        repeated_top_ps,
+        repeated_min_ps,
+        need_min_p_sampling,
     )
-    predicts.zero_()
-    accept_index.fill_(-1)
-    accept_token_num.zero_()
+    target_probs_sort = target_probs_sort.view(bs, draft_token_num, -1).contiguous()
+    target_probs_idx = target_probs_idx.view(bs, draft_token_num, -1).contiguous()
+
     candidates_i64 = (
         candidates if candidates.dtype == torch.int64 else candidates.to(torch.int64)
     )
-    tree_speculative_sampling_target_only(
-        predicts=predicts,
-        accept_index=accept_index,
-        accept_token_num=accept_token_num,
-        candidates=candidates_i64,
-        retrive_index=retrieve_index,
-        retrive_next_token=retrieve_next_token,
-        retrive_next_sibling=retrieve_next_sibling,
-        uniform_samples=uniform_samples,
-        uniform_samples_for_final_sampling=uniform_samples_for_final_sampling,
-        target_probs=target_probs,
-        draft_probs=draft_probs,
-        threshold_single=threshold_single,
-        threshold_acc=threshold_acc,
-        deterministic=True,
-    )
-    if (os.environ.get("SGLANG_DFLASH_DEBUG_SAMPLED_HELPER_SYNC") or "").strip().lower() not in (
-        "",
-        "0",
-        "false",
-        "off",
-        "no",
-    ):
-        torch.cuda.synchronize(device)
+    step_count = int(max(0, draft_token_num - 1))
+    if step_count <= 0:
+        accept_len = torch.zeros((bs,), dtype=torch.int32, device=device)
+        bonus_local = _sample_dflash_sparse_probs_with_uniform(
+            target_probs_sort[:, 0, :],
+            uniform_samples_for_final_sampling,
+        )
+        bonus = target_probs_idx[:, 0, :].gather(1, bonus_local.unsqueeze(1)).view(-1)
+        bonus = bonus.to(torch.int64)
+        if not return_proposed_tokens:
+            return accept_len, bonus
+        proposed_tokens = bonus.unsqueeze(1)
+        return accept_len, bonus, proposed_tokens
 
-    # The sampling kernel is expected to return the accepted draft-token count,
-    # excluding the final bonus token. Keep the value inside the legal DFLASH
-    # block range here so a transient kernel-side edge case cannot poison the
-    # compact target-only packing path with an out-of-range accept length.
-    accept_len = accept_token_num.clamp(min=0, max=int(draft_token_num - 1))
+    proposal_tokens = candidates_i64[:, 1:]
+    proposal_match = target_probs_idx[:, :-1, :] == proposal_tokens.unsqueeze(-1)
+    proposal_target_probs = torch.where(
+        proposal_match,
+        target_probs_sort[:, :-1, :],
+        torch.zeros_like(target_probs_sort[:, :-1, :]),
+    ).sum(dim=-1)
+
+    if linear_mode == "draft=sampled,target=sampled":
+        if draft_selected_probs is None:
+            raise RuntimeError(
+                "DFLASH exact sampled-draft verify requires per-token draft proposal probabilities."
+            )
+        if draft_selected_probs.shape != proposal_target_probs.shape:
+            raise ValueError(
+                "draft_selected_probs shape mismatch: "
+                f"expected {tuple(proposal_target_probs.shape)}, got {tuple(draft_selected_probs.shape)}"
+            )
+        if draft_proposal_indices is None or draft_proposal_probs is None:
+            raise RuntimeError(
+                "DFLASH exact sampled-draft verify requires sparse draft proposal support."
+            )
+        if draft_proposal_indices.ndim != 3 or draft_proposal_probs.ndim != 3:
+            raise ValueError(
+                "draft proposal support tensors must be 3D, got "
+                f"indices={None if draft_proposal_indices is None else tuple(draft_proposal_indices.shape)} "
+                f"probs={None if draft_proposal_probs is None else tuple(draft_proposal_probs.shape)}"
+            )
+        if tuple(draft_proposal_indices.shape[:2]) != tuple(proposal_target_probs.shape):
+            raise ValueError(
+                "draft proposal support batch/step shape mismatch: "
+                f"expected {tuple(proposal_target_probs.shape)}, "
+                f"got {tuple(draft_proposal_indices.shape[:2])}"
+            )
+        accept_prob = proposal_target_probs / draft_selected_probs.to(
+            device=device, dtype=proposal_target_probs.dtype
+        ).clamp_min(1e-20)
+        accept_prob.clamp_(min=0.0, max=1.0)
+    else:
+        accept_prob = proposal_target_probs.clamp(min=0.0, max=1.0)
+
+    accept_mask = uniform_samples[:, :step_count] <= accept_prob
     if max_steps_per_req is not None:
         if max_steps_per_req.ndim != 1 or int(max_steps_per_req.shape[0]) != int(bs):
             raise ValueError(
                 "max_steps_per_req must be a 1D tensor with shape [bs]. "
                 f"Got shape={tuple(max_steps_per_req.shape)} for bs={bs}."
             )
-        caps = max_steps_per_req.to(device=device, dtype=torch.int32).clamp(
-            min=0, max=int(draft_token_num - 1)
+        caps = max_steps_per_req.to(device=device, dtype=torch.int64).clamp(
+            min=0, max=int(step_count)
         )
-        accept_len = torch.minimum(accept_len, caps)
+        step_ids = torch.arange(step_count, device=device, dtype=torch.int64)
+        accept_mask = accept_mask & (step_ids.unsqueeze(0) < caps.unsqueeze(1))
+    accept_len = accept_mask.to(torch.int32).cumprod(dim=1).sum(dim=1)
+    if max_steps_per_req is not None:
+        accept_len = torch.minimum(
+            accept_len,
+            max_steps_per_req.to(device=device, dtype=torch.int32).clamp(
+                min=0, max=int(step_count)
+            ),
+        )
     row_ids = torch.arange(bs, dtype=torch.long, device=device)
-    accept_pos = accept_index[row_ids, accept_len.to(torch.long)].to(torch.long)
-    if bool(
-        ((accept_pos < 0) | (accept_pos >= int(predicts.shape[0]))).any().detach().cpu().item()
-    ):
-        bad = accept_pos.detach().cpu().tolist()
-        raise RuntimeError(
-            "DFLASH sampled helper produced invalid bonus indices: "
-            f"accept_pos={bad} predicts_len={int(predicts.shape[0])}"
-        )
-    bonus = predicts[accept_pos].to(torch.int64)
+    reject_step = accept_len.to(torch.long).clamp(min=0, max=int(step_count))
+    bonus_probs_sort = target_probs_sort[row_ids, reject_step].clone()
+    bonus_token_ids = target_probs_idx[row_ids, reject_step].clone()
+
+    rejected_mask = reject_step < int(step_count)
+    if bool(rejected_mask.any().item()):
+        rejected_rows = row_ids[rejected_mask]
+        rejected_steps = reject_step[rejected_mask]
+        if linear_mode == "draft=sampled,target=sampled":
+            assert draft_proposal_indices is not None
+            assert draft_proposal_probs is not None
+            rejected_support_idx = draft_proposal_indices[
+                rejected_rows, rejected_steps
+            ].to(device=device, dtype=torch.long)
+            rejected_support_probs = draft_proposal_probs[
+                rejected_rows, rejected_steps
+            ].to(device=device, dtype=bonus_probs_sort.dtype)
+            overlap = (
+                bonus_token_ids[rejected_mask].unsqueeze(2)
+                == rejected_support_idx.unsqueeze(1)
+            )
+            subtract = (
+                overlap.to(dtype=bonus_probs_sort.dtype)
+                * rejected_support_probs.unsqueeze(1)
+            ).sum(dim=-1)
+            bonus_probs_sort[rejected_mask].sub_(subtract).clamp_min_(0.0)
+        else:
+            rejected_tokens = proposal_tokens[rejected_rows, rejected_steps].unsqueeze(1)
+            zero_mask = bonus_token_ids[rejected_mask] == rejected_tokens
+            bonus_probs_sort[rejected_mask] = torch.where(
+                zero_mask,
+                torch.zeros_like(bonus_probs_sort[rejected_mask]),
+                bonus_probs_sort[rejected_mask],
+            )
+
+    bonus_local = _sample_dflash_sparse_probs_with_uniform(
+        bonus_probs_sort,
+        uniform_samples_for_final_sampling,
+    )
+    bonus = bonus_token_ids.gather(1, bonus_local.unsqueeze(1)).view(-1).to(torch.int64)
     if not return_proposed_tokens:
         return accept_len, bonus
 
-    # Target-only commit only needs the accepted draft prefix plus the target-sampled
-    # bonus token. Reconstruct that prefix directly instead of trusting wider
-    # kernel-side accept-index layouts beyond the accepted boundary.
     proposed_tokens = torch.zeros(
         (bs, draft_token_num), dtype=torch.int64, device=device
     )
-    if draft_token_num > 1:
-        accepted_prefix = candidates_i64[:, 1:]
+    if step_count > 0:
+        accepted_prefix = proposal_tokens
         prefix_cols = torch.arange(
-            draft_token_num - 1, device=device, dtype=torch.int32
+            step_count, device=device, dtype=torch.int32
         )[None, :]
         prefix_mask = prefix_cols < accept_len.unsqueeze(1)
         proposed_tokens[:, :-1] = torch.where(
