@@ -733,7 +733,7 @@ def resolve_dflash_capture_contract(
         mask_token=draft_config.mask_token,
         mask_token_id=draft_config.mask_token_id,
         target_layer_ids=target_layer_ids,
-        capture_layer_ids=[int(x) - 1 for x in target_layer_ids if int(x) > 0],
+        capture_layer_ids=[int(x) + 1 for x in target_layer_ids],
     )
 
 
