@@ -1723,7 +1723,7 @@ class GptOssForCausalLM(nn.Module):
         boundaries = [val + 1 for val in layer_ids]
         logger.info(
             "DFLASH capture boundaries resolved from checkpoint target_layer_ids=%s -> runtime boundaries=%s. "
-            "These are layer *input* boundaries: i>0 captures after layer (i-1).",
+            "These are layer *input* boundaries: i=0 is embeddings; i>0 is after layer (i-1).",
             layer_ids,
             boundaries,
         )
