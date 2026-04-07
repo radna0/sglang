@@ -117,24 +117,21 @@ class DFlashWorker:
         self.use_compact_draft_cache = self.draft_window_size is not None
         self.device = target_worker.device
 
-        # ---------- Target layer capture mapping (+1 rule) ----------
-        draft_config = parse_dflash_draft_config(
-            draft_hf_config=self.target_worker.model_runner.model_config.hf_config
+        # ---------- Target layer capture mapping ----------
+        # ModelRunner already resolves the authoritative DFLASH capture contract from the
+        # draft checkpoint config. Reuse it here instead of re-deriving capture layers.
+        raw_target_layer_ids = list(
+            getattr(self.target_worker.model_runner, "dflash_target_layer_ids", []) or []
         )
-        raw_target_layer_ids = draft_config.target_layer_ids  # from config, e.g. [1,9,17,25,33]
-        if raw_target_layer_ids:
-            # +1 mapping: config stores the layer that *consumes* the hidden state,
-            # so we capture after the previous layer.
-            self.capture_layer_ids = [lid - 1 for lid in raw_target_layer_ids if lid > 0]
-            if self.tp_rank == 0:
-                logger.info(
-                    "DFLASH target layer capture mapping: config %s -> capture layers %s",
-                    raw_target_layer_ids,
-                    self.capture_layer_ids,
-                )
-        else:
-            self.capture_layer_ids = []
-        # Ensure the target model runner uses these capture layers for hidden state extraction.
+        self.capture_layer_ids = list(
+            getattr(self.target_worker.model_runner, "dflash_capture_layer_ids", []) or []
+        )
+        if self.tp_rank == 0 and raw_target_layer_ids:
+            logger.info(
+                "DFLASH target layer capture mapping: checkpoint target_layer_ids=%s -> runtime capture_layer_ids=%s",
+                raw_target_layer_ids,
+                self.capture_layer_ids,
+            )
         self.model_runner.capture_layer_ids = self.capture_layer_ids
 
         # ---------- Draft worker initialization ----------
@@ -218,6 +215,11 @@ class DFlashWorker:
         set_global_server_args_for_scheduler(saved_server_args)
         self.draft_model_runner = self.draft_worker.model_runner
         self.draft_model = self.draft_model_runner.model
+
+        # Parse the draft checkpoint config from the actual draft model config.
+        draft_config = parse_dflash_draft_config(
+            draft_hf_config=self.draft_model_runner.model_config.hf_config
+        )
 
         # Block size (training default 16, can be overridden)
         if server_args.speculative_num_draft_tokens is None:
