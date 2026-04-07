@@ -567,7 +567,6 @@ class DFlashVerifyInput(SpecInput):
         
         t_commit_0 = time.perf_counter()
         commit_results = commit_dflash_target_only_batch(
-            req_to_token_pool=batch.req_to_token_pool,
             reqs=batch.reqs,
             proposed_flat_cpu=proposed_flat_cpu,
             commit_lens_cpu=commit_lens_cpu_t,
