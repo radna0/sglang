@@ -826,7 +826,12 @@ class GptOssModel(nn.Module):
         for i in range(self.start_layer, self.end_layer):
             with get_global_expert_distribution_recorder().with_current_layer(i):
                 if i in self.layers_to_capture:
-                    aux_hidden_states.append(hidden_states + residual)
+                    # DFLASH/EAGLE aux capture happens *before* executing layer i.
+                    # For i==0 on the first PP rank, residual is None (we are at embeddings),
+                    # so interpret "hidden + residual" as just hidden.
+                    aux_hidden_states.append(
+                        hidden_states if residual is None else (hidden_states + residual)
+                    )
                 layer = self.layers[i]
                 hidden_states, residual = layer(
                     positions, hidden_states, forward_batch, residual
@@ -1696,7 +1701,33 @@ class GptOssForCausalLM(nn.Module):
             )
 
         self.capture_aux_hidden_states = True
-        self.model.layers_to_capture = [val + 1 for val in layer_ids]
+        # Default contract: checkpoint target_layer_ids refer to "after layer L", but the
+        # aux capture hook in forward() fires *before* executing layer i. So runtime must
+        # capture at boundary (L+1).
+        #
+        # For debugging, allow overriding the runtime capture boundaries directly.
+        override = (os.environ.get("SGLANG_DFLASH_CAPTURE_BOUNDARIES_OVERRIDE") or "").strip()
+        if override:
+            try:
+                boundaries = [int(x.strip()) for x in override.split(",") if x.strip()]
+            except Exception:
+                boundaries = []
+            if boundaries:
+                logger.warning(
+                    "DFLASH capture boundaries OVERRIDE active: %s. "
+                    "These are layer *input* boundaries: i=0 is embeddings; i>0 is after layer (i-1).",
+                    boundaries,
+                )
+                self.model.layers_to_capture = boundaries
+                return
+        boundaries = [val + 1 for val in layer_ids]
+        logger.info(
+            "DFLASH capture boundaries resolved from checkpoint target_layer_ids=%s -> runtime boundaries=%s. "
+            "These are layer *input* boundaries: i>0 captures after layer (i-1).",
+            layer_ids,
+            boundaries,
+        )
+        self.model.layers_to_capture = boundaries
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):
