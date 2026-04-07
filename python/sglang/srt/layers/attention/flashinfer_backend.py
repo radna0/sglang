@@ -421,6 +421,31 @@ class FlashInferAttnBackend(AttentionBackend):
             ),
         )
 
+    @torch.inference_mode()
+    def append_kv(self, pool, ctx_lens, hidden_states):
+        """Append projected hidden states to the KV pool for conditioning."""
+        if hidden_states is None or hidden_states.numel() == 0:
+            return
+
+        # Obtain layer projections from the draft model.
+        model = self._model_runner.model
+        layers = model.layers
+
+        # Extract cache locations from the req_to_token_pool.
+        req_to_token = self._model_runner.req_to_token_pool.req_to_token
+        req_indices = self._model_runner.req_pool_indices
+        num_ctx = hidden_states.shape[0] // req_indices.shape[0]
+
+        # Extract the cache locations from the pool.
+        # We assume ctx tokens are at [req_idx, 0:num_ctx]
+        locs = req_to_token[req_indices, :num_ctx].reshape(-1).to(torch.int32)
+
+        # Project and write to KV pool.
+        for layer in layers:
+            if hasattr(layer.self_attn, "kv_proj_only"):
+                k, v = layer.self_attn.kv_proj_only(hidden_states)
+                pool.set_kv_buffer(layer.self_attn, locs, k, v)
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         if forward_batch.forward_mode.is_decode_or_idle():
             self.indices_updater_decode.update(

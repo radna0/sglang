@@ -703,6 +703,28 @@ def resolve_dflash_capture_contract(
         target_num_layers=runtime_target_num_layers,
         draft_num_layers=draft_num_layers,
     )
+    override = (os.environ.get("SGLANG_DFLASH_CAPTURE_BOUNDARIES_OVERRIDE") or "").strip()
+    if override:
+        try:
+            boundaries = [int(x.strip()) for x in override.split(",") if x.strip()]
+        except Exception:
+            boundaries = []
+        if boundaries:
+            logger.warning(
+                "DFLASH capture boundary override enabled via SGLANG_DFLASH_CAPTURE_BOUNDARIES_OVERRIDE=%r. "
+                "This bypasses the default +1 mapping and can reduce acceptance if it mismatches the checkpoint.",
+                override,
+            )
+            return DFlashCaptureContract(
+                runtime_target_num_layers=runtime_target_num_layers,
+                draft_num_layers=draft_num_layers,
+                trained_target_num_layers=draft_config.num_target_layers,
+                block_size=draft_config.block_size,
+                mask_token=draft_config.mask_token,
+                mask_token_id=draft_config.mask_token_id,
+                target_layer_ids=target_layer_ids,
+                capture_layer_ids=[int(x) for x in boundaries],
+            )
     return DFlashCaptureContract(
         runtime_target_num_layers=runtime_target_num_layers,
         draft_num_layers=draft_num_layers,
@@ -711,7 +733,7 @@ def resolve_dflash_capture_contract(
         mask_token=draft_config.mask_token,
         mask_token_id=draft_config.mask_token_id,
         target_layer_ids=target_layer_ids,
-        capture_layer_ids=[int(x) + 1 for x in target_layer_ids],
+        capture_layer_ids=[int(x) - 1 for x in target_layer_ids if int(x) > 0],
     )
 
 

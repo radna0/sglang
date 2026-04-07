@@ -558,13 +558,23 @@ class DFlashVerifyInput(SpecInput):
             ),
         )
         if packed_commits.proposed_flat.is_cuda:
+            t_sync_0 = time.perf_counter()
             torch.cuda.current_stream(device=device).synchronize()
+            if os.getenv("SGLANG_DFLASH_PROFILE"):
+                dt_sync = (time.perf_counter() - t_sync_0) * 1000
+                logger.info(f"[DFLASH_PROF] verify_synchronize: {dt_sync:.3f}ms")
+        
+        t_commit_0 = time.perf_counter()
         commit_results = commit_dflash_target_only_batch(
+            req_to_token_pool=batch.req_to_token_pool,
             reqs=batch.reqs,
             proposed_flat_cpu=proposed_flat_cpu,
             commit_lens_cpu=commit_lens_cpu_t,
             empty_error_prefix="DFLASH verify",
         )
+        if os.getenv("SGLANG_DFLASH_PROFILE"):
+            dt_commit = (time.perf_counter() - t_commit_0) * 1000
+            logger.info(f"[DFLASH_PROF] commit_dflash_batch: {dt_commit:.3f}ms")
         accept_length_per_req_cpu = [
             int(result.accepted_draft_tokens) for result in commit_results
         ]

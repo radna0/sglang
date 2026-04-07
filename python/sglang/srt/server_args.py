@@ -2506,6 +2506,35 @@ class ServerArgs:
                         f"window_size={window_size}, block_size={block_size}."
                     )
 
+            prefill_attn_backend, decode_attn_backend = self.get_attention_backends()
+            draft_attn_backend = (
+                self.speculative_draft_attention_backend or decode_attn_backend
+            )
+            if prefill_attn_backend != "fa3" or decode_attn_backend != "fa3":
+                raise ValueError(
+                    f"{self.speculative_algorithm} on showtime requires "
+                    "--attention-backend fa3 for both prefill and decode. "
+                    f"Got prefill={prefill_attn_backend}, decode={decode_attn_backend}."
+                )
+            if draft_attn_backend != "fa3":
+                raise ValueError(
+                    f"{self.speculative_algorithm} on showtime requires "
+                    "--speculative-draft-attention-backend fa3. "
+                    f"Got draft={draft_attn_backend}."
+                )
+            if self.moe_runner_backend != "triton_kernel":
+                raise ValueError(
+                    f"{self.speculative_algorithm} on showtime requires "
+                    "--moe-runner-backend triton_kernel. "
+                    f"Got {self.moe_runner_backend}."
+                )
+            if self.speculative_moe_runner_backend != "triton_kernel":
+                raise ValueError(
+                    f"{self.speculative_algorithm} on showtime requires "
+                    "--speculative-moe-runner-backend triton_kernel. "
+                    f"Got {self.speculative_moe_runner_backend}."
+                )
+
             if self.max_running_requests is None:
                 self.max_running_requests = 48
                 logger.warning(
