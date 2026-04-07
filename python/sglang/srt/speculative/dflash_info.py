@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Tuple
 
+import os
 import torch
 
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
@@ -31,6 +32,11 @@ from sglang.srt.speculative.dflash_utils import (
 )
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
+
+import logging
+
+logger = logging.getLogger(__name__)
+_DFLASH_GREEDY_VERIFY_DEBUG_CT: int = 0
 
 
 def _compute_paged_keep_slots(
@@ -462,6 +468,48 @@ class DFlashVerifyInput(SpecInput):
                 candidates=candidates,
                 target_predict=target_predict,
             )
+            global _DFLASH_GREEDY_VERIFY_DEBUG_CT
+            if (
+                (os.environ.get("SGLANG_DFLASH_DEBUG_GREEDY_VERIFY") or "")
+                .strip()
+                .lower()
+                not in ("", "0", "false", "off", "no")
+                and _DFLASH_GREEDY_VERIFY_DEBUG_CT < 10
+            ):
+                _DFLASH_GREEDY_VERIFY_DEBUG_CT += 1
+                with torch.no_grad():
+                    try:
+                        step_count = int(max(0, self.draft_token_num - 1))
+                        if step_count > 0:
+                            first_match = (candidates[:, 1] == target_predict[:, 0]).to(
+                                torch.float32
+                            )
+                            first_match_frac = float(first_match.mean().item())
+                        else:
+                            first_match_frac = 0.0
+                        accept_mean = float(accept_len.to(torch.float32).mean().item())
+                        # Log a tiny sample for quick diagnosis (token ids only).
+                        samp_n = min(2, bs)
+                        cand0 = candidates[:samp_n, : min(4, self.draft_token_num)].detach().to("cpu").tolist()
+                        pred0 = target_predict[:samp_n, : min(4, self.draft_token_num)].detach().to("cpu").tolist()
+                        alt0 = getattr(self, "_debug_alt_next0", None)
+                        if isinstance(alt0, torch.Tensor):
+                            alt0 = alt0[:samp_n].detach().to("cpu").tolist()
+                        logger.info(
+                            "DFLASH greedy-verify debug: bs=%d block=%d first_match_frac=%.3f accept_mean=%.3f "
+                            "cand[:%d,:4]=%s target_pred[:%d,:4]=%s alt_next0=%s",
+                            int(bs),
+                            int(self.draft_token_num),
+                            float(first_match_frac),
+                            float(accept_mean),
+                            int(samp_n),
+                            cand0,
+                            int(samp_n),
+                            pred0,
+                            alt0,
+                        )
+                    except Exception as e:
+                        logger.info("DFLASH greedy-verify debug failed: %s", e)
             proposed_tokens = torch.zeros(
                 (bs, self.draft_token_num), dtype=torch.int64, device=device
             )

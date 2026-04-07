@@ -6,6 +6,7 @@ from numbers import Integral
 from typing import Any, Callable, List, Optional, Tuple
 
 import os
+import logging
 import torch
 import torch.nn.functional as F
 from sglang.srt.layers.sampler import (
@@ -23,6 +24,7 @@ DEFAULT_DFLASH_MASK_TOKEN = "<|MASK|>"
 
 _DFLASH_SAMPLING_VERIFY_AVAILABLE = is_cuda()
 _DFLASH_CHAIN_VERIFY_BUFFERS: dict[tuple[Optional[int], int], dict[str, Any]] = {}
+_DFLASH_SAMPLED_DEBUG_CT: int = 0
 _DFLASH_VERIFY_SKIP_CUSTOM_MASK_BACKENDS = frozenset(
     {
         "FlashInferAttnBackend",
@@ -32,6 +34,8 @@ _DFLASH_VERIFY_SKIP_CUSTOM_MASK_BACKENDS = frozenset(
         "TRTLLMMLABackend",
     }
 )
+
+logger = logging.getLogger(__name__)
 
 
 def _env_truthy(name: str) -> bool:
@@ -2903,6 +2907,29 @@ def compute_dflash_sampling_accept_len_and_bonus(
         accept_prob.clamp_(min=0.0, max=1.0)
     else:
         accept_prob = proposal_target_probs.clamp(min=0.0, max=1.0)
+
+    # Optional debug to explain low acceptance: if the draft proposes tokens outside the
+    # target's filtered sampling support, proposal_target_probs becomes 0 and acceptance
+    # collapses. This log is intentionally rate-limited and off by default.
+    global _DFLASH_SAMPLED_DEBUG_CT
+    if _env_truthy("SGLANG_DFLASH_DEBUG_SAMPLED_VERIFY") and _DFLASH_SAMPLED_DEBUG_CT < 10:
+        _DFLASH_SAMPLED_DEBUG_CT += 1
+        with torch.no_grad():
+            try:
+                zero_frac = float((proposal_target_probs <= 0).to(torch.float32).mean().item())
+                p_mean = float(proposal_target_probs.to(torch.float32).mean().item())
+                a_mean = float(accept_prob.to(torch.float32).mean().item())
+                logger.info(
+                    "DFLASH sampled-verify debug: mode=%s bs=%d steps=%d proposal_p_zero_frac=%.3f proposal_p_mean=%.4g accept_prob_mean=%.4g",
+                    linear_mode,
+                    int(bs),
+                    int(step_count),
+                    zero_frac,
+                    p_mean,
+                    a_mean,
+                )
+            except Exception as e:
+                logger.info("DFLASH sampled-verify debug failed: %s", e)
 
     accept_mask = uniform_samples[:, :step_count] <= accept_prob
     if max_steps_per_req is not None:
