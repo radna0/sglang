@@ -1031,7 +1031,9 @@ class DFlashWorker:
         draft_req_to_token = self.draft_model_runner.req_to_token_pool.req_to_token
         req_pool_indices = batch.req_pool_indices.to(torch.int64)
 
-        ctx_lens = draft_input.ctx_lens.to(torch.int32, device=device, non_blocking=True)
+        ctx_lens = draft_input.ctx_lens.to(
+            device=device, dtype=torch.int32, non_blocking=True
+        )
         is_extend = batch.forward_mode.is_extend() or batch.is_extend_in_batch
         if is_extend:
             ctx_start = batch.seq_lens.to(torch.int64)
@@ -1439,7 +1441,10 @@ class DFlashWorker:
 
     def _compute_compact_draft_seq_lens(self, seq_lens: torch.Tensor) -> torch.Tensor:
         assert self.draft_window_size is not None
-        visible_lens = torch.clamp(seq_lens.to(torch.int32, device=self.device), max=self.draft_window_size)
+        visible_lens = torch.clamp(
+            seq_lens.to(device=self.device, dtype=torch.int32),
+            max=self.draft_window_size,
+        )
         if self.page_size <= 1:
             return visible_lens
         seq_lens_i64 = seq_lens.to(torch.int64)
