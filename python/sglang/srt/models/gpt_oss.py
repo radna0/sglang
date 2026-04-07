@@ -368,6 +368,7 @@ class GptOssAttention(nn.Module):
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
         topk_indices = None
+        gpt_oss_dsa_recent = False
         if (
             self.enable_gqa_dsa
             and get_global_server_args().gpt_oss_dsa_topk_source == "recent"
@@ -379,11 +380,11 @@ class GptOssAttention(nn.Module):
             if seq_lens_cpu is not None:
                 # Enforce: disable DSA when the context length is <= topk.
                 if int(seq_lens_cpu.max().item()) > topk:
-                    # IMPORTANT: `recent` is a capture-friendly debug lane; the FlashAttention
-                    # backend does not actually require token-level topk indices. We pass a
-                    # tiny sentinel tensor to activate sparse decode and let the backend
-                    # build the suffix page table directly from `seq_lens`.
-                    topk_indices = q.new_empty((q.shape[0], 1), dtype=torch.int32)
+                    # IMPORTANT: `recent` is decode-only and does not require token-level
+                    # indices. We pass an explicit flag instead of a fake sentinel tensor so
+                    # the backend can enter the sparse recent-window path without per-layer
+                    # tensor allocation.
+                    gpt_oss_dsa_recent = True
         elif self.indexer is not None and q.shape[0] > 0:
             if forward_batch.forward_mode.is_extend_without_speculative():
                 # Prefill/extend: populate index-K cache only (no top-k indices needed).
@@ -431,14 +432,14 @@ class GptOssAttention(nn.Module):
                 ),
             }
         q, k = self.rotary_emb(positions, q, k, **extra_args)
-        inner_state = q, k, v, forward_batch, topk_indices
+        inner_state = q, k, v, forward_batch, topk_indices, gpt_oss_dsa_recent
         return None, forward_batch, inner_state
 
     def forward_core(self, intermediate_state):
         hidden_states, forward_batch, inner_state = intermediate_state
         if inner_state is None:
             return hidden_states
-        q, k, v, forward_batch, topk_indices = inner_state
+        q, k, v, forward_batch, topk_indices, gpt_oss_dsa_recent = inner_state
         attn_output = self.attn(
             q,
             k,
@@ -446,6 +447,7 @@ class GptOssAttention(nn.Module):
             forward_batch,
             sinks=self.sinks,
             save_kv_cache=not enable_fused_set_kv_buffer(forward_batch),
+            gpt_oss_dsa_recent=gpt_oss_dsa_recent,
             **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
         )
         output, _ = self.o_proj(attn_output)

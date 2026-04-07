@@ -116,6 +116,7 @@ class ModelRunnerKVCacheMixin:
             # Add indexer KV cache overhead for GPT-OSS GQA DSA (MHA/GQA mode)
             if (
                 self.server_args.enable_gpt_oss_gqa_dsa
+                and self.server_args.gpt_oss_dsa_topk_source == "indexer"
                 and self.model_config.hf_config.architectures is not None
                 and self.model_config.hf_config.architectures[0] == "GptOssForCausalLM"
             ):
@@ -127,7 +128,13 @@ class ModelRunnerKVCacheMixin:
                 element_size = torch._utils._element_size(
                     NSATokenToKVPool.index_k_with_scale_buffer_dtype
                 )
-                cell_size += indexer_size_per_token * num_layers * element_size
+                # For hybrid SWA models, we only allocate index-K buffers for full-attention layers.
+                index_layers = (
+                    len(self.model_config.full_attention_layer_ids)
+                    if self.model_config.is_hybrid_swa
+                    else num_layers
+                )
+                cell_size += indexer_size_per_token * index_layers * element_size
         return cell_size
 
     def profile_max_num_token(self: ModelRunner, total_gpu_memory: int):
@@ -559,6 +566,7 @@ class ModelRunnerKVCacheMixin:
             (not self.use_mla_backend)
             and self.server_args.enable_gpt_oss_gqa_dsa
             and self.server_args.gpt_oss_dsa_topk_source == "indexer"
+            and (not self.is_hybrid_swa)
             and self.model_config.hf_config.architectures is not None
             and self.model_config.hf_config.architectures[0] == "GptOssForCausalLM"
         ):
@@ -620,6 +628,12 @@ class ModelRunnerKVCacheMixin:
             )
         else:
             if self.is_hybrid_swa:
+                use_gpt_oss_indexer_dsa = (
+                    self.server_args.enable_gpt_oss_gqa_dsa
+                    and self.server_args.gpt_oss_dsa_topk_source == "indexer"
+                    and self.model_config.hf_config.architectures is not None
+                    and self.model_config.hf_config.architectures[0] == "GptOssForCausalLM"
+                )
                 kwargs = {}
                 if self.is_hybrid_swa_compress:
                     kwargs = {
@@ -631,6 +645,21 @@ class ModelRunnerKVCacheMixin:
                         "swa_head_dim": self.model_config.hf_text_config.swa_head_dim,
                         "swa_v_head_dim": self.model_config.hf_text_config.swa_v_head_dim,
                         "v_head_dim": self.model_config.hf_text_config.v_head_dim,
+                    }
+                # Ensure v_head_dim is passed through for GPT-OSS pool variants (NSAMHATokenToKVPool
+                # accepts it, and MHATokenToKVPool defaults to head_dim if omitted).
+                if hasattr(self.model_config, "v_head_dim") and "v_head_dim" not in kwargs:
+                    kwargs["v_head_dim"] = self.model_config.v_head_dim
+
+                full_pool_kwargs = None
+                full_pool_class = MHATokenToKVPool
+                swa_pool_class = MHATokenToKVPool
+                if use_gpt_oss_indexer_dsa:
+                    # GPT-OSS hybrid SWA models must keep SWAKVPool for allocator + SWA semantics,
+                    # but the full-attention pool needs NSA/DSA index-K buffers for the indexer lane.
+                    full_pool_class = NSAMHATokenToKVPool
+                    full_pool_kwargs = {
+                        "index_head_dim": self.server_args.gpt_oss_dsa_index_head_dim,
                     }
                 self.token_to_kv_pool = SWAKVPool(
                     size=self.full_max_total_num_tokens,
@@ -645,6 +674,9 @@ class ModelRunnerKVCacheMixin:
                     full_attention_layer_ids=self.model_config.full_attention_layer_ids,
                     enable_kvcache_transpose=False,
                     device=self.device,
+                    swa_token_to_kv_pool_class=swa_pool_class,
+                    full_token_to_kv_pool_class=full_pool_class,
+                    full_token_to_kv_pool_kwargs=full_pool_kwargs,
                     **kwargs,
                 )
             elif config := self.mambaish_config:

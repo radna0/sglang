@@ -1,6 +1,6 @@
 import logging
 import weakref
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Type
 
 import torch
 
@@ -32,7 +32,14 @@ class SWAKVPool(KVCache):
         full_attention_layer_ids: List[int],
         enable_kvcache_transpose: bool,
         device: str,
-        token_to_kv_pool_class: KVCache = MHATokenToKVPool,
+        token_to_kv_pool_class: Type[KVCache] = MHATokenToKVPool,
+        *,
+        # Optional overrides to use different KV pool implementations for full-attention
+        # and SWA layers (e.g. NSA/DSA index-K buffers only for full-attn layers).
+        swa_token_to_kv_pool_class: Optional[Type[KVCache]] = None,
+        full_token_to_kv_pool_class: Optional[Type[KVCache]] = None,
+        swa_token_to_kv_pool_kwargs: Optional[Dict[str, Any]] = None,
+        full_token_to_kv_pool_kwargs: Optional[Dict[str, Any]] = None,
         **kwargs,
     ):
         self.size = size
@@ -47,33 +54,45 @@ class SWAKVPool(KVCache):
         self.page_size = page_size
         self.swa_loc = None
 
-        kwargs["page_size"] = page_size
-        kwargs["enable_memory_saver"] = False
-        kwargs["head_num"] = head_num
-        kwargs["head_dim"] = head_dim
-        kwargs["device"] = device
+        base_kwargs: Dict[str, Any] = dict(kwargs)
+        base_kwargs["page_size"] = page_size
+        base_kwargs["enable_memory_saver"] = False
+        base_kwargs["head_num"] = head_num
+        base_kwargs["head_dim"] = head_dim
+        base_kwargs["device"] = device
         # TODO MHATransposedTokenToKVPool if enable_kvcache_transpose is True
         assert not enable_kvcache_transpose
+
+        swa_pool_cls = swa_token_to_kv_pool_class or token_to_kv_pool_class
+        full_pool_cls = full_token_to_kv_pool_class or token_to_kv_pool_class
+
+        swa_kwargs = dict(base_kwargs)
+        if swa_token_to_kv_pool_kwargs:
+            swa_kwargs.update(swa_token_to_kv_pool_kwargs)
+
+        full_kwargs = dict(base_kwargs)
+        # SWA-only kwargs should never flow into the full-attn pool constructor.
+        for k in ("swa_head_num", "swa_head_dim", "swa_v_head_dim"):
+            full_kwargs.pop(k, None)
+        if full_token_to_kv_pool_kwargs:
+            full_kwargs.update(full_token_to_kv_pool_kwargs)
 
         # for disagg with nvlink
         self.enable_custom_mem_pool, self.custom_mem_pool, _ = (
             maybe_init_custom_mem_pool(device=self.device)
         )
 
-        self.swa_kv_pool = token_to_kv_pool_class(
+        self.swa_kv_pool = swa_pool_cls(
             size=size_swa,
             dtype=dtype,
             layer_num=self.swa_layer_nums,
-            **kwargs,
+            **swa_kwargs,
         )
-        kwargs.pop("swa_head_num", None)
-        kwargs.pop("swa_head_dim", None)
-        kwargs.pop("swa_v_head_dim", None)
-        self.full_kv_pool = token_to_kv_pool_class(
+        self.full_kv_pool = full_pool_cls(
             size=size,
             dtype=dtype,
             layer_num=self.full_layer_nums,
-            **kwargs,
+            **full_kwargs,
         )
         # {layer_id: (index, is_swa_layer)}
         self.layers_mapping: Dict[int, Tuple[int, bool]] = {}
@@ -108,11 +127,82 @@ class SWAKVPool(KVCache):
         )
 
     def get_state_buf_infos(self):
+        # For hybrid SWA, we treat the SWA pool as "state" because only the full pool is
+        # transferred through get_contiguous_buf_infos().
         swa_kv_data_ptrs, swa_kv_data_lens, swa_kv_item_lens = (
             self.swa_kv_pool.get_contiguous_buf_infos()
         )
 
+        # If the full pool has additional state (e.g. NSA/DSA index-K buffers), include it
+        # in the state payload so disaggregation/transfer can preserve it.
+        if hasattr(self.full_kv_pool, "get_state_buf_infos"):
+            full_state_ptrs, full_state_lens, full_state_item_lens = (
+                self.full_kv_pool.get_state_buf_infos()
+            )
+            return (
+                swa_kv_data_ptrs + full_state_ptrs,
+                swa_kv_data_lens + full_state_lens,
+                swa_kv_item_lens + full_state_item_lens,
+            )
+
         return swa_kv_data_ptrs, swa_kv_data_lens, swa_kv_item_lens
+
+    def _map_full_layer(self, layer_id: int) -> int:
+        layer_id_pool, is_swa_layer = self.layers_mapping[layer_id]
+        if is_swa_layer:
+            raise RuntimeError(
+                "NSA/DSA index-K buffers are only defined for full-attention layers; "
+                f"got SWA layer_id={layer_id}."
+            )
+        return layer_id_pool
+
+    # NSA/DSA index-K buffer APIs (delegated to the full-attention KV pool).
+    def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
+        return self.full_kv_pool.get_index_k_with_scale_buffer(self._map_full_layer(layer_id))
+
+    def get_index_k_continuous(
+        self,
+        layer_id: int,
+        seq_len: int,
+        page_indices: torch.Tensor,
+    ):
+        return self.full_kv_pool.get_index_k_continuous(
+            self._map_full_layer(layer_id), seq_len=seq_len, page_indices=page_indices
+        )
+
+    def get_index_k_scale_continuous(
+        self,
+        layer_id: int,
+        seq_len: int,
+        page_indices: torch.Tensor,
+    ):
+        return self.full_kv_pool.get_index_k_scale_continuous(
+            self._map_full_layer(layer_id), seq_len=seq_len, page_indices=page_indices
+        )
+
+    def get_index_k_scale_buffer(
+        self,
+        layer_id: int,
+        seq_len: int,
+        page_indices: torch.Tensor,
+    ):
+        return self.full_kv_pool.get_index_k_scale_buffer(
+            self._map_full_layer(layer_id), seq_len=seq_len, page_indices=page_indices
+        )
+
+    def set_index_k_scale_buffer(
+        self,
+        layer_id: int,
+        loc: torch.Tensor,
+        index_k: torch.Tensor,
+        index_k_scale: torch.Tensor,
+    ) -> None:
+        return self.full_kv_pool.set_index_k_scale_buffer(
+            self._map_full_layer(layer_id),
+            loc=loc,
+            index_k=index_k,
+            index_k_scale=index_k_scale,
+        )
 
     def get_key_buffer(self, layer_id: int):
         layer_id_pool, is_swa_layer = self.layers_mapping[layer_id]

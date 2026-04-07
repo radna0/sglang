@@ -297,20 +297,36 @@ class NativeSparseAttnBackend(
         self.num_splits = (
             1 if model_runner.server_args.enable_deterministic_inference else 0
         )
+        architectures = model_runner.model_config.hf_config.architectures or []
         self.use_nsa = is_deepseek_nsa(model_runner.model_config.hf_config)
-        assert self.use_nsa, "NSA backend only supports DeepSeek NSA"
+        self.is_gpt_oss_gqa_dsa = (
+            model_runner.server_args.enable_gpt_oss_gqa_dsa
+            and "GptOssForCausalLM" in architectures
+        )
+        assert self.use_nsa or self.is_gpt_oss_gqa_dsa, (
+            "NSA backend only supports DeepSeek NSA or GPT-OSS GQA DSA"
+        )
         self.nsa_kv_cache_store_fp8 = (
             model_runner.token_to_kv_pool.nsa_kv_cache_store_fp8
         )
-        self.nsa_index_topk = get_nsa_index_topk(model_runner.model_config.hf_config)
+        if self.use_nsa:
+            self.nsa_index_topk = get_nsa_index_topk(
+                model_runner.model_config.hf_config
+            )
+        else:
+            self.nsa_index_topk = model_runner.server_args.gpt_oss_dsa_index_topk
         self.max_context_len = model_runner.model_config.context_len
         self.num_q_heads = (
             model_runner.model_config.num_attention_heads // get_attention_tp_size()
         )
-        self.kv_cache_dim = model_runner.token_to_kv_pool.kv_cache_dim
-        self.qk_nope_head_dim = model_runner.model_config.qk_nope_head_dim
-        self.kv_lora_rank = model_runner.model_config.kv_lora_rank
-        self.qk_rope_head_dim = model_runner.model_config.qk_rope_head_dim
+        self.kv_cache_dim = getattr(model_runner.token_to_kv_pool, "kv_cache_dim", None)
+        self.qk_nope_head_dim = getattr(
+            model_runner.model_config, "qk_nope_head_dim", None
+        )
+        self.kv_lora_rank = getattr(model_runner.model_config, "kv_lora_rank", None)
+        self.qk_rope_head_dim = getattr(
+            model_runner.model_config, "qk_rope_head_dim", None
+        )
 
         assert model_runner.req_to_token_pool is not None
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
@@ -1500,6 +1516,18 @@ class NativeSparseAttnBackend(
         metadata = self.forward_metadata
         assert causal, "NSA is causal only"
 
+        if self.is_gpt_oss_gqa_dsa:
+            return self._forward_decode_standard_mha_sparse(
+                q=q,
+                k=k,
+                v=v,
+                layer=layer,
+                forward_batch=forward_batch,
+                metadata=metadata,
+                topk_indices=topk_indices,
+                save_kv_cache=save_kv_cache,
+            )
+
         if self.nsa_decode_impl == "trtllm":
             return self._forward_trtllm(
                 q,
@@ -1619,6 +1647,152 @@ class NativeSparseAttnBackend(
 
         else:
             assert False, f"Unsupported {self.nsa_decode_impl = }"
+
+    def _forward_decode_standard_mha_sparse(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        metadata: NSAMetadata,
+        topk_indices: Optional[torch.Tensor],
+        save_kv_cache: bool,
+    ) -> torch.Tensor:
+        from sglang.srt.layers.attention.nsa.transform_index import (
+            select_topk_pages_decode,
+        )
+
+        if save_kv_cache:
+            assert k is not None and v is not None
+            cache_loc = (
+                forward_batch.out_cache_loc
+                if not layer.is_cross_attention
+                else forward_batch.encoder_out_cache_loc
+            )
+            forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
+
+        q = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+        key_cache, value_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
+            layer.layer_id
+        )
+        key_cache = key_cache.view(
+            -1, self.real_page_size, layer.tp_k_head_num, layer.head_dim
+        )
+        value_cache = value_cache.view(
+            -1, self.real_page_size, layer.tp_v_head_num, layer.v_head_dim
+        )
+
+        page_table = metadata.real_page_table
+        cache_seqlens = metadata.cache_seqlens_int32
+
+        if topk_indices is not None:
+            bs = forward_batch.batch_size
+            seq_lens = metadata.cache_seqlens_int32.to(dtype=torch.int64)[:bs]
+            topk = int(self.nsa_index_topk)
+            pages_out = (topk + self.real_page_size - 1) // self.real_page_size
+
+            if topk_indices.shape[0] != bs:
+                topk_indices = topk_indices[:bs]
+
+            if topk_indices.shape[1] == 1:
+                total_pages = (
+                    seq_lens.to(torch.int32) + self.real_page_size - 1
+                ) // self.real_page_size
+                page_counts = torch.clamp(total_pages, max=pages_out).to(torch.int32)
+                start_page = (total_pages - page_counts).clamp(min=0).to(torch.int32)
+                ar = torch.arange(
+                    pages_out, device=q.device, dtype=torch.int32
+                ).view(1, -1)
+                logical_pages = torch.where(
+                    ar < page_counts.view(-1, 1),
+                    start_page.view(-1, 1) + ar,
+                    torch.full_like(ar, -1).expand(bs, -1),
+                )
+
+                last_page = (total_pages - 1).clamp(min=0)
+                remainder = seq_lens.to(torch.int32) - last_page * self.real_page_size
+                remainder = torch.where(
+                    seq_lens > 0,
+                    remainder,
+                    torch.zeros_like(remainder),
+                )
+                cache_seqlens = torch.where(
+                    total_pages > pages_out,
+                    (page_counts - 1) * self.real_page_size + remainder,
+                    seq_lens.to(torch.int32),
+                ).to(torch.int32)
+            else:
+                idx = topk_indices.to(torch.int64)
+                if idx.dim() == 1:
+                    idx = idx.view(bs, 1)
+                seq_lens_i64 = seq_lens.view(bs, 1)
+                valid_topk_mask = (idx >= 0) & (idx < seq_lens_i64)
+                idx_i32 = torch.where(
+                    valid_topk_mask,
+                    idx,
+                    torch.full_like(idx, -1),
+                ).to(torch.int32)
+                logical_pages, page_counts = select_topk_pages_decode(
+                    idx_i32,
+                    page_size=self.real_page_size,
+                    pages_out=pages_out,
+                    sink_lens=None,
+                )
+
+                seq_lens_i32 = seq_lens.to(torch.int32)
+                last_page = (
+                    (seq_lens_i32 - 1).clamp(min=0) // self.real_page_size
+                ).to(torch.int32)
+                remainder = seq_lens_i32 - last_page * self.real_page_size
+                match = logical_pages == last_page.unsqueeze(1)
+                found = match.any(dim=1)
+                pos = match.to(torch.int32).argmax(dim=1)
+                last_valid = (page_counts - 1).clamp(min=0)
+                row_idx = torch.arange(bs, device=q.device, dtype=torch.int64)
+                pages_tmp = logical_pages[row_idx, last_valid]
+                pages_pos = logical_pages[row_idx, pos]
+                logical_pages[row_idx, pos] = torch.where(
+                    found, pages_tmp, pages_pos
+                )
+                logical_pages[row_idx, last_valid] = torch.where(
+                    found, pages_pos, pages_tmp
+                )
+
+                cache_seqlens = (page_counts * self.real_page_size).to(torch.int32)
+                cache_seqlens = torch.where(
+                    found,
+                    ((page_counts - 1) * self.real_page_size + remainder).to(
+                        torch.int32
+                    ),
+                    cache_seqlens,
+                )
+
+            gather_index = logical_pages.clamp(min=0).to(torch.int64)
+            sparse_page_table = torch.gather(
+                metadata.real_page_table[:bs].to(torch.int64), 1, gather_index
+            ).to(torch.int32)
+            page_table = torch.where(
+                logical_pages >= 0,
+                sparse_page_table,
+                torch.full_like(sparse_page_table, -1),
+            )
+
+        o = flash_attn_with_kvcache(
+            q=q,
+            k_cache=key_cache,
+            v_cache=value_cache,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            cu_seqlens_q=metadata.cu_seqlens_q,
+            max_seqlen_q=metadata.max_seq_len_q,
+            softmax_scale=layer.scaling,
+            causal=True,
+            window_size=(-1, -1),
+            softcap=layer.logit_cap,
+            num_splits=self.num_splits,
+        )
+        return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
     def _forward_fa3(
         self,
@@ -2025,6 +2199,13 @@ class NativeSparseAttnBackend(
         from sglang.srt.utils import get_device_sm, is_blackwell
 
         # Decide MHA vs MLA
+        if self.is_gpt_oss_gqa_dsa:
+            # GPT-OSS keeps prefill dense/native and only sparsifies decode.
+            self.use_mha = bool(
+                forward_batch
+                and forward_batch.forward_mode.is_extend_without_speculative()
+            )
+            return
         if forward_batch and forward_batch.forward_mode.is_extend_without_speculative():
             # Check if sequence meets criteria for MHA_ONE_SHOT
             assert forward_batch.seq_lens_cpu is not None

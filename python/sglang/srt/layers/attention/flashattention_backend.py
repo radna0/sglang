@@ -702,42 +702,6 @@ class FlashAttentionBackend(AttentionBackend):
                 metadata.page_table[:, self.strided_indices] // self.page_size
             )
 
-            # Cache GPT-OSS GQA DSA sparse page tables for `topk_source=recent` once per
-            # forward pass (reused across full-attention layers).
-            server_args = get_global_server_args()
-            if (
-                forward_batch.forward_mode.is_decode_or_idle()
-                and forward_batch.spec_info is None
-                and server_args.enable_gpt_oss_gqa_dsa
-                and server_args.gpt_oss_dsa_topk_source == "recent"
-            ):
-                topk = int(server_args.gpt_oss_dsa_index_topk)
-                pages_out = (topk + self.page_size - 1) // self.page_size
-                seq_lens_i32 = metadata.cache_seqlens_int32
-                total_pages = (seq_lens_i32 + self.page_size - 1) // self.page_size
-                page_counts = torch.clamp(total_pages, max=pages_out).to(torch.int32)
-                start_page = (total_pages - page_counts).clamp(min=0).to(torch.int32)
-                ar = torch.arange(pages_out, device=self.device, dtype=torch.int32).view(
-                    1, -1
-                )
-                mask = ar < page_counts.view(-1, 1)
-                gather_index = torch.where(
-                    mask, start_page.view(-1, 1) + ar, torch.zeros_like(ar).expand(batch_size, -1)
-                ).to(torch.int64)
-                metadata.gpt_oss_dsa_page_table = torch.gather(
-                    metadata.page_table.to(torch.int64), dim=1, index=gather_index
-                ).to(torch.int32)
-
-                # Key length inside the selected suffix pages (<= pages_out * page_size).
-                last_page = (total_pages - 1).clamp(min=0)
-                remainder = seq_lens_i32 - last_page * self.page_size
-                remainder = torch.where(seq_lens_i32 > 0, remainder, torch.zeros_like(remainder))
-                metadata.gpt_oss_dsa_cache_seqlens_int32 = torch.where(
-                    total_pages > pages_out,
-                    (pages_out - 1) * self.page_size + remainder,
-                    seq_lens_i32,
-                ).to(torch.int32)
-
             if (
                 self.topk > 1
                 and forward_batch.forward_mode.is_decode_or_idle()
@@ -790,6 +754,7 @@ class FlashAttentionBackend(AttentionBackend):
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
+        gpt_oss_dsa_recent: bool = False,
     ):
         if k is not None:
             assert v is not None
@@ -967,7 +932,7 @@ class FlashAttentionBackend(AttentionBackend):
                     k_descale=k_descale,
                     v_descale=v_descale,
                     return_softmax_lse=True,
-                    num_splits=self.num_splits,
+                    num_splits=sparse_num_splits,
                     **kwargs,
                 )
                 o, _ = merge_state_v2_wrapper(
@@ -1082,7 +1047,7 @@ class FlashAttentionBackend(AttentionBackend):
                     k_descale=k_descale,
                     v_descale=v_descale,
                     return_softmax_lse=use_cascade_attn,
-                    num_splits=self.num_splits,
+                    num_splits=sparse_num_splits,
                 )
                 if use_cascade_attn:
                     o, softmax_lse, *rest = result
@@ -1131,6 +1096,7 @@ class FlashAttentionBackend(AttentionBackend):
         k_rope: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
         topk_indices: Optional[torch.Tensor] = None,
+        gpt_oss_dsa_recent: bool = False,
     ) -> torch.Tensor:
         if k is not None:
             assert v is not None
@@ -1184,6 +1150,14 @@ class FlashAttentionBackend(AttentionBackend):
             kwargs["sinks"] = sinks
 
         k_descale, v_descale = None, None
+        server_args = get_global_server_args()
+        sparse_gpt_oss_dsa_decode = (
+            (not self.use_mla)
+            and (topk_indices is not None or gpt_oss_dsa_recent)
+            and server_args.enable_gpt_oss_gqa_dsa
+            and forward_batch.forward_mode.is_decode_or_idle()
+        )
+        sparse_num_splits = 1 if sparse_gpt_oss_dsa_decode else self.num_splits
         # only use kv scaling if: 1) fp8 kv is explicitly enabled, 2) RadixAttention
         # has corresponding quantization method so that layer.k_scale is not None,
         # 3) layer.head_dim <= 256 since fa3 kernel require fp16 and bf16 data type in this case.
@@ -1192,16 +1166,22 @@ class FlashAttentionBackend(AttentionBackend):
                 descale_shape = (forward_batch.batch_size, layer.tp_k_head_num)
                 k_descale = layer.k_scale.expand(descale_shape)
                 v_descale = layer.v_scale.expand(descale_shape)
-            # sgl_kernel FA3 path requires query/key dtypes to match.
-            if q.dtype != self.kv_cache_dtype:
-                q = q.to(self.kv_cache_dtype)
-            if q_rope is not None and q_rope.dtype != self.kv_cache_dtype:
-                q_rope = q_rope.to(self.kv_cache_dtype)
-            if k_rope is not None and k_rope.dtype != self.kv_cache_dtype:
-                k_rope = k_rope.to(self.kv_cache_dtype)
+            # GPT-OSS sparse decode can either preserve bf16 queries or cast queries to
+            # FP8 to match dense FP8 decode. Expose the choice as a server flag so we can
+            # benchmark the actual serving path instead of relying on assumptions.
+            sparse_fp8_query_mode = getattr(
+                server_args, "gpt_oss_dsa_fp8_query_mode", "bf16"
+            )
+            if (not sparse_gpt_oss_dsa_decode) or sparse_fp8_query_mode == "fp8":
+                if q.dtype != self.kv_cache_dtype:
+                    q = q.to(self.kv_cache_dtype)
+                if q_rope is not None and q_rope.dtype != self.kv_cache_dtype:
+                    q_rope = q_rope.to(self.kv_cache_dtype)
+                if k_rope is not None and k_rope.dtype != self.kv_cache_dtype:
+                    k_rope = k_rope.to(self.kv_cache_dtype)
         if not self.use_mla:
             # Do multi-head attention
-            if topk_indices is not None:
+            if topk_indices is not None or gpt_oss_dsa_recent:
                 # Sparse decode: attend to per-token top-k indices only (GPT-OSS GQA DSA).
                 assert forward_batch.forward_mode.is_decode_or_idle(), (
                     "GPT-OSS GQA DSA topk_indices are decode-only; "
@@ -1220,11 +1200,10 @@ class FlashAttentionBackend(AttentionBackend):
 
                 req_pool_indices = forward_batch.req_pool_indices
 
-                if topk_indices.shape[0] != bs:
+                if topk_indices is not None and topk_indices.shape[0] != bs:
                     topk_indices = topk_indices[:bs]
 
                 seq_lens = forward_batch.seq_lens.to(dtype=torch.int64)[:bs]  # (bs,)
-                server_args = get_global_server_args()
                 if server_args.gpt_oss_dsa_topk_source == "recent":
                     # `recent` lane does not require token-level indices.
                     topk = int(server_args.gpt_oss_dsa_index_topk)
@@ -1246,38 +1225,11 @@ class FlashAttentionBackend(AttentionBackend):
                 sparse_page_table = None
 
                 if server_args.gpt_oss_dsa_topk_source == "recent":
-                    cached_pages = getattr(metadata, "gpt_oss_dsa_page_table", None)
-                    cached_lens = getattr(metadata, "gpt_oss_dsa_cache_seqlens_int32", None)
-                    if cached_pages is not None and cached_lens is not None:
-                        sparse_page_table = cached_pages[:bs]
-                        cache_seqlens_sparse = cached_lens[:bs]
-                    else:
-                        # Capture-friendly / debug mode: select a contiguous suffix of KV pages.
-                        seq_lens_i32 = seq_lens.to(torch.int32)
-                        total_pages = (seq_lens_i32 + self.page_size - 1) // self.page_size
-                        page_counts = torch.clamp(total_pages, max=pages_out).to(torch.int32)
-                        start_page = (total_pages - page_counts).clamp(min=0).to(torch.int32)
-                        ar = torch.arange(
-                            pages_out, device=q.device, dtype=torch.int32
-                        ).view(1, -1)
-                        mask = ar < page_counts.view(-1, 1)
-                        logical_pages = torch.where(
-                            mask,
-                            start_page.view(-1, 1) + ar,
-                            torch.zeros_like(ar).expand(bs, -1),
-                        )
-
-                        # Key length inside the selected suffix pages (<= pages_out * page_size).
-                        last_page = (total_pages - 1).clamp(min=0)
-                        remainder = seq_lens_i32 - last_page * self.page_size
-                        remainder = torch.where(
-                            seq_lens_i32 > 0, remainder, torch.zeros_like(remainder)
-                        )
-                        cache_seqlens_sparse = torch.where(
-                            total_pages > pages_out,
-                            (pages_out - 1) * self.page_size + remainder,
-                            seq_lens_i32,
-                        ).to(torch.int32)
+                    # `recent` is a contiguous suffix. Route it through FA3 local attention
+                    # on the dense page table instead of the generic sparse page-table path.
+                    # This preserves decode semantics for a fixed recent window while using
+                    # the better-optimized local-attention kernel.
+                    recent_window = (topk - 1, 0)
                 else:
                     from sglang.srt.layers.attention.nsa.transform_index import (
                         select_topk_pages_decode,
@@ -1311,6 +1263,42 @@ class FlashAttentionBackend(AttentionBackend):
                         cache_seqlens_sparse,
                     )
 
+                key_cache, value_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
+                    layer.layer_id
+                )
+                key_cache = key_cache.view(
+                    -1, self.page_size, layer.tp_k_head_num, layer.head_dim
+                )
+                value_cache = value_cache.view(
+                    -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
+                )
+
+                # `recent` can use the dense page table directly with a local window.
+                if server_args.gpt_oss_dsa_topk_source == "recent":
+                    dense_recent_result = flash_attn_with_kvcache(
+                        q=q_reshaped,
+                        k_cache=key_cache,
+                        v_cache=value_cache,
+                        page_table=metadata.page_table[:bs],
+                        cache_seqlens=metadata.cache_seqlens_int32[:bs],
+                        cu_seqlens_q=metadata.cu_seqlens_q,
+                        max_seqlen_q=1,
+                        softmax_scale=layer.scaling,
+                        causal=True,
+                        window_size=recent_window,
+                        softcap=layer.logit_cap,
+                        k_descale=k_descale,
+                        v_descale=v_descale,
+                        return_softmax_lse=use_cascade_attn,
+                        num_splits=sparse_num_splits,
+                        **kwargs,
+                    )
+                    if use_cascade_attn:
+                        dense_recent_result = dense_recent_result[0]
+                    return dense_recent_result.view(
+                        -1, layer.tp_q_head_num * layer.v_head_dim
+                    )
+
                 # Map logical page ids -> physical page ids via the existing dense page table.
                 if sparse_page_table is None:
                     full_page_table = metadata.page_table[:bs]
@@ -1318,14 +1306,6 @@ class FlashAttentionBackend(AttentionBackend):
                     sparse_page_table = torch.gather(
                         full_page_table.to(torch.int64), dim=1, index=gather_index
                     ).to(torch.int32)
-
-                key_cache, value_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
-                key_cache = key_cache.view(
-                    -1, self.page_size, layer.tp_k_head_num, layer.head_dim
-                )
-                value_cache = value_cache.view(
-                    -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
-                )
 
                 sparse_result = flash_attn_with_kvcache(
                     q=q_reshaped,

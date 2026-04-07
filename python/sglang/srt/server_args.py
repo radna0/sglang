@@ -470,6 +470,7 @@ class ServerArgs:
     gpt_oss_dsa_rope_head_dim: Optional[int] = None  # None = auto (use model head_dim)
     gpt_oss_dsa_index_block_size: int = 128
     gpt_oss_dsa_scale_fmt: str = "ue8m0"
+    gpt_oss_dsa_fp8_query_mode: str = "bf16"  # bf16 | fp8
     disable_flashinfer_autotune: bool = False
     mamba_backend: str = "triton"
 
@@ -1344,7 +1345,7 @@ class ServerArgs:
             # Set attention backend for GPT-OSS
             if self.is_attention_backend_not_set():
                 if self.enable_gpt_oss_gqa_dsa:
-                    # For now, GPT-OSS GQA DSA is only implemented on FA3.
+                    # Default to the proven FA3 lane; the native NSA lane can be selected explicitly.
                     self.attention_backend = "fa3" if is_sm90_supported() else "triton"
                     logger.info(
                         "GPT-OSS GQA DSA enabled: defaulting attention backend to "
@@ -1359,6 +1360,8 @@ class ServerArgs:
                         self.attention_backend = "triton"
 
             supported_backends = ["triton", "trtllm_mha", "fa3", "fa4", "ascend"]
+            if self.enable_gpt_oss_gqa_dsa:
+                supported_backends.append("nsa")
             prefill_attn_backend, decode_attn_backend = self.get_attention_backends()
             assert (
                 prefill_attn_backend in supported_backends
@@ -1370,9 +1373,13 @@ class ServerArgs:
             )
 
             if self.enable_gpt_oss_gqa_dsa:
-                assert prefill_attn_backend == "fa3" and decode_attn_backend == "fa3", (
-                    "GPT-OSS GQA DSA is currently implemented for attention_backend='fa3' only "
-                    "(and no per-phase override). "
+                allowed_dsa_backends = {"fa3", "nsa"}
+                assert (
+                    prefill_attn_backend in allowed_dsa_backends
+                    and decode_attn_backend in allowed_dsa_backends
+                ), (
+                    "GPT-OSS GQA DSA currently supports attention_backend in "
+                    f"{sorted(allowed_dsa_backends)} only. "
                     f"Got prefill={prefill_attn_backend}, decode={decode_attn_backend}."
                 )
                 if envs.SGLANG_NSA_FUSE_TOPK.get():
@@ -1404,6 +1411,14 @@ class ServerArgs:
                 if self.kv_cache_dtype == "bf16":
                     self.kv_cache_dtype = "bfloat16"
 
+                if (
+                    prefill_attn_backend == "nsa" or decode_attn_backend == "nsa"
+                ) and self.kv_cache_dtype == "auto":
+                    self.kv_cache_dtype = "bfloat16"
+                    logger.warning(
+                        "GPT-OSS GQA DSA on attention_backend='nsa' defaults to --kv-cache-dtype=bfloat16."
+                    )
+
                 if self.gpt_oss_dsa_topk_source == "indexer":
                     if self.kv_cache_dtype in ["auto"]:
                         self.kv_cache_dtype = "bfloat16"
@@ -1417,6 +1432,19 @@ class ServerArgs:
                         "GPT-OSS GQA DSA (topk_source=indexer) currently requires bf16/bfloat16 KV cache "
                         f"but got {self.kv_cache_dtype!r}."
                     )
+                elif prefill_attn_backend == "nsa" or decode_attn_backend == "nsa":
+                    assert self.kv_cache_dtype in [
+                        "bfloat16",
+                        "bf16",
+                    ], (
+                        "GPT-OSS GQA DSA on attention_backend='nsa' currently requires bf16/bfloat16 KV cache "
+                        f"but got {self.kv_cache_dtype!r}."
+                    )
+
+                assert self.gpt_oss_dsa_fp8_query_mode in ["bf16", "fp8"], (
+                    "GPT-OSS DSA fp8 query mode must be 'bf16' or 'fp8', "
+                    f"but got {self.gpt_oss_dsa_fp8_query_mode!r}."
+                )
 
             if (
                 prefill_attn_backend == "trtllm_mha"
@@ -4007,6 +4035,13 @@ class ServerArgs:
             type=str,
             default=ServerArgs.gpt_oss_dsa_scale_fmt,
             help="Scale format used by GPT-OSS DSA indexer quantization (DeepSeek uses 'ue8m0').",
+        )
+        parser.add_argument(
+            "--gpt-oss-dsa-fp8-query-mode",
+            type=str,
+            default=ServerArgs.gpt_oss_dsa_fp8_query_mode,
+            choices=["bf16", "fp8"],
+            help="Query dtype mode for GPT-OSS DSA when using FP8 KV cache.",
         )
         parser.add_argument(
             "--fp8-gemm-backend",
