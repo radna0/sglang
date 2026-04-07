@@ -306,8 +306,8 @@ def dflash_sampling_info_uses_sampled_target(
     if sampling_info is None:
         return False
 
-    if not bool(getattr(sampling_info, "is_all_greedy", True)):
-        return True
+    if bool(getattr(sampling_info, "is_all_greedy", True)):
+        return False
 
     top_ks = getattr(sampling_info, "top_ks", None)
     if isinstance(top_ks, torch.Tensor) and top_ks.numel() > 0:
@@ -349,13 +349,13 @@ def dflash_sampling_info_uses_sampled_target(
             except Exception:
                 temperature = 1.0
 
-            if min_p > 0.0:
+            if top_k <= 0 or top_k > 1:
                 return True
             if top_p < 0.999999:
                 return True
-            if top_k <= 0 or top_k > 1:
-                return True
             if temperature > 0.0 and top_k <= 0:
+                return True
+            if min_p > 0.0 and top_k > 1:
                 return True
 
     return False
@@ -2850,7 +2850,12 @@ def compute_dflash_sampling_accept_len_and_bonus(
 
     expanded_temperature = torch.repeat_interleave(
         sampling_info.temperatures, draft_token_num, dim=0
-    )
+    ).to(device=device, dtype=next_token_logits.dtype)
+    if bool(torch.any(expanded_temperature <= 0).item()):
+        raise RuntimeError(
+            "DFLASH sampled verification received non-positive temperature. "
+            "This batch should have stayed on the greedy target-verify path."
+        )
     scaled_logits = next_token_logits / expanded_temperature.view(-1, 1)
     repeated_top_ks = torch.repeat_interleave(
         sampling_info.top_ks, draft_token_num, dim=0
