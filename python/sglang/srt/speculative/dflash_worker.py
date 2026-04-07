@@ -449,7 +449,7 @@ class DFlashWorker:
             (new_cap,),
             dtype=torch.int32,
             device="cpu",
-            pin_memory=is_cuda(),
+            pin_memory=bool(torch.cuda.is_available()),
         )
 
     def _get_mask_token_embedding(self, embed_module) -> torch.Tensor:
