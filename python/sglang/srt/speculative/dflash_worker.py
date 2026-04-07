@@ -561,7 +561,8 @@ class DFlashWorker:
         if batch.has_grammar:
             raise RuntimeError("DFLASH does not support grammar constraints.")
         if dflash_sampling_info_uses_sampled_target(
-            getattr(batch, "sampling_info", None), getattr(batch, "reqs", None)
+            getattr(batch, "sampling_info", None),
+            reqs=getattr(batch, "reqs", None),
         ):
             if not is_dflash_sampling_verify_available():
                 raise RuntimeError(
