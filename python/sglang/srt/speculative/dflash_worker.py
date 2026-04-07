@@ -978,7 +978,10 @@ class DFlashWorker:
                     probs, top_ks_chunk, top_ps_chunk, min_ps_chunk, need_min_p_sampling
                 )
                 sampled_local, sampled_prob = sample_dflash_filtered_distribution(
-                    probs_sort, probs_idx, sampling_seed_chunk, positions_chunk
+                    probs_sort=probs_sort,
+                    probs_idx=probs_idx,
+                    sampling_seed=sampling_seed_chunk,
+                    positions=positions_chunk,
                 )
                 out_selected_probs[start:end] = sampled_prob.to(torch.float32)
                 out_proposal_probs[start:end].copy_(probs_sort.to(torch.float32))
@@ -994,7 +997,12 @@ class DFlashWorker:
                     probs_sort, probs_idx = build_dflash_filtered_sampling_distribution_from_probs(
                         probs, top_ks_chunk, top_ps_chunk, min_ps_chunk, need_min_p_sampling
                     )
-                    sampled_local, _ = sample_dflash_filtered_distribution(probs_sort, probs_idx, sampling_seed_chunk, positions_chunk)
+                    sampled_local, _ = sample_dflash_filtered_distribution(
+                        probs_sort=probs_sort,
+                        probs_idx=probs_idx,
+                        sampling_seed=sampling_seed_chunk,
+                        positions=positions_chunk,
+                    )
             out_token_ids[start:end] = valid_token_ids.index_select(0, sampled_local.to(torch.long))
 
         return DFlashDraftSamplingResult(
