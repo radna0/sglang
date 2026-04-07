@@ -1305,7 +1305,11 @@ class DFlashWorker:
 
         t2 = time.perf_counter() if profile_this_step else 0.0
         new_verified_id, commit_lens, cache_plan, next_target_hidden, accept_length_per_req_cpu = (
-            verify_input.verify(batch, logits_output, self.page_size)
+            verify_input.verify(
+                batch=batch,
+                logits_output=logits_output,
+                page_size=self.page_size,
+            )
         )
         t_verify = time.perf_counter() if profile_this_step else 0.0
 
