@@ -15,6 +15,7 @@
 
 """Inference-only GptOss model compatible with HuggingFace weights."""
 
+import os
 import logging
 import math
 from collections.abc import Iterable
@@ -1220,6 +1221,72 @@ class GptOssForCausalLM(nn.Module):
                             weight_loader(param, loaded_weight)
                     else:
                         logger.warning(f"Parameter {name} not found in params_dict")
+
+        # Optional: load an external indexer-only state dict (DSA) after the base
+        # checkpoint is loaded. This is the hook for "covariance initialization":
+        # we can generate indexer weights from CARE covariance once and reuse them.
+        self._maybe_load_gpt_oss_dsa_indexer_weights(params_dict)
+
+    def _maybe_load_gpt_oss_dsa_indexer_weights(self, params_dict: dict[str, torch.nn.Parameter]) -> None:
+        path = os.environ.get("SGLANG_GPT_OSS_DSA_INDEXER_WEIGHTS", "").strip()
+        if not path:
+            return
+        if not os.path.exists(path):
+            logger.warning(
+                "SGLANG_GPT_OSS_DSA_INDEXER_WEIGHTS is set but file does not exist: %s",
+                path,
+            )
+            return
+        try:
+            if path.endswith(".safetensors"):
+                from safetensors.torch import load_file
+
+                state = load_file(path)
+            else:
+                state = torch.load(path, map_location="cpu")
+                if isinstance(state, dict) and "state_dict" in state and isinstance(
+                    state["state_dict"], dict
+                ):
+                    state = state["state_dict"]
+
+            if not isinstance(state, dict):
+                raise TypeError(f"Unexpected indexer weights type: {type(state)}")
+
+            loaded = 0
+            skipped = 0
+            for name, w in state.items():
+                if not isinstance(name, str):
+                    continue
+
+                layer_id = get_layer_id(name)
+                if (
+                    layer_id is not None
+                    and hasattr(self.model, "start_layer")
+                    and (
+                        layer_id < self.model.start_layer
+                        or layer_id >= self.model.end_layer
+                    )
+                ):
+                    skipped += 1
+                    continue
+
+                if name not in params_dict:
+                    skipped += 1
+                    continue
+
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, w)
+                loaded += 1
+
+            logger.warning(
+                "Loaded %d external GPT-OSS DSA indexer params from %s (skipped %d).",
+                loaded,
+                path,
+                skipped,
+            )
+        except Exception:
+            logger.exception("Failed to load external GPT-OSS DSA indexer weights from %s", path)
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
