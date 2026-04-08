@@ -911,11 +911,26 @@ class Indexer(MultiPlatformOp):
             0, block_tables.shape[-1], page_size, device="cuda"
         )
         block_tables = block_tables[:, strided_indices] // page_size
+        # NOTE: During CUDA-graph capture and for padded rows, req_to_token_pool entries
+        # can contain -1. The index-K gather kernels do not mask negative page indices,
+        # so clamp to a valid page to avoid illegal memory access.
+        block_tables = block_tables.clamp(min=0)
 
         q_len_start = 0
 
         for i in range(forward_batch.batch_size):
-            seq_len = forward_batch.seq_lens[i].item()
+            # NOTE: CUDA graph capture forbids GPU->CPU syncs like `.item()` on CUDA
+            # tensors. For graph-safe decode, we rely on the optional CPU copy of
+            # sequence lengths that ForwardBatch can carry.
+            if forward_batch.seq_lens_cpu is not None:
+                seq_len = int(forward_batch.seq_lens_cpu[i].item())
+            else:
+                if get_is_capture_mode():
+                    raise RuntimeError(
+                        "NSA indexer requires ForwardBatch.seq_lens_cpu during CUDA-graph capture "
+                        "(avoid seq_lens[i].item() on CUDA)."
+                    )
+                seq_len = int(forward_batch.seq_lens[i].item())
             q_len = (
                 forward_batch.extend_seq_lens_cpu[i]
                 if forward_batch.forward_mode.is_extend()
