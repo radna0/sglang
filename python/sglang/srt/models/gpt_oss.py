@@ -397,19 +397,33 @@ class GptOssAttention(nn.Module):
                     return_indices=False,
                 )
             elif forward_batch.forward_mode.is_decode_or_idle():
-                seq_lens = getattr(forward_batch, "seq_lens", None)
-                if seq_lens is not None:
-                    seq_lens = seq_lens[: q.shape[0]]
-                if (
-                    seq_lens is not None
-                    and seq_lens.numel() > 0
-                    and not torch.any(
-                        seq_lens.to(dtype=torch.int64)
-                        > get_global_server_args().gpt_oss_dsa_index_topk
-                    )
-                ):
-                    topk_indices = None
+                # IMPORTANT: When CUDA graphs are enabled, this function executes under
+                # stream capture during server init. Any Python truthiness check on a
+                # CUDA tensor (e.g. `not torch.any(...)`) triggers an implicit `.item()`
+                # sync and can hard-fail capture with:
+                #   CUDA error: operation not permitted when stream is capturing
+                #
+                # Use the optional CPU copy of seq lens to decide if DSA is a no-op.
+                topk = int(get_global_server_args().gpt_oss_dsa_index_topk)
+                seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
+                if seq_lens_cpu is not None and seq_lens_cpu.numel() > 0:
+                    max_seq_len = int(seq_lens_cpu[: q.shape[0]].max().item())
+                    # If everything is short, DSA provides no benefit. We only take this
+                    # branch when NOT capturing, because CUDA graphs require a stable
+                    # execution path across replays.
+                    if (not get_is_capture_mode()) and max_seq_len <= topk:
+                        topk_indices = None
+                    else:
+                        topk_indices = self.indexer(
+                            x=hidden_states,
+                            q_lora=None,
+                            positions=positions,
+                            forward_batch=forward_batch,
+                            layer_id=self.layer_id,
+                        )
                 else:
+                    # Fallback: assume DSA is needed (safe for capture; correctness-wise
+                    # attention backend will still clamp indices to seqlens).
                     topk_indices = self.indexer(
                         x=hidden_states,
                         q_lora=None,
