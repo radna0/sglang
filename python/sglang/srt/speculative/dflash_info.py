@@ -465,7 +465,13 @@ class DFlashVerifyInput(SpecInput):
             return empty, empty.to(torch.int32), None, empty, []
 
         bs = batch.batch_size()
-        device = logits_output.next_token_logits.device
+        next_token_logits = logits_output.next_token_logits
+        if isinstance(next_token_logits, torch.Tensor):
+            device = next_token_logits.device
+        elif isinstance(target_next_token_ids, torch.Tensor):
+            device = target_next_token_ids.device
+        else:
+            device = self.draft_token.device
         profile_details = _should_profile_verify_details()
         verify_profile_ms: dict[str, float] = {}
 
@@ -479,8 +485,12 @@ class DFlashVerifyInput(SpecInput):
 
             # Keep speculative verify semantics consistent with normal sampling path.
             if sampling_info.has_custom_logit_processor:
+                if next_token_logits is None:
+                    raise RuntimeError(
+                        "DFLASH verify requires next_token_logits when custom logit processors are active."
+                    )
                 apply_custom_logit_processor(
-                    logits_output.next_token_logits,
+                    next_token_logits,
                     sampling_info,
                     num_tokens_in_batch=self.draft_token_num,
                 )
@@ -489,13 +499,17 @@ class DFlashVerifyInput(SpecInput):
                 sampling_info.penalizer_orchestrator.is_required
                 or sampling_info.logit_bias is not None
             ):
+                if next_token_logits is None:
+                    raise RuntimeError(
+                        "DFLASH verify requires next_token_logits when logit bias or penalizers are active."
+                    )
                 linear_penalty = torch.zeros(
-                    (bs, logits_output.next_token_logits.shape[1]),
+                    (bs, next_token_logits.shape[1]),
                     dtype=torch.float32,
                     device=device,
                 )
                 sampling_info.apply_logits_bias(linear_penalty)
-                logits_output.next_token_logits.add_(
+                next_token_logits.add_(
                     torch.repeat_interleave(linear_penalty, self.draft_token_num, dim=0)
                 )
 
@@ -531,8 +545,12 @@ class DFlashVerifyInput(SpecInput):
                     device=device, dtype=torch.int64, non_blocking=True
                 ).view(bs, self.draft_token_num)
             else:
+                if next_token_logits is None:
+                    raise RuntimeError(
+                        "DFLASH greedy verify needs either target_next_token_ids or next_token_logits."
+                    )
                 target_predict = torch.argmax(
-                    logits_output.next_token_logits, dim=-1
+                    next_token_logits, dim=-1
                 ).view(bs, self.draft_token_num)
             accept_len, _bonus = compute_dflash_accept_len_and_bonus(
                 candidates=candidates,

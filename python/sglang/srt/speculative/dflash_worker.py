@@ -10,6 +10,7 @@ import pstats
 from typing import List, Optional, Union
 
 import torch
+from torch.profiler import ProfilerActivity, profile as torch_profile
 
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.layers.sampler import (
@@ -19,7 +20,7 @@ from sglang.srt.layers.sampler import (
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
-from sglang.srt.mem_cache.common import get_last_loc
+from sglang.srt.mem_cache.common import evict_from_tree_cache, get_last_loc
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -65,6 +66,13 @@ def _should_cprofile_verify_step(enabled: bool, step_index: int) -> bool:
     return ((int(step_index) + 1) % int(every)) == 0
 
 
+def _should_torch_profile_verify_step(enabled: bool, step_index: int) -> bool:
+    if not enabled:
+        return False
+    every = _parse_env_int("SGLANG_DFLASH_TORCH_PROFILER_VERIFY_EVERY", 200)
+    return ((int(step_index) + 1) % int(every)) == 0
+
+
 def _env_enabled(name: str) -> bool:
     return (str(os.environ.get(name) or "").strip().lower()) in (
         "1",
@@ -73,6 +81,30 @@ def _env_enabled(name: str) -> bool:
         "y",
         "on",
     )
+
+
+def _device_is_cuda(device: object) -> bool:
+    if isinstance(device, torch.device):
+        return device.type == "cuda"
+    try:
+        return torch.device(device).type == "cuda"
+    except Exception:
+        return False
+
+
+def _can_use_dflash_greedy_top1_only(sampling_info: object) -> bool:
+    if sampling_info is None:
+        return True
+    if not bool(getattr(sampling_info, "is_all_greedy", True)):
+        return False
+    if bool(getattr(sampling_info, "has_custom_logit_processor", False)):
+        return False
+    if getattr(sampling_info, "logit_bias", None) is not None:
+        return False
+    penalizer = getattr(sampling_info, "penalizer_orchestrator", None)
+    if penalizer is not None and bool(getattr(penalizer, "is_required", False)):
+        return False
+    return True
 
 
 def _log_cprofile_stats(
@@ -89,6 +121,23 @@ def _log_cprofile_stats(
         stats = pstats.Stats(profile, stream=stream).sort_stats("cumtime")
     stats.print_stats(int(top_n))
     for raw_line in stream.getvalue().splitlines():
+        line = raw_line.rstrip()
+        if line:
+            logger.info("%s %s", prefix, line)
+
+
+def _log_torch_profile_stats(
+    *,
+    profiler,
+    prefix: str,
+    sort_by: str,
+) -> None:
+    top_n = _parse_env_int("SGLANG_DFLASH_TORCH_PROFILER_VERIFY_TOP", 25)
+    table = profiler.key_averages().table(
+        sort_by=sort_by,
+        row_limit=int(top_n),
+    )
+    for raw_line in table.splitlines():
         line = raw_line.rstrip()
         if line:
             logger.info("%s %s", prefix, line)
@@ -491,6 +540,21 @@ class DFlashWorker:
             dtype=self._draft_embed_dtype,
             device=device,
         )
+
+    def _iter_draft_block_size_fallbacks(self, requested_block_size: int) -> List[int]:
+        requested_block_size = max(1, int(requested_block_size))
+        widths: List[int] = []
+        seen: set[int] = set()
+        current = requested_block_size
+        while current not in seen:
+            widths.append(current)
+            seen.add(current)
+            if current <= 1:
+                break
+            current = max(1, current // 2)
+        if widths[-1] != 1:
+            widths.append(1)
+        return widths
         self._draft_seq_lens_cpu_buf = torch.empty(
             (new_cap,),
             dtype=torch.int32,
@@ -634,18 +698,6 @@ class DFlashWorker:
 
         # 2) Draft a block (non-causal)
         self._ensure_draft_block_buffers(bs)
-        block_ids = self._draft_block_ids_buf[:bs]
-        block_ids.fill_(self._mask_token_id)
-        block_ids[:, 0].copy_(draft_input.verified_id.to(torch.long))
-
-        input_embeds_3d = self._draft_input_embeds_buf[:bs]
-        mask_emb = self._get_mask_token_embedding(embed_module).view(1, 1, -1)
-        input_embeds_3d[:] = mask_emb
-        verified_embeds = embed_module(draft_input.verified_id.to(torch.long)).to(
-            dtype=input_embeds_3d.dtype
-        )
-        input_embeds_3d[:, 0, :].copy_(verified_embeds)
-        input_embeds = input_embeds_3d.view(-1, input_embeds_3d.shape[-1])
 
         target_prefix_lens = batch.seq_lens  # int32, device
         draft_prefix_lens = draft_input.draft_seq_lens
@@ -653,137 +705,219 @@ class DFlashWorker:
             draft_prefix_lens = draft_prefix_lens.to(torch.int32)
         if draft_prefix_lens.device != self.device:
             draft_prefix_lens = draft_prefix_lens.to(self.device, non_blocking=True)
-
-        positions_2d = self._draft_block_positions_buf[:bs]
-        torch.add(target_prefix_lens.unsqueeze(1), self._block_pos_offsets, out=positions_2d)
-        positions = positions_2d.reshape(-1)
-
-        block_start = draft_prefix_lens
-        block_end = self._draft_block_end_buf[:bs]
-        torch.add(block_start, self.block_size, out=block_end)
-
-        if not self.use_compact_draft_cache:
-            seq_lens_cpu = batch.seq_lens_cpu[:bs]
-        else:
-            seq_lens_cpu = self._draft_seq_lens_cpu_buf[:bs]
-            seq_lens_cpu.copy_(draft_prefix_lens.to(device="cpu", dtype=torch.int32))
-
+        requested_block_size = int(self.block_size)
         allocator = self.draft_model_runner.token_to_kv_pool_allocator
+        active_block_size = requested_block_size
+        block_ids = None
+        positions_2d = None
+        positions = None
+        block_start = draft_prefix_lens
+        block_end = None
+        input_embeds_3d = None
+        input_embeds = None
+        seq_lens_cpu = None
+        block_cache_loc = None
         token_to_kv_pool_state_backup = None
         should_free_block_cache_loc = False
-        if self.page_size == 1:
-            # Allocate per iteration to avoid scheduler leak detection
-            block_cache_loc = allocator.alloc(bs * self.block_size)
-            should_free_block_cache_loc = True
-        else:
-            token_to_kv_pool_state_backup = allocator.backup_state()
-            block_end_cpu = seq_lens_cpu + self.block_size
-            last_loc = get_last_loc(
-                self.draft_model_runner.req_to_token_pool.req_to_token,
-                batch.req_pool_indices,
-                block_start,
+        block_size_fallbacks = self._iter_draft_block_size_fallbacks(requested_block_size)
+
+        for attempt_idx, attempt_block_size in enumerate(block_size_fallbacks):
+            active_block_size = int(attempt_block_size)
+            block_ids = self._draft_block_ids_buf[:bs, :active_block_size]
+            block_ids.fill_(self._mask_token_id)
+            block_ids[:, 0].copy_(draft_input.verified_id.to(torch.long))
+
+            input_embeds_3d = self._draft_input_embeds_buf[:bs, :active_block_size]
+            mask_emb = self._get_mask_token_embedding(embed_module).view(1, 1, -1)
+            input_embeds_3d[:] = mask_emb
+            verified_embeds = embed_module(draft_input.verified_id.to(torch.long)).to(
+                dtype=input_embeds_3d.dtype
             )
-            block_cache_loc = allocator.alloc_extend(
-                block_start,
-                seq_lens_cpu,
-                block_end,
-                block_end_cpu,
-                last_loc,
-                bs * self.block_size,
+            input_embeds_3d[:, 0, :].copy_(verified_embeds)
+            input_embeds = input_embeds_3d.reshape(-1, input_embeds_3d.shape[-1])
+
+            positions_2d = self._draft_block_positions_buf[:bs, :active_block_size]
+            torch.add(
+                target_prefix_lens.unsqueeze(1),
+                self._block_pos_offsets[:active_block_size],
+                out=positions_2d,
             )
-        if block_cache_loc is None:
-            raise RuntimeError(f"DFLASH draft OOM allocating {bs * self.block_size} block tokens.")
-        try:
-            if self.page_size == 1 and not self.use_compact_draft_cache:
-                draft_req_to_token = self.draft_model_runner.req_to_token_pool.req_to_token
-                row_ids = batch.req_pool_indices.to(torch.int64).unsqueeze(1).expand(
-                    -1, self.block_size
-                )
-                draft_req_to_token[row_ids, positions_2d.to(torch.int64)] = (
-                    block_cache_loc.view(bs, self.block_size).to(draft_req_to_token.dtype)
-                )
+            positions = positions_2d.reshape(-1)
+
+            block_end = self._draft_block_end_buf[:bs]
+            torch.add(block_start, active_block_size, out=block_end)
+
+            if not self.use_compact_draft_cache:
+                seq_lens_cpu = batch.seq_lens_cpu[:bs]
             else:
-                assign_req_to_token_pool_func(
-                    batch.req_pool_indices,
+                seq_lens_cpu = self._draft_seq_lens_cpu_buf[:bs]
+                seq_lens_cpu.copy_(draft_prefix_lens.to(device="cpu", dtype=torch.int32))
+
+            block_cache_loc = None
+            token_to_kv_pool_state_backup = None
+            should_free_block_cache_loc = False
+
+            if active_block_size <= 1:
+                break
+
+            needed_tokens = bs * active_block_size
+            evict_from_tree_cache(getattr(batch, "tree_cache", None), needed_tokens)
+            if self.page_size == 1:
+                # Allocate per iteration to avoid scheduler leak detection
+                block_cache_loc = allocator.alloc(needed_tokens)
+                should_free_block_cache_loc = block_cache_loc is not None
+            else:
+                token_to_kv_pool_state_backup = allocator.backup_state()
+                block_end_cpu = seq_lens_cpu + active_block_size
+                last_loc = get_last_loc(
                     self.draft_model_runner.req_to_token_pool.req_to_token,
+                    batch.req_pool_indices,
                     block_start,
+                )
+                block_cache_loc = allocator.alloc_extend(
+                    block_start,
+                    seq_lens_cpu,
                     block_end,
-                    block_cache_loc,
+                    block_end_cpu,
+                    last_loc,
+                    needed_tokens,
+                )
+                if block_cache_loc is None:
+                    allocator.restore_state(token_to_kv_pool_state_backup)
+                    token_to_kv_pool_state_backup = None
+
+            if block_cache_loc is not None:
+                break
+
+            next_width = (
+                block_size_fallbacks[attempt_idx + 1]
+                if attempt_idx + 1 < len(block_size_fallbacks)
+                else None
+            )
+            if self.tp_rank == 0:
+                try:
+                    available_tokens = allocator.available_size()
+                except Exception:
+                    available_tokens = "unknown"
+                logger.warning(
+                    "DFLASH draft KV OOM at physical_block_size=%s (needed_tokens=%s, available_tokens=%s, batch=%s). "
+                    "Retrying with %s.",
+                    active_block_size,
+                    needed_tokens,
+                    available_tokens,
                     bs,
+                    next_width,
                 )
 
-            # Run draft forward (TARGET_VERIFY mode)
-            draft_spec_info = self._draft_block_spec_info
-            seq_lens = draft_prefix_lens
-            seq_lens_sum = int(seq_lens_cpu.sum().item())
-            forward_batch = ForwardBatch(
-                forward_mode=ForwardMode.TARGET_VERIFY,
-                batch_size=bs,
-                input_ids=block_ids.flatten(),
-                req_pool_indices=batch.req_pool_indices,
-                seq_lens=seq_lens,
-                out_cache_loc=block_cache_loc,
-                seq_lens_sum=seq_lens_sum,
-                seq_lens_cpu=seq_lens_cpu,
-                positions=positions,
-                req_to_token_pool=self.draft_model_runner.req_to_token_pool,
-                token_to_kv_pool=self.draft_model_runner.token_to_kv_pool,
-                attn_backend=self.draft_model_runner.attn_backend,
-                input_embeds=input_embeds,
-                spec_algorithm=SpeculativeAlgorithm.DFLASH,
-                spec_info=draft_spec_info,
-                capture_hidden_mode=CaptureHiddenMode.NULL,  # draft does not need hidden
-            )
-            with torch.inference_mode():
-                draft_out = self.draft_model_runner.forward(forward_batch)
-                draft_logits_output = draft_out.logits_output
-        finally:
-            if token_to_kv_pool_state_backup is not None:
-                allocator.restore_state(token_to_kv_pool_state_backup)
-            elif should_free_block_cache_loc:
-                # Clean up req->token pointers to avoid dangling references
-                try:
-                    if self.page_size == 1 and not self.use_compact_draft_cache:
-                        draft_req_to_token = self.draft_model_runner.req_to_token_pool.req_to_token
-                        row_ids = batch.req_pool_indices.to(torch.int64).unsqueeze(1).expand(
-                            -1, self.block_size
-                        )
-                        draft_req_to_token[row_ids, positions_2d.to(torch.int64)] = 0
-                    else:
-                        zeros = torch.zeros_like(block_cache_loc)
-                        assign_req_to_token_pool_func(
-                            batch.req_pool_indices,
-                            self.draft_model_runner.req_to_token_pool.req_to_token,
-                            block_start,
-                            block_end,
-                            zeros,
-                            bs,
-                        )
-                finally:
-                    allocator.free(block_cache_loc)
+        if block_ids is None or positions is None or positions_2d is None or input_embeds is None:
+            raise RuntimeError("DFLASH internal error: draft block state was not initialized.")
 
-        draft_hidden = draft_logits_output.hidden_states
-        if draft_hidden is None:
-            raise RuntimeError("DFLASH draft model returned no hidden states.")
-        draft_hidden = draft_hidden.view(bs, self.block_size, -1)
-
-        draft_hidden_tail = draft_hidden[:, 1:, :].reshape(-1, draft_hidden.shape[-1])
-
-        # Sample draft tokens (greedy or sampled)
         draft_selected_probs = None
         draft_proposal_indices = None
         draft_proposal_probs = None
-        if linear_mode == "draft=sampled,target=sampled":
+        if active_block_size > 1:
+            if block_cache_loc is None or block_end is None or seq_lens_cpu is None:
+                raise RuntimeError(
+                    "DFLASH draft OOM: failed all physical block-size fallbacks "
+                    f"for requested_block_size={requested_block_size}, batch={bs}."
+                )
+            try:
+                if self.page_size == 1 and not self.use_compact_draft_cache:
+                    draft_req_to_token = self.draft_model_runner.req_to_token_pool.req_to_token
+                    row_ids = batch.req_pool_indices.to(torch.int64).unsqueeze(1).expand(
+                        -1, active_block_size
+                    )
+                    draft_req_to_token[row_ids, positions_2d.to(torch.int64)] = (
+                        block_cache_loc.view(bs, active_block_size).to(draft_req_to_token.dtype)
+                    )
+                else:
+                    assign_req_to_token_pool_func(
+                        batch.req_pool_indices,
+                        self.draft_model_runner.req_to_token_pool.req_to_token,
+                        block_start,
+                        block_end,
+                        block_cache_loc,
+                        bs,
+                    )
+
+                # Run draft forward (TARGET_VERIFY mode)
+                draft_spec_info = self._draft_block_spec_info
+                draft_spec_info.draft_token_num = int(active_block_size)
+                draft_spec_info.num_tokens_per_batch = int(active_block_size)
+                seq_lens = draft_prefix_lens
+                seq_lens_sum = int(seq_lens_cpu.sum().item())
+                forward_batch = ForwardBatch(
+                    forward_mode=ForwardMode.TARGET_VERIFY,
+                    batch_size=bs,
+                    input_ids=block_ids.flatten(),
+                    req_pool_indices=batch.req_pool_indices,
+                    seq_lens=seq_lens,
+                    out_cache_loc=block_cache_loc,
+                    seq_lens_sum=seq_lens_sum,
+                    seq_lens_cpu=seq_lens_cpu,
+                    positions=positions,
+                    req_to_token_pool=self.draft_model_runner.req_to_token_pool,
+                    token_to_kv_pool=self.draft_model_runner.token_to_kv_pool,
+                    attn_backend=self.draft_model_runner.attn_backend,
+                    input_embeds=input_embeds,
+                    spec_algorithm=SpeculativeAlgorithm.DFLASH,
+                    spec_info=draft_spec_info,
+                    capture_hidden_mode=CaptureHiddenMode.NULL,  # draft does not need hidden
+                )
+                with torch.inference_mode():
+                    draft_out = self.draft_model_runner.forward(forward_batch)
+                    draft_logits_output = draft_out.logits_output
+            finally:
+                if token_to_kv_pool_state_backup is not None:
+                    allocator.restore_state(token_to_kv_pool_state_backup)
+                elif should_free_block_cache_loc:
+                    # Clean up req->token pointers to avoid dangling references
+                    try:
+                        if self.page_size == 1 and not self.use_compact_draft_cache:
+                            draft_req_to_token = self.draft_model_runner.req_to_token_pool.req_to_token
+                            row_ids = batch.req_pool_indices.to(torch.int64).unsqueeze(1).expand(
+                                -1, active_block_size
+                            )
+                            draft_req_to_token[row_ids, positions_2d.to(torch.int64)] = 0
+                        else:
+                            zeros = torch.zeros_like(block_cache_loc)
+                            assign_req_to_token_pool_func(
+                                batch.req_pool_indices,
+                                self.draft_model_runner.req_to_token_pool.req_to_token,
+                                block_start,
+                                block_end,
+                                zeros,
+                                bs,
+                            )
+                    finally:
+                        allocator.free(block_cache_loc)
+
+            draft_hidden = draft_logits_output.hidden_states
+            if draft_hidden is None:
+                raise RuntimeError("DFLASH draft model returned no hidden states.")
+            draft_hidden = draft_hidden.view(bs, active_block_size, -1)
+            draft_hidden_tail = draft_hidden[:, 1:, :].reshape(-1, draft_hidden.shape[-1])
+        else:
+            if self.tp_rank == 0 and requested_block_size != active_block_size:
+                logger.warning(
+                    "DFLASH fell back to target-only physical width for this batch: requested_block_size=%s, batch=%s.",
+                    requested_block_size,
+                    bs,
+                )
+            draft_hidden_tail = self._draft_input_embeds_buf[:0, :0, :].reshape(0, self._draft_embed_dim)
+
+        # Sample draft tokens (greedy or sampled)
+        if linear_mode == "draft=sampled,target=sampled" and active_block_size > 1:
             sampling_info = batch.sampling_info
             assert sampling_info is not None
-            row_count = bs * (self.block_size - 1)
-            temperatures = torch.repeat_interleave(sampling_info.temperatures, self.block_size - 1, dim=0)
-            top_ps = torch.repeat_interleave(sampling_info.top_ps, self.block_size - 1, dim=0)
-            top_ks = torch.repeat_interleave(sampling_info.top_ks, self.block_size - 1, dim=0)
-            min_ps = torch.repeat_interleave(sampling_info.min_ps, self.block_size - 1, dim=0)
+            row_count = bs * (active_block_size - 1)
+            temperatures = torch.repeat_interleave(sampling_info.temperatures, active_block_size - 1, dim=0)
+            top_ps = torch.repeat_interleave(sampling_info.top_ps, active_block_size - 1, dim=0)
+            top_ks = torch.repeat_interleave(sampling_info.top_ks, active_block_size - 1, dim=0)
+            min_ps = torch.repeat_interleave(sampling_info.min_ps, active_block_size - 1, dim=0)
             sampling_seed = getattr(sampling_info, "sampling_seed", None)
             if sampling_seed is not None:
-                sampling_seed = torch.repeat_interleave(sampling_seed, self.block_size - 1, dim=0)
+                sampling_seed = torch.repeat_interleave(sampling_seed, active_block_size - 1, dim=0)
             sampled_result = self._sample_from_vocab_parallel_head_tp1(
                 hidden_states=draft_hidden_tail,
                 lm_head=lm_head,
@@ -795,24 +929,28 @@ class DFlashWorker:
                 sampling_seed=sampling_seed[:row_count] if sampling_seed is not None else None,
                 return_proposal_support=True,
             )
-            draft_next = sampled_result.token_ids.view(bs, self.block_size - 1)
-            draft_selected_probs = sampled_result.selected_probs.view(bs, self.block_size - 1)
+            draft_next = sampled_result.token_ids.view(bs, active_block_size - 1)
+            draft_selected_probs = (
+                None
+                if sampled_result.selected_probs is None
+                else sampled_result.selected_probs.view(bs, active_block_size - 1)
+            )
             support_width = sampled_result.proposal_indices.shape[-1]
-            draft_proposal_indices = sampled_result.proposal_indices.view(bs, self.block_size - 1, support_width)
-            draft_proposal_probs = sampled_result.proposal_probs.view(bs, self.block_size - 1, support_width)
+            draft_proposal_indices = sampled_result.proposal_indices.view(bs, active_block_size - 1, support_width)
+            draft_proposal_probs = sampled_result.proposal_probs.view(bs, active_block_size - 1, support_width)
         else:
             draft_next = self._greedy_sample_from_vocab_parallel_head(
                 hidden_states=draft_hidden_tail, lm_head=lm_head
-            ).view(bs, self.block_size - 1)
+            ).view(bs, active_block_size - 1)
 
-        draft_tokens = self._draft_block_tokens_buf[:bs]
+        draft_tokens = self._draft_block_tokens_buf[:bs, :active_block_size]
         draft_tokens[:, 0].copy_(block_ids[:, 0])
         draft_tokens[:, 1:].copy_(draft_next)
 
         verify_input = DFlashVerifyInput(
             draft_token=draft_tokens.reshape(-1),
             positions=positions,
-            draft_token_num=self.block_size,
+            draft_token_num=active_block_size,
             linear_mode=linear_mode,
             draft_selected_probs=draft_selected_probs,
             draft_proposal_indices=draft_proposal_indices,
@@ -825,6 +963,15 @@ class DFlashWorker:
         batch.spec_info = verify_input
         batch.return_hidden_states = False
         draft_input.linear_mode = linear_mode
+        draft_input._active_draft_token_num = int(active_block_size)
+        draft_input._active_step_count = int(max(0, active_block_size - 1))
+        if self.tp_rank == 0 and requested_block_size != active_block_size and active_block_size > 1:
+            logger.warning(
+                "DFLASH reduced physical draft width for this batch: requested_block_size=%s -> active_block_size=%s (batch=%s).",
+                requested_block_size,
+                active_block_size,
+                bs,
+            )
 
     # ------------------------------------------------------------------
     #  Greedy / Sampled draft sampling (TP‑safe)
@@ -1337,10 +1484,17 @@ class DFlashWorker:
                 self._profile_step,
             )
         )
+        torch_profile_verify_this_step = (
+            self.tp_rank == 0
+            and _should_torch_profile_verify_step(
+                _env_enabled("SGLANG_DFLASH_TORCH_PROFILER_VERIFY"),
+                self._profile_step,
+            )
+        )
         cuda_event_profile_this_step = (
             profile_this_step
             and self.tp_rank == 0
-            and batch.device.type == "cuda"
+            and _device_is_cuda(batch.device)
             and _env_enabled("SGLANG_DFLASH_PROFILE_CUDA_EVENTS")
         )
         self._profile_step += 1
@@ -1353,6 +1507,10 @@ class DFlashWorker:
         assert model_worker_batch.forward_mode.is_target_verify()
         verify_input = model_worker_batch.spec_info
         assert isinstance(verify_input, DFlashVerifyInput)
+        verify_input.dflash_greedy_top1_only = bool(
+            getattr(draft_input, "linear_mode", "") == "draft=greedy,target=greedy"
+            and _can_use_dflash_greedy_top1_only(batch.sampling_info)
+        )
 
         # Ensure target model captures hidden states for the verify forward
         model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
@@ -1375,9 +1533,33 @@ class DFlashWorker:
             step_cuda_start = verify_cuda_start = verify_cuda_end = step_cuda_end = None
 
         t1 = time.perf_counter() if profile_this_step else 0.0
-        batch_result = self.target_worker.forward_batch_generation(
-            model_worker_batch, is_verify=True, **kwargs
-        )
+        if torch_profile_verify_this_step:
+            activities = [ProfilerActivity.CPU]
+            if _device_is_cuda(batch.device):
+                activities.append(ProfilerActivity.CUDA)
+            with torch_profile(
+                activities=activities,
+                record_shapes=False,
+                profile_memory=False,
+                with_stack=False,
+            ) as verify_torch_profile:
+                batch_result = self.target_worker.forward_batch_generation(
+                    model_worker_batch, is_verify=True, **kwargs
+                )
+            _log_torch_profile_stats(
+                profiler=verify_torch_profile,
+                prefix="[DFLASH_TORCHPROF_VERIFY_CUDA]",
+                sort_by="self_cuda_time_total",
+            )
+            _log_torch_profile_stats(
+                profiler=verify_torch_profile,
+                prefix="[DFLASH_TORCHPROF_VERIFY_CPU]",
+                sort_by="self_cpu_time_total",
+            )
+        else:
+            batch_result = self.target_worker.forward_batch_generation(
+                model_worker_batch, is_verify=True, **kwargs
+            )
         t_target = time.perf_counter() if profile_this_step else 0.0
         if cuda_event_profile_this_step and verify_cuda_end is not None:
             verify_cuda_end.record(torch.cuda.current_stream(device=batch.device))
@@ -1388,12 +1570,15 @@ class DFlashWorker:
             verify_profile = cProfile.Profile()
             verify_profile.enable()
             try:
+                target_next_token_ids = getattr(
+                    logits_output, "_dflash_target_top1_ids", batch_result.next_token_ids
+                )
                 new_verified_id, commit_lens, cache_plan, next_target_hidden, accept_length_per_req_cpu = (
                     verify_input.verify(
                         batch=batch,
                         logits_output=logits_output,
                         page_size=self.page_size,
-                        target_next_token_ids=batch_result.next_token_ids,
+                        target_next_token_ids=target_next_token_ids,
                     )
                 )
             finally:
@@ -1403,12 +1588,15 @@ class DFlashWorker:
                     prefix="[DFLASH_CPROFILE_VERIFY]",
                 )
         else:
+            target_next_token_ids = getattr(
+                logits_output, "_dflash_target_top1_ids", batch_result.next_token_ids
+            )
             new_verified_id, commit_lens, cache_plan, next_target_hidden, accept_length_per_req_cpu = (
                 verify_input.verify(
                     batch=batch,
                     logits_output=logits_output,
                     page_size=self.page_size,
-                    target_next_token_ids=batch_result.next_token_ids,
+                    target_next_token_ids=target_next_token_ids,
                 )
             )
         
@@ -1446,14 +1634,20 @@ class DFlashWorker:
             appended_from_verify=appended_from_verify,
             fused_helper_active=bool(self._use_fused_kv_materialize and self._fused_kv_helper is not None),
         )
+        effective_draft_token_num = int(
+            getattr(draft_input, "_active_draft_token_num", self.block_size)
+        )
+        effective_step_count = int(
+            getattr(draft_input, "_active_step_count", max(0, self.block_size - 1))
+        )
         update_dflash_req_verify_bookkeeping(
             reqs=list(batch.reqs),
             accept_length_per_req_cpu=accept_length_per_req_cpu,
             verify_mode=str(getattr(draft_input, "linear_mode", "target_only")),
             append_path=append_path,
-            default_max_steps=self.block_size - 1,
-            default_effective_draft_token_num=self.block_size,
-            default_effective_step_count=self.block_size - 1,
+            default_max_steps=effective_step_count,
+            default_effective_draft_token_num=effective_draft_token_num,
+            default_effective_step_count=effective_step_count,
         )
 
         logits_output.hidden_states = None
