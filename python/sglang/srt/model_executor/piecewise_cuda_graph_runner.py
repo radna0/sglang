@@ -752,10 +752,13 @@ class PiecewiseCudaGraphRunner:
                         **forward_kwargs,
                     )
                 if isinstance(output, LogitsProcessorOutput):
+                    next_token_logits = (
+                        output.next_token_logits[: self.raw_num_tokens]
+                        if output.next_token_logits is not None
+                        else None
+                    )
                     ret = LogitsProcessorOutput(
-                        next_token_logits=output.next_token_logits[
-                            : self.raw_num_tokens
-                        ],
+                        next_token_logits=next_token_logits,
                         hidden_states=(
                             output.hidden_states[: self.raw_num_tokens]
                             if output.hidden_states is not None
@@ -765,6 +768,10 @@ class PiecewiseCudaGraphRunner:
                     if getattr(output, "_dflash_final_hidden_states", None) is not None:
                         ret._dflash_final_hidden_states = (
                             output._dflash_final_hidden_states[: self.raw_num_tokens]
+                        )
+                    if getattr(output, "_dflash_target_top1_ids", None) is not None:
+                        ret._dflash_target_top1_ids = (
+                            output._dflash_target_top1_ids[: self.raw_num_tokens]
                         )
                     return ret
                 elif isinstance(output, EmbeddingPoolerOutput):

@@ -1782,13 +1782,21 @@ class DFlashWorker:
         target_model_runner = self.target_worker.model_runner
         saved_graph_runner = None
         saved_piecewise_runner = None
+        piecewise_runner_available = hasattr(
+            target_model_runner, "piecewise_cuda_graph_runner"
+        ) and getattr(target_model_runner, "piecewise_cuda_graph_runner", None) is not None
         if disable_target_verify_graph:
             saved_graph_runner = target_model_runner.graph_runner
             saved_piecewise_runner = getattr(
                 target_model_runner, "piecewise_cuda_graph_runner", None
             )
             target_model_runner.graph_runner = None
-            if hasattr(target_model_runner, "piecewise_cuda_graph_runner"):
+            # Prefer piecewise graphs for reduced-width verify when available.
+            # Only force eager verify if no piecewise runner exists.
+            if (
+                hasattr(target_model_runner, "piecewise_cuda_graph_runner")
+                and not piecewise_runner_available
+            ):
                 target_model_runner.piecewise_cuda_graph_runner = None
 
         t1 = time.perf_counter() if profile_this_step else 0.0
