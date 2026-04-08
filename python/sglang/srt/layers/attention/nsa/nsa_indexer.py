@@ -185,6 +185,18 @@ class Indexer(MultiPlatformOp):
             quant_config=quant_config,
             prefix=add_prefix("wq_b", prefix),
         )
+        # Optional q-lora projection for architectures that do not natively expose a
+        # low-rank Q path (e.g. GPT-OSS GQA). When q_lora is provided with the correct
+        # dimension, this projection is unused.
+        self.wq_a = None
+        if self.q_lora_rank != self.hidden_size:
+            self.wq_a = ReplicatedLinear(
+                self.hidden_size,
+                self.q_lora_rank,
+                bias=False,
+                quant_config=quant_config,
+                prefix=add_prefix("wq_a", prefix),
+            )
 
         self.wk = ReplicatedLinear(
             self.hidden_size,
@@ -213,6 +225,29 @@ class Indexer(MultiPlatformOp):
         self.block_size = block_size
         self.scale_fmt = scale_fmt
         self.softmax_scale = self.head_dim**-0.5
+
+        # This module is often created without checkpoint weights (e.g. GPT-OSS DSA
+        # bring-up / random-init). Ensure parameters are initialized deterministically
+        # instead of leaving torch.empty() garbage.
+        self._init_parameters()
+
+    def _init_parameters(self) -> None:
+        for name, param in self.named_parameters(recurse=True):
+            if param is None:
+                continue
+            if name.endswith(("k_norm.weight", "k_norm.bias")):
+                continue
+            with torch.no_grad():
+                if "scale_inv" in name:
+                    param.fill_(1.0)
+                else:
+                    param.zero_()
+        # LayerNorm defaults: weight=1, bias=0.
+        with torch.no_grad():
+            if hasattr(self.k_norm, "weight") and self.k_norm.weight is not None:
+                self.k_norm.weight.fill_(1.0)
+            if hasattr(self.k_norm, "bias") and self.k_norm.bias is not None:
+                self.k_norm.bias.zero_()
 
     @contextlib.contextmanager
     def _with_real_sm_count(self):
@@ -250,12 +285,23 @@ class Indexer(MultiPlatformOp):
 
     def _get_q_k_bf16(
         self,
-        q_lora: torch.Tensor,
+        q_lora: Optional[torch.Tensor],
         x: torch.Tensor,
         positions: torch.Tensor,
         enable_dual_stream: bool,
         forward_batch: ForwardBatch,
     ):
+        if q_lora is None or q_lora.shape[-1] != self.q_lora_rank:
+            if isinstance(x, tuple):
+                raise NotImplementedError(
+                    "Indexer wq_a projection does not currently support tuple (FP8) activations; "
+                    "pass a precomputed q_lora tensor instead."
+                )
+            assert (
+                self.wq_a is not None
+            ), "q_lora is required when indexer has no wq_a projection"
+            q_lora, _ = self.wq_a(x)
+
         if enable_dual_stream:
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
@@ -865,11 +911,26 @@ class Indexer(MultiPlatformOp):
             0, block_tables.shape[-1], page_size, device="cuda"
         )
         block_tables = block_tables[:, strided_indices] // page_size
+        # NOTE: During CUDA-graph capture and for padded rows, req_to_token_pool entries
+        # can contain -1. The index-K gather kernels do not mask negative page indices,
+        # so clamp to a valid page to avoid illegal memory access.
+        block_tables = block_tables.clamp(min=0)
 
         q_len_start = 0
 
         for i in range(forward_batch.batch_size):
-            seq_len = forward_batch.seq_lens[i].item()
+            # NOTE: CUDA graph capture forbids GPU->CPU syncs like `.item()` on CUDA
+            # tensors. For graph-safe decode, we rely on the optional CPU copy of
+            # sequence lengths that ForwardBatch can carry.
+            if forward_batch.seq_lens_cpu is not None:
+                seq_len = int(forward_batch.seq_lens_cpu[i].item())
+            else:
+                if get_is_capture_mode():
+                    raise RuntimeError(
+                        "NSA indexer requires ForwardBatch.seq_lens_cpu during CUDA-graph capture "
+                        "(avoid seq_lens[i].item() on CUDA)."
+                    )
+                seq_len = int(forward_batch.seq_lens[i].item())
             q_len = (
                 forward_batch.extend_seq_lens_cpu[i]
                 if forward_batch.forward_mode.is_extend()
@@ -903,8 +964,29 @@ class Indexer(MultiPlatformOp):
                 k_fp8,
                 k_scale,
             )
-            end_pos = seq_len
-            topk_indices = index_score.topk(min(topk, end_pos), dim=-1)[1].squeeze(0)
+            # NOTE: A naive token-level `topk` over the full seq_len axis triggers an
+            # expensive radix sort (see `radixSortKVInPlace`) and dominates decode time
+            # at long context. For paged KV decode, we only need to identify the top pages
+            # (each page covers `page_size` tokens). We score each page by max token score
+            # and then expand selected pages back into token indices.
+            #
+            # This produces a deterministic "top pages" token set of size pages_out*page_size
+            # (typically 2048) and avoids a topk over ~65k.
+            pages_out = (topk + page_size - 1) // page_size
+            scores = index_score.squeeze(0)
+            if scores.dim() == 2:
+                # (q_len, seq_len) -> use last query row (decode q_len==1)
+                scores = scores[-1]
+            # Clamp to actual sequence length.
+            scores = scores[:seq_len]
+            n_pages = (seq_len + page_size - 1) // page_size
+            pad = n_pages * page_size - seq_len
+            if pad:
+                scores = torch.nn.functional.pad(scores, (0, pad), "constant", float("-inf"))
+            page_scores = scores.view(n_pages, page_size).amax(dim=1)
+            top_pages = page_scores.topk(min(pages_out, n_pages), dim=-1)[1].to(torch.int64)
+            page_offsets = torch.arange(page_size, device=top_pages.device, dtype=torch.int64)
+            topk_indices = (top_pages.unsqueeze(1) * page_size + page_offsets.unsqueeze(0)).reshape(-1)
 
             pad_len = ceil_align(topk_indices.shape[-1], 2048) - topk_indices.shape[-1]
             topk_indices = torch.nn.functional.pad(
@@ -921,7 +1003,7 @@ class Indexer(MultiPlatformOp):
     def forward_cuda(
         self,
         x: torch.Tensor,
-        q_lora: torch.Tensor,
+        q_lora: Optional[torch.Tensor],
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         layer_id: int,
@@ -946,8 +1028,8 @@ class Indexer(MultiPlatformOp):
         enable_dual_stream = (
             self.alt_stream is not None
             and get_is_capture_mode()
-            and q_lora.shape[0] > 0
-            and q_lora.shape[0] <= DUAL_STREAM_TOKEN_THRESHOLD
+            and x_meta.shape[0] > 0
+            and x_meta.shape[0] <= DUAL_STREAM_TOKEN_THRESHOLD
         )
 
         # skip NSA if attention backend choose to skip this batch
@@ -1050,6 +1132,11 @@ class Indexer(MultiPlatformOp):
             index_k=k_fp8,
             index_k_scale=k_scale,
         )
+
+        # GPT-OSS extend/prefill uses the indexer to populate index-K cache only.
+        # Respect return_indices=False for the full CUDA path too, not just the short-sequence fast path.
+        if not return_indices:
+            return None
 
         if _is_cuda or _is_hip:
             assert forward_batch.seq_lens_cpu is not None

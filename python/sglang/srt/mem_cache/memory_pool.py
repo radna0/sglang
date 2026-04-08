@@ -1883,6 +1883,163 @@ class NSATokenToKVPool(MLATokenToKVPool):
         return kv_size_bytes
 
 
+class NSAMHATokenToKVPool(MHATokenToKVPool):
+    """
+    NSA/DSA-compatible KV pool for MHA/GQA models.
+
+    Stores standard MHA/GQA K/V caches (inherited from MHATokenToKVPool) plus an
+    additional per-layer index-K-with-scale buffer for the Lightning Indexer.
+    """
+
+    quant_block_size = 128
+    index_k_with_scale_buffer_dtype = torch.uint8
+
+    def __init__(
+        self,
+        size: int,
+        page_size: int,
+        dtype: torch.dtype,
+        head_num: int,
+        head_dim: int,
+        layer_num: int,
+        device: str,
+        enable_memory_saver: bool,
+        *,
+        index_head_dim: int,
+        v_head_dim: Optional[int] = None,
+        start_layer: Optional[int] = None,
+        end_layer: Optional[int] = None,
+        enable_alt_stream: bool = True,
+        enable_kv_cache_copy: bool = False,
+    ):
+        self.index_head_dim = index_head_dim
+        self.nsa_kv_cache_store_fp8 = False
+        # The parent KV pool constructor calls get_kv_size_bytes() while finishing allocation logs.
+        # Seed the attribute up front so the override is safe before the real index-K buffers exist.
+        self.index_k_with_scale_buffer = []
+
+        super().__init__(
+            size=size,
+            page_size=page_size,
+            dtype=dtype,
+            head_num=head_num,
+            head_dim=head_dim,
+            layer_num=layer_num,
+            device=device,
+            enable_memory_saver=enable_memory_saver,
+            v_head_dim=v_head_dim,
+            start_layer=start_layer,
+            end_layer=end_layer,
+            enable_alt_stream=enable_alt_stream,
+            enable_kv_cache_copy=enable_kv_cache_copy,
+        )
+
+        assert self.index_head_dim == 128, "NSA index_k currently assumes index_head_dim=128"
+        if _is_hip:
+            assert self.page_size == 1
+        else:
+            assert (
+                self.page_size == 64
+            ), "NSA index_k buffer currently assumes page_size=64"
+
+        with (
+            torch.cuda.use_mem_pool(self.custom_mem_pool)
+            if self.enable_custom_mem_pool
+            else nullcontext()
+        ):
+            self.index_k_with_scale_buffer = [
+                torch.zeros(
+                    (
+                        (size + page_size + 1) // self.page_size,
+                        self.page_size
+                        * (
+                            self.index_head_dim
+                            + self.index_head_dim // self.quant_block_size * 4
+                        ),
+                    ),
+                    dtype=self.index_k_with_scale_buffer_dtype,
+                    device=device,
+                )
+                for _ in range(layer_num)
+            ]
+
+        # Update mem usage to include index-K buffer (MHATokenToKVPool already logged K/V).
+        kv_size_bytes = self.get_kv_size_bytes()
+        if isinstance(kv_size_bytes, tuple):
+            k_size, v_size = kv_size_bytes
+            self.mem_usage = (k_size + v_size) / GB
+        else:
+            self.mem_usage = kv_size_bytes / GB
+
+    def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+        return self.index_k_with_scale_buffer[layer_id - self.start_layer]
+
+    def get_index_k_continuous(
+        self,
+        layer_id: int,
+        seq_len: int,
+        page_indices: torch.Tensor,
+    ):
+        buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
+        return index_buf_accessor.GetK.execute(
+            self, buf, seq_len=seq_len, page_indices=page_indices
+        )
+
+    def get_index_k_scale_continuous(
+        self,
+        layer_id: int,
+        seq_len: int,
+        page_indices: torch.Tensor,
+    ):
+        buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
+        return index_buf_accessor.GetS.execute(
+            self, buf, seq_len=seq_len, page_indices=page_indices
+        )
+
+    def get_index_k_scale_buffer(
+        self,
+        layer_id: int,
+        seq_len: int,
+        page_indices: torch.Tensor,
+    ):
+        buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
+        return index_buf_accessor.GetKAndS.execute(
+            self, buf, seq_len=seq_len, page_indices=page_indices
+        )
+
+    def set_index_k_scale_buffer(
+        self,
+        layer_id: int,
+        loc: torch.Tensor,
+        index_k: torch.Tensor,
+        index_k_scale: torch.Tensor,
+    ) -> None:
+        buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
+        index_buf_accessor.SetKAndS.execute(
+            pool=self, buf=buf, loc=loc, index_k=index_k, index_k_scale=index_k_scale
+        )
+
+    def get_state_buf_infos(self):
+        data_ptrs = [
+            self.index_k_with_scale_buffer[i].data_ptr() for i in range(self.layer_num)
+        ]
+        data_lens = [
+            self.index_k_with_scale_buffer[i].nbytes for i in range(self.layer_num)
+        ]
+        item_lens = [
+            self.index_k_with_scale_buffer[i][0].nbytes for i in range(self.layer_num)
+        ]
+        return data_ptrs, data_lens, item_lens
+
+    def get_kv_size_bytes(self):
+        k_size_bytes, v_size_bytes = super().get_kv_size_bytes()
+        for index_k_cache in self.index_k_with_scale_buffer:
+            k_size_bytes += get_tensor_size_bytes(index_k_cache)
+        return k_size_bytes, v_size_bytes
+
+
 class DoubleSparseTokenToKVPool(KVCache):
     def __init__(
         self,

@@ -460,6 +460,17 @@ class ServerArgs:
     nsa_decode_backend: Optional[str] = (
         None  # auto-detect based on hardware/kv_cache_dtype
     )
+    # GPT-OSS native GQA DSA (DeepSeek-style Lightning Indexer + sparse top-k attention)
+    enable_gpt_oss_gqa_dsa: bool = False
+    gpt_oss_dsa_index_topk: int = 2048
+    gpt_oss_dsa_topk_source: str = "indexer"  # indexer | recent
+    gpt_oss_dsa_index_head_dim: int = 128
+    gpt_oss_dsa_index_n_heads: Optional[int] = None  # None = auto (use model num heads)
+    gpt_oss_dsa_q_lora_rank: Optional[int] = None  # None = auto (use model hidden size)
+    gpt_oss_dsa_rope_head_dim: Optional[int] = None  # None = auto (use model head_dim)
+    gpt_oss_dsa_index_block_size: int = 128
+    gpt_oss_dsa_scale_fmt: str = "ue8m0"
+    gpt_oss_dsa_fp8_query_mode: str = "bf16"  # bf16 | fp8
     disable_flashinfer_autotune: bool = False
     mamba_backend: str = "triton"
 
@@ -1333,14 +1344,24 @@ class ServerArgs:
         elif model_arch in ["GptOssForCausalLM"]:
             # Set attention backend for GPT-OSS
             if self.is_attention_backend_not_set():
-                if is_sm100_supported():
-                    self.attention_backend = "trtllm_mha"
-                elif is_sm90_supported():
-                    self.attention_backend = "fa3"
+                if self.enable_gpt_oss_gqa_dsa:
+                    # Default to the proven FA3 lane; the native NSA lane can be selected explicitly.
+                    self.attention_backend = "fa3" if is_sm90_supported() else "triton"
+                    logger.info(
+                        "GPT-OSS GQA DSA enabled: defaulting attention backend to "
+                        f"{self.attention_backend}."
+                    )
                 else:
-                    self.attention_backend = "triton"
+                    if is_sm100_supported():
+                        self.attention_backend = "trtllm_mha"
+                    elif is_sm90_supported():
+                        self.attention_backend = "fa3"
+                    else:
+                        self.attention_backend = "triton"
 
             supported_backends = ["triton", "trtllm_mha", "fa3", "fa4", "ascend"]
+            if self.enable_gpt_oss_gqa_dsa:
+                supported_backends.append("nsa")
             prefill_attn_backend, decode_attn_backend = self.get_attention_backends()
             assert (
                 prefill_attn_backend in supported_backends
@@ -1350,6 +1371,92 @@ class ServerArgs:
                 f"- Prefill: {prefill_attn_backend}\n"
                 f"- Decode: {decode_attn_backend}\n"
             )
+
+            if self.enable_gpt_oss_gqa_dsa:
+                allowed_dsa_backends = {"fa3", "nsa"}
+                assert (
+                    prefill_attn_backend in allowed_dsa_backends
+                    and decode_attn_backend in allowed_dsa_backends
+                ), (
+                    "GPT-OSS GQA DSA currently supports attention_backend in "
+                    f"{sorted(allowed_dsa_backends)} only. "
+                    f"Got prefill={prefill_attn_backend}, decode={decode_attn_backend}."
+                )
+                if envs.SGLANG_NSA_FUSE_TOPK.get():
+                    envs.SGLANG_NSA_FUSE_TOPK.set(False)
+                    logger.warning(
+                        "Disabling SGLANG_NSA_FUSE_TOPK for GPT-OSS GQA DSA "
+                        "(needs raw topk indices for sparse decode)."
+                    )
+                # Index-k buffer requires page_size=64 on CUDA and bf16 KV cache.
+                if is_hip():
+                    self.page_size = 1
+                    logger.warning(
+                        "Setting page size to 1 for GPT-OSS GQA DSA on ROCm."
+                    )
+                else:
+                    self.page_size = 64
+                    logger.warning("Setting page size to 64 for GPT-OSS GQA DSA.")
+
+                # KV cache dtype constraints:
+                # - never use fp16 for KV cache (quality/perf issues).
+                # - `topk_source=indexer` requires bf16 KV cache for the index-K buffer path.
+                # - `topk_source=recent` is a debug lane and can optionally run with fp8 KV
+                #   cache to test throughput; keep user choice if explicitly set.
+                if self.kv_cache_dtype in ["fp16", "float16"]:
+                    self.kv_cache_dtype = "bfloat16"
+                    logger.warning(
+                        "GPT-OSS GQA DSA does not support fp16 KV cache; setting --kv-cache-dtype=bfloat16."
+                    )
+                if self.kv_cache_dtype == "bf16":
+                    self.kv_cache_dtype = "bfloat16"
+
+                if (
+                    prefill_attn_backend == "nsa" or decode_attn_backend == "nsa"
+                ) and self.kv_cache_dtype == "auto":
+                    self.kv_cache_dtype = "bfloat16"
+                    logger.warning(
+                        "GPT-OSS GQA DSA on attention_backend='nsa' defaults to --kv-cache-dtype=bfloat16."
+                    )
+
+                if self.gpt_oss_dsa_topk_source == "indexer":
+                    if self.kv_cache_dtype in ["auto"]:
+                        self.kv_cache_dtype = "bfloat16"
+                        logger.warning(
+                            "GPT-OSS GQA DSA (topk_source=indexer) requires bfloat16 KV cache; setting --kv-cache-dtype=bfloat16."
+                        )
+                    # NOTE: The index-K side buffer is always fp8 and is independent of
+                    # the main KV cache dtype. We allow fp8 KV cache for throughput
+                    # benchmarking (and future optimization), but keep bf16 as the safe
+                    # default.
+                    if self.kv_cache_dtype not in [
+                        "bfloat16",
+                        "bf16",
+                        "fp8_e4m3",
+                        "fp8",
+                    ]:
+                        raise AssertionError(
+                            "GPT-OSS GQA DSA (topk_source=indexer) currently supports "
+                            "bfloat16/bf16 and experimental fp8 KV cache "
+                            f"but got {self.kv_cache_dtype!r}."
+                        )
+                    if self.kv_cache_dtype in ["fp8_e4m3", "fp8"]:
+                        logger.warning(
+                            "GPT-OSS GQA DSA (topk_source=indexer) with fp8 KV cache is experimental."
+                        )
+                elif prefill_attn_backend == "nsa" or decode_attn_backend == "nsa":
+                    assert self.kv_cache_dtype in [
+                        "bfloat16",
+                        "bf16",
+                    ], (
+                        "GPT-OSS GQA DSA on attention_backend='nsa' currently requires bf16/bfloat16 KV cache "
+                        f"but got {self.kv_cache_dtype!r}."
+                    )
+
+                assert self.gpt_oss_dsa_fp8_query_mode in ["bf16", "fp8"], (
+                    "GPT-OSS DSA fp8 query mode must be 'bf16' or 'fp8', "
+                    f"but got {self.gpt_oss_dsa_fp8_query_mode!r}."
+                )
 
             if (
                 prefill_attn_backend == "trtllm_mha"
@@ -1390,7 +1497,7 @@ class ServerArgs:
                 elif (
                     self.ep_size == 1
                     and is_triton_kernels_available()
-                    and self.quantization is None
+                    and (self.quantization is None or self.quantization == "mxfp4")
                 ):
                     self.moe_runner_backend = "triton_kernel"
                     logger.warning(
@@ -3881,6 +3988,72 @@ class ServerArgs:
             type=str,
             choices=NSA_CHOICES,
             help="NSA decode backend. If not specified, auto-detects based on hardware and kv_cache_dtype.",
+        )
+        parser.add_argument(
+            "--enable-gpt-oss-gqa-dsa",
+            default=ServerArgs.enable_gpt_oss_gqa_dsa,
+            action="store_true",
+            help="Enable GPT-OSS native GQA DSA (DeepSeek-style Lightning Indexer + sparse top-k attention).",
+        )
+        parser.add_argument(
+            "--gpt-oss-dsa-index-topk",
+            type=int,
+            default=ServerArgs.gpt_oss_dsa_index_topk,
+            help="Top-k tokens to attend for GPT-OSS DSA full-attention layers.",
+        )
+        parser.add_argument(
+            "--gpt-oss-dsa-topk-source",
+            type=str,
+            default=ServerArgs.gpt_oss_dsa_topk_source,
+            choices=["indexer", "recent"],
+            help=(
+                "How GPT-OSS DSA produces topk indices. "
+                "'indexer' uses the DeepSeek-style Lightning Indexer; "
+                "'recent' uses a deterministic recent-window topk (speed debugging only)."
+            ),
+        )
+        parser.add_argument(
+            "--gpt-oss-dsa-index-head-dim",
+            type=int,
+            default=ServerArgs.gpt_oss_dsa_index_head_dim,
+            help="Indexer head dim for GPT-OSS DSA (DeepSeek uses 128).",
+        )
+        parser.add_argument(
+            "--gpt-oss-dsa-index-n-heads",
+            type=int,
+            default=ServerArgs.gpt_oss_dsa_index_n_heads,
+            help="Indexer number of heads for GPT-OSS DSA. Default (None) uses model attention heads.",
+        )
+        parser.add_argument(
+            "--gpt-oss-dsa-q-lora-rank",
+            type=int,
+            default=ServerArgs.gpt_oss_dsa_q_lora_rank,
+            help="Indexer q_lora_rank for GPT-OSS DSA. Default (None) uses model hidden size.",
+        )
+        parser.add_argument(
+            "--gpt-oss-dsa-rope-head-dim",
+            type=int,
+            default=ServerArgs.gpt_oss_dsa_rope_head_dim,
+            help="Indexer rope_head_dim for GPT-OSS DSA. Default (None) uses model head_dim.",
+        )
+        parser.add_argument(
+            "--gpt-oss-dsa-index-block-size",
+            type=int,
+            default=ServerArgs.gpt_oss_dsa_index_block_size,
+            help="Activation quantization block size for GPT-OSS DSA indexer.",
+        )
+        parser.add_argument(
+            "--gpt-oss-dsa-scale-fmt",
+            type=str,
+            default=ServerArgs.gpt_oss_dsa_scale_fmt,
+            help="Scale format used by GPT-OSS DSA indexer quantization (DeepSeek uses 'ue8m0').",
+        )
+        parser.add_argument(
+            "--gpt-oss-dsa-fp8-query-mode",
+            type=str,
+            default=ServerArgs.gpt_oss_dsa_fp8_query_mode,
+            choices=["bf16", "fp8"],
+            help="Query dtype mode for GPT-OSS DSA when using FP8 KV cache.",
         )
         parser.add_argument(
             "--fp8-gemm-backend",

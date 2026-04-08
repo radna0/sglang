@@ -55,6 +55,11 @@ class GetK:
         # can handle per 128B instead of per element
 
         # page_indices: (num_pages,), element := a page index
+        # NOTE: During CUDA-graph capture/padding, callers may pass -1 page indices for
+        # invalid tokens. Clamp here to avoid negative indexing into flat_buf.
+        if page_indices.dtype != torch.int32:
+            page_indices = page_indices.to(torch.int32)
+        page_indices = torch.clamp(page_indices, min=0)
         buf_numel_per_page = buf.shape[1]
 
         num_k_bytes_per_page = pool.page_size * pool.index_head_dim
@@ -130,6 +135,11 @@ class GetS:
         s_offset_in_page = pool.page_size * pool.index_head_dim
 
         flat_buf = buf.flatten()
+        # NOTE: During CUDA-graph capture/padding, callers may pass -1 page indices for
+        # invalid tokens. Clamp here to avoid negative indexing into flat_buf.
+        if page_indices.dtype != torch.int32:
+            page_indices = page_indices.to(torch.int32)
+        page_indices = torch.clamp(page_indices, min=0)
         flat_indices = (
             (page_indices * buf_numel_per_page)[:, None]
             + torch.arange(num_s_bytes_per_page, dtype=torch.int32, device="cuda")[
@@ -502,6 +512,10 @@ def _get_k_triton_kernel(
 
     # Load the page index from page_indices
     page_index = tl.load(page_indices_ptr + page_idx)
+    # NOTE: During CUDA-graph capture/padding, page_indices can contain -1. Clamp to a
+    # valid page to avoid illegal memory access. The corresponding tokens are masked
+    # out by attention seqlens; the actual value does not matter as long as it's in-bounds.
+    page_index = tl.where(page_index < 0, 0, page_index)
 
     # Calculate source offset in buf
     # buf[page_index, token_offset_in_page * index_head_dim : ...]
@@ -579,6 +593,8 @@ def _get_s_triton_kernel(
 
     # Load the page index from page_indices
     page_index = tl.load(page_indices_ptr + page_idx)
+    # See _get_k_triton_kernel: clamp -1 padded pages during CUDA graph capture.
+    page_index = tl.where(page_index < 0, 0, page_index)
 
     # Calculate source offset in buf
     # Scales are stored after K data: page_size * index_head_dim offset
@@ -667,6 +683,8 @@ def _get_k_and_s_triton_kernel(
 
     # Load the page index from page_indices
     page_index = tl.load(page_indices_ptr + page_idx)
+    # See _get_k_triton_kernel: clamp -1 padded pages during CUDA graph capture.
+    page_index = tl.where(page_index < 0, 0, page_index)
 
     # ===== Load K data (128 bytes) =====
     # Calculate source offset for K in buf

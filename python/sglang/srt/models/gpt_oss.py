@@ -15,6 +15,7 @@
 
 """Inference-only GptOss model compatible with HuggingFace weights."""
 
+import os
 import logging
 import math
 from collections.abc import Iterable
@@ -60,8 +61,10 @@ from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.moe.utils import filter_moe_weight_param_global_expert
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.fp8_utils import dequant_mxfp4
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.layers.attention.nsa.nsa_indexer import Indexer
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -69,6 +72,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.utils import (
     create_fused_set_kv_buffer_arg,
@@ -300,6 +304,47 @@ class GptOssAttention(nn.Module):
             rope_scaling=rope_scaling,
         )
 
+        server_args = get_global_server_args()
+        self.enable_gqa_dsa = (
+            server_args.enable_gpt_oss_gqa_dsa and layer_type == "full_attention"
+        )
+        self.indexer = None
+        if self.enable_gqa_dsa and server_args.gpt_oss_dsa_topk_source == "indexer":
+            index_n_heads = (
+                server_args.gpt_oss_dsa_index_n_heads
+                if server_args.gpt_oss_dsa_index_n_heads is not None
+                else self.num_heads
+            )
+            q_lora_rank = (
+                server_args.gpt_oss_dsa_q_lora_rank
+                if server_args.gpt_oss_dsa_q_lora_rank is not None
+                else min(self.q_size, 1536)
+            )
+            rope_head_dim = (
+                server_args.gpt_oss_dsa_rope_head_dim
+                if server_args.gpt_oss_dsa_rope_head_dim is not None
+                else self.head_dim
+            )
+            self.indexer = Indexer(
+                hidden_size=hidden_size,
+                index_n_heads=index_n_heads,
+                index_head_dim=server_args.gpt_oss_dsa_index_head_dim,
+                rope_head_dim=rope_head_dim,
+                index_topk=server_args.gpt_oss_dsa_index_topk,
+                q_lora_rank=q_lora_rank,
+                max_position_embeddings=max_position_embeddings,
+                rope_theta=rope_theta,
+                layer_id=layer_id,
+                scale_fmt=server_args.gpt_oss_dsa_scale_fmt,
+                block_size=server_args.gpt_oss_dsa_index_block_size,
+                rope_scaling=rope_scaling,
+                is_neox_style=True,
+                prefix=add_prefix("indexer", prefix),
+                quant_config=Fp8Config(
+                    is_checkpoint_fp8_serialized=True, activation_scheme="dynamic"
+                ),
+            )
+
         assert layer_type in {"sliding_attention", "full_attention"}
         use_sliding_window = layer_type == "sliding_attention"
         self.attn = RadixAttention(
@@ -324,6 +369,71 @@ class GptOssAttention(nn.Module):
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
+        topk_indices = None
+        gpt_oss_dsa_recent = False
+        if (
+            self.enable_gqa_dsa
+            and get_global_server_args().gpt_oss_dsa_topk_source == "recent"
+            and forward_batch.forward_mode.is_decode_or_idle()
+            and q.shape[0] > 0
+        ):
+            topk = int(get_global_server_args().gpt_oss_dsa_index_topk)
+            seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
+            if seq_lens_cpu is not None:
+                # Enforce: disable DSA when the context length is <= topk.
+                if int(seq_lens_cpu.max().item()) > topk:
+                    # IMPORTANT: `recent` is decode-only and does not require token-level
+                    # indices. We pass an explicit flag instead of a fake sentinel tensor so
+                    # the backend can enter the sparse recent-window path without per-layer
+                    # tensor allocation.
+                    gpt_oss_dsa_recent = True
+        elif self.indexer is not None and q.shape[0] > 0:
+            if forward_batch.forward_mode.is_extend_without_speculative():
+                # Prefill/extend: populate index-K cache only (no top-k indices needed).
+                _ = self.indexer(
+                    x=hidden_states,
+                    q_lora=None,
+                    positions=positions,
+                    forward_batch=forward_batch,
+                    layer_id=self.layer_id,
+                    return_indices=False,
+                )
+            elif forward_batch.forward_mode.is_decode_or_idle():
+                # IMPORTANT: When CUDA graphs are enabled, this function executes under
+                # stream capture during server init. Any Python truthiness check on a
+                # CUDA tensor (e.g. `not torch.any(...)`) triggers an implicit `.item()`
+                # sync and can hard-fail capture with:
+                #   CUDA error: operation not permitted when stream is capturing
+                #
+                # Use the optional CPU copy of seq lens to decide if DSA is a no-op.
+                topk = int(get_global_server_args().gpt_oss_dsa_index_topk)
+                seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
+                if seq_lens_cpu is not None and seq_lens_cpu.numel() > 0:
+                    max_seq_len = int(seq_lens_cpu[: q.shape[0]].max().item())
+                    # If everything is short, DSA provides no benefit. We only take this
+                    # branch when NOT capturing, because CUDA graphs require a stable
+                    # execution path across replays.
+                    if (not get_is_capture_mode()) and max_seq_len <= topk:
+                        topk_indices = None
+                    else:
+                        topk_indices = self.indexer(
+                            x=hidden_states,
+                            q_lora=None,
+                            positions=positions,
+                            forward_batch=forward_batch,
+                            layer_id=self.layer_id,
+                        )
+                else:
+                    # Fallback: assume DSA is needed (safe for capture; correctness-wise
+                    # attention backend will still clamp indices to seqlens).
+                    topk_indices = self.indexer(
+                        x=hidden_states,
+                        q_lora=None,
+                        positions=positions,
+                        forward_batch=forward_batch,
+                        layer_id=self.layer_id,
+                    )
+
         extra_args = {}
         if not _is_npu:
             extra_args = {
@@ -338,17 +448,23 @@ class GptOssAttention(nn.Module):
                 ),
             }
         q, k = self.rotary_emb(positions, q, k, **extra_args)
-        inner_state = q, k, v, forward_batch
+        inner_state = q, k, v, forward_batch, topk_indices, gpt_oss_dsa_recent
         return None, forward_batch, inner_state
 
     def forward_core(self, intermediate_state):
         hidden_states, forward_batch, inner_state = intermediate_state
         if inner_state is None:
             return hidden_states
+        q, k, v, forward_batch, topk_indices, gpt_oss_dsa_recent = inner_state
         attn_output = self.attn(
-            *inner_state,
+            q,
+            k,
+            v,
+            forward_batch,
             sinks=self.sinks,
             save_kv_cache=not enable_fused_set_kv_buffer(forward_batch),
+            gpt_oss_dsa_recent=gpt_oss_dsa_recent,
+            **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
         )
         output, _ = self.o_proj(attn_output)
         return output
@@ -1105,6 +1221,72 @@ class GptOssForCausalLM(nn.Module):
                             weight_loader(param, loaded_weight)
                     else:
                         logger.warning(f"Parameter {name} not found in params_dict")
+
+        # Optional: load an external indexer-only state dict (DSA) after the base
+        # checkpoint is loaded. This is the hook for "covariance initialization":
+        # we can generate indexer weights from CARE covariance once and reuse them.
+        self._maybe_load_gpt_oss_dsa_indexer_weights(params_dict)
+
+    def _maybe_load_gpt_oss_dsa_indexer_weights(self, params_dict: dict[str, torch.nn.Parameter]) -> None:
+        path = os.environ.get("SGLANG_GPT_OSS_DSA_INDEXER_WEIGHTS", "").strip()
+        if not path:
+            return
+        if not os.path.exists(path):
+            logger.warning(
+                "SGLANG_GPT_OSS_DSA_INDEXER_WEIGHTS is set but file does not exist: %s",
+                path,
+            )
+            return
+        try:
+            if path.endswith(".safetensors"):
+                from safetensors.torch import load_file
+
+                state = load_file(path)
+            else:
+                state = torch.load(path, map_location="cpu")
+                if isinstance(state, dict) and "state_dict" in state and isinstance(
+                    state["state_dict"], dict
+                ):
+                    state = state["state_dict"]
+
+            if not isinstance(state, dict):
+                raise TypeError(f"Unexpected indexer weights type: {type(state)}")
+
+            loaded = 0
+            skipped = 0
+            for name, w in state.items():
+                if not isinstance(name, str):
+                    continue
+
+                layer_id = get_layer_id(name)
+                if (
+                    layer_id is not None
+                    and hasattr(self.model, "start_layer")
+                    and (
+                        layer_id < self.model.start_layer
+                        or layer_id >= self.model.end_layer
+                    )
+                ):
+                    skipped += 1
+                    continue
+
+                if name not in params_dict:
+                    skipped += 1
+                    continue
+
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, w)
+                loaded += 1
+
+            logger.warning(
+                "Loaded %d external GPT-OSS DSA indexer params from %s (skipped %d).",
+                loaded,
+                path,
+                skipped,
+            )
+        except Exception:
+            logger.exception("Failed to load external GPT-OSS DSA indexer weights from %s", path)
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight

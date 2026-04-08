@@ -10,6 +10,9 @@ import triton.language as tl
 
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.nsa.transform_index import (
+    transform_index_page_table_decode,
+)
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
@@ -60,6 +63,13 @@ class FlashAttentionMetadata:
     page_table: torch.Tensor = None
     # Page table for Sliding Window Attention
     swa_page_table: torch.Tensor = None
+
+    # GPT-OSS GQA DSA (decode-only) cached sparse metadata.
+    # When enabled with topk_source="recent", the sparse page table and cache seqlens
+    # depend only on seq_lens and can be computed once per forward pass and reused
+    # across all full-attention layers.
+    gpt_oss_dsa_page_table: Optional[torch.Tensor] = None
+    gpt_oss_dsa_cache_seqlens_int32: Optional[torch.Tensor] = None
 
     # Encoder metadata
     # Cumulative sequence lengths for encoder key
@@ -744,6 +754,7 @@ class FlashAttentionBackend(AttentionBackend):
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
+        gpt_oss_dsa_recent: bool = False,
     ):
         if k is not None:
             assert v is not None
@@ -921,7 +932,7 @@ class FlashAttentionBackend(AttentionBackend):
                     k_descale=k_descale,
                     v_descale=v_descale,
                     return_softmax_lse=True,
-                    num_splits=self.num_splits,
+                    num_splits=sparse_num_splits,
                     **kwargs,
                 )
                 o, _ = merge_state_v2_wrapper(
@@ -1036,7 +1047,7 @@ class FlashAttentionBackend(AttentionBackend):
                     k_descale=k_descale,
                     v_descale=v_descale,
                     return_softmax_lse=use_cascade_attn,
-                    num_splits=self.num_splits,
+                    num_splits=sparse_num_splits,
                 )
                 if use_cascade_attn:
                     o, softmax_lse, *rest = result
@@ -1084,6 +1095,8 @@ class FlashAttentionBackend(AttentionBackend):
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
+        topk_indices: Optional[torch.Tensor] = None,
+        gpt_oss_dsa_recent: bool = False,
     ) -> torch.Tensor:
         if k is not None:
             assert v is not None
@@ -1137,6 +1150,14 @@ class FlashAttentionBackend(AttentionBackend):
             kwargs["sinks"] = sinks
 
         k_descale, v_descale = None, None
+        server_args = get_global_server_args()
+        sparse_gpt_oss_dsa_decode = (
+            (not self.use_mla)
+            and (topk_indices is not None or gpt_oss_dsa_recent)
+            and server_args.enable_gpt_oss_gqa_dsa
+            and forward_batch.forward_mode.is_decode_or_idle()
+        )
+        sparse_num_splits = 1 if sparse_gpt_oss_dsa_decode else self.num_splits
         # only use kv scaling if: 1) fp8 kv is explicitly enabled, 2) RadixAttention
         # has corresponding quantization method so that layer.k_scale is not None,
         # 3) layer.head_dim <= 256 since fa3 kernel require fp16 and bf16 data type in this case.
@@ -1145,11 +1166,195 @@ class FlashAttentionBackend(AttentionBackend):
                 descale_shape = (forward_batch.batch_size, layer.tp_k_head_num)
                 k_descale = layer.k_scale.expand(descale_shape)
                 v_descale = layer.v_scale.expand(descale_shape)
-            q = q.to(self.kv_cache_dtype)
-            q_rope = q_rope.to(self.kv_cache_dtype) if q_rope is not None else None
-            k_rope = k_rope.to(self.kv_cache_dtype) if k_rope is not None else None
+            # GPT-OSS sparse decode can either preserve bf16 queries or cast queries to
+            # FP8 to match dense FP8 decode. Expose the choice as a server flag so we can
+            # benchmark the actual serving path instead of relying on assumptions.
+            sparse_fp8_query_mode = getattr(
+                server_args, "gpt_oss_dsa_fp8_query_mode", "bf16"
+            )
+            if (not sparse_gpt_oss_dsa_decode) or sparse_fp8_query_mode == "fp8":
+                if q.dtype != self.kv_cache_dtype:
+                    q = q.to(self.kv_cache_dtype)
+                if q_rope is not None and q_rope.dtype != self.kv_cache_dtype:
+                    q_rope = q_rope.to(self.kv_cache_dtype)
+                if k_rope is not None and k_rope.dtype != self.kv_cache_dtype:
+                    k_rope = k_rope.to(self.kv_cache_dtype)
         if not self.use_mla:
             # Do multi-head attention
+            if topk_indices is not None or gpt_oss_dsa_recent:
+                # Sparse decode: attend to per-token top-k indices only (GPT-OSS GQA DSA).
+                assert forward_batch.forward_mode.is_decode_or_idle(), (
+                    "GPT-OSS GQA DSA topk_indices are decode-only; "
+                    f"got forward_mode={forward_batch.forward_mode}"
+                )
+                assert (
+                    forward_batch.seq_lens_cpu is not None
+                ), "topk_indices requires seq_lens_cpu"
+                assert (
+                    not layer.is_cross_attention
+                ), "topk_indices is only supported for self-attention"
+
+                bs = forward_batch.batch_size
+                if bs == 0:
+                    return q.new_empty((0, layer.tp_q_head_num * layer.v_head_dim))
+
+                req_pool_indices = forward_batch.req_pool_indices
+
+                if topk_indices is not None and topk_indices.shape[0] != bs:
+                    topk_indices = topk_indices[:bs]
+
+                seq_lens = forward_batch.seq_lens.to(dtype=torch.int64)[:bs]  # (bs,)
+                if server_args.gpt_oss_dsa_topk_source == "recent":
+                    # `recent` lane does not require token-level indices.
+                    topk = int(server_args.gpt_oss_dsa_index_topk)
+                    idx_i32 = None
+                else:
+                    idx = topk_indices.to(torch.int64)
+                    if idx.dim() == 1:
+                        idx = idx.view(bs, 1)
+                    topk = int(idx.shape[1])
+
+                    # Canonicalize token-topk indices: keep -1 padding; clamp out-of-range to -1.
+                    seq_lens_i64 = seq_lens.view(bs, 1)
+                    valid_topk_mask = (idx >= 0) & (idx < seq_lens_i64)
+                    idx_i32 = torch.where(
+                        valid_topk_mask, idx, torch.full_like(idx, -1)
+                    ).to(torch.int32)
+                q_reshaped = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+                pages_out = (topk + self.page_size - 1) // self.page_size
+                # NOTE: Do NOT cache sparse page tables across layers for the indexer lane.
+                # Each layer has its own indexer and therefore its own selected pages.
+                #
+                # For `topk_source=recent`, the window is identical across layers so using
+                # the dense page table path is already optimal (no caching needed here).
+                sparse_page_table = None
+                cache_seqlens_sparse = None
+
+                if server_args.gpt_oss_dsa_topk_source == "recent":
+                    # `recent` is a contiguous suffix. Route it through FA3 local attention
+                    # on the dense page table instead of the generic sparse page-table path.
+                    # This preserves decode semantics for a fixed recent window while using
+                    # the better-optimized local-attention kernel.
+                    recent_window = (topk - 1, 0)
+                else:
+                    # GPT-OSS indexer lane: the Indexer returns token indices that already
+                    # cover whole KV pages (page_size tokens per selected page). Converting
+                    # token indices -> pages via the generic select_topk_pages_decode()
+                    # path is expensive (stable-unique uses per-row sort) and shows up as
+                    # radixSortKVInPlace/topk_kernel overhead in traces.
+                    #
+                    # Fast path: pick the first token index of each page and compute the
+                    # logical page id directly.
+                    idx_page_starts = idx_i32[:, :: self.page_size]  # (bs, pages_out)
+                    valid_pages = idx_page_starts >= 0
+                    logical_pages = torch.where(
+                        valid_pages,
+                        (idx_page_starts.to(torch.int64) // int(self.page_size)).to(
+                            torch.int32
+                        ),
+                        torch.full_like(idx_page_starts, -1, dtype=torch.int32),
+                    )
+                    page_counts = (
+                        valid_pages.sum(dim=1)
+                        .to(torch.int32)
+                        .clamp(min=0, max=pages_out)
+                    )
+
+                    # Place the (possibly partial) last page at the end so cache_seqlens masks correctly.
+                    seq_lens_i32 = seq_lens.to(torch.int32)
+                    last_page = ((seq_lens_i32 - 1).clamp(min=0) // self.page_size).to(torch.int32)
+                    remainder = seq_lens_i32 - last_page * self.page_size
+                    match = logical_pages == last_page.unsqueeze(1)
+                    found = match.any(dim=1)
+                    pos = match.to(torch.int32).argmax(dim=1)
+                    last_valid = (page_counts - 1).clamp(min=0)
+                    row_idx = torch.arange(bs, device=q.device, dtype=torch.int64)
+                    # If the selected pages didn't include the last page, overwrite the last
+                    # slot with the last page so masking and next-token recency are correct.
+                    logical_pages[row_idx, last_valid] = torch.where(
+                        found, logical_pages[row_idx, last_valid], last_page
+                    )
+                    # Now "found" must be true; re-locate last_page and swap it to the end.
+                    match = logical_pages == last_page.unsqueeze(1)
+                    pos = match.to(torch.int32).argmax(dim=1)
+                    pages_tmp = logical_pages[row_idx, last_valid]
+                    pages_pos = logical_pages[row_idx, pos]
+                    logical_pages[row_idx, pos] = torch.where(found, pages_tmp, pages_pos)
+                    logical_pages[row_idx, last_valid] = torch.where(found, pages_pos, pages_tmp)
+
+                    if cache_seqlens_sparse is None:
+                        cache_seqlens_sparse = (page_counts * self.page_size).to(torch.int32)
+                        cache_seqlens_sparse = torch.where(
+                            page_counts > 0,
+                            ((page_counts - 1) * self.page_size + remainder).to(torch.int32),
+                            cache_seqlens_sparse,
+                        )
+
+                key_cache, value_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
+                    layer.layer_id
+                )
+                key_cache = key_cache.view(
+                    -1, self.page_size, layer.tp_k_head_num, layer.head_dim
+                )
+                value_cache = value_cache.view(
+                    -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
+                )
+
+                # `recent` can use the dense page table directly with a local window.
+                if server_args.gpt_oss_dsa_topk_source == "recent":
+                    dense_recent_result = flash_attn_with_kvcache(
+                        q=q_reshaped,
+                        k_cache=key_cache,
+                        v_cache=value_cache,
+                        page_table=metadata.page_table[:bs],
+                        cache_seqlens=metadata.cache_seqlens_int32[:bs],
+                        cu_seqlens_q=metadata.cu_seqlens_q,
+                        max_seqlen_q=1,
+                        softmax_scale=layer.scaling,
+                        causal=True,
+                        window_size=recent_window,
+                        softcap=layer.logit_cap,
+                        k_descale=k_descale,
+                        v_descale=v_descale,
+                        return_softmax_lse=use_cascade_attn,
+                        num_splits=sparse_num_splits,
+                        **kwargs,
+                    )
+                    if use_cascade_attn:
+                        dense_recent_result = dense_recent_result[0]
+                    return dense_recent_result.view(
+                        -1, layer.tp_q_head_num * layer.v_head_dim
+                    )
+
+                # Map logical page ids -> physical page ids via the existing dense page table.
+                if sparse_page_table is None:
+                    full_page_table = metadata.page_table[:bs]
+                    gather_index = logical_pages.clamp(min=0).to(torch.int64)
+                    sparse_page_table = torch.gather(
+                        full_page_table.to(torch.int64), dim=1, index=gather_index
+                    ).to(torch.int32)
+
+                sparse_result = flash_attn_with_kvcache(
+                    q=q_reshaped,
+                    k_cache=key_cache,
+                    v_cache=value_cache,
+                    page_table=sparse_page_table,
+                    cache_seqlens=cache_seqlens_sparse,
+                    cu_seqlens_q=metadata.cu_seqlens_q,
+                    max_seqlen_q=1,
+                    softmax_scale=layer.scaling,
+                    causal=True,
+                    window_size=(-1, -1),
+                    softcap=layer.logit_cap,
+                    k_descale=k_descale,
+                    v_descale=v_descale,
+                    return_softmax_lse=use_cascade_attn,
+                    num_splits=sparse_num_splits,
+                    **kwargs,
+                )
+                if use_cascade_attn:
+                    sparse_result = sparse_result[0]
+                return sparse_result.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
             key_cache, value_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
                 layer.layer_id
@@ -2190,6 +2395,90 @@ class FlashAttentionBackend(AttentionBackend):
     def get_cuda_graph_seq_len_fill_value(self):
         """Get the fill value for sequence length in CUDA graph."""
         return 1
+
+    def get_indexer_metadata(self, layer_id: int, forward_batch: ForwardBatch):
+        server_args = get_global_server_args()
+        if not server_args.enable_gpt_oss_gqa_dsa:
+            return None
+        # Enable indexer metadata for decode (top-k) and extend/prefill (index-K cache only).
+        if not (
+            forward_batch.forward_mode.is_decode_or_idle()
+            or forward_batch.forward_mode.is_extend_without_speculative()
+        ):
+            return None
+
+        from sglang.srt.layers.attention.nsa.nsa_backend_mtp_precompute import (
+            compute_cu_seqlens,
+        )
+        from sglang.srt.layers.attention.nsa.utils import (
+            compute_nsa_seqlens,
+            pad_nsa_cache_seqlens,
+        )
+        from sglang.srt.layers.attention.nsa_backend import (
+            NSAIndexerMetadata,
+            NSAMetadata,
+            TopkTransformMethod,
+        )
+
+        assert forward_batch.seq_lens_cpu is not None
+        device = forward_batch.seq_lens.device
+        batch_size = forward_batch.batch_size
+
+        cache_seqlens_int32 = forward_batch.seq_lens.to(torch.int32)
+        cu_seqlens_k = compute_cu_seqlens(cache_seqlens_int32)
+
+        max_seqlen_k = int(forward_batch.seq_lens_cpu.max().item()) if batch_size else 0
+        page_table_1 = forward_batch.req_to_token_pool.req_to_token[
+            forward_batch.req_pool_indices, :max_seqlen_k
+        ]
+
+        if self.page_size == 1 or max_seqlen_k == 0:
+            real_page_table = page_table_1
+        else:
+            strided_indices = torch.arange(
+                0, max_seqlen_k, self.page_size, device=device, dtype=torch.int32
+            )
+            real_page_table = page_table_1[:, strided_indices] // self.page_size
+
+        nsa_cache_seqlens_int32 = compute_nsa_seqlens(
+            original_seq_lens=cache_seqlens_int32,
+            nsa_index_topk=server_args.gpt_oss_dsa_index_topk,
+        )
+        nsa_cache_seqlens_int32 = pad_nsa_cache_seqlens(
+            forward_batch, nsa_cache_seqlens_int32
+        )
+        nsa_cu_seqlens_k = compute_cu_seqlens(nsa_cache_seqlens_int32)
+        nsa_cu_seqlens_q = torch.arange(
+            0, len(nsa_cu_seqlens_k), dtype=torch.int32, device=device
+        )
+        cu_seqlens_q = torch.arange(0, batch_size + 1, dtype=torch.int32, device=device)
+
+        attn_metadata = NSAMetadata(
+            page_size=self.page_size,
+            cache_seqlens_int32=cache_seqlens_int32,
+            max_seq_len_q=1,
+            max_seq_len_k=max_seqlen_k,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            page_table_1=page_table_1,
+            real_page_table=real_page_table,
+            nsa_cache_seqlens_int32=nsa_cache_seqlens_int32,
+            nsa_cu_seqlens_q=nsa_cu_seqlens_q,
+            nsa_cu_seqlens_k=nsa_cu_seqlens_k,
+            nsa_extend_seq_lens_list=[1] * batch_size,
+            nsa_seqlens_expanded=cache_seqlens_int32,
+            seq_lens_sum=forward_batch.seq_lens_sum,
+            indexer_seq_lens_cpu=forward_batch.seq_lens_cpu.to(torch.int32),
+            token_to_batch_idx=torch.arange(
+                0, batch_size, dtype=torch.int32, device=device
+            ),
+        )
+
+        return NSAIndexerMetadata(
+            attn_metadata=attn_metadata,
+            topk_transform_method=TopkTransformMethod.PAGED,
+            paged_mqa_schedule_metadata=None,
+        )
 
     def _maybe_init_local_attn_metadata(
         self, forwardbatch: ForwardBatch, metadata: FlashAttentionMetadata, device
