@@ -1425,13 +1425,25 @@ class ServerArgs:
                         logger.warning(
                             "GPT-OSS GQA DSA (topk_source=indexer) requires bfloat16 KV cache; setting --kv-cache-dtype=bfloat16."
                         )
-                    assert self.kv_cache_dtype in [
+                    # NOTE: The index-K side buffer is always fp8 and is independent of
+                    # the main KV cache dtype. We allow fp8 KV cache for throughput
+                    # benchmarking (and future optimization), but keep bf16 as the safe
+                    # default.
+                    if self.kv_cache_dtype not in [
                         "bfloat16",
                         "bf16",
-                    ], (
-                        "GPT-OSS GQA DSA (topk_source=indexer) currently requires bf16/bfloat16 KV cache "
-                        f"but got {self.kv_cache_dtype!r}."
-                    )
+                        "fp8_e4m3",
+                        "fp8",
+                    ]:
+                        raise AssertionError(
+                            "GPT-OSS GQA DSA (topk_source=indexer) currently supports "
+                            "bfloat16/bf16 and experimental fp8 KV cache "
+                            f"but got {self.kv_cache_dtype!r}."
+                        )
+                    if self.kv_cache_dtype in ["fp8_e4m3", "fp8"]:
+                        logger.warning(
+                            "GPT-OSS GQA DSA (topk_source=indexer) with fp8 KV cache is experimental."
+                        )
                 elif prefill_attn_backend == "nsa" or decode_attn_backend == "nsa":
                     assert self.kv_cache_dtype in [
                         "bfloat16",
