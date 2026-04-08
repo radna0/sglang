@@ -59,6 +59,13 @@ def _parse_env_int(name: str, default: int) -> int:
         return int(default)
 
 
+def _parse_env_float(name: str, default: float) -> float:
+    try:
+        return float((os.environ.get(name) or str(default)).strip())
+    except Exception:
+        return float(default)
+
+
 def _should_cprofile_verify_step(enabled: bool, step_index: int) -> bool:
     if not enabled:
         return False
@@ -409,6 +416,30 @@ class DFlashWorker:
             )
         self._linear_draft_mode = draft_mode
         self._last_logged_linear_mode: Optional[str] = None
+        self._failfast_enabled = _env_enabled("SGLANG_DFLASH_FAILFAST_ENABLE")
+        self._failfast_conf_threshold = _parse_env_float(
+            "SGLANG_DFLASH_FAILFAST_CONF_THRESHOLD", 0.40
+        )
+        self._failfast_entropy_threshold = _parse_env_float(
+            "SGLANG_DFLASH_FAILFAST_ENTROPY_THRESHOLD", -1.0
+        )
+        self._failfast_step_size = _parse_env_int(
+            "SGLANG_DFLASH_FAILFAST_STEP_SIZE", 4
+        )
+        self._failfast_min_block_size = _parse_env_int(
+            "SGLANG_DFLASH_FAILFAST_MIN_BLOCK_SIZE", 4
+        )
+        self._failfast_log_ct = 0
+        if self._failfast_enabled and self.tp_rank == 0:
+            logger.info(
+                "DFLASH FailFast enabled. tau=%.3f, entropy_threshold=%.3f, "
+                "step_size=%d, min_block_size=%d, max_block_size=%d",
+                self._failfast_conf_threshold,
+                self._failfast_entropy_threshold,
+                self._failfast_step_size,
+                self._failfast_min_block_size,
+                self.block_size,
+            )
 
     # ------------------------------------------------------------------
     #  Helper methods (KV materialization, buffer management, sampling)
@@ -436,6 +467,111 @@ class DFlashWorker:
         if tp_size == 1:
             return "draft=sampled,target=sampled"
         return "draft=greedy,target=sampled"
+
+    def _resolve_failfast_block_candidates(self, max_block_size: int) -> List[int]:
+        max_block_size = max(1, int(max_block_size))
+        min_block_size = max(
+            2, min(max_block_size, int(self._failfast_min_block_size))
+        )
+        step_size = max(1, int(self._failfast_step_size))
+        candidates: List[int] = []
+        current = min_block_size
+        while current < max_block_size:
+            candidates.append(int(current))
+            current += step_size
+        if max_block_size not in candidates:
+            candidates.append(max_block_size)
+        candidates = sorted({int(x) for x in candidates if 1 < int(x) <= max_block_size})
+        return candidates or [max_block_size]
+
+    def _resolve_failfast_logical_block_size(
+        self,
+        *,
+        active_block_size: int,
+        draft_confidence: Optional[torch.Tensor],
+        draft_entropy: Optional[torch.Tensor],
+    ) -> tuple[int, Optional[dict[str, float]]]:
+        active_block_size = max(1, int(active_block_size))
+        if (
+            not self._failfast_enabled
+            or active_block_size <= 1
+            or draft_confidence is None
+            or draft_confidence.numel() == 0
+        ):
+            return active_block_size, None
+
+        q_conf = draft_confidence.to(torch.float32)
+        if q_conf.dim() != 2:
+            q_conf = q_conf.view(q_conf.shape[0], -1)
+        q_conf = q_conf[:, : max(0, active_block_size - 1)]
+        if q_conf.numel() == 0:
+            return active_block_size, None
+
+        q_ent = None
+        if draft_entropy is not None and draft_entropy.numel() > 0:
+            q_ent = draft_entropy.to(torch.float32)
+            if q_ent.dim() != 2:
+                q_ent = q_ent.view(q_ent.shape[0], -1)
+            q_ent = q_ent[:, : q_conf.shape[1]]
+
+        candidates = self._resolve_failfast_block_candidates(active_block_size)
+        logical_block_size = active_block_size
+        prev_width = 1
+        tau = float(self._failfast_conf_threshold)
+        entropy_threshold = float(self._failfast_entropy_threshold)
+        for width in candidates:
+            start_idx = max(0, int(prev_width) - 1)
+            end_idx = max(start_idx, int(width) - 1)
+            chunk_conf = q_conf[:, start_idx:end_idx]
+            chunk_ok = True
+            if chunk_conf.numel() > 0:
+                chunk_ok = bool(torch.all(chunk_conf >= tau).item())
+            if (
+                chunk_ok
+                and q_ent is not None
+                and entropy_threshold >= 0.0
+            ):
+                chunk_ent = q_ent[:, start_idx:end_idx]
+                if chunk_ent.numel() > 0:
+                    chunk_ok = bool(torch.all(chunk_ent <= entropy_threshold).item())
+            logical_block_size = int(width)
+            if not chunk_ok:
+                break
+            prev_width = int(width)
+
+        proposal_width = max(0, logical_block_size - 1)
+        conf_prefix = q_conf[:, :proposal_width]
+        ent_prefix = None if q_ent is None else q_ent[:, :proposal_width]
+        draft_conf_debug: dict[str, float] = {}
+        if conf_prefix.numel() > 0:
+            draft_conf_debug["q_max_mean_first"] = float(conf_prefix.mean().item())
+            draft_conf_debug["q_max_min_first"] = float(conf_prefix.min().item())
+        if ent_prefix is not None and ent_prefix.numel() > 0:
+            draft_conf_debug["q_ent_mean_first"] = float(ent_prefix.mean().item())
+        if not draft_conf_debug:
+            draft_conf_debug = None
+
+        if (
+            logical_block_size < active_block_size
+            and self.tp_rank == 0
+            and self._failfast_log_ct < 20
+        ):
+            self._failfast_log_ct += 1
+            logger.info(
+                "DFLASH FailFast reduced logical verify width: physical_block_size=%s -> logical_block_size=%s "
+                "(tau=%.3f, q_max_mean=%.4f, q_max_min=%.4f)",
+                active_block_size,
+                logical_block_size,
+                tau,
+                float(draft_conf_debug.get("q_max_mean_first"))
+                if draft_conf_debug and "q_max_mean_first" in draft_conf_debug
+                else float("nan"),
+                float(draft_conf_debug.get("q_max_min_first"))
+                if draft_conf_debug and "q_max_min_first" in draft_conf_debug
+                else float("nan"),
+            )
+
+        return logical_block_size, draft_conf_debug
 
     def _init_fused_kv_helper(self) -> None:
         """Initialize fused KV materialization helper (CUDA only)."""
@@ -815,6 +951,9 @@ class DFlashWorker:
         draft_selected_probs = None
         draft_proposal_indices = None
         draft_proposal_probs = None
+        draft_confidence = None
+        draft_entropy = None
+        draft_conf_debug = None
         if active_block_size > 1:
             if block_cache_loc is None or block_end is None or seq_lens_cpu is None:
                 raise RuntimeError(
@@ -938,23 +1077,66 @@ class DFlashWorker:
             support_width = sampled_result.proposal_indices.shape[-1]
             draft_proposal_indices = sampled_result.proposal_indices.view(bs, active_block_size - 1, support_width)
             draft_proposal_probs = sampled_result.proposal_probs.view(bs, active_block_size - 1, support_width)
+            if draft_proposal_probs is not None:
+                draft_confidence = draft_proposal_probs[:, :, 0].to(torch.float32)
+                safe_probs = draft_proposal_probs.to(torch.float32).clamp_min(1e-20)
+                draft_entropy = -(safe_probs * safe_probs.log()).sum(dim=-1)
         else:
-            draft_next = self._greedy_sample_from_vocab_parallel_head(
-                hidden_states=draft_hidden_tail, lm_head=lm_head
-            ).view(bs, active_block_size - 1)
+            greedy_result = self._greedy_sample_from_vocab_parallel_head(
+                hidden_states=draft_hidden_tail,
+                lm_head=lm_head,
+                return_confidence=self._failfast_enabled and active_block_size > 1,
+            )
+            if (
+                self._failfast_enabled
+                and active_block_size > 1
+                and isinstance(greedy_result, tuple)
+            ):
+                draft_next_flat, draft_conf_flat = greedy_result
+                draft_next = draft_next_flat.view(bs, active_block_size - 1)
+                if draft_conf_flat is not None:
+                    draft_confidence = draft_conf_flat.view(bs, active_block_size - 1)
+            else:
+                draft_next = greedy_result.view(bs, active_block_size - 1)
 
         draft_tokens = self._draft_block_tokens_buf[:bs, :active_block_size]
         draft_tokens[:, 0].copy_(block_ids[:, 0])
         draft_tokens[:, 1:].copy_(draft_next)
 
+        logical_block_size = int(active_block_size)
+        if self._failfast_enabled and active_block_size > 1:
+            logical_block_size, draft_conf_debug = self._resolve_failfast_logical_block_size(
+                active_block_size=active_block_size,
+                draft_confidence=draft_confidence,
+                draft_entropy=draft_entropy,
+            )
+        verify_positions_2d = positions_2d[:, :logical_block_size]
+        verify_positions = verify_positions_2d.reshape(-1)
+        verify_draft_tokens = draft_tokens[:, :logical_block_size]
+        verify_selected_probs = (
+            None
+            if draft_selected_probs is None
+            else draft_selected_probs[:, : max(0, logical_block_size - 1)]
+        )
+        verify_proposal_indices = (
+            None
+            if draft_proposal_indices is None
+            else draft_proposal_indices[:, : max(0, logical_block_size - 1), :]
+        )
+        verify_proposal_probs = (
+            None
+            if draft_proposal_probs is None
+            else draft_proposal_probs[:, : max(0, logical_block_size - 1), :]
+        )
+
         verify_input = DFlashVerifyInput(
-            draft_token=draft_tokens.reshape(-1),
-            positions=positions,
-            draft_token_num=active_block_size,
+            draft_token=verify_draft_tokens.reshape(-1),
+            positions=verify_positions,
+            draft_token_num=logical_block_size,
             linear_mode=linear_mode,
-            draft_selected_probs=draft_selected_probs,
-            draft_proposal_indices=draft_proposal_indices,
-            draft_proposal_probs=draft_proposal_probs,
+            draft_selected_probs=verify_selected_probs,
+            draft_proposal_indices=verify_proposal_indices,
+            draft_proposal_probs=verify_proposal_probs,
         )
         _, build_custom_mask = resolve_dflash_verify_mask_policy(self.model_runner.attn_backend)
         verify_input.prepare_for_verify(batch, self.page_size, build_custom_mask=build_custom_mask)
@@ -963,8 +1145,10 @@ class DFlashWorker:
         batch.spec_info = verify_input
         batch.return_hidden_states = False
         draft_input.linear_mode = linear_mode
-        draft_input._active_draft_token_num = int(active_block_size)
-        draft_input._active_step_count = int(max(0, active_block_size - 1))
+        draft_input._active_physical_block_size = int(active_block_size)
+        draft_input._active_draft_token_num = int(logical_block_size)
+        draft_input._active_step_count = int(max(0, logical_block_size - 1))
+        draft_input._draft_conf_debug = draft_conf_debug
         if self.tp_rank == 0 and requested_block_size != active_block_size and active_block_size > 1:
             logger.warning(
                 "DFLASH reduced physical draft width for this batch: requested_block_size=%s -> active_block_size=%s (batch=%s).",
@@ -983,10 +1167,17 @@ class DFlashWorker:
         hidden_states: torch.Tensor,
         lm_head,
         chunk_size: int = 256,
-    ) -> torch.Tensor:
+        return_confidence: bool = False,
+    ) -> Union[torch.Tensor, tuple[torch.Tensor, Optional[torch.Tensor]]]:
         """TP‑safe greedy argmax over the target LM head."""
         if hidden_states.numel() == 0:
-            return torch.empty((0,), dtype=torch.long, device=hidden_states.device)
+            empty_ids = torch.empty((0,), dtype=torch.long, device=hidden_states.device)
+            if return_confidence:
+                empty_conf = torch.empty(
+                    (0,), dtype=torch.float32, device=hidden_states.device
+                )
+                return empty_ids, empty_conf
+            return empty_ids
 
         tp_group = get_tp_group()
         tp_size = tp_group.world_size
@@ -1002,7 +1193,14 @@ class DFlashWorker:
         added_vocab_start = int(shard.added_vocab_start_index)
 
         num_tokens = hidden_states.shape[0]
-        out_token_ids = torch.empty((num_tokens,), dtype=torch.long, device=hidden_states.device)
+        out_token_ids = torch.empty(
+            (num_tokens,), dtype=torch.long, device=hidden_states.device
+        )
+        out_confidences = (
+            torch.empty((num_tokens,), dtype=torch.float32, device=hidden_states.device)
+            if return_confidence
+            else None
+        )
 
         def _cast_hs(x: torch.Tensor) -> torch.Tensor:
             return x if x.dtype == weight_dtype else x.to(weight_dtype)
@@ -1014,9 +1212,19 @@ class DFlashWorker:
                 hs = _cast_hs(hidden_states[start:end])
                 if num_org > 0:
                     logits = torch.matmul(hs, weight[:num_org].T)
-                    out_token_ids[start:end] = torch.argmax(logits, dim=-1).to(torch.long) + org_vocab_start
+                    max_vals, max_ids = torch.max(logits, dim=-1)
+                    out_token_ids[start:end] = max_ids.to(torch.long) + org_vocab_start
+                    if out_confidences is not None:
+                        denom = torch.logsumexp(logits.to(torch.float32), dim=-1)
+                        out_confidences[start:end] = torch.exp(
+                            max_vals.to(torch.float32) - denom
+                        )
                 else:
                     out_token_ids[start:end] = 0
+                    if out_confidences is not None:
+                        out_confidences[start:end] = 0.0
+            if return_confidence:
+                return out_token_ids, out_confidences
             return out_token_ids
 
         # General case with TP>1 or added vocab
@@ -1054,6 +1262,27 @@ class DFlashWorker:
 
             if tp_size == 1:
                 out_token_ids[start:end] = global_ids
+                if out_confidences is not None:
+                    total_logsumexp = None
+                    if num_org > 0:
+                        total_logsumexp = torch.logsumexp(
+                            base_logits.to(torch.float32), dim=-1
+                        )
+                    if num_added > 0:
+                        added_lse = torch.logsumexp(
+                            added_logits.to(torch.float32), dim=-1
+                        )
+                        total_logsumexp = (
+                            added_lse
+                            if total_logsumexp is None
+                            else torch.logaddexp(total_logsumexp, added_lse)
+                        )
+                    if total_logsumexp is None:
+                        out_confidences[start:end] = 0.0
+                    else:
+                        out_confidences[start:end] = torch.exp(
+                            local_max.to(torch.float32) - total_logsumexp
+                        )
                 continue
 
             # TP>1: gather per‑rank maxima and select global max
@@ -1085,6 +1314,8 @@ class DFlashWorker:
                          out=self._draft_greedy_selected_ids_buf[:, :chunk_len])
             out_token_ids[start:end] = self._draft_greedy_selected_ids_buf[0, :chunk_len]
 
+        if return_confidence:
+            return out_token_ids, out_confidences
         return out_token_ids
 
     def _sample_from_vocab_parallel_head_tp1(
@@ -1532,34 +1763,70 @@ class DFlashWorker:
         else:
             step_cuda_start = verify_cuda_start = verify_cuda_end = step_cuda_end = None
 
+        active_physical_block_size = int(
+            getattr(draft_input, "_active_physical_block_size", self.block_size)
+        )
+        active_logical_block_size = int(
+            getattr(draft_input, "_active_draft_token_num", active_physical_block_size)
+        )
+        # TARGET_VERIFY graphs are captured for the configured physical DFlash block.
+        # If this batch either:
+        # 1) shrank the physical draft width due to KV pressure / OOM fallback, or
+        # 2) shrank the logical verify width due to FailFast,
+        # then the replay token count no longer matches the captured graph shape.
+        # In those cases we must run verify eagerly for this batch.
+        disable_target_verify_graph = bool(
+            active_physical_block_size != int(self.block_size)
+            or active_logical_block_size < active_physical_block_size
+        )
+        target_model_runner = self.target_worker.model_runner
+        saved_graph_runner = None
+        saved_piecewise_runner = None
+        if disable_target_verify_graph:
+            saved_graph_runner = target_model_runner.graph_runner
+            saved_piecewise_runner = getattr(
+                target_model_runner, "piecewise_cuda_graph_runner", None
+            )
+            target_model_runner.graph_runner = None
+            if hasattr(target_model_runner, "piecewise_cuda_graph_runner"):
+                target_model_runner.piecewise_cuda_graph_runner = None
+
         t1 = time.perf_counter() if profile_this_step else 0.0
-        if torch_profile_verify_this_step:
-            activities = [ProfilerActivity.CPU]
-            if _device_is_cuda(batch.device):
-                activities.append(ProfilerActivity.CUDA)
-            with torch_profile(
-                activities=activities,
-                record_shapes=False,
-                profile_memory=False,
-                with_stack=False,
-            ) as verify_torch_profile:
+        try:
+            if torch_profile_verify_this_step:
+                activities = [ProfilerActivity.CPU]
+                if _device_is_cuda(batch.device):
+                    activities.append(ProfilerActivity.CUDA)
+                with torch_profile(
+                    activities=activities,
+                    record_shapes=False,
+                    profile_memory=False,
+                    with_stack=False,
+                ) as verify_torch_profile:
+                    batch_result = self.target_worker.forward_batch_generation(
+                        model_worker_batch, is_verify=True, **kwargs
+                    )
+                _log_torch_profile_stats(
+                    profiler=verify_torch_profile,
+                    prefix="[DFLASH_TORCHPROF_VERIFY_CUDA]",
+                    sort_by="self_cuda_time_total",
+                )
+                _log_torch_profile_stats(
+                    profiler=verify_torch_profile,
+                    prefix="[DFLASH_TORCHPROF_VERIFY_CPU]",
+                    sort_by="self_cpu_time_total",
+                )
+            else:
                 batch_result = self.target_worker.forward_batch_generation(
                     model_worker_batch, is_verify=True, **kwargs
                 )
-            _log_torch_profile_stats(
-                profiler=verify_torch_profile,
-                prefix="[DFLASH_TORCHPROF_VERIFY_CUDA]",
-                sort_by="self_cuda_time_total",
-            )
-            _log_torch_profile_stats(
-                profiler=verify_torch_profile,
-                prefix="[DFLASH_TORCHPROF_VERIFY_CPU]",
-                sort_by="self_cpu_time_total",
-            )
-        else:
-            batch_result = self.target_worker.forward_batch_generation(
-                model_worker_batch, is_verify=True, **kwargs
-            )
+        finally:
+            if disable_target_verify_graph:
+                target_model_runner.graph_runner = saved_graph_runner
+                if hasattr(target_model_runner, "piecewise_cuda_graph_runner"):
+                    target_model_runner.piecewise_cuda_graph_runner = (
+                        saved_piecewise_runner
+                    )
         t_target = time.perf_counter() if profile_this_step else 0.0
         if cuda_event_profile_this_step and verify_cuda_end is not None:
             verify_cuda_end.record(torch.cuda.current_stream(device=batch.device))
@@ -1645,6 +1912,7 @@ class DFlashWorker:
             accept_length_per_req_cpu=accept_length_per_req_cpu,
             verify_mode=str(getattr(draft_input, "linear_mode", "target_only")),
             append_path=append_path,
+            draft_conf_debug=getattr(draft_input, "_draft_conf_debug", None),
             default_max_steps=effective_step_count,
             default_effective_draft_token_num=effective_draft_token_num,
             default_effective_step_count=effective_step_count,
