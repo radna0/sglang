@@ -4,6 +4,9 @@ import os
 import time
 from copy import deepcopy
 from dataclasses import dataclass
+import cProfile
+import io
+import pstats
 from typing import List, Optional, Union
 
 import torch
@@ -46,6 +49,49 @@ from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
 from sglang.srt.utils import is_cuda
 
 logger = logging.getLogger(__name__)
+
+
+def _parse_env_int(name: str, default: int) -> int:
+    try:
+        return max(1, int((os.environ.get(name) or str(default)).strip()))
+    except Exception:
+        return int(default)
+
+
+def _should_cprofile_verify_step(enabled: bool, step_index: int) -> bool:
+    if not enabled:
+        return False
+    every = _parse_env_int("SGLANG_DFLASH_CPROFILE_VERIFY_EVERY", 50)
+    return ((int(step_index) + 1) % int(every)) == 0
+
+
+def _env_enabled(name: str) -> bool:
+    return (str(os.environ.get(name) or "").strip().lower()) in (
+        "1",
+        "true",
+        "yes",
+        "y",
+        "on",
+    )
+
+
+def _log_cprofile_stats(
+    *,
+    profile: cProfile.Profile,
+    prefix: str,
+) -> None:
+    sort_key = (os.environ.get("SGLANG_DFLASH_CPROFILE_VERIFY_SORT") or "cumtime").strip() or "cumtime"
+    top_n = _parse_env_int("SGLANG_DFLASH_CPROFILE_VERIFY_TOP", 20)
+    stream = io.StringIO()
+    try:
+        stats = pstats.Stats(profile, stream=stream).sort_stats(sort_key)
+    except Exception:
+        stats = pstats.Stats(profile, stream=stream).sort_stats("cumtime")
+    stats.print_stats(int(top_n))
+    for raw_line in stream.getvalue().splitlines():
+        line = raw_line.rstrip()
+        if line:
+            logger.info("%s %s", prefix, line)
 
 _FusedKVMaterializeHelper = None
 _DFLASH_RESERVED_ENV_KEY = "SGLANG_DFLASH_SSD_RESERVED_TOKENS"
@@ -1284,6 +1330,19 @@ class DFlashWorker:
             and self.tp_rank == 0
             and (self._profile_step % self._profile_every == 0)
         )
+        cprofile_verify_this_step = (
+            self.tp_rank == 0
+            and _should_cprofile_verify_step(
+                _env_enabled("SGLANG_DFLASH_CPROFILE_VERIFY"),
+                self._profile_step,
+            )
+        )
+        cuda_event_profile_this_step = (
+            profile_this_step
+            and self.tp_rank == 0
+            and batch.device.type == "cuda"
+            and _env_enabled("SGLANG_DFLASH_PROFILE_CUDA_EVENTS")
+        )
         self._profile_step += 1
 
         t0 = time.perf_counter() if profile_this_step else 0.0
@@ -1304,21 +1363,55 @@ class DFlashWorker:
         )
         seq_lens_pre_verify = batch.seq_lens.clone() if need_mamba_verify_commit else None
 
+        if cuda_event_profile_this_step:
+            cuda_stream = torch.cuda.current_stream(device=batch.device)
+            step_cuda_start = torch.cuda.Event(enable_timing=True)
+            verify_cuda_start = torch.cuda.Event(enable_timing=True)
+            verify_cuda_end = torch.cuda.Event(enable_timing=True)
+            step_cuda_end = torch.cuda.Event(enable_timing=True)
+            step_cuda_start.record(cuda_stream)
+            verify_cuda_start.record(cuda_stream)
+        else:
+            step_cuda_start = verify_cuda_start = verify_cuda_end = step_cuda_end = None
+
         t1 = time.perf_counter() if profile_this_step else 0.0
         batch_result = self.target_worker.forward_batch_generation(
             model_worker_batch, is_verify=True, **kwargs
         )
         t_target = time.perf_counter() if profile_this_step else 0.0
+        if cuda_event_profile_this_step and verify_cuda_end is not None:
+            verify_cuda_end.record(torch.cuda.current_stream(device=batch.device))
         logits_output, can_run_cuda_graph = batch_result.logits_output, batch_result.can_run_cuda_graph
 
         t2 = time.perf_counter() if profile_this_step else 0.0
-        new_verified_id, commit_lens, cache_plan, next_target_hidden, accept_length_per_req_cpu = (
-            verify_input.verify(
-                batch=batch,
-                logits_output=logits_output,
-                page_size=self.page_size,
+        if cprofile_verify_this_step:
+            verify_profile = cProfile.Profile()
+            verify_profile.enable()
+            try:
+                new_verified_id, commit_lens, cache_plan, next_target_hidden, accept_length_per_req_cpu = (
+                    verify_input.verify(
+                        batch=batch,
+                        logits_output=logits_output,
+                        page_size=self.page_size,
+                        target_next_token_ids=batch_result.next_token_ids,
+                    )
+                )
+            finally:
+                verify_profile.disable()
+                _log_cprofile_stats(
+                    profile=verify_profile,
+                    prefix="[DFLASH_CPROFILE_VERIFY]",
+                )
+        else:
+            new_verified_id, commit_lens, cache_plan, next_target_hidden, accept_length_per_req_cpu = (
+                verify_input.verify(
+                    batch=batch,
+                    logits_output=logits_output,
+                    page_size=self.page_size,
+                    target_next_token_ids=batch_result.next_token_ids,
+                )
             )
-        )
+        
         t_verify = time.perf_counter() if profile_this_step else 0.0
 
         if need_mamba_verify_commit and seq_lens_pre_verify is not None:
@@ -1346,6 +1439,8 @@ class DFlashWorker:
             draft_input.ctx_lens = commit_lens
             self._append_target_hidden_to_draft_kv(batch, draft_input)
         t_append = time.perf_counter() if profile_this_step else 0.0
+        if cuda_event_profile_this_step and step_cuda_end is not None:
+            step_cuda_end.record(torch.cuda.current_stream(device=batch.device))
 
         append_path = resolve_dflash_verify_append_path(
             appended_from_verify=appended_from_verify,
@@ -1371,10 +1466,23 @@ class DFlashWorker:
             self._logged_first_verify = True
 
         if profile_this_step and self.tp_rank == 0:
+            verify_cuda_ms = None
+            step_cuda_ms = None
+            if (
+                cuda_event_profile_this_step
+                and verify_cuda_start is not None
+                and verify_cuda_end is not None
+                and step_cuda_start is not None
+                and step_cuda_end is not None
+            ):
+                step_cuda_end.synchronize()
+                verify_cuda_ms = float(verify_cuda_start.elapsed_time(verify_cuda_end))
+                step_cuda_ms = float(step_cuda_start.elapsed_time(step_cuda_end))
             bs = batch.batch_size()
             logger.info(
                 "[DFLASH profile] bs=%d mode=%s can_run_cuda_graph=%s "
-                "prepare_ms=%.2f target_verify_ms=%.2f verify_cpu_ms=%.2f append_ms=%.2f total_ms=%.2f "
+                "prepare_ms=%.2f target_verify_ms=%.2f verify_cpu_ms=%.2f verify_wall_ms=%.2f append_ms=%.2f total_ms=%.2f "
+                "verify_cuda_ms=%s step_cuda_ms=%s "
                 "accept_sum=%d accept_mean=%.2f",
                 bs,
                 str(getattr(draft_input, "linear_mode", "")),
@@ -1382,8 +1490,11 @@ class DFlashWorker:
                 (t_prepare - t0) * 1000.0,
                 (t_target - t1) * 1000.0,
                 (t_verify - t2) * 1000.0,
+                (t_verify - t2) * 1000.0,
                 (t_append - t_verify) * 1000.0,
                 (t_append - t0) * 1000.0,
+                f"{verify_cuda_ms:.2f}" if verify_cuda_ms is not None else "n/a",
+                f"{step_cuda_ms:.2f}" if step_cuda_ms is not None else "n/a",
                 num_accepted_tokens,
                 num_accepted_tokens / max(1, bs),
             )

@@ -980,7 +980,8 @@ def commit_dflash_proposed_tokens_to_req(
 def commit_dflash_target_only_batch(
     *,
     reqs: List[Any],
-    proposed_flat_cpu: torch.Tensor,
+    proposed_flat_cpu: torch.Tensor | None = None,
+    proposed_dense_cpu: torch.Tensor | None = None,
     commit_lens_cpu: torch.Tensor,
     empty_error_prefix: str = "DFLASH verify",
 ) -> List[DFlashTargetOnlyCommitResult]:
@@ -997,11 +998,27 @@ def commit_dflash_target_only_batch(
         FINISH_MATCHED_TOKEN,
     )
 
-    if proposed_flat_cpu.device.type != "cpu":
+    if (proposed_flat_cpu is None) == (proposed_dense_cpu is None):
+        raise ValueError(
+            "commit_dflash_target_only_batch expects exactly one of proposed_flat_cpu "
+            "or proposed_dense_cpu."
+        )
+    if proposed_flat_cpu is not None and proposed_flat_cpu.device.type != "cpu":
         raise ValueError(
             "commit_dflash_target_only_batch expects proposed_flat_cpu on CPU, "
             f"got device={proposed_flat_cpu.device}."
         )
+    if proposed_dense_cpu is not None:
+        if proposed_dense_cpu.device.type != "cpu":
+            raise ValueError(
+                "commit_dflash_target_only_batch expects proposed_dense_cpu on CPU, "
+                f"got device={proposed_dense_cpu.device}."
+            )
+        if proposed_dense_cpu.ndim != 2:
+            raise ValueError(
+                "commit_dflash_target_only_batch expects proposed_dense_cpu to be 2D, "
+                f"got shape={tuple(proposed_dense_cpu.shape)}."
+            )
     if commit_lens_cpu.device.type != "cpu":
         raise ValueError(
             "commit_dflash_target_only_batch expects commit_lens_cpu on CPU, "
@@ -1014,11 +1031,30 @@ def commit_dflash_target_only_batch(
             "commit_lens_cpu size mismatch: "
             f"expected {num_reqs}, got {int(commit_lens_cpu.numel())}."
         )
+    if proposed_dense_cpu is not None and int(proposed_dense_cpu.shape[0]) != num_reqs:
+        raise ValueError(
+            "proposed_dense_cpu batch size mismatch: "
+            f"expected {num_reqs}, got {int(proposed_dense_cpu.shape[0])}."
+        )
     commit_lens_list = [int(x) for x in commit_lens_cpu.tolist()]
-    proposed_flat_list = [int(x) for x in proposed_flat_cpu.tolist()]
-    commit_offsets_list = [0] * (num_reqs + 1)
-    for i, width in enumerate(commit_lens_list):
-        commit_offsets_list[i + 1] = commit_offsets_list[i] + int(width)
+    proposed_flat_list: list[int] | None = None
+    commit_offsets_list: list[int] | None = None
+    if proposed_flat_cpu is not None:
+        proposed_flat_list = [int(x) for x in proposed_flat_cpu.tolist()]
+        commit_offsets_list = [0] * (num_reqs + 1)
+        for i, width in enumerate(commit_lens_list):
+            commit_offsets_list[i + 1] = commit_offsets_list[i] + int(width)
+
+    def _slice_proposed_tokens(req_index: int, width: int) -> list[int]:
+        width = int(width)
+        if width <= 0:
+            return []
+        if proposed_dense_cpu is not None:
+            return [int(x) for x in proposed_dense_cpu[req_index, :width].tolist()]
+        assert proposed_flat_list is not None and commit_offsets_list is not None
+        start_offset = int(commit_offsets_list[req_index])
+        end_offset = start_offset + width
+        return proposed_flat_list[start_offset:end_offset]
 
     results: list[DFlashTargetOnlyCommitResult | None] = [None] * num_reqs
     grouped_fast_indices: dict[_DFlashFastFinishPolicy, list[int]] = {}
@@ -1026,9 +1062,7 @@ def commit_dflash_target_only_batch(
     for i, req in enumerate(reqs):
         policy = _build_dflash_fast_finish_policy(req)
         if policy is None:
-            start_offset = int(commit_offsets_list[i])
-            end_offset = int(commit_offsets_list[i + 1])
-            proposed = proposed_flat_list[start_offset:end_offset]
+            proposed = _slice_proposed_tokens(i, commit_lens_list[i])
             results[i] = commit_dflash_proposed_tokens_to_req(
                 req=req,
                 proposed=proposed,
@@ -1047,16 +1081,11 @@ def commit_dflash_target_only_batch(
         )
         for req_index in group_indices:
             req = reqs[req_index]
-            start_offset = int(commit_offsets_list[req_index])
             default_len = int(commit_lens_list[req_index])
             old_output_len = len(req.output_ids)
             remaining = int(req.sampling_params.max_new_tokens) - old_output_len
             effective_len = min(default_len, max(remaining, 0))
-            tokens = (
-                list(proposed_flat_list[start_offset : start_offset + effective_len])
-                if effective_len > 0
-                else []
-            )
+            tokens = _slice_proposed_tokens(req_index, effective_len)
             finish_kind = "none"
             finish_pos = -1
 
@@ -1228,6 +1257,7 @@ def build_dflash_target_only_cache_plan(
     *,
     out_cache_loc: torch.Tensor,
     commit_lens: torch.Tensor,
+    commit_lens_cpu: List[int] | None = None,
     seq_lens: torch.Tensor,
     draft_token_num: int,
     page_size: int,
@@ -1255,7 +1285,15 @@ def build_dflash_target_only_cache_plan(
     compact_out_cache_loc = out_cache_loc_rows.reshape(-1)[accepted_indices]
     clear_start = seq_lens + commit_lens.to(seq_lens.dtype)
     clear_end = seq_lens + int(draft_token_num)
-    clear_token_count = int((clear_end - clear_start).sum().item())
+    if commit_lens_cpu is not None:
+        if len(commit_lens_cpu) != bs:
+            raise ValueError(
+                "commit_lens_cpu size mismatch: "
+                f"expected {bs}, got {len(commit_lens_cpu)}."
+            )
+        clear_token_count = int(bs * int(draft_token_num) - sum(int(x) for x in commit_lens_cpu))
+    else:
+        clear_token_count = int((clear_end - clear_start).sum().item())
 
     if int(page_size) == 1:
         return DFlashTargetOnlyCachePlan(
@@ -1754,11 +1792,16 @@ def _assign_dflash_req_to_token_packed_direct(
     start_offset: torch.Tensor,
     lengths: torch.Tensor,
     out_cache_loc: torch.Tensor,
+    max_len_hint: int | None = None,
 ) -> None:
     if int(lengths.numel()) == 0 or int(out_cache_loc.numel()) == 0:
         return
     lengths_i64 = lengths.to(device=req_pool_indices.device, dtype=torch.int64)
-    max_len = int(lengths_i64.max().item())
+    max_len = (
+        int(max_len_hint)
+        if max_len_hint is not None
+        else int(lengths_i64.max().item())
+    )
     if max_len <= 0:
         return
     offs = torch.arange(max_len, device=req_pool_indices.device, dtype=torch.int64)
@@ -1788,6 +1831,7 @@ def apply_dflash_commit_mapping_updates(
     clear_start: torch.Tensor | None = None,
     clear_end: torch.Tensor | None = None,
     clear_token_count: int = 0,
+    draft_token_num: int | None = None,
 ) -> None:
     from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
 
@@ -1803,6 +1847,7 @@ def apply_dflash_commit_mapping_updates(
             start_offset=batch.seq_lens,
             lengths=commit_lens.to(batch.seq_lens.dtype),
             out_cache_loc=batch.out_cache_loc,
+            max_len_hint=max((int(x) for x in commit_lens_cpu), default=0),
         )
     else:
         assign_req_to_token_pool_func(
@@ -1831,6 +1876,17 @@ def apply_dflash_commit_mapping_updates(
                 start_offset=clear_start,
                 lengths=clear_lengths,
                 out_cache_loc=pad_locs,
+                max_len_hint=(
+                    max(
+                        (
+                            max(0, int(draft_token_num) - int(commit_len))
+                            for commit_len in commit_lens_cpu
+                        ),
+                        default=0,
+                    )
+                    if draft_token_num is not None
+                    else None
+                ),
             )
         else:
             assign_req_to_token_pool_func(
@@ -1862,6 +1918,7 @@ def apply_dflash_target_only_mapping_updates(
     commit_lens_cpu: List[int],
     commit_lens_cpu_tensor: torch.Tensor | None = None,
     cache_plan: DFlashTargetOnlyCachePlan,
+    draft_token_num: int | None = None,
 ) -> None:
     apply_dflash_commit_mapping_updates(
         batch=batch,
@@ -1871,6 +1928,7 @@ def apply_dflash_target_only_mapping_updates(
         clear_start=cache_plan.clear_start,
         clear_end=cache_plan.clear_end,
         clear_token_count=cache_plan.clear_token_count,
+        draft_token_num=draft_token_num,
     )
 
 
@@ -2493,17 +2551,70 @@ def pack_dflash_target_only_commits(
             f"Got shape={tuple(accept_len.shape)} for bs={int(target_predict.shape[0])}."
         )
 
-    # Safe fallback: pack on CPU to avoid CUDA advanced-indexing kernels.
-    if _env_truthy("SGLANG_DFLASH_TARGET_ONLY_PACK_ON_CPU") and target_predict.is_cuda:
-        target_predict = target_predict.to(device="cpu", dtype=torch.int64)
-        accept_len = accept_len.to(device="cpu", dtype=torch.int32)
-
     device = target_predict.device
     bs, draft_token_num = target_predict.shape
     commit_lens = accept_len.to(device=device, dtype=torch.int32).clamp(
         min=0, max=int(draft_token_num - 1)
     )
     commit_lens = commit_lens + 1
+
+    try:
+        cpu_pack_max = max(
+            0,
+            int(
+                (
+                    os.environ.get("SGLANG_DFLASH_TARGET_ONLY_SMALL_CPU_PACK_MAX")
+                    or "512"
+                ).strip()
+            ),
+        )
+    except Exception:
+        cpu_pack_max = 512
+
+    use_cpu_pack = bool(
+        target_predict.is_cuda
+        and (
+            _env_truthy("SGLANG_DFLASH_TARGET_ONLY_PACK_ON_CPU")
+            or int(target_predict.numel()) <= cpu_pack_max
+        )
+    )
+    if use_cpu_pack:
+        target_predict_cpu = target_predict.to(
+            device="cpu", dtype=torch.int64, non_blocking=False
+        ).contiguous()
+        commit_lens_cpu = commit_lens.to(
+            device="cpu", dtype=torch.int32, non_blocking=False
+        ).contiguous()
+        commit_offsets = torch.empty((bs + 1,), dtype=torch.int64, device="cpu")
+        commit_offsets[0] = 0
+        commit_offsets[1:].copy_(commit_lens_cpu.to(torch.int64).cumsum(0))
+        total_commits = int(commit_offsets[-1].item()) if int(bs) > 0 else 0
+        proposed_flat = torch.empty((total_commits,), dtype=torch.int64, device="cpu")
+        write_offset = 0
+        for row_idx, width in enumerate(commit_lens_cpu.tolist()):
+            width = int(width)
+            if width <= 0:
+                continue
+            proposed_flat[write_offset : write_offset + width].copy_(
+                target_predict_cpu[row_idx, :width]
+            )
+            write_offset += width
+        if int(bs) > 0:
+            default_new_verified_id = target_predict_cpu[
+                torch.arange(bs, device="cpu"),
+                commit_lens_cpu.to(torch.int64) - 1,
+            ].to(torch.int64)
+        else:
+            default_new_verified_id = torch.empty(
+                (0,), dtype=torch.int64, device="cpu"
+            )
+        return DFlashPackedTargetOnlyCommits(
+            proposed_flat=proposed_flat,
+            commit_lens=commit_lens_cpu,
+            commit_offsets=commit_offsets,
+            default_new_verified_id=default_new_verified_id,
+        )
+
     keep_mask = torch.arange(draft_token_num, device=device, dtype=torch.int32)[
         None, :
     ] < commit_lens.unsqueeze(1)
