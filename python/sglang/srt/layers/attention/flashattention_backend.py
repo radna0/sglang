@@ -1222,7 +1222,20 @@ class FlashAttentionBackend(AttentionBackend):
                     ).to(torch.int32)
                 q_reshaped = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
                 pages_out = (topk + self.page_size - 1) // self.page_size
-                sparse_page_table = None
+                # Cache the computed sparse page table + cache_seqlens on the shared
+                # forward metadata so we don't recompute it for every layer.
+                sparse_page_table = getattr(metadata, "gpt_oss_dsa_page_table", None)
+                cache_seqlens_sparse = getattr(
+                    metadata, "gpt_oss_dsa_cache_seqlens_int32", None
+                )
+                if sparse_page_table is not None and cache_seqlens_sparse is not None:
+                    # Trim to current batch size. The stored tensors are always full-bs.
+                    sparse_page_table = sparse_page_table[:bs]
+                    cache_seqlens_sparse = cache_seqlens_sparse[:bs]
+                    if sparse_page_table.shape[1] != pages_out:
+                        # Different topk/paging (should not happen in a fixed-topk serve).
+                        sparse_page_table = None
+                        cache_seqlens_sparse = None
 
                 if server_args.gpt_oss_dsa_topk_source == "recent":
                     # `recent` is a contiguous suffix. Route it through FA3 local attention
@@ -1276,12 +1289,14 @@ class FlashAttentionBackend(AttentionBackend):
                     logical_pages[row_idx, pos] = torch.where(found, pages_tmp, pages_pos)
                     logical_pages[row_idx, last_valid] = torch.where(found, pages_pos, pages_tmp)
 
-                    cache_seqlens_sparse = (page_counts * self.page_size).to(torch.int32)
-                    cache_seqlens_sparse = torch.where(
-                        page_counts > 0,
-                        ((page_counts - 1) * self.page_size + remainder).to(torch.int32),
-                        cache_seqlens_sparse,
-                    )
+                    if cache_seqlens_sparse is None:
+                        cache_seqlens_sparse = (page_counts * self.page_size).to(torch.int32)
+                        cache_seqlens_sparse = torch.where(
+                            page_counts > 0,
+                            ((page_counts - 1) * self.page_size + remainder).to(torch.int32),
+                            cache_seqlens_sparse,
+                        )
+                        metadata.gpt_oss_dsa_cache_seqlens_int32 = cache_seqlens_sparse
 
                 key_cache, value_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
                     layer.layer_id
@@ -1326,6 +1341,7 @@ class FlashAttentionBackend(AttentionBackend):
                     sparse_page_table = torch.gather(
                         full_page_table.to(torch.int64), dim=1, index=gather_index
                     ).to(torch.int32)
+                    metadata.gpt_oss_dsa_page_table = sparse_page_table
 
                 sparse_result = flash_attn_with_kvcache(
                     q=q_reshaped,
@@ -1342,7 +1358,7 @@ class FlashAttentionBackend(AttentionBackend):
                     k_descale=k_descale,
                     v_descale=v_descale,
                     return_softmax_lse=use_cascade_attn,
-                    num_splits=self.num_splits,
+                    num_splits=sparse_num_splits,
                     **kwargs,
                 )
                 if use_cascade_attn:
