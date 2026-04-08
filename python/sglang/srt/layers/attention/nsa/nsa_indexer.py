@@ -949,8 +949,29 @@ class Indexer(MultiPlatformOp):
                 k_fp8,
                 k_scale,
             )
-            end_pos = seq_len
-            topk_indices = index_score.topk(min(topk, end_pos), dim=-1)[1].squeeze(0)
+            # NOTE: A naive token-level `topk` over the full seq_len axis triggers an
+            # expensive radix sort (see `radixSortKVInPlace`) and dominates decode time
+            # at long context. For paged KV decode, we only need to identify the top pages
+            # (each page covers `page_size` tokens). We score each page by max token score
+            # and then expand selected pages back into token indices.
+            #
+            # This produces a deterministic "top pages" token set of size pages_out*page_size
+            # (typically 2048) and avoids a topk over ~65k.
+            pages_out = (topk + page_size - 1) // page_size
+            scores = index_score.squeeze(0)
+            if scores.dim() == 2:
+                # (q_len, seq_len) -> use last query row (decode q_len==1)
+                scores = scores[-1]
+            # Clamp to actual sequence length.
+            scores = scores[:seq_len]
+            n_pages = (seq_len + page_size - 1) // page_size
+            pad = n_pages * page_size - seq_len
+            if pad:
+                scores = torch.nn.functional.pad(scores, (0, pad), "constant", float("-inf"))
+            page_scores = scores.view(n_pages, page_size).amax(dim=1)
+            top_pages = page_scores.topk(min(pages_out, n_pages), dim=-1)[1].to(torch.int64)
+            page_offsets = torch.arange(page_size, device=top_pages.device, dtype=torch.int64)
+            topk_indices = (top_pages.unsqueeze(1) * page_size + page_offsets.unsqueeze(0)).reshape(-1)
 
             pad_len = ceil_align(topk_indices.shape[-1], 2048) - topk_indices.shape[-1]
             topk_indices = torch.nn.functional.pad(
