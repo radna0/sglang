@@ -1231,15 +1231,27 @@ class FlashAttentionBackend(AttentionBackend):
                     # the better-optimized local-attention kernel.
                     recent_window = (topk - 1, 0)
                 else:
-                    from sglang.srt.layers.attention.nsa.transform_index import (
-                        select_topk_pages_decode,
+                    # GPT-OSS indexer lane: the Indexer returns token indices that already
+                    # cover whole KV pages (page_size tokens per selected page). Converting
+                    # token indices -> pages via the generic select_topk_pages_decode()
+                    # path is expensive (stable-unique uses per-row sort) and shows up as
+                    # radixSortKVInPlace/topk_kernel overhead in traces.
+                    #
+                    # Fast path: pick the first token index of each page and compute the
+                    # logical page id directly.
+                    idx_page_starts = idx_i32[:, :: self.page_size]  # (bs, pages_out)
+                    valid_pages = idx_page_starts >= 0
+                    logical_pages = torch.where(
+                        valid_pages,
+                        (idx_page_starts.to(torch.int64) // int(self.page_size)).to(
+                            torch.int32
+                        ),
+                        torch.full_like(idx_page_starts, -1, dtype=torch.int32),
                     )
-
-                    logical_pages, page_counts = select_topk_pages_decode(
-                        idx_i32,
-                        page_size=self.page_size,
-                        pages_out=pages_out,
-                        sink_lens=None,
+                    page_counts = (
+                        valid_pages.sum(dim=1)
+                        .to(torch.int32)
+                        .clamp(min=0, max=pages_out)
                     )
 
                     # Place the (possibly partial) last page at the end so cache_seqlens masks correctly.
@@ -1251,6 +1263,14 @@ class FlashAttentionBackend(AttentionBackend):
                     pos = match.to(torch.int32).argmax(dim=1)
                     last_valid = (page_counts - 1).clamp(min=0)
                     row_idx = torch.arange(bs, device=q.device, dtype=torch.int64)
+                    # If the selected pages didn't include the last page, overwrite the last
+                    # slot with the last page so masking and next-token recency are correct.
+                    logical_pages[row_idx, last_valid] = torch.where(
+                        found, logical_pages[row_idx, last_valid], last_page
+                    )
+                    # Now "found" must be true; re-locate last_page and swap it to the end.
+                    match = logical_pages == last_page.unsqueeze(1)
+                    pos = match.to(torch.int32).argmax(dim=1)
                     pages_tmp = logical_pages[row_idx, last_valid]
                     pages_pos = logical_pages[row_idx, pos]
                     logical_pages[row_idx, pos] = torch.where(found, pages_tmp, pages_pos)
@@ -1258,7 +1278,7 @@ class FlashAttentionBackend(AttentionBackend):
 
                     cache_seqlens_sparse = (page_counts * self.page_size).to(torch.int32)
                     cache_seqlens_sparse = torch.where(
-                        found,
+                        page_counts > 0,
                         ((page_counts - 1) * self.page_size + remainder).to(torch.int32),
                         cache_seqlens_sparse,
                     )
