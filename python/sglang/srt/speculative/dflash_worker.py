@@ -874,7 +874,7 @@ class DFlashWorker:
 
             positions_2d = self._draft_block_positions_buf[:bs, :active_block_size]
             torch.add(
-                target_prefix_lens.unsqueeze(1),
+                block_start.unsqueeze(1),
                 self._block_pos_offsets[:active_block_size],
                 out=positions_2d,
             )
@@ -1467,13 +1467,17 @@ class DFlashWorker:
         ctx_lens = draft_input.ctx_lens.to(
             device=device, dtype=torch.int32, non_blocking=True
         )
-        is_extend = batch.forward_mode.is_extend() or batch.is_extend_in_batch
-        if is_extend:
-            ctx_start = batch.seq_lens.to(torch.int64)
-            seq_lens_after = (batch.seq_lens.to(torch.int64) + ctx_lens.to(torch.int64)).to(torch.int32)
-        else:
-            ctx_start = batch.seq_lens.to(torch.int64) - ctx_lens.to(torch.int64)
-            seq_lens_after = batch.seq_lens.to(torch.int32)
+        # Use the draft-visible prefix as the authoritative append boundary.
+        # This keeps staged append aligned with truncation/eviction behavior and
+        # avoids indexing req_to_token with logical target positions the draft
+        # cache no longer mirrors.
+        draft_prefix_lens = draft_input.draft_seq_lens.to(
+            device=device, dtype=torch.int32, non_blocking=True
+        )
+        ctx_start = draft_prefix_lens.to(torch.int64)
+        seq_lens_after = (
+            draft_prefix_lens.to(torch.int64) + ctx_lens.to(torch.int64)
+        ).to(torch.int32)
 
         # Gather cache locations and positions
         if bs == 1:
@@ -1484,7 +1488,7 @@ class DFlashWorker:
             ctx_cache_loc = cache2d.reshape(-1).to(torch.int64)
             ctx_positions = pos2d.reshape(-1)
         else:
-            max_ctx = int(ctx_lens.max().item()) if is_extend else self.block_size
+            max_ctx = int(ctx_lens.max().item())
             if max_ctx <= 0:
                 raise RuntimeError(f"DFLASH invalid max_ctx={max_ctx} for KV append.")
             r = self._block_pos_offsets[:max_ctx] if max_ctx <= self.block_size else torch.arange(max_ctx, device=device, dtype=torch.int64)
@@ -2001,6 +2005,16 @@ class DFlashWorker:
             if mask.any():
                 raise RuntimeError(f"{context} req_to_token table empty but mask non-empty.")
             return torch.empty((0,), dtype=torch.int64, device=self.device)
+        valid_mask = (~mask) | ((pos2d >= 0) & (pos2d < int(table_width)))
+        if not bool(torch.all(valid_mask).item()):
+            bad_positions = pos2d[mask & ~valid_mask]
+            bad_min = int(bad_positions.min().item()) if bad_positions.numel() > 0 else 0
+            bad_max = int(bad_positions.max().item()) if bad_positions.numel() > 0 else 0
+            raise RuntimeError(
+                f"{context} req_to_token position out of bounds: "
+                f"table_width={int(table_width)} bad_count={int(bad_positions.numel())} "
+                f"min={bad_min} max={bad_max}"
+            )
         safe_pos2d = pos2d.masked_fill(~mask, 0)
         return req_to_token[req_pool_indices[:, None], safe_pos2d][mask].to(torch.int64)
 
