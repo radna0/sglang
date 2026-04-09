@@ -373,6 +373,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For hidden states before normal
     return_hidden_states_before_norm: bool = False
 
+    # Optional n-gram embedding state. Some runner paths probe this attribute even
+    # when the current model/batch does not provide it.
+    ngram_embedding_info: object = None
+
     @classmethod
     def init_new(
         cls,

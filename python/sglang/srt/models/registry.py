@@ -2,6 +2,7 @@
 
 import importlib
 import logging
+import os
 import pkgutil
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -12,6 +13,28 @@ import torch.nn as nn
 from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_registry_module_filter(
+    package_name: str,
+) -> Optional[set[str]]:
+    if package_name != "sglang.srt.models":
+        return None
+
+    raw = os.environ.get("SGLANG_MODEL_REGISTRY_ONLY_MODULES", "").strip()
+    if not raw:
+        return None
+
+    modules: set[str] = set()
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if item.startswith(package_name + "."):
+            modules.add(item)
+        else:
+            modules.add(f"{package_name}.{item}")
+    return modules or None
 
 
 @dataclass
@@ -93,8 +116,17 @@ class _ModelRegistry:
 def import_model_classes(package_name: str, strict: bool = False):
     model_arch_name_to_cls = {}
     package = importlib.import_module(package_name)
+    allowed_modules = _resolve_registry_module_filter(package_name)
+    if allowed_modules:
+        logger.info(
+            "Model registry filter active for %s: %s",
+            package_name,
+            sorted(allowed_modules),
+        )
     for _, name, ispkg in pkgutil.iter_modules(package.__path__, package_name + "."):
         if not ispkg:
+            if allowed_modules is not None and name not in allowed_modules:
+                continue
             if name.split(".")[-1] in envs.SGLANG_DISABLED_MODEL_ARCHS.get():
                 logger.debug(f"Skip loading {name} due to SGLANG_DISABLED_MODEL_ARCHS")
                 continue

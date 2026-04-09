@@ -185,6 +185,12 @@ class ModelConfig:
             self.hf_config, "audio_config"
         )
 
+        # Optional ngram embedding support is off for GPT-OSS by default, but
+        # some code paths expect the config fields to exist.
+        self.use_ngram_embedding = getattr(self.hf_config, "use_ngram_embedding", False)
+        self.ngram_embedding_n = getattr(self.hf_config, "ngram_embedding_n", None)
+        self.ngram_embedding_k = getattr(self.hf_config, "ngram_embedding_k", None)
+
         self.is_multimodal_chunked_prefill_supported = (
             enable_multimodal
             and is_multimodal_chunked_prefill_supported(self.hf_config.architectures)
@@ -192,6 +198,11 @@ class ModelConfig:
         self.is_encoder_decoder = is_encoder_decoder_model(self.hf_config.architectures)
         self.is_local_attention_model = is_local_attention_model(
             self.hf_config.architectures
+        )
+        self.use_ngram_embedding = getattr(self.hf_config, "use_ngram_embedding", False)
+        self.is_piecewise_cuda_graph_disabled_model = (
+            is_piecewise_cuda_graph_disabled_model(self.hf_config.architectures)
+            or is_deepseek_nsa(self.hf_text_config)
         )
         self.dtype = _get_and_verify_dtype(self.hf_text_config, dtype)
 
@@ -414,7 +425,23 @@ class ModelConfig:
             self.v_head_dim,
         )
         # FIXME: temporary special judge for MLA architecture
-        if (
+        if "GptOssMlaForCausalLM" in self.hf_config.architectures:
+            self.attention_arch = AttentionArch.MLA
+            self.kv_lora_rank = getattr(self.hf_text_config, "kv_lora_rank", None)
+            self.qk_nope_head_dim = getattr(
+                self.hf_text_config, "qk_nope_head_dim", None
+            )
+            self.qk_rope_head_dim = getattr(
+                self.hf_text_config, "qk_rope_head_dim", None
+            )
+            self.v_head_dim = getattr(self.hf_text_config, "v_head_dim", self.v_head_dim)
+            self.scaling = 1 / math.sqrt(self.qk_nope_head_dim + self.qk_rope_head_dim)
+        elif "GptOssForCausalLM" in self.hf_config.architectures:
+            # The plain GPT-OSS checkpoint is the original GQA-style model, not
+            # the MLA export. Keep it on the regular MHA path and let the
+            # backend-specific attention implementation use head_dim/num_kv_heads.
+            self.attention_arch = AttentionArch.MHA
+        elif (
             "DeepseekV2ForCausalLM" in self.hf_config.architectures
             or "DeepseekV32ForCausalLM" in self.hf_config.architectures
             or "DeepseekV3ForCausalLM" in self.hf_config.architectures
@@ -456,6 +483,7 @@ class ModelConfig:
                     scaling_factor = rope_scaling["factor"]
                     mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
                     self.scaling = self.scaling * mscale * mscale
+
         elif "MiniCPM3ForCausalLM" in self.hf_config.architectures:
             self.head_dim = 128
             self.attention_arch = AttentionArch.MLA
@@ -549,6 +577,23 @@ class ModelConfig:
             self.hf_text_config, "num_nextn_predict_layers", None
         )
         self.vocab_size = self.hf_text_config.vocab_size
+
+    def get_quantization_config_log_str(self) -> str:
+        """Return a concise human-readable quantization summary for startup logs."""
+        quant_cfg = getattr(self.hf_config, "quantization_config", None)
+        if quant_cfg is None:
+            quant_cfg = getattr(self.hf_config, "compression_config", None)
+        if quant_cfg is None:
+            return self.quantization or ""
+        if not isinstance(quant_cfg, dict):
+            quant_cfg = quant_cfg.to_dict()
+        quant_method = quant_cfg.get("quant_method") or quant_cfg.get("name")
+        if quant_method is None:
+            quant_method = self.quantization or "unknown"
+        modules = quant_cfg.get("modules_to_not_convert")
+        if modules:
+            return f"quant_method={quant_method}, skipped_modules={len(modules)}"
+        return f"quant_method={quant_method}"
 
     def get_total_num_attention_heads(self) -> int:
         return self.num_attention_heads
@@ -763,6 +808,27 @@ class ModelConfig:
         elif quant_algo and "FP8" in quant_algo:
             return {"quant_method": "modelopt_fp8"}
         else:
+            return None
+
+    def get_quantization_config_log_str(self) -> Optional[str]:
+        """
+        Get a concise string representation of the quantization config for logging.
+        Returns something like "quant=fp8, fmt=e4m3" or "quant=gptq, bits=4".
+        """
+        try:
+            quant_cfg = self._parse_quant_hf_config()
+            if not quant_cfg:
+                return None
+
+            quant_method = quant_cfg.get("quant_method", "quantized")
+            log_str = f"quant={quant_method}"
+
+            for field in ["bits", "quant_algo", "fmt"]:
+                if field in quant_cfg:
+                    log_str += f", {field}={quant_cfg[field]}"
+
+            return log_str
+        except Exception:
             return None
 
     def _is_already_quantized(self) -> bool:
@@ -1328,6 +1394,20 @@ def is_hybrid_swa_model(model_architectures: List[str]):
         "Step3p5MTP",
     }
     return any(arch in hybrid_swa_archs for arch in model_architectures)
+
+
+def is_piecewise_cuda_graph_disabled_model(model_architectures: List[str]):
+    disabled_archs = {
+        "LlavaForConditionalGeneration",
+        "LlavaLlamaForCausalLM",
+        "LlavaMistralForCausalLM",
+        "LlavaQwenForCausalLM",
+        "LlavaVidForCausalLM",
+        "MllamaForConditionalGeneration",
+        "MiniCPMO",
+        "GlmAsrForConditionalGeneration",
+    }
+    return any(arch in disabled_archs for arch in model_architectures)
 
 
 def get_hybrid_layer_ids(

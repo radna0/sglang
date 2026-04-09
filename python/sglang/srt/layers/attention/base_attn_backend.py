@@ -22,8 +22,18 @@ class AttentionBackend(ABC):
         """Init the metadata for a forward pass."""
         raise NotImplementedError()
 
-    def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
-        """Init the global shared states for cuda graph."""
+    @abstractmethod
+    def init_cuda_graph_state(
+        self,
+        max_bs: int,
+        max_num_tokens: int,
+        kv_indices_buf: Optional[torch.Tensor] = None,
+        cuda_graph_num_kv_splits_buf: Optional[torch.Tensor] = None,
+    ):
+        pass
+
+    def append_kv(self, pool, ctx_lens, hidden_states):
+        """Append projected hidden states to the KV pool for conditioning."""
         raise NotImplementedError()
 
     def init_forward_metadata_capture_cuda_graph(
