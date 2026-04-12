@@ -522,6 +522,8 @@ class DFlashWorker:
         # Fused KV materialization (CUDA only)
         self._use_fused_kv_materialize = is_cuda()
         self._fused_kv_helper: Optional[object] = None
+        self._fused_append_fail_ct = 0
+        self._fused_selected_append_fail_ct = 0
         if self._use_fused_kv_materialize:
             self._init_fused_kv_helper()
 
@@ -2015,7 +2017,17 @@ class DFlashWorker:
                         max_position_hint=max_position_hint,
                     )
                 except Exception as e:
-                    logger.warning("Fused KV append failed, falling back to sequential: %s", e)
+                    if self.tp_rank == 0:
+                        self._fused_append_fail_ct += 1
+                        if self._fused_append_fail_ct <= 3:
+                            logger.warning(
+                                "Fused KV append failed, falling back to sequential: %s", e
+                            )
+                        elif self._fused_append_fail_ct == 10:
+                            logger.info(
+                                "Fused KV append has failed %d times; suppressing further warnings.",
+                                self._fused_append_fail_ct,
+                            )
                     # Only permanently disable the fused helper for structural incompatibilities.
                     # Transient errors (allocator pressure, etc.) should not poison the fast path.
                     if isinstance(e, (AttributeError, NotImplementedError)):
@@ -2152,7 +2164,17 @@ class DFlashWorker:
                     )
                     return
                 except Exception as e:
-                    logger.warning("Fused selected verify append failed, falling back: %s", e)
+                    if self.tp_rank == 0:
+                        self._fused_selected_append_fail_ct += 1
+                        if self._fused_selected_append_fail_ct <= 3:
+                            logger.warning(
+                                "Fused selected verify append failed, falling back: %s", e
+                            )
+                        elif self._fused_selected_append_fail_ct == 10:
+                            logger.info(
+                                "Fused selected verify append has failed %d times; suppressing further warnings.",
+                                self._fused_selected_append_fail_ct,
+                            )
                     if isinstance(e, (AttributeError, NotImplementedError)):
                         self._use_fused_kv_materialize = False
                         self._fused_kv_helper = None
