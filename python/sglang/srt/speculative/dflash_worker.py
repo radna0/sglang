@@ -268,11 +268,9 @@ class DFlashWorker:
         self.model_runner = target_worker.model_runner
         # Target paging controls the target worker's KV allocator behavior.
         self.page_size = server_args.page_size
-        # Draft paging is independent; production often runs paged target KV with
-        # non-paged draft KV (`speculative_draft_page_size=1`).
-        self.draft_page_size = int(
-            getattr(server_args, "speculative_draft_page_size", None) or 1
-        )
+        # Draft paging is independent. IMPORTANT: use the resolved draft worker page_size
+        # (after applying speculative_draft_page_size) to keep allocator behavior consistent.
+        self.draft_page_size = int(server_args.page_size)
         self.draft_window_size: Optional[int] = (
             int(server_args.speculative_dflash_draft_window_size)
             if server_args.speculative_dflash_draft_window_size is not None
@@ -358,6 +356,8 @@ class DFlashWorker:
             )
         if draft_server_args.speculative_draft_page_size is not None:
             draft_server_args.page_size = draft_server_args.speculative_draft_page_size
+        # Now that draft_server_args.page_size is finalized, mirror it into the worker state.
+        self.draft_page_size = int(getattr(draft_server_args, "page_size", server_args.page_size))
         draft_backend = draft_server_args.speculative_draft_attention_backend
         supported_draft_backends = ("flashinfer", "fa3", "fa4")
         if draft_backend is None:
@@ -455,7 +455,7 @@ class DFlashWorker:
                     getattr(server_args, "kv_cache_dtype", None),
                     getattr(server_args, "speculative_draft_kv_cache_dtype", None),
                     int(getattr(server_args, "page_size", 1) or 1),
-                    int(getattr(server_args, "speculative_draft_page_size", None) or 1),
+                    int(getattr(self, "draft_page_size", getattr(server_args, "page_size", 1) or 1)),
                     getattr(server_args, "cuda_graph_mode", None),
                     getattr(server_args, "piecewise_cuda_graph_max_tokens", None),
                     getattr(server_args, "max_running_requests", None),
