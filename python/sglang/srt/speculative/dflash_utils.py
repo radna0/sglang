@@ -306,26 +306,11 @@ def dflash_sampling_info_uses_sampled_target(
     if sampling_info is None:
         return False
 
-    if bool(getattr(sampling_info, "is_all_greedy", True)):
-        return False
-
-    top_ks = getattr(sampling_info, "top_ks", None)
-    if isinstance(top_ks, torch.Tensor) and top_ks.numel() > 0:
-        with torch.no_grad():
-            if bool(torch.any(top_ks.to(torch.int64) > 1).item()):
-                return True
-
-    top_ps = getattr(sampling_info, "top_ps", None)
-    if isinstance(top_ps, torch.Tensor) and top_ps.numel() > 0:
-        with torch.no_grad():
-            if bool(torch.any(top_ps.to(torch.float32) < 0.999999).item()):
-                return True
-
-    min_ps = getattr(sampling_info, "min_ps", None)
-    if isinstance(min_ps, torch.Tensor) and min_ps.numel() > 0:
-        with torch.no_grad():
-            if bool(torch.any(min_ps.to(torch.float32) > 0).item()):
-                return True
+    # Avoid host synchronizations on device tensors in the decode hot path. SamplingBatchInfo
+    # already computes CPU-resident flags for greedy vs sampled requests.
+    is_all_greedy = getattr(sampling_info, "is_all_greedy", None)
+    if isinstance(is_all_greedy, bool):
+        return not is_all_greedy
 
     if reqs:
         for req in reqs:
