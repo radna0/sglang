@@ -2016,8 +2016,11 @@ class DFlashWorker:
                     )
                 except Exception as e:
                     logger.warning("Fused KV append failed, falling back to sequential: %s", e)
-                    self._use_fused_kv_materialize = False
-                    self._fused_kv_helper = None
+                    # Only permanently disable the fused helper for structural incompatibilities.
+                    # Transient errors (allocator pressure, etc.) should not poison the fast path.
+                    if isinstance(e, (AttributeError, NotImplementedError)):
+                        self._use_fused_kv_materialize = False
+                        self._fused_kv_helper = None
                     self._append_target_hidden_sequential(ctx_hidden, ctx_positions, ctx_cache_loc)
             else:
                 self._append_target_hidden_sequential(ctx_hidden, ctx_positions, ctx_cache_loc)
@@ -2150,8 +2153,9 @@ class DFlashWorker:
                     return
                 except Exception as e:
                     logger.warning("Fused selected verify append failed, falling back: %s", e)
-                    self._use_fused_kv_materialize = False
-                    self._fused_kv_helper = None
+                    if isinstance(e, (AttributeError, NotImplementedError)):
+                        self._use_fused_kv_materialize = False
+                        self._fused_kv_helper = None
             self._append_target_hidden_sequential(ctx_hidden, ctx_positions, ctx_cache_loc)
 
     def _append_verified_hidden_selected_fused(
