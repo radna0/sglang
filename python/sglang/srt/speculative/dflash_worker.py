@@ -351,6 +351,23 @@ class DFlashWorker:
                 draft_server_args.speculative_draft_kv_cache_dtype
             )
         if draft_server_args.speculative_draft_mem_fraction_static is not None:
+            # When sharing the target token allocator, draft KV indices are drawn from the
+            # target allocator's slot space. Ensure the draft KV pool is at least as large
+            # as the target pool so those indices remain in-bounds.
+            if (
+                bool(getattr(self, "_draft_shares_token_allocator", True))
+                and float(draft_server_args.speculative_draft_mem_fraction_static)
+                < float(server_args.mem_fraction_static)
+            ):
+                logger.warning(
+                    "DFLASH draft mem_fraction_static=%s < target mem_fraction_static=%s while sharing allocator; "
+                    "clamping draft mem_fraction_static to target value for safety.",
+                    float(draft_server_args.speculative_draft_mem_fraction_static),
+                    float(server_args.mem_fraction_static),
+                )
+                draft_server_args.speculative_draft_mem_fraction_static = float(
+                    server_args.mem_fraction_static
+                )
             draft_server_args.mem_fraction_static = (
                 draft_server_args.speculative_draft_mem_fraction_static
             )
