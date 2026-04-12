@@ -149,6 +149,25 @@ def _get_dflash_cpu_copy_stream(
     return stream
 
 
+def _get_dflash_cpu_copy_event(
+    batch: ScheduleBatch,
+    *,
+    device: torch.device,
+) -> torch.cuda.Event:
+    event = getattr(batch, "_dflash_cpu_copy_event", None)
+    event_device_index = getattr(batch, "_dflash_cpu_copy_event_device_index", None)
+    device_index = (
+        int(device.index)
+        if device.index is not None
+        else int(torch.cuda.current_device())
+    )
+    if not isinstance(event, torch.cuda.Event) or event_device_index != device_index:
+        event = torch.cuda.Event()
+        setattr(batch, "_dflash_cpu_copy_event", event)
+        setattr(batch, "_dflash_cpu_copy_event_device_index", device_index)
+    return event
+
+
 def _assign_fixed_width_req_to_token_direct(
     *,
     req_pool_indices: torch.Tensor,
@@ -680,7 +699,7 @@ class DFlashVerifyInput(SpecInput):
             # Prefer an event-based wait (waits only for the D2H copies we recorded) instead of
             # synchronizing the entire stream. This is still a host wait, but avoids an extra
             # full stream sync point in the profiler hot path.
-            copy_done = torch.cuda.Event()
+            copy_done = _get_dflash_cpu_copy_event(batch, device=device)
             copy_done.record(copy_stream)
             copy_done.synchronize()
             if os.getenv("SGLANG_DFLASH_PROFILE"):
@@ -781,7 +800,7 @@ class DFlashVerifyInput(SpecInput):
                 verify_profile_ms["stage_copy"] = (time.perf_counter() - t_sub) * 1000.0
             if packed_commits.proposed_flat.is_cuda:
                 t_sync_0 = time.perf_counter()
-                copy_done = torch.cuda.Event()
+                copy_done = _get_dflash_cpu_copy_event(batch, device=device)
                 copy_done.record(copy_stream)
                 copy_done.synchronize()
                 if os.getenv("SGLANG_DFLASH_PROFILE"):

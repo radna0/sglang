@@ -2115,7 +2115,9 @@ class DFlashWorker:
                 prefix_i64 = prefix_lens.to(torch.int64)
                 last_loc = torch.full((bs,), -1, dtype=torch.int64, device=device)
                 has_prefix = prefix_i64 > 0
-                if bool(has_prefix.any()):
+                # Avoid a device->host sync from `has_prefix.any()` when prefix_i64 lives on CUDA.
+                # We already have CPU copies of the prefix lengths for paged alloc_extend.
+                if int(prefix_lens_cpu.max().item()) > 0:
                     last_pos = (prefix_i64 - 1).clamp_min(0)
                     last_loc[has_prefix] = draft_req_to_token[
                         req_pool_indices[has_prefix],
