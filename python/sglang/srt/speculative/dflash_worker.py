@@ -1214,7 +1214,11 @@ class DFlashWorker:
     # ------------------------------------------------------------------
 
     def _prepare_for_speculative_decoding(
-        self, batch: ScheduleBatch, draft_input: DFlashDraftInput
+        self,
+        batch: ScheduleBatch,
+        draft_input: DFlashDraftInput,
+        *,
+        profile_this_step: bool = False,
     ):
         """Draft a block using the draft model and prepare verify info."""
         if batch.forward_mode.is_extend() or batch.forward_mode.is_idle():
@@ -1238,7 +1242,9 @@ class DFlashWorker:
             self._last_logged_linear_mode = linear_mode
 
         # 1) Append newly committed tokens to draft KV
+        t0 = time.perf_counter() if profile_this_step else 0.0
         self._append_target_hidden_to_draft_kv(batch, draft_input)
+        t_append = time.perf_counter() if profile_this_step else 0.0
 
         target_model = self.target_worker.model_runner.model
         embed_module = target_model.get_input_embeddings()
@@ -1483,6 +1489,11 @@ class DFlashWorker:
                 raise RuntimeError("DFLASH draft model returned no hidden states.")
             draft_hidden = draft_hidden.view(bs, active_block_size, -1)
             draft_hidden_tail = draft_hidden[:, 1:, :].reshape(-1, draft_hidden.shape[-1])
+            if profile_this_step:
+                draft_input._profile_prepare_append_ms = (t_append - t0) * 1000.0
+                draft_input._profile_prepare_draft_ms = (
+                    time.perf_counter() - t_append
+                ) * 1000.0
         else:
             if self.tp_rank == 0 and requested_block_size != active_block_size:
                 logger.warning(
@@ -1491,6 +1502,9 @@ class DFlashWorker:
                     bs,
                 )
             draft_hidden_tail = self._draft_input_embeds_buf[:0, :0, :].reshape(0, self._draft_embed_dim)
+            if profile_this_step:
+                draft_input._profile_prepare_append_ms = (t_append - t0) * 1000.0
+                draft_input._profile_prepare_draft_ms = 0.0
 
         # Sample draft tokens (greedy or sampled)
         if linear_mode == "draft=sampled,target=sampled" and active_block_size > 1:
@@ -2298,7 +2312,9 @@ class DFlashWorker:
         self._profile_step += 1
 
         t0 = time.perf_counter() if profile_this_step else 0.0
-        self._prepare_for_speculative_decoding(batch, draft_input)
+        self._prepare_for_speculative_decoding(
+            batch, draft_input, profile_this_step=profile_this_step
+        )
         t_prepare = time.perf_counter() if profile_this_step else 0.0
 
         # Draft OOM / FailFast collapse can force this step back onto target-only decode.
@@ -2560,13 +2576,15 @@ class DFlashWorker:
             bs = batch.batch_size()
             logger.info(
                 "[DFLASH profile] bs=%d mode=%s can_run_cuda_graph=%s "
-                "prepare_ms=%.2f target_verify_ms=%.2f verify_cpu_ms=%.2f verify_wall_ms=%.2f append_ms=%.2f total_ms=%.2f "
+                "prepare_ms=%.2f (append_ms=%.2f draft_ms=%.2f) target_verify_ms=%.2f verify_cpu_ms=%.2f verify_wall_ms=%.2f append_ms=%.2f total_ms=%.2f "
                 "verify_cuda_ms=%s step_cuda_ms=%s "
                 "accept_sum=%d accept_mean=%.2f",
                 bs,
                 str(getattr(draft_input, "linear_mode", "")),
                 can_run_cuda_graph,
                 (t_prepare - t0) * 1000.0,
+                float(getattr(draft_input, "_profile_prepare_append_ms", 0.0)),
+                float(getattr(draft_input, "_profile_prepare_draft_ms", 0.0)),
                 (t_target - t1) * 1000.0,
                 (t_verify - t2) * 1000.0,
                 (t_verify - t2) * 1000.0,
