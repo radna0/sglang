@@ -2299,6 +2299,27 @@ class DFlashWorker:
         assert model_worker_batch.forward_mode.is_target_verify()
         verify_input = model_worker_batch.spec_info
         assert isinstance(verify_input, DFlashVerifyInput)
+        # Sanity: verify token count must match [bs * draft_token_num]. If this diverges, we must not
+        # attempt CUDA-graph replay because input buffer shapes will mismatch.
+        expected_verify_tokens = int(batch.batch_size()) * int(verify_input.draft_token_num)
+        if (
+            model_worker_batch.input_ids is None
+            or int(model_worker_batch.input_ids.numel()) != expected_verify_tokens
+        ):
+            raise RuntimeError(
+                "DFLASH verify input_ids size mismatch: "
+                f"got={0 if model_worker_batch.input_ids is None else int(model_worker_batch.input_ids.numel())} "
+                f"expected={expected_verify_tokens} (bs={int(batch.batch_size())} block={int(verify_input.draft_token_num)})."
+            )
+        if (
+            model_worker_batch.out_cache_loc is None
+            or int(model_worker_batch.out_cache_loc.numel()) != expected_verify_tokens
+        ):
+            raise RuntimeError(
+                "DFLASH verify out_cache_loc size mismatch: "
+                f"got={0 if model_worker_batch.out_cache_loc is None else int(model_worker_batch.out_cache_loc.numel())} "
+                f"expected={expected_verify_tokens} (bs={int(batch.batch_size())} block={int(verify_input.draft_token_num)})."
+            )
         verify_input.dflash_greedy_top1_only = bool(
             getattr(draft_input, "linear_mode", "") == "draft=greedy,target=greedy"
             and _can_use_dflash_greedy_top1_only(batch.sampling_info)
