@@ -14,9 +14,11 @@
 """Fused Triton kernel for DFlash KV materialization.
 
 Combines: KV projection (cuBLAS) + RMSNorm + RoPE (Triton), then pool-managed KV writes.
+Optionally fuses the DFlash target-feature projection (fc + RMSNorm) for selected
+verify tokens to keep the decode hot path fast.
 """
 
-from typing import Callable, List
+from typing import Callable, List, Optional
 
 import torch
 import triton
@@ -191,6 +193,10 @@ class FusedKVMaterializeHelper:
         num_kv_heads: int,
         head_dim: int,
         device: torch.device,
+        *,
+        target_fc_weight: Optional[torch.Tensor] = None,
+        target_hidden_norm_weight: Optional[torch.Tensor] = None,
+        target_hidden_norm_eps: Optional[float] = None,
     ):
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
@@ -209,8 +215,16 @@ class FusedKVMaterializeHelper:
                 f"rotary_dim={self.rotary_dim}, head_dim={self.head_dim}."
             )
 
+        # Optional DFlash target-feature projection weights.
+        # When provided, we can project concatenated target hidden features into the draft
+        # hidden space inside the fused selected-append path.
+        self.target_fc_weight = target_fc_weight
+        self.target_hidden_norm_weight = target_hidden_norm_weight
+        self.target_hidden_norm_eps = target_hidden_norm_eps
+
         # Pre-extract and stack weights for batched projection.
         kv_weights = []
+        kv_biases = []
         self.k_norm_weights = []
         self.eps_values = []
 
@@ -244,11 +258,71 @@ class FusedKVMaterializeHelper:
             qkv_w = attn.qkv_proj.weight
             kv_weight = qkv_w[attn.q_size : attn.q_size + 2 * attn.kv_size]
             kv_weights.append(kv_weight)
+            qkv_b = getattr(attn.qkv_proj, "bias", None)
+            if qkv_b is not None:
+                kv_bias = qkv_b[attn.q_size : attn.q_size + 2 * attn.kv_size]
+                kv_biases.append(kv_bias)
+            else:
+                kv_biases.append(None)
             self.k_norm_weights.append(attn.k_norm.weight)
             self.eps_values.append(attn.k_norm.variance_epsilon)
 
         # Stack for batched einsum: [n_layers, kv_size*2, hidden_size]
         self.batched_kv_weight = torch.stack(kv_weights)
+        if any(bias is not None for bias in kv_biases):
+            if not all(bias is not None for bias in kv_biases):
+                raise ValueError("qkv bias presence mismatch across layers for fused KV path.")
+            self.batched_kv_bias = torch.stack(kv_biases)  # type: ignore[arg-type]
+        else:
+            self.batched_kv_bias = None
+
+    def _project_target_hidden(self, target_hidden: torch.Tensor) -> torch.Tensor:
+        if (
+            self.target_fc_weight is None
+            or self.target_hidden_norm_weight is None
+            or self.target_hidden_norm_eps is None
+        ):
+            raise RuntimeError(
+                "FusedKVMaterializeHelper is missing DFlash target projection weights."
+            )
+        ctx_hidden = torch.nn.functional.linear(target_hidden, self.target_fc_weight)
+        if ctx_hidden.numel() == 0:
+            return ctx_hidden
+
+        ctx_hidden_fp32 = ctx_hidden.to(torch.float32)
+        variance = ctx_hidden_fp32.pow(2).mean(dim=-1, keepdim=True)
+        ctx_hidden_fp32 = ctx_hidden_fp32 * torch.rsqrt(
+            variance + float(self.target_hidden_norm_eps)
+        )
+        ctx_hidden_fp32 = ctx_hidden_fp32 * self.target_hidden_norm_weight.to(
+            dtype=torch.float32, device=ctx_hidden_fp32.device
+        )
+        return ctx_hidden_fp32.to(dtype=ctx_hidden.dtype)
+
+    def project_target_hidden_selected(
+        self, *, target_hidden: torch.Tensor, accepted_indices: torch.Tensor
+    ) -> torch.Tensor:
+        if target_hidden.ndim == 3:
+            flat_target_hidden = target_hidden.reshape(-1, target_hidden.shape[-1])
+        elif target_hidden.ndim == 2:
+            flat_target_hidden = target_hidden
+        else:
+            raise ValueError(
+                f"target_hidden must be 2D or 3D, got shape={tuple(target_hidden.shape)}"
+            )
+
+        if accepted_indices.ndim != 1:
+            accepted_indices = accepted_indices.reshape(-1)
+        accepted_indices = accepted_indices.to(
+            dtype=torch.int64, device=flat_target_hidden.device
+        )
+        if accepted_indices.numel() == 0:
+            return flat_target_hidden[:0]
+        selected_hidden = flat_target_hidden.index_select(0, accepted_indices)
+        if self.target_fc_weight is None:
+            # Back-compat: no projection weights, treat target_hidden as ctx_hidden.
+            return selected_hidden
+        return self._project_target_hidden(selected_hidden)
 
     def materialize(
         self,
@@ -294,6 +368,8 @@ class FusedKVMaterializeHelper:
 
         # Batched KV projection: [n_layers, total_ctx, kv_size*2]
         kv_all = torch.einsum("th,loh->lto", ctx_hidden, self.batched_kv_weight)
+        if self.batched_kv_bias is not None:
+            kv_all = kv_all + self.batched_kv_bias[:, None, :]
 
         # Per-layer fused norm/RoPE/materialize, then delegate writes to the KV pool.
         for layer_id in range(self.n_layers):
@@ -320,27 +396,49 @@ class FusedKVMaterializeHelper:
     ) -> None:
         """Materialize only the accepted subset of verify hidden states.
 
-        Linear/tree DFlash verify append already computes the accepted token index
-        set. Reuse the fused batched KV projection path instead of falling back to
-        sequential per-layer projection.
+        Positions are already compacted/ordered by the caller (matching accepted_indices).
+        When target projection weights are provided, this also applies the draft fc + RMSNorm
+        before KV projection to keep the decode hot path fused.
         """
         if accepted_indices.ndim != 1:
             accepted_indices = accepted_indices.reshape(-1)
         if accepted_indices.numel() == 0:
             return
-
-        accepted_indices = accepted_indices.to(
-            device=target_hidden.device, dtype=torch.int64
-        )
-        if positions.ndim != 1:
-            positions = positions.reshape(-1)
-        selected_hidden = target_hidden.index_select(0, accepted_indices)
-        selected_positions = positions.index_select(
-            0, accepted_indices.to(device=positions.device, dtype=torch.int64)
+        ctx_hidden = self.project_target_hidden_selected(
+            target_hidden=target_hidden, accepted_indices=accepted_indices
         )
         self.materialize(
-            ctx_hidden=selected_hidden,
-            positions=selected_positions,
+            ctx_hidden=ctx_hidden,
+            positions=positions,
+            write_layer_kv=write_layer_kv,
+            max_position_hint=None if max_position_hint is None else int(max_position_hint),
+        )
+
+    def materialize_from_target_hidden(
+        self,
+        *,
+        target_hidden: torch.Tensor,
+        positions: torch.Tensor,
+        write_layer_kv: Callable[[int, torch.Tensor, torch.Tensor], None],
+        max_position_hint: int | None = None,
+    ) -> None:
+        """Project (fc + RMSNorm) then materialize KV for all tokens."""
+        if self.target_fc_weight is None:
+            raise RuntimeError(
+                "materialize_from_target_hidden requires DFlash target projection weights."
+            )
+        if target_hidden.ndim == 3:
+            flat_target_hidden = target_hidden.reshape(-1, target_hidden.shape[-1])
+        elif target_hidden.ndim == 2:
+            flat_target_hidden = target_hidden
+        else:
+            raise ValueError(
+                f"target_hidden must be 2D or 3D, got shape={tuple(target_hidden.shape)}"
+            )
+        ctx_hidden = self._project_target_hidden(flat_target_hidden)
+        self.materialize(
+            ctx_hidden=ctx_hidden,
+            positions=positions,
             write_layer_kv=write_layer_kv,
             max_position_hint=None if max_position_hint is None else int(max_position_hint),
         )

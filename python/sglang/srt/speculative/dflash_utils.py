@@ -90,10 +90,10 @@ def build_dflash_filtered_sampling_distribution_from_logits(
         return logits, empty_idx
 
     vocab_size = int(logits.shape[-1])
-    top_ks_view = top_ks.view(-1).to(device=logits.device, dtype=torch.int64)
-    use_bounded_topk = top_ks_view.numel() > 0 and not torch.any(
-        top_ks_view >= vocab_size
-    )
+    # Avoid GPU->CPU sync from `.max().item()` on device tensors: top_k comes from request params
+    # and is naturally available on CPU. Compute the bounded-topk decision on CPU, then transfer.
+    top_ks_cpu = top_ks.view(-1).to(device="cpu", dtype=torch.int64)
+    use_bounded_topk = top_ks_cpu.numel() > 0 and bool(torch.all(top_ks_cpu < vocab_size))
     if not use_bounded_topk:
         probs = F.softmax(logits, dim=-1)
         return build_dflash_filtered_sampling_distribution_from_probs(
@@ -104,7 +104,8 @@ def build_dflash_filtered_sampling_distribution_from_logits(
             need_min_p_sampling,
         )
 
-    max_top_k = int(top_ks_view.max().item())
+    top_ks_view = top_ks_cpu.to(device=logits.device, dtype=torch.int64, non_blocking=True)
+    max_top_k = int(top_ks_cpu.max().item())
     max_top_k = max(1, min(max_top_k, vocab_size))
     topk_logits, topk_indices = torch.topk(
         logits,
@@ -3052,11 +3053,8 @@ def compute_dflash_sampling_accept_len_and_bonus(
     expanded_temperature = torch.repeat_interleave(
         sampling_info.temperatures, draft_token_num, dim=0
     ).to(device=device, dtype=next_token_logits.dtype)
-    if bool(torch.any(expanded_temperature <= 0).item()):
-        raise RuntimeError(
-            "DFLASH sampled verification received non-positive temperature. "
-            "This batch should have stayed on the greedy target-verify path."
-        )
+    # NOTE: avoid GPU->CPU synchronizations in the decode hot path. Temperature validity is
+    # guaranteed by the sampling path (and `dflash_sampling_info_uses_sampled_target` guards).
     scaled_logits = next_token_logits / expanded_temperature.view(-1, 1)
     repeated_top_ks = torch.repeat_interleave(
         sampling_info.top_ks, draft_token_num, dim=0
@@ -3185,35 +3183,35 @@ def compute_dflash_sampling_accept_len_and_bonus(
     bonus_token_ids = target_probs_idx[row_ids, reject_step].clone()
 
     rejected_mask = reject_step < int(step_count)
-    if bool(rejected_mask.any().item()):
-        rejected_rows = row_ids[rejected_mask]
-        rejected_steps = reject_step[rejected_mask]
-        if linear_mode == "draft=sampled,target=sampled":
-            assert draft_proposal_indices is not None
-            assert draft_proposal_probs is not None
-            rejected_support_idx = draft_proposal_indices[
-                rejected_rows, rejected_steps
-            ].to(device=device, dtype=torch.long)
-            rejected_support_probs = draft_proposal_probs[
-                rejected_rows, rejected_steps
-            ].to(device=device, dtype=bonus_probs_sort.dtype)
-            overlap = (
-                bonus_token_ids[rejected_mask].unsqueeze(2)
-                == rejected_support_idx.unsqueeze(1)
-            )
-            subtract = (
-                overlap.to(dtype=bonus_probs_sort.dtype)
-                * rejected_support_probs.unsqueeze(1)
-            ).sum(dim=-1)
-            bonus_probs_sort[rejected_mask].sub_(subtract).clamp_min_(0.0)
-        else:
-            rejected_tokens = proposal_tokens[rejected_rows, rejected_steps].unsqueeze(1)
-            zero_mask = bonus_token_ids[rejected_mask] == rejected_tokens
-            bonus_probs_sort[rejected_mask] = torch.where(
-                zero_mask,
-                torch.zeros_like(bonus_probs_sort[rejected_mask]),
-                bonus_probs_sort[rejected_mask],
-            )
+    # Avoid `.any().item()` host sync; all operations below are safe on empty selections.
+    rejected_rows = row_ids[rejected_mask]
+    rejected_steps = reject_step[rejected_mask]
+    if linear_mode == "draft=sampled,target=sampled":
+        assert draft_proposal_indices is not None
+        assert draft_proposal_probs is not None
+        rejected_support_idx = draft_proposal_indices[
+            rejected_rows, rejected_steps
+        ].to(device=device, dtype=torch.long)
+        rejected_support_probs = draft_proposal_probs[
+            rejected_rows, rejected_steps
+        ].to(device=device, dtype=bonus_probs_sort.dtype)
+        overlap = (
+            bonus_token_ids[rejected_mask].unsqueeze(2)
+            == rejected_support_idx.unsqueeze(1)
+        )
+        subtract = (
+            overlap.to(dtype=bonus_probs_sort.dtype)
+            * rejected_support_probs.unsqueeze(1)
+        ).sum(dim=-1)
+        bonus_probs_sort[rejected_mask].sub_(subtract).clamp_min_(0.0)
+    else:
+        rejected_tokens = proposal_tokens[rejected_rows, rejected_steps].unsqueeze(1)
+        zero_mask = bonus_token_ids[rejected_mask] == rejected_tokens
+        bonus_probs_sort[rejected_mask] = torch.where(
+            zero_mask,
+            torch.zeros_like(bonus_probs_sort[rejected_mask]),
+            bonus_probs_sort[rejected_mask],
+        )
 
     bonus_local = _sample_dflash_sparse_probs_with_uniform(
         bonus_probs_sort,

@@ -323,27 +323,12 @@ class DFlashWorker:
 
         # DFlash draft KV materialization currently assumes that target-side cache locations
         # (from the scheduler's req_to_token_pool) are valid indices for the draft KV writes.
-        # That only holds when the draft worker shares the token_to_kv_pool_allocator with the
-        # target worker (slot indices stay consistent across the two KV pools even if KV dtypes differ).
-        #
-        # Supporting a fully independent draft allocator would require allocating new draft slots
-        # and maintaining an independent req_to_token mapping for the draft worker end-to-end.
+        # When the draft uses an independent allocator (e.g. draft_page_size != target_page_size),
+        # we allocate draft KV slots separately and update the draft req_to_token mapping.
         should_share_token_allocator = True
         self._draft_shares_token_allocator = True
         if self.use_compact_draft_cache:
             shared_req_to_token_pool = None
-        if self.tp_rank == 0:
-            try:
-                alloc_type = type(target_token_to_kv_pool_allocator).__name__
-            except Exception:
-                alloc_type = "unknown"
-            logger.info(
-                "DFLASH draft allocator policy: share_token_allocator=%s share_req_to_token=%s (target_allocator=%s, draft_kv_cache_dtype=%s)",
-                self._draft_shares_token_allocator,
-                shared_req_to_token_pool is not None,
-                alloc_type,
-                getattr(server_args, "speculative_draft_kv_cache_dtype", None),
-            )
         draft_server_args = deepcopy(server_args)
         draft_server_args.skip_tokenizer_init = True
         if draft_server_args.speculative_draft_kv_cache_dtype is not None:
@@ -373,8 +358,49 @@ class DFlashWorker:
             )
         if draft_server_args.speculative_draft_page_size is not None:
             draft_server_args.page_size = draft_server_args.speculative_draft_page_size
-        # Now that draft_server_args.page_size is finalized, mirror it into the worker state.
-        self.draft_page_size = int(getattr(draft_server_args, "page_size", server_args.page_size))
+
+        # Pool sharing requires allocator semantics (including page_size) to match. When the user
+        # requests a different draft page_size (common in production: target paged-KV but draft non-paged),
+        # we must disable allocator + req_to_token sharing and allocate draft KV slots independently.
+        target_page_size = int(getattr(server_args, "page_size", 1) or 1)
+        requested_draft_page_size = int(
+            getattr(draft_server_args, "page_size", target_page_size) or target_page_size
+        )
+        if should_share_token_allocator and requested_draft_page_size != target_page_size:
+            should_share_token_allocator = False
+            self._draft_shares_token_allocator = False
+            shared_req_to_token_pool = None
+            if self.tp_rank == 0:
+                logger.warning(
+                    "DFLASH disabling pool sharing due to draft_page_size mismatch: "
+                    "target_page_size=%s draft_page_size=%s. Draft KV will allocate independently.",
+                    int(target_page_size),
+                    int(requested_draft_page_size),
+                )
+        else:
+            self._draft_shares_token_allocator = bool(should_share_token_allocator)
+
+        if should_share_token_allocator:
+            draft_server_args.page_size = target_page_size
+            self.draft_page_size = target_page_size
+        else:
+            self.draft_page_size = requested_draft_page_size
+
+        if self.tp_rank == 0:
+            try:
+                alloc_type = type(target_token_to_kv_pool_allocator).__name__
+            except Exception:
+                alloc_type = "unknown"
+            logger.info(
+                "DFLASH draft allocator policy: share_token_allocator=%s share_req_to_token=%s "
+                "(target_allocator=%s, target_page_size=%s draft_page_size=%s draft_kv_cache_dtype=%s)",
+                bool(self._draft_shares_token_allocator),
+                shared_req_to_token_pool is not None,
+                alloc_type,
+                int(target_page_size),
+                int(self.draft_page_size),
+                getattr(server_args, "speculative_draft_kv_cache_dtype", None),
+            )
         draft_backend = draft_server_args.speculative_draft_attention_backend
         supported_draft_backends = ("flashinfer", "fa3", "fa4")
         if draft_backend is None:
@@ -602,9 +628,9 @@ class DFlashWorker:
                 )
             return "draft=sampled,target=sampled"
 
-        # auto: use sampled draft only when TP=1, else greedy draft
-        if tp_size == 1:
-            return "draft=sampled,target=sampled"
+        # auto: keep the draft proposal deterministic for production speed/stability.
+        # Sampled-draft mode is supported but must be explicitly enabled via
+        # SGLANG_DFLASH_LINEAR_DRAFT_MODE=sample.
         return "draft=greedy,target=sampled"
 
     def _resolve_failfast_block_candidates(self, max_block_size: int) -> List[int]:
@@ -712,15 +738,25 @@ class DFlashWorker:
         prefix_ok = torch.cumprod(token_ok.to(torch.int32), dim=1).to(torch.bool)
         row_support_steps = prefix_ok.to(torch.int32).sum(dim=1)
         selected_support_ratio = 0.0
-        for width in candidates:
-            support_steps = max(0, int(width) - 1)
+        # Avoid per-candidate `.item()` synchronizations. Compute all support ratios on device,
+        # then transfer the small [len(candidates)] vector once for the CPU decision logic.
+        support_steps_list = [max(0, int(width) - 1) for width in candidates]
+        support_steps_vec = torch.tensor(
+            support_steps_list,
+            device=row_support_steps.device,
+            dtype=row_support_steps.dtype,
+        )
+        # [bs, num_candidates]
+        support_ok = row_support_steps[:, None] >= support_steps_vec[None, :]
+        support_ratio_vec = support_ok.to(torch.float32).mean(dim=0)
+        support_ratio_cpu = support_ratio_vec.detach().to(device="cpu", dtype=torch.float32)
+        for idx, width in enumerate(candidates):
+            support_steps = int(support_steps_list[idx])
             if support_steps <= 0:
                 logical_block_size = int(width)
                 selected_support_ratio = 1.0
                 continue
-            support_ratio = float(
-                (row_support_steps >= support_steps).to(torch.float32).mean().item()
-            )
+            support_ratio = float(support_ratio_cpu[idx].item())
             if support_ratio + 1e-6 >= batch_pass_ratio:
                 logical_block_size = int(width)
                 selected_support_ratio = support_ratio
@@ -730,27 +766,30 @@ class DFlashWorker:
         proposal_width = max(0, logical_block_size - 1)
         conf_prefix = q_conf[:, :proposal_width]
         ent_prefix = None if q_ent is None else q_ent[:, :proposal_width]
-        draft_conf_debug: dict[str, float] = {}
-        if conf_prefix.numel() > 0:
-            draft_conf_debug["q_max_mean_first"] = float(conf_prefix.mean().item())
-            draft_conf_debug["q_max_min_first"] = float(conf_prefix.min().item())
-            draft_conf_debug["q_pass_ratio_first"] = float(selected_support_ratio)
-            draft_conf_debug["q_support_steps_mean"] = float(
-                row_support_steps.to(torch.float32).mean().item()
-            )
-            draft_conf_debug["q_support_steps_min"] = float(
-                row_support_steps.min().item()
-            )
-        if ent_prefix is not None and ent_prefix.numel() > 0:
-            draft_conf_debug["q_ent_mean_first"] = float(ent_prefix.mean().item())
-        if not draft_conf_debug:
-            draft_conf_debug = None
-
-        if (
+        # Computing debug stats requires device->host syncs. Keep them off the hot path unless
+        # explicitly requested or we are about to emit a shrink log line.
+        want_debug = _env_enabled("SGLANG_DFLASH_FAILFAST_DEBUG")
+        will_log_shrink = (
             logical_block_size < active_block_size
             and self.tp_rank == 0
             and self._failfast_log_ct < 20
-        ):
+        )
+        draft_conf_debug: Optional[dict[str, float]] = None
+        if (want_debug or will_log_shrink) and conf_prefix.numel() > 0:
+            tmp: dict[str, float] = {
+                "q_max_mean_first": float(conf_prefix.mean().item()),
+                "q_max_min_first": float(conf_prefix.min().item()),
+                "q_pass_ratio_first": float(selected_support_ratio),
+                "q_support_steps_mean": float(
+                    row_support_steps.to(torch.float32).mean().item()
+                ),
+                "q_support_steps_min": float(row_support_steps.min().item()),
+            }
+            if ent_prefix is not None and ent_prefix.numel() > 0:
+                tmp["q_ent_mean_first"] = float(ent_prefix.mean().item())
+            draft_conf_debug = tmp
+
+        if will_log_shrink:
             self._failfast_log_ct += 1
             logger.info(
                 "DFLASH FailFast reduced logical verify width: physical_block_size=%s -> logical_block_size=%s "
@@ -761,13 +800,13 @@ class DFlashWorker:
                 row_mean_threshold,
                 batch_pass_ratio,
                 float(draft_conf_debug.get("q_max_mean_first"))
-                if draft_conf_debug and "q_max_mean_first" in draft_conf_debug
+                if draft_conf_debug is not None
                 else float("nan"),
                 float(draft_conf_debug.get("q_max_min_first"))
-                if draft_conf_debug and "q_max_min_first" in draft_conf_debug
+                if draft_conf_debug is not None
                 else float("nan"),
                 float(draft_conf_debug.get("q_pass_ratio_first"))
-                if draft_conf_debug and "q_pass_ratio_first" in draft_conf_debug
+                if draft_conf_debug is not None
                 else float("nan"),
             )
 
@@ -1033,6 +1072,19 @@ class DFlashWorker:
             FusedKVMaterializeHelper = _get_fused_kv_materialize_helper()
             first_attn = layers[0].self_attn
             rotary_emb = first_attn.rotary_emb
+            target_fc_weight = None
+            target_hidden_norm_weight = None
+            target_hidden_norm_eps = None
+            try:
+                fc = getattr(self.draft_model, "fc", None)
+                target_fc_weight = getattr(fc, "weight", None)
+                hn = getattr(self.draft_model, "hidden_norm", None)
+                target_hidden_norm_weight = getattr(hn, "weight", None)
+                target_hidden_norm_eps = getattr(hn, "variance_epsilon", None)
+            except Exception:
+                target_fc_weight = None
+                target_hidden_norm_weight = None
+                target_hidden_norm_eps = None
 
             self._fused_kv_helper = FusedKVMaterializeHelper(
                 layers=layers,
@@ -1040,6 +1092,9 @@ class DFlashWorker:
                 num_kv_heads=first_attn.num_kv_heads,
                 head_dim=first_attn.head_dim,
                 device=self.device,
+                target_fc_weight=target_fc_weight,
+                target_hidden_norm_weight=target_hidden_norm_weight,
+                target_hidden_norm_eps=target_hidden_norm_eps,
             )
             # Pre-grow RoPE cache once to avoid per-step Python overhead inside the fused helper.
             try:
@@ -1087,6 +1142,12 @@ class DFlashWorker:
         self._draft_block_end_buf = torch.empty(
             (new_cap,), dtype=torch.int32, device=device
         )
+        self._draft_seq_lens_cpu_buf = torch.empty(
+            (new_cap,),
+            dtype=torch.int32,
+            device="cpu",
+            pin_memory=bool(torch.cuda.is_available()),
+        )
         self._draft_input_embeds_buf = torch.empty(
             (new_cap, block_size, self._draft_embed_dim),
             dtype=self._draft_embed_dtype,
@@ -1107,12 +1168,6 @@ class DFlashWorker:
         if widths[-1] != 1:
             widths.append(1)
         return widths
-        self._draft_seq_lens_cpu_buf = torch.empty(
-            (new_cap,),
-            dtype=torch.int32,
-            device="cpu",
-            pin_memory=bool(torch.cuda.is_available()),
-        )
 
     def _get_mask_token_embedding(self, embed_module) -> torch.Tensor:
         if self._draft_mask_token_embed is None:
@@ -1452,9 +1507,34 @@ class DFlashWorker:
                     spec_info=draft_spec_info,
                     capture_hidden_mode=CaptureHiddenMode.NULL,  # draft does not need hidden
                 )
-                with torch.inference_mode():
-                    draft_out = self.draft_model_runner.forward(forward_batch)
-                    draft_logits_output = draft_out.logits_output
+
+                # Draft CUDA graphs are captured for the configured max block size. If we shrink
+                # the physical draft width (FailFast or KV/OOM fallback), the replay token count
+                # no longer matches the captured graph shapes. Disable draft graph replay for
+                # this forward so the server never crashes on shape mismatch.
+                draft_runner = self.draft_model_runner
+                disable_draft_graph = bool(active_block_size != int(self.block_size))
+                saved_draft_graph_runner = None
+                saved_draft_piecewise_runner = None
+                if disable_draft_graph:
+                    saved_draft_graph_runner = draft_runner.graph_runner
+                    saved_draft_piecewise_runner = getattr(
+                        draft_runner, "piecewise_cuda_graph_runner", None
+                    )
+                    draft_runner.graph_runner = None
+                    if hasattr(draft_runner, "piecewise_cuda_graph_runner"):
+                        draft_runner.piecewise_cuda_graph_runner = None
+                try:
+                    with torch.inference_mode():
+                        draft_out = draft_runner.forward(forward_batch)
+                        draft_logits_output = draft_out.logits_output
+                finally:
+                    if disable_draft_graph:
+                        draft_runner.graph_runner = saved_draft_graph_runner
+                        if hasattr(draft_runner, "piecewise_cuda_graph_runner"):
+                            draft_runner.piecewise_cuda_graph_runner = (
+                                saved_draft_piecewise_runner
+                            )
             finally:
                 # Clean up req->token pointers to avoid dangling references, regardless of whether we
                 # free explicitly or restore allocator state.
@@ -1945,13 +2025,6 @@ class DFlashWorker:
         bs = batch.batch_size()
         device = self.model_runner.device
 
-        if not bool(getattr(self, "_draft_shares_token_allocator", True)):
-            raise RuntimeError(
-                "DFLASH internal error: draft token allocator is not shared, but the current "
-                "append path requires shared slot indices. Independent draft allocators are "
-                "not implemented on this branch."
-            )
-
         if draft_input.target_hidden is None:
             raise RuntimeError("DFLASH draft state missing target_hidden.")
         if draft_input.ctx_lens.numel() != bs or draft_input.draft_seq_lens.numel() != bs:
@@ -1962,6 +2035,12 @@ class DFlashWorker:
             draft_input.ctx_lens = torch.zeros_like(draft_input.ctx_lens)
             draft_input.target_hidden = draft_input.target_hidden[:0]
             return
+
+        share_pools = bool(getattr(self, "_draft_shares_token_allocator", True))
+        share_req_to_token = bool(
+            getattr(self.draft_model_runner, "req_to_token_pool", None)
+            is getattr(batch, "req_to_token_pool", None)
+        )
 
         target_req_to_token = batch.req_to_token_pool.req_to_token
         draft_req_to_token = self.draft_model_runner.req_to_token_pool.req_to_token
@@ -2007,29 +2086,84 @@ class DFlashWorker:
         mask = r < ctx_lens[:, None]
         ctx_positions = pos2d[mask]
 
-        ctx_cache_loc = self._gather_req_to_token_masked(
-            req_to_token=target_req_to_token,
-            req_pool_indices=req_pool_indices,
-            pos2d=pos2d,
-            mask=mask,
-            context="DFLASH target hidden KV append",
-        )
+        if share_pools:
+            ctx_cache_loc = self._gather_req_to_token_masked(
+                req_to_token=target_req_to_token,
+                req_pool_indices=req_pool_indices,
+                pos2d=pos2d,
+                mask=mask,
+                context="DFLASH target hidden KV append",
+            )
+            # If req_to_token is not shared (e.g. compact draft cache), we must still populate
+            # the draft mapping for the appended tokens.
+            if not share_req_to_token and ctx_cache_loc.numel() > 0:
+                row_ids = req_pool_indices.repeat_interleave(
+                    ctx_lens.to(torch.int64), dim=0
+                )
+                draft_req_to_token[row_ids, ctx_positions] = ctx_cache_loc.to(
+                    dtype=draft_req_to_token.dtype
+                )
+        else:
+            allocator = self.draft_model_runner.token_to_kv_pool_allocator
+            page_size = int(getattr(allocator, "page_size", 1) or 1)
+            if page_size > 1:
+                prefix_lens = draft_prefix_lens.to(torch.int32)
+                seq_lens = seq_lens_after.to(torch.int32)
+                prefix_lens_cpu = prefix_lens.to(device="cpu", dtype=torch.int32)
+                seq_lens_cpu = seq_lens.to(device="cpu", dtype=torch.int32)
+
+                prefix_i64 = prefix_lens.to(torch.int64)
+                last_loc = torch.full((bs,), -1, dtype=torch.int64, device=device)
+                has_prefix = prefix_i64 > 0
+                if bool(has_prefix.any()):
+                    last_pos = (prefix_i64 - 1).clamp_min(0)
+                    last_loc[has_prefix] = draft_req_to_token[
+                        req_pool_indices[has_prefix],
+                        last_pos[has_prefix],
+                    ].to(torch.int64)
+                alloc = allocator.alloc_extend(
+                    prefix_lens,
+                    prefix_lens_cpu,
+                    seq_lens,
+                    seq_lens_cpu,
+                    last_loc,
+                    int(total_ctx),
+                )
+            else:
+                alloc = allocator.alloc(int(total_ctx))
+
+            if alloc is None or int(alloc.numel()) < int(total_ctx):
+                raise RuntimeError(
+                    "DFLASH draft KV alloc OOM (non-shared pools): "
+                    f"need_tokens={int(total_ctx)} available={int(allocator.available_size())}"
+                )
+            ctx_cache_loc = alloc[: int(total_ctx)].to(torch.int64)
+            if ctx_cache_loc.numel() > 0:
+                row_ids = req_pool_indices.repeat_interleave(
+                    ctx_lens.to(torch.int64), dim=0
+                )
+                draft_req_to_token[row_ids, ctx_positions] = ctx_cache_loc.to(
+                    dtype=draft_req_to_token.dtype
+                )
 
         with torch.inference_mode():
-            ctx_hidden = self.draft_model.project_target_hidden(draft_input.target_hidden)
-            if ctx_hidden.shape[0] != ctx_cache_loc.numel():
-                raise RuntimeError(f"ctx_hidden/cache_loc mismatch: {ctx_hidden.shape[0]} vs {ctx_cache_loc.numel()}.")
-
             max_position_hint = None
             try:
-                max_position_hint = int(batch.seq_lens_cpu[:bs].max().item()) + int(self.block_size)
+                max_position_hint = int(batch.seq_lens_cpu[:bs].max().item()) + int(
+                    self.block_size
+                )
             except Exception:
                 max_position_hint = None
 
-            if self._use_fused_kv_materialize and self._fused_kv_helper is not None:
+            fused_supports_target_proj = bool(
+                self._use_fused_kv_materialize
+                and self._fused_kv_helper is not None
+                and getattr(self._fused_kv_helper, "target_fc_weight", None) is not None
+            )
+            if fused_supports_target_proj:
                 try:
-                    self._append_target_hidden_fused(
-                        ctx_hidden,
+                    self._append_target_hidden_from_target_features_fused(
+                        draft_input.target_hidden,
                         ctx_positions,
                         ctx_cache_loc,
                         max_position_hint=max_position_hint,
@@ -2039,23 +2173,66 @@ class DFlashWorker:
                         self._fused_append_fail_ct += 1
                         if self._fused_append_fail_ct <= 3:
                             logger.warning(
-                                "Fused KV append failed, falling back to sequential: %s", e
+                                "Fused KV append (target features) failed, falling back: %s",
+                                e,
                             )
                         elif self._fused_append_fail_ct == 10:
                             logger.info(
                                 "Fused KV append has failed %d times; suppressing further warnings.",
                                 self._fused_append_fail_ct,
                             )
-                    # Only permanently disable the fused helper for structural incompatibilities.
-                    # Transient errors (allocator pressure, etc.) should not poison the fast path.
                     if isinstance(e, (AttributeError, NotImplementedError)):
                         self._use_fused_kv_materialize = False
                         self._fused_kv_helper = None
-                    self._append_target_hidden_sequential(ctx_hidden, ctx_positions, ctx_cache_loc)
-            else:
-                self._append_target_hidden_sequential(ctx_hidden, ctx_positions, ctx_cache_loc)
+                    # Fall back to the projected path below.
+                    fused_supports_target_proj = False
+
+            if not fused_supports_target_proj:
+                ctx_hidden = self.draft_model.project_target_hidden(
+                    draft_input.target_hidden
+                )
+                if ctx_hidden.shape[0] != ctx_cache_loc.numel():
+                    raise RuntimeError(
+                        f"ctx_hidden/cache_loc mismatch: {ctx_hidden.shape[0]} vs {ctx_cache_loc.numel()}."
+                    )
+
+                if self._use_fused_kv_materialize and self._fused_kv_helper is not None:
+                    try:
+                        self._append_target_hidden_fused(
+                            ctx_hidden,
+                            ctx_positions,
+                            ctx_cache_loc,
+                            max_position_hint=max_position_hint,
+                        )
+                    except Exception as e:
+                        if self.tp_rank == 0:
+                            self._fused_append_fail_ct += 1
+                            if self._fused_append_fail_ct <= 3:
+                                logger.warning(
+                                    "Fused KV append failed, falling back to sequential: %s",
+                                    e,
+                                )
+                            elif self._fused_append_fail_ct == 10:
+                                logger.info(
+                                    "Fused KV append has failed %d times; suppressing further warnings.",
+                                    self._fused_append_fail_ct,
+                                )
+                        if isinstance(e, (AttributeError, NotImplementedError)):
+                            self._use_fused_kv_materialize = False
+                            self._fused_kv_helper = None
+                        self._append_target_hidden_sequential(
+                            ctx_hidden, ctx_positions, ctx_cache_loc
+                        )
+                else:
+                    self._append_target_hidden_sequential(
+                        ctx_hidden, ctx_positions, ctx_cache_loc
+                    )
 
         if self.use_compact_draft_cache:
+            if not share_pools:
+                raise RuntimeError(
+                    "DFLASH compact draft cache requires shared pools on this branch."
+                )
             new_draft_seq_lens = self._compute_compact_draft_seq_lens(seq_lens_after)
             suffix_start = seq_lens_after.to(torch.int64) - new_draft_seq_lens.to(torch.int64)
             suffix_cache_loc = self._gather_req_to_token_segments(
@@ -2118,6 +2295,28 @@ class DFlashWorker:
             max_position_hint=None if max_position_hint is None else int(max_position_hint),
         )
 
+    def _append_target_hidden_from_target_features_fused(
+        self,
+        target_hidden: torch.Tensor,
+        ctx_positions: torch.Tensor,
+        ctx_cache_loc: torch.Tensor,
+        *,
+        max_position_hint: Optional[int] = None,
+    ) -> None:
+        token_to_kv_pool = self.draft_model_runner.token_to_kv_pool
+        layers = self.draft_model.layers
+
+        def _write_layer_kv(layer_idx: int, cache_k: torch.Tensor, cache_v: torch.Tensor) -> None:
+            attn = layers[layer_idx].self_attn.attn
+            token_to_kv_pool.set_kv_buffer(attn, ctx_cache_loc, cache_k, cache_v, attn.k_scale, attn.v_scale)
+
+        self._fused_kv_helper.materialize_from_target_hidden(
+            target_hidden=target_hidden,
+            positions=ctx_positions,
+            write_layer_kv=_write_layer_kv,
+            max_position_hint=None if max_position_hint is None else int(max_position_hint),
+        )
+
     def _project_verified_hidden_selected(
         self,
         *,
@@ -2132,12 +2331,20 @@ class DFlashWorker:
     def _append_verified_hidden_from_cache_plan(
         self,
         *,
+        batch: ScheduleBatch,
         draft_input: DFlashDraftInput,
         verify_positions: torch.Tensor,
         hidden_states: torch.Tensor,
         cache_plan,
         commit_lens: torch.Tensor,
     ) -> bool:
+        # Direct verify-append relies on shared req_to_token + allocator semantics.
+        if not bool(getattr(self, "_draft_shares_token_allocator", True)):
+            return False
+        if getattr(self.draft_model_runner, "req_to_token_pool", None) is not getattr(
+            batch, "req_to_token_pool", None
+        ):
+            return False
         max_position_hint = None
         try:
             bs = int(commit_lens.shape[0])
@@ -2166,18 +2373,17 @@ class DFlashWorker:
         max_position_hint: Optional[int] = None,
     ) -> None:
         with torch.inference_mode():
-            ctx_hidden = self._project_verified_hidden_selected(
-                hidden_states=hidden_states,
-                accepted_indices=accepted_indices,
-            )
-            if ctx_hidden.shape[0] != ctx_cache_loc.numel():
-                raise RuntimeError(f"Selected hidden/cache_loc mismatch: {ctx_hidden.shape[0]} vs {ctx_cache_loc.numel()}.")
-            if self._use_fused_kv_materialize and self._fused_kv_helper is not None:
+            if (
+                self._use_fused_kv_materialize
+                and self._fused_kv_helper is not None
+                and getattr(self._fused_kv_helper, "target_fc_weight", None) is not None
+            ):
                 try:
                     self._append_verified_hidden_selected_fused(
-                        ctx_hidden,
-                        ctx_positions,
-                        ctx_cache_loc,
+                        hidden_states=hidden_states,
+                        accepted_indices=accepted_indices,
+                        ctx_positions=ctx_positions,
+                        ctx_cache_loc=ctx_cache_loc,
                         max_position_hint=max_position_hint,
                     )
                     return
@@ -2196,9 +2402,53 @@ class DFlashWorker:
                     if isinstance(e, (AttributeError, NotImplementedError)):
                         self._use_fused_kv_materialize = False
                         self._fused_kv_helper = None
+
+            ctx_hidden = self._project_verified_hidden_selected(
+                hidden_states=hidden_states,
+                accepted_indices=accepted_indices,
+            )
+            if ctx_hidden.shape[0] != ctx_cache_loc.numel():
+                raise RuntimeError(
+                    f"Selected hidden/cache_loc mismatch: {ctx_hidden.shape[0]} vs {ctx_cache_loc.numel()}."
+                )
+            if self._use_fused_kv_materialize and self._fused_kv_helper is not None:
+                try:
+                    self._append_verified_hidden_selected_fused_projected(
+                        ctx_hidden,
+                        ctx_positions,
+                        ctx_cache_loc,
+                        max_position_hint=max_position_hint,
+                    )
+                    return
+                except Exception:
+                    pass
             self._append_target_hidden_sequential(ctx_hidden, ctx_positions, ctx_cache_loc)
 
     def _append_verified_hidden_selected_fused(
+        self,
+        *,
+        hidden_states: torch.Tensor,
+        accepted_indices: torch.Tensor,
+        ctx_positions: torch.Tensor,
+        ctx_cache_loc: torch.Tensor,
+        max_position_hint: Optional[int] = None,
+    ) -> None:
+        token_to_kv_pool = self.draft_model_runner.token_to_kv_pool
+        layers = self.draft_model.layers
+
+        def _write_layer_kv(layer_idx: int, cache_k: torch.Tensor, cache_v: torch.Tensor) -> None:
+            attn = layers[layer_idx].self_attn.attn
+            token_to_kv_pool.set_kv_buffer(attn, ctx_cache_loc, cache_k, cache_v, attn.k_scale, attn.v_scale)
+
+        self._fused_kv_helper.materialize_from_target_hidden_selected(
+            target_hidden=hidden_states,
+            accepted_indices=accepted_indices,
+            positions=ctx_positions,
+            write_layer_kv=_write_layer_kv,
+            max_position_hint=None if max_position_hint is None else int(max_position_hint),
+        )
+
+    def _append_verified_hidden_selected_fused_projected(
         self,
         ctx_hidden: torch.Tensor,
         ctx_positions: torch.Tensor,
@@ -2352,19 +2602,85 @@ class DFlashWorker:
             model_worker_batch.input_ids is None
             or int(model_worker_batch.input_ids.numel()) != expected_verify_tokens
         ):
-            raise RuntimeError(
-                "DFLASH verify input_ids size mismatch: "
-                f"got={0 if model_worker_batch.input_ids is None else int(model_worker_batch.input_ids.numel())} "
-                f"expected={expected_verify_tokens} (bs={int(batch.batch_size())} block={int(verify_input.draft_token_num)})."
+            if self.tp_rank == 0:
+                logger.warning(
+                    "DFLASH verify input_ids size mismatch (got=%s expected=%s bs=%s block=%s); "
+                    "forcing target-only decode for this step.",
+                    0
+                    if model_worker_batch.input_ids is None
+                    else int(model_worker_batch.input_ids.numel()),
+                    expected_verify_tokens,
+                    int(batch.batch_size()),
+                    int(verify_input.draft_token_num),
+                )
+            batch.forward_mode = ForwardMode.DECODE
+            batch.spec_info = draft_input
+            model_worker_batch = batch.get_model_worker_batch()
+            model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
+            model_worker_batch.capture_layer_ids = self.capture_layer_ids
+            batch_result = self.target_worker.forward_batch_generation(
+                model_worker_batch, **kwargs
+            )
+            logits_output, next_token_ids = (
+                batch_result.logits_output,
+                batch_result.next_token_ids,
+            )
+            if logits_output.hidden_states is not None:
+                bs = int(next_token_ids.shape[0])
+                draft_input.verified_id = next_token_ids.to(torch.int64)
+                draft_input.target_hidden = logits_output.hidden_states
+                draft_input.ctx_lens = torch.ones(
+                    (bs,), device=next_token_ids.device, dtype=torch.int32
+                )
+                logits_output.hidden_states = None
+            batch.spec_info = draft_input
+            return GenerationBatchResult(
+                logits_output=logits_output,
+                next_token_ids=next_token_ids,
+                num_accepted_tokens=0,
+                can_run_cuda_graph=batch_result.can_run_cuda_graph,
             )
         if (
             model_worker_batch.out_cache_loc is None
             or int(model_worker_batch.out_cache_loc.numel()) != expected_verify_tokens
         ):
-            raise RuntimeError(
-                "DFLASH verify out_cache_loc size mismatch: "
-                f"got={0 if model_worker_batch.out_cache_loc is None else int(model_worker_batch.out_cache_loc.numel())} "
-                f"expected={expected_verify_tokens} (bs={int(batch.batch_size())} block={int(verify_input.draft_token_num)})."
+            if self.tp_rank == 0:
+                logger.warning(
+                    "DFLASH verify out_cache_loc size mismatch (got=%s expected=%s bs=%s block=%s); "
+                    "forcing target-only decode for this step.",
+                    0
+                    if model_worker_batch.out_cache_loc is None
+                    else int(model_worker_batch.out_cache_loc.numel()),
+                    expected_verify_tokens,
+                    int(batch.batch_size()),
+                    int(verify_input.draft_token_num),
+                )
+            batch.forward_mode = ForwardMode.DECODE
+            batch.spec_info = draft_input
+            model_worker_batch = batch.get_model_worker_batch()
+            model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
+            model_worker_batch.capture_layer_ids = self.capture_layer_ids
+            batch_result = self.target_worker.forward_batch_generation(
+                model_worker_batch, **kwargs
+            )
+            logits_output, next_token_ids = (
+                batch_result.logits_output,
+                batch_result.next_token_ids,
+            )
+            if logits_output.hidden_states is not None:
+                bs = int(next_token_ids.shape[0])
+                draft_input.verified_id = next_token_ids.to(torch.int64)
+                draft_input.target_hidden = logits_output.hidden_states
+                draft_input.ctx_lens = torch.ones(
+                    (bs,), device=next_token_ids.device, dtype=torch.int32
+                )
+                logits_output.hidden_states = None
+            batch.spec_info = draft_input
+            return GenerationBatchResult(
+                logits_output=logits_output,
+                next_token_ids=next_token_ids,
+                num_accepted_tokens=0,
+                can_run_cuda_graph=batch_result.can_run_cuda_graph,
             )
         verify_input.dflash_greedy_top1_only = bool(
             getattr(draft_input, "linear_mode", "") == "draft=greedy,target=greedy"
@@ -2513,6 +2829,7 @@ class DFlashWorker:
         if cache_plan is not None:
             try:
                 appended_from_verify = self._append_verified_hidden_from_cache_plan(
+                    batch=batch,
                     draft_input=draft_input,
                     verify_positions=verify_input.positions,
                     hidden_states=logits_output.hidden_states,
@@ -2742,3 +3059,32 @@ class DFlashWorker:
             self._draft_block_cache_loc_buf = None
             self._draft_block_cache_loc_cap = 0
         os.environ[_DFLASH_RESERVED_ENV_KEY] = "0"
+
+    def on_req_finished(self, req):
+        # Free draft KV allocations when the draft worker uses independent pools.
+        req_pool_idx = getattr(req, "req_pool_idx", None)
+        if req_pool_idx is not None and not bool(
+            getattr(self, "_draft_shares_token_allocator", True)
+        ):
+            try:
+                req_to_token_pool = self.draft_model_runner.req_to_token_pool
+                allocator = self.draft_model_runner.token_to_kv_pool_allocator
+                row = req_to_token_pool.req_to_token[int(req_pool_idx)].to(torch.int64)
+                # Slot 0 is reserved/padded in TokenToKVPoolAllocator.
+                valid = row[row > 0]
+                if valid.numel() > 0:
+                    allocator.free(valid)
+                req_to_token_pool.req_to_token[int(req_pool_idx)].zero_()
+            except Exception as exc:
+                if self.tp_rank == 0:
+                    logger.warning(
+                        "DFLASH on_req_finished draft KV free failed (req_pool_idx=%s): %s",
+                        req_pool_idx,
+                        exc,
+                    )
+
+        # The wrapped target worker may not implement request cleanup hooks.
+        # Do not crash the scheduler in that case.
+        if hasattr(self.target_worker, "on_req_finished"):
+            return self.target_worker.on_req_finished(req)
+        return None
