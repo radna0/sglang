@@ -1450,10 +1450,9 @@ class DFlashWorker:
                     draft_out = self.draft_model_runner.forward(forward_batch)
                     draft_logits_output = draft_out.logits_output
             finally:
-                if token_to_kv_pool_state_backup is not None:
-                    allocator.restore_state(token_to_kv_pool_state_backup)
-                elif should_free_block_cache_loc:
-                    # Clean up req->token pointers to avoid dangling references
+                # Clean up req->token pointers to avoid dangling references, regardless of whether we
+                # free explicitly or restore allocator state.
+                if block_cache_loc is not None:
                     try:
                         if self.draft_page_size == 1 and not self.use_compact_draft_cache:
                             draft_req_to_token = self.draft_model_runner.req_to_token_pool.req_to_token
@@ -1471,8 +1470,13 @@ class DFlashWorker:
                                 zeros,
                                 bs,
                             )
-                    finally:
-                        allocator.free(block_cache_loc)
+                    except Exception:
+                        pass
+
+                if token_to_kv_pool_state_backup is not None:
+                    allocator.restore_state(token_to_kv_pool_state_backup)
+                elif should_free_block_cache_loc and block_cache_loc is not None:
+                    allocator.free(block_cache_loc)
 
             draft_hidden = draft_logits_output.hidden_states
             if draft_hidden is None:
