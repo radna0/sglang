@@ -1908,6 +1908,13 @@ class DFlashWorker:
         bs = batch.batch_size()
         device = self.model_runner.device
 
+        if not bool(getattr(self, "_draft_shares_token_allocator", True)):
+            raise RuntimeError(
+                "DFLASH internal error: draft token allocator is not shared, but the current "
+                "append path requires shared slot indices. Independent draft allocators are "
+                "not implemented on this branch."
+            )
+
         if draft_input.target_hidden is None:
             raise RuntimeError("DFLASH draft state missing target_hidden.")
         if draft_input.ctx_lens.numel() != bs or draft_input.draft_seq_lens.numel() != bs:
