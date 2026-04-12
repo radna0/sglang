@@ -2654,18 +2654,18 @@ def pack_dflash_target_only_commits(
             int(
                 (
                     os.environ.get("SGLANG_DFLASH_TARGET_ONLY_SMALL_CPU_PACK_MAX")
-                    or "512"
+                    or "0"
                 ).strip()
             ),
         )
     except Exception:
-        cpu_pack_max = 512
+        cpu_pack_max = 0
 
     use_cpu_pack = bool(
         target_predict.is_cuda
         and (
             _env_truthy("SGLANG_DFLASH_TARGET_ONLY_PACK_ON_CPU")
-            or int(target_predict.numel()) <= cpu_pack_max
+            or (cpu_pack_max > 0 and int(target_predict.numel()) <= cpu_pack_max)
         )
     )
     if use_cpu_pack:
