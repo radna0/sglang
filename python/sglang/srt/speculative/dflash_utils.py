@@ -854,6 +854,14 @@ def _build_dflash_fast_finish_policy(req: Any) -> _DFlashFastFinishPolicy | None
     if req.sampling_params.stop_strs or req.sampling_params.stop_regex_strs:
         return None
 
+    # Cache policy per-request to reduce per-verify CPU overhead (called every verify step).
+    try:
+        cached = getattr(req, "_dflash_fast_finish_policy_cache", None)
+        cached_sig = getattr(req, "_dflash_fast_finish_policy_sig", None)
+    except Exception:
+        cached = None
+        cached_sig = None
+
     stop_ids: set[int] = set()
     nan_replacement_token = None
     if not req.sampling_params.ignore_eos:
@@ -876,13 +884,37 @@ def _build_dflash_fast_finish_policy(req: Any) -> _DFlashFastFinishPolicy | None
     if vocab_size is not None:
         vocab_size = int(vocab_size)
 
-    return _DFlashFastFinishPolicy(
+    sig = None
+    try:
+        tok = getattr(req, "tokenizer", None)
+        sig = (
+            bool(getattr(req.sampling_params, "ignore_eos", False)),
+            tuple(int(x) for x in (getattr(req.sampling_params, "stop_token_ids", None) or ())),
+            tuple(int(x) for x in (getattr(req, "eos_token_ids", None) or ())),
+            int(getattr(tok, "eos_token_id", -1)) if tok is not None else -1,
+            tuple(int(x) for x in (getattr(tok, "additional_stop_token_ids", None) or ())) if tok is not None else (),
+            int(vocab_size) if vocab_size is not None else None,
+        )
+    except Exception:
+        sig = None
+
+    if cached is not None and cached_sig is not None and sig is not None and cached_sig == sig:
+        return cached
+
+    policy = _DFlashFastFinishPolicy(
         stop_ids=tuple(sorted(stop_ids)),
         vocab_size=vocab_size,
         nan_replacement_token=(
             int(nan_replacement_token) if nan_replacement_token is not None else None
         ),
     )
+    if sig is not None:
+        try:
+            setattr(req, "_dflash_fast_finish_policy_cache", policy)
+            setattr(req, "_dflash_fast_finish_policy_sig", sig)
+        except Exception:
+            pass
+    return policy
 
 
 def commit_dflash_proposed_tokens_to_req(
@@ -1036,11 +1068,84 @@ def commit_dflash_target_only_batch(
             "proposed_dense_cpu batch size mismatch: "
             f"expected {num_reqs}, got {int(proposed_dense_cpu.shape[0])}."
         )
+
+    # Ultra-fast path: plain decode-only requests (no grammar, no stop strings/regex,
+    # no stop-token ids) with max_new_tokens truncation only. This is the dominant
+    # DFLASH benchmark lane and avoids per-step policy construction and large tolist()
+    # materializations.
+    try:
+        all_plain = True
+        for req in reqs:
+            sp = req.sampling_params
+            if req.grammar is not None:
+                all_plain = False
+                break
+            if sp.stop_strs or sp.stop_regex_strs:
+                all_plain = False
+                break
+            if not bool(getattr(sp, "ignore_eos", False)):
+                all_plain = False
+                break
+            # NOTE: stop_token_ids are semantically independent from ignore_eos in SGLang.
+            if getattr(sp, "stop_token_ids", None):
+                all_plain = False
+                break
+
+        if all_plain:
+            results: list[DFlashTargetOnlyCommitResult] = []
+            flat_offset = 0
+            for i, req in enumerate(reqs):
+                default_len = int(commit_lens_cpu[i].item())
+                old_output_len = len(req.output_ids)
+                remaining = int(req.sampling_params.max_new_tokens) - old_output_len
+                effective_len = min(default_len, max(remaining, 0))
+                if effective_len > 0:
+                    if proposed_dense_cpu is not None:
+                        tokens = proposed_dense_cpu[i, :effective_len].tolist()
+                    else:
+                        assert proposed_flat_cpu is not None
+                        tokens = proposed_flat_cpu[flat_offset : flat_offset + effective_len].tolist()
+                        flat_offset += default_len
+                    req.output_ids.extend(tokens)
+                    req.check_finished(new_accepted_len=effective_len)
+                else:
+                    if proposed_flat_cpu is not None:
+                        flat_offset += default_len
+
+                if req.output_ids:
+                    new_verified_token = int(req.output_ids[-1])
+                elif req.origin_input_ids:
+                    new_verified_token = int(req.origin_input_ids[-1])
+                else:
+                    raise RuntimeError(
+                        f"{empty_error_prefix} cannot determine current token: both output_ids and "
+                        "origin_input_ids are empty."
+                    )
+
+                accepted_draft_tokens = max(0, effective_len - 1)
+                req.spec_verify_ct += 1
+                req.spec_accepted_tokens += accepted_draft_tokens
+                if hasattr(req, "update_spec_acceptance_histogram"):
+                    req.update_spec_acceptance_histogram(accepted_draft_tokens)
+
+                results.append(
+                    DFlashTargetOnlyCommitResult(
+                        commit_len=effective_len,
+                        new_verified_token=new_verified_token,
+                        accepted_draft_tokens=accepted_draft_tokens,
+                        used_device_defaults=bool(effective_len == default_len),
+                    )
+                )
+            return results
+    except Exception:
+        # Fall back to the fully general path below.
+        pass
+
+    # Avoid materializing the full packed proposal list in Python for every step.
+    # We keep the CPU tensors and slice per-request (segments are small: <= block_size).
     commit_lens_list = [int(x) for x in commit_lens_cpu.tolist()]
-    proposed_flat_list: list[int] | None = None
     commit_offsets_list: list[int] | None = None
     if proposed_flat_cpu is not None:
-        proposed_flat_list = [int(x) for x in proposed_flat_cpu.tolist()]
         commit_offsets_list = [0] * (num_reqs + 1)
         for i, width in enumerate(commit_lens_list):
             commit_offsets_list[i + 1] = commit_offsets_list[i] + int(width)
@@ -1051,10 +1156,10 @@ def commit_dflash_target_only_batch(
             return []
         if proposed_dense_cpu is not None:
             return [int(x) for x in proposed_dense_cpu[req_index, :width].tolist()]
-        assert proposed_flat_list is not None and commit_offsets_list is not None
+        assert proposed_flat_cpu is not None and commit_offsets_list is not None
         start_offset = int(commit_offsets_list[req_index])
         end_offset = start_offset + width
-        return proposed_flat_list[start_offset:end_offset]
+        return [int(x) for x in proposed_flat_cpu[start_offset:end_offset].tolist()]
 
     results: list[DFlashTargetOnlyCommitResult | None] = [None] * num_reqs
     grouped_fast_indices: dict[_DFlashFastFinishPolicy, list[int]] = {}

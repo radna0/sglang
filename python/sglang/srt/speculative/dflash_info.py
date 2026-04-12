@@ -603,8 +603,19 @@ class DFlashVerifyInput(SpecInput):
             # materialize a separate proposed_tokens buffer.
             commit_source_tokens = target_predict.to(torch.int64)
 
+        # Dense CPU commit copies the full [bs, block] token matrix to host every step.
+        # This is often slower than the packed path when acceptance is low (common in GPT-OSS
+        # DFlash). Default to packed commits unless explicitly enabled.
+        dense_enabled = (os.environ.get("SGLANG_DFLASH_TARGET_ONLY_DENSE_CPU_COMMIT") or "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "y",
+            "on",
+        )
         use_dense_cpu_commit = bool(
-            commit_source_tokens.is_cuda
+            dense_enabled
+            and commit_source_tokens.is_cuda
             and int(commit_source_tokens.numel())
             <= _get_dflash_target_only_small_cpu_pack_max()
         )
@@ -666,7 +677,12 @@ class DFlashVerifyInput(SpecInput):
                 verify_profile_ms["stage_copy"] = (time.perf_counter() - t_sub) * 1000.0
 
             t_sync_0 = time.perf_counter()
-            copy_stream.synchronize()
+            # Prefer an event-based wait (waits only for the D2H copies we recorded) instead of
+            # synchronizing the entire stream. This is still a host wait, but avoids an extra
+            # full stream sync point in the profiler hot path.
+            copy_done = torch.cuda.Event()
+            copy_done.record(copy_stream)
+            copy_done.synchronize()
             if os.getenv("SGLANG_DFLASH_PROFILE"):
                 dt_sync = (time.perf_counter() - t_sync_0) * 1000
                 logger.info(f"[DFLASH_PROF] verify_synchronize: {dt_sync:.3f}ms")
@@ -765,7 +781,9 @@ class DFlashVerifyInput(SpecInput):
                 verify_profile_ms["stage_copy"] = (time.perf_counter() - t_sub) * 1000.0
             if packed_commits.proposed_flat.is_cuda:
                 t_sync_0 = time.perf_counter()
-                copy_stream.synchronize()
+                copy_done = torch.cuda.Event()
+                copy_done.record(copy_stream)
+                copy_done.synchronize()
                 if os.getenv("SGLANG_DFLASH_PROFILE"):
                     dt_sync = (time.perf_counter() - t_sync_0) * 1000
                     logger.info(f"[DFLASH_PROF] verify_synchronize: {dt_sync:.3f}ms")

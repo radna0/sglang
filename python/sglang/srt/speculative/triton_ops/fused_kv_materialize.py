@@ -255,6 +255,8 @@ class FusedKVMaterializeHelper:
         ctx_hidden: torch.Tensor,
         positions: torch.Tensor,
         write_layer_kv: Callable[[int, torch.Tensor, torch.Tensor], None],
+        *,
+        max_position_hint: int | None = None,
     ) -> None:
         """Materialize KV cache for all layers using batched projection."""
         total_ctx = ctx_hidden.shape[0]
@@ -269,7 +271,12 @@ class FusedKVMaterializeHelper:
                 f"positions={positions.numel()}, total_ctx={total_ctx}."
             )
 
-        max_position = int(positions.max().item())
+        if max_position_hint is None:
+            # NOTE: positions is typically on CUDA; .max().item() introduces a host sync.
+            # Callers in the DFlash decode hot path should pass max_position_hint whenever possible.
+            max_position = int(positions.max().item())
+        else:
+            max_position = int(max_position_hint)
         ensure_cos_sin_cache_length = getattr(
             self.rotary_emb, "_ensure_cos_sin_cache_length", None
         )
@@ -309,6 +316,7 @@ class FusedKVMaterializeHelper:
         accepted_indices: torch.Tensor,
         positions: torch.Tensor,
         write_layer_kv: Callable[[int, torch.Tensor, torch.Tensor], None],
+        max_position_hint: int | None = None,
     ) -> None:
         """Materialize only the accepted subset of verify hidden states.
 
@@ -334,4 +342,5 @@ class FusedKVMaterializeHelper:
             ctx_hidden=selected_hidden,
             positions=selected_positions,
             write_layer_kv=write_layer_kv,
+            max_position_hint=None if max_position_hint is None else int(max_position_hint),
         )

@@ -59,6 +59,13 @@ def _parse_env_int(name: str, default: int) -> int:
         return int(default)
 
 
+def _parse_env_int_allow_zero(name: str, default: int) -> int:
+    try:
+        return max(0, int((os.environ.get(name) or str(default)).strip()))
+    except Exception:
+        return int(default)
+
+
 def _parse_env_float(name: str, default: float) -> float:
     try:
         return float((os.environ.get(name) or str(default)).strip())
@@ -76,7 +83,10 @@ def _should_cprofile_verify_step(enabled: bool, step_index: int) -> bool:
 def _should_torch_profile_verify_step(enabled: bool, step_index: int) -> bool:
     if not enabled:
         return False
-    every = _parse_env_int("SGLANG_DFLASH_TORCH_PROFILER_VERIFY_EVERY", 200)
+    # Back-compat: older harnesses used *_PROFILE_VERIFY_DETAILS[_EVERY].
+    every = _parse_env_int_allow_zero("SGLANG_DFLASH_TORCH_PROFILER_VERIFY_EVERY", 0)
+    if every <= 0:
+        every = _parse_env_int("SGLANG_DFLASH_PROFILE_VERIFY_DETAILS_EVERY", 200)
     return ((int(step_index) + 1) % int(every)) == 0
 
 
@@ -149,6 +159,52 @@ def _log_torch_profile_stats(
         if line:
             logger.info("%s %s", prefix, line)
 
+    # Optional: emit a coarse breakdown so we can see where time goes (sync vs memcpy vs GEMM vs attention vs KV move).
+    # This is intentionally heuristic and is only for fast investigation; Nsight is still the ground truth.
+    if not _env_enabled("SGLANG_DFLASH_TORCH_PROFILER_GROUPS"):
+        return
+
+    def _match_group(key: str) -> str:
+        k = key.lower()
+        if "cudastreamsynchronize" in k or "cudadevicesynchronize" in k:
+            return "sync"
+        if "cudaevent" in k:
+            return "events"
+        if "cudamemcpy" in k or "memcpy" in k or "memmove" in k:
+            return "memcpy"
+        if "flash" in k or "fa3" in k or "fa4" in k or "attention" in k:
+            return "attention"
+        if "moe" in k or "expert" in k:
+            return "moe"
+        if "matmul" in k or "mm" == k or "addmm" in k or "gemm" in k:
+            return "gemm"
+        if "gather" in k or "scatter" in k or "index" in k or "copy_" in k:
+            return "kv_move"
+        return "other"
+
+    try:
+        groups_cuda_us: dict[str, float] = {}
+        groups_cpu_us: dict[str, float] = {}
+        for evt in profiler.key_averages():
+            key = getattr(evt, "key", "") or ""
+            g = _match_group(key)
+            groups_cuda_us[g] = groups_cuda_us.get(g, 0.0) + float(
+                getattr(evt, "self_cuda_time_total", 0.0) or 0.0
+            )
+            groups_cpu_us[g] = groups_cpu_us.get(g, 0.0) + float(
+                getattr(evt, "self_cpu_time_total", 0.0) or 0.0
+            )
+
+        def _fmt(groups_us: dict[str, float]) -> str:
+            items = sorted(groups_us.items(), key=lambda kv: kv[1], reverse=True)
+            parts = [f"{k}={v/1000.0:.2f}ms" for k, v in items if v > 0]
+            return " ".join(parts) if parts else "(empty)"
+
+        logger.info("%s [groups cuda] %s", prefix, _fmt(groups_cuda_us))
+        logger.info("%s [groups cpu] %s", prefix, _fmt(groups_cpu_us))
+    except Exception as exc:
+        logger.info("%s [groups] failed: %s", prefix, exc)
+
 _FusedKVMaterializeHelper = None
 _DFLASH_RESERVED_ENV_KEY = "SGLANG_DFLASH_SSD_RESERVED_TOKENS"
 
@@ -210,7 +266,13 @@ class DFlashWorker:
         self.nccl_port = nccl_port
         self.target_worker = target_worker
         self.model_runner = target_worker.model_runner
+        # Target paging controls the target worker's KV allocator behavior.
         self.page_size = server_args.page_size
+        # Draft paging is independent; production often runs paged target KV with
+        # non-paged draft KV (`speculative_draft_page_size=1`).
+        self.draft_page_size = int(
+            getattr(server_args, "speculative_draft_page_size", None) or 1
+        )
         self.draft_window_size: Optional[int] = (
             int(server_args.speculative_dflash_draft_window_size)
             if server_args.speculative_dflash_draft_window_size is not None
@@ -260,6 +322,30 @@ class DFlashWorker:
         shared_req_to_token_pool = (
             None if self.use_compact_draft_cache else target_req_to_token_pool
         )
+
+        # DFlash draft KV materialization currently assumes that target-side cache locations
+        # (from the scheduler's req_to_token_pool) are valid indices for the draft KV writes.
+        # That only holds when the draft worker shares the token_to_kv_pool_allocator with the
+        # target worker (slot indices stay consistent across the two KV pools even if KV dtypes differ).
+        #
+        # Supporting a fully independent draft allocator would require allocating new draft slots
+        # and maintaining an independent req_to_token mapping for the draft worker end-to-end.
+        should_share_token_allocator = True
+        self._draft_shares_token_allocator = True
+        if self.use_compact_draft_cache:
+            shared_req_to_token_pool = None
+        if self.tp_rank == 0:
+            try:
+                alloc_type = type(target_token_to_kv_pool_allocator).__name__
+            except Exception:
+                alloc_type = "unknown"
+            logger.info(
+                "DFLASH draft allocator policy: share_token_allocator=%s share_req_to_token=%s (target_allocator=%s, draft_kv_cache_dtype=%s)",
+                self._draft_shares_token_allocator,
+                shared_req_to_token_pool is not None,
+                alloc_type,
+                getattr(server_args, "speculative_draft_kv_cache_dtype", None),
+            )
         draft_server_args = deepcopy(server_args)
         draft_server_args.skip_tokenizer_init = True
         if draft_server_args.speculative_draft_kv_cache_dtype is not None:
@@ -312,7 +398,9 @@ class DFlashWorker:
             nccl_port=nccl_port,
             is_draft_worker=True,
             req_to_token_pool=shared_req_to_token_pool,
-            token_to_kv_pool_allocator=target_token_to_kv_pool_allocator,
+            token_to_kv_pool_allocator=(
+                target_token_to_kv_pool_allocator if should_share_token_allocator else None
+            ),
         )
         set_global_server_args_for_scheduler(saved_server_args)
         self.draft_model_runner = self.draft_worker.model_runner
@@ -418,27 +506,44 @@ class DFlashWorker:
         self._last_logged_linear_mode: Optional[str] = None
         self._failfast_enabled = _env_enabled("SGLANG_DFLASH_FAILFAST_ENABLE")
         self._failfast_conf_threshold = _parse_env_float(
-            "SGLANG_DFLASH_FAILFAST_CONF_THRESHOLD", 0.40
+            "SGLANG_DFLASH_FAILFAST_CONF_THRESHOLD", 0.06
         )
         self._failfast_entropy_threshold = _parse_env_float(
             "SGLANG_DFLASH_FAILFAST_ENTROPY_THRESHOLD", -1.0
         )
         self._failfast_step_size = _parse_env_int(
-            "SGLANG_DFLASH_FAILFAST_STEP_SIZE", 4
+            "SGLANG_DFLASH_FAILFAST_STEP_SIZE", 2
         )
-        self._failfast_min_block_size = _parse_env_int(
-            "SGLANG_DFLASH_FAILFAST_MIN_BLOCK_SIZE", 4
+        self._failfast_min_block_size = _parse_env_int_allow_zero(
+            "SGLANG_DFLASH_FAILFAST_MIN_BLOCK_SIZE", 0
+        )
+        self._failfast_batch_pass_ratio = _parse_env_float(
+            "SGLANG_DFLASH_FAILFAST_BATCH_PASS_RATIO", 0.50
+        )
+        self._failfast_row_mean_threshold = _parse_env_float(
+            "SGLANG_DFLASH_FAILFAST_ROW_MEAN_THRESHOLD",
+            float(self._failfast_conf_threshold),
+        )
+        self._failfast_hard_conf_floor = _parse_env_float(
+            "SGLANG_DFLASH_FAILFAST_HARD_CONF_FLOOR",
+            max(0.0, float(self._failfast_conf_threshold) - 0.04),
         )
         self._failfast_log_ct = 0
         if self._failfast_enabled and self.tp_rank == 0:
+            failfast_candidates = self._resolve_failfast_block_candidates(self.block_size)
             logger.info(
                 "DFLASH FailFast enabled. tau=%.3f, entropy_threshold=%.3f, "
-                "step_size=%d, min_block_size=%d, max_block_size=%d",
+                "step_size=%d, min_block_size=%d, batch_pass_ratio=%.2f, "
+                "row_mean_threshold=%.3f, hard_conf_floor=%.3f, max_block_size=%d, candidates=%s",
                 self._failfast_conf_threshold,
                 self._failfast_entropy_threshold,
                 self._failfast_step_size,
                 self._failfast_min_block_size,
+                self._failfast_batch_pass_ratio,
+                self._failfast_row_mean_threshold,
+                self._failfast_hard_conf_floor,
                 self.block_size,
+                failfast_candidates,
             )
 
     # ------------------------------------------------------------------
@@ -470,10 +575,41 @@ class DFlashWorker:
 
     def _resolve_failfast_block_candidates(self, max_block_size: int) -> List[int]:
         max_block_size = max(1, int(max_block_size))
-        min_block_size = max(
-            2, min(max_block_size, int(self._failfast_min_block_size))
-        )
+        configured_min_block_size = int(self._failfast_min_block_size)
+        if configured_min_block_size <= 0:
+            # Auto floor: keep at least half the physical width so FailFast can
+            # outpace the fixed b8 lane by expanding to 16 on easy regions while
+            # still backing off to a graph-friendly width on harder ones.
+            min_block_size = max(4, (max_block_size + 1) // 2)
+        else:
+            min_block_size = max(2, min(max_block_size, configured_min_block_size))
         step_size = max(1, int(self._failfast_step_size))
+        candidates: List[int] = []
+        current = min_block_size
+        while current < max_block_size:
+            candidates.append(int(current))
+            current += step_size
+        if max_block_size not in candidates:
+            candidates.append(max_block_size)
+        candidates = sorted({int(x) for x in candidates if 1 < int(x) <= max_block_size})
+        return candidates or [max_block_size]
+
+    def _resolve_failfast_logical_block_candidates(self, max_block_size: int) -> List[int]:
+        max_block_size = max(1, int(max_block_size))
+        step_size = max(1, int(self._failfast_step_size))
+        if max_block_size <= 4:
+            return [max_block_size]
+        configured_min_block_size = int(self._failfast_min_block_size)
+        if configured_min_block_size <= 0:
+            # Never shrink below the strong fixed b8 lane by default.
+            # For block 16 this explores 12/14/16 first; for block 12 it
+            # explores 8/10/12; for block 8 it stays at 8.
+            min_block_size = min(
+                max_block_size,
+                max(8, max_block_size - 2 * step_size),
+            )
+        else:
+            min_block_size = max(2, min(max_block_size, configured_min_block_size))
         candidates: List[int] = []
         current = min_block_size
         while current < max_block_size:
@@ -514,30 +650,48 @@ class DFlashWorker:
                 q_ent = q_ent.view(q_ent.shape[0], -1)
             q_ent = q_ent[:, : q_conf.shape[1]]
 
-        candidates = self._resolve_failfast_block_candidates(active_block_size)
-        logical_block_size = active_block_size
-        prev_width = 1
+        candidates = self._resolve_failfast_logical_block_candidates(active_block_size)
+        logical_block_size = int(candidates[0]) if candidates else active_block_size
         tau = float(self._failfast_conf_threshold)
         entropy_threshold = float(self._failfast_entropy_threshold)
+        batch_pass_ratio = min(
+            1.0, max(0.0, float(self._failfast_batch_pass_ratio))
+        )
+        row_mean_threshold = float(self._failfast_row_mean_threshold)
+        hard_conf_floor = float(self._failfast_hard_conf_floor)
+        token_ok = torch.ones_like(q_conf, dtype=torch.bool)
+        if hard_conf_floor >= 0.0:
+            token_ok = torch.logical_and(token_ok, q_conf >= hard_conf_floor)
+        if row_mean_threshold >= 0.0:
+            prefix_sum = torch.cumsum(q_conf, dim=1)
+            prefix_den = torch.arange(
+                1,
+                q_conf.shape[1] + 1,
+                device=q_conf.device,
+                dtype=torch.float32,
+            ).view(1, -1)
+            prefix_mean = prefix_sum / prefix_den
+            token_ok = torch.logical_and(token_ok, prefix_mean >= row_mean_threshold)
+        if q_ent is not None and entropy_threshold >= 0.0:
+            token_ok = torch.logical_and(token_ok, q_ent <= entropy_threshold)
+
+        prefix_ok = torch.cumprod(token_ok.to(torch.int32), dim=1).to(torch.bool)
+        row_support_steps = prefix_ok.to(torch.int32).sum(dim=1)
+        selected_support_ratio = 0.0
         for width in candidates:
-            start_idx = max(0, int(prev_width) - 1)
-            end_idx = max(start_idx, int(width) - 1)
-            chunk_conf = q_conf[:, start_idx:end_idx]
-            chunk_ok = True
-            if chunk_conf.numel() > 0:
-                chunk_ok = bool(torch.all(chunk_conf >= tau).item())
-            if (
-                chunk_ok
-                and q_ent is not None
-                and entropy_threshold >= 0.0
-            ):
-                chunk_ent = q_ent[:, start_idx:end_idx]
-                if chunk_ent.numel() > 0:
-                    chunk_ok = bool(torch.all(chunk_ent <= entropy_threshold).item())
-            logical_block_size = int(width)
-            if not chunk_ok:
-                break
-            prev_width = int(width)
+            support_steps = max(0, int(width) - 1)
+            if support_steps <= 0:
+                logical_block_size = int(width)
+                selected_support_ratio = 1.0
+                continue
+            support_ratio = float(
+                (row_support_steps >= support_steps).to(torch.float32).mean().item()
+            )
+            if support_ratio + 1e-6 >= batch_pass_ratio:
+                logical_block_size = int(width)
+                selected_support_ratio = support_ratio
+                continue
+            break
 
         proposal_width = max(0, logical_block_size - 1)
         conf_prefix = q_conf[:, :proposal_width]
@@ -546,6 +700,13 @@ class DFlashWorker:
         if conf_prefix.numel() > 0:
             draft_conf_debug["q_max_mean_first"] = float(conf_prefix.mean().item())
             draft_conf_debug["q_max_min_first"] = float(conf_prefix.min().item())
+            draft_conf_debug["q_pass_ratio_first"] = float(selected_support_ratio)
+            draft_conf_debug["q_support_steps_mean"] = float(
+                row_support_steps.to(torch.float32).mean().item()
+            )
+            draft_conf_debug["q_support_steps_min"] = float(
+                row_support_steps.min().item()
+            )
         if ent_prefix is not None and ent_prefix.numel() > 0:
             draft_conf_debug["q_ent_mean_first"] = float(ent_prefix.mean().item())
         if not draft_conf_debug:
@@ -559,19 +720,233 @@ class DFlashWorker:
             self._failfast_log_ct += 1
             logger.info(
                 "DFLASH FailFast reduced logical verify width: physical_block_size=%s -> logical_block_size=%s "
-                "(tau=%.3f, q_max_mean=%.4f, q_max_min=%.4f)",
+                "(tau=%.3f, row_mean_threshold=%.3f, batch_pass_ratio=%.2f, q_max_mean=%.4f, q_max_min=%.4f, q_pass_ratio=%.4f)",
                 active_block_size,
                 logical_block_size,
                 tau,
+                row_mean_threshold,
+                batch_pass_ratio,
                 float(draft_conf_debug.get("q_max_mean_first"))
                 if draft_conf_debug and "q_max_mean_first" in draft_conf_debug
                 else float("nan"),
                 float(draft_conf_debug.get("q_max_min_first"))
                 if draft_conf_debug and "q_max_min_first" in draft_conf_debug
                 else float("nan"),
+                float(draft_conf_debug.get("q_pass_ratio_first"))
+                if draft_conf_debug and "q_pass_ratio_first" in draft_conf_debug
+                else float("nan"),
             )
 
         return logical_block_size, draft_conf_debug
+
+    def _resolve_failfast_history_physical_block_size(
+        self,
+        *,
+        batch: ScheduleBatch,
+        requested_block_size: int,
+    ) -> tuple[int, Optional[dict[str, float]]]:
+        requested_block_size = max(1, int(requested_block_size))
+        if not self._failfast_enabled or requested_block_size <= 1:
+            return requested_block_size, None
+
+        reqs = list(getattr(batch, "reqs", []) or [])
+        if not reqs:
+            return requested_block_size, None
+
+        candidates = self._resolve_failfast_block_candidates(requested_block_size)
+        if not candidates:
+            return requested_block_size, None
+
+        batch_pass_ratio = min(
+            1.0, max(0.0, float(self._failfast_batch_pass_ratio))
+        )
+        step_size = max(1, int(self._failfast_step_size))
+        base_width = int(candidates[0])
+
+        desired_widths: List[int] = []
+        hist_ready = 0
+        accept_ema_sum = 0.0
+        accept_ema_denom = 0
+        min_history_verify_ct = max(4, 2 * step_size)
+        # Bias the controller toward climbing above the strong fixed-b8 lane
+        # once a request shows even modestly easy behavior.
+        promote_accept_ema_ge = 2.25
+        promote_accept_last_ge = 3.0
+        promote_qmax_ge = max(0.06, float(self._failfast_conf_threshold))
+        demote_accept_ema_le = 1.25
+        demote_accept_last_le = 1.0
+        demote_qmax_le = max(0.0, float(self._failfast_hard_conf_floor))
+        for req in reqs:
+            st = getattr(req, "dflash_difficulty_state", None)
+            if (
+                st is not None
+                and int(getattr(st, "verify_ct_last", 0)) >= min_history_verify_ct
+            ):
+                hist_ready += 1
+            if st is not None:
+                accept_ema_sum += float(getattr(st, "accept_len_ema", 0.0))
+                accept_ema_denom += 1
+            current_width = base_width
+            if st is not None:
+                current_width = int(
+                    getattr(st, "failfast_width_last", 0) or base_width
+                )
+                current_width = max(base_width, min(requested_block_size, current_width))
+
+            verify_ct = int(getattr(st, "verify_ct_last", 0)) if st is not None else 0
+            if verify_ct < min_history_verify_ct:
+                desired_width = base_width
+                if st is not None:
+                    st.failfast_width_last = int(desired_width)
+                    st.failfast_promote_streak = 0
+                    st.failfast_demote_streak = 0
+            else:
+                accept_ema = (
+                    float(getattr(st, "accept_len_ema", 0.0)) if st is not None else 0.0
+                )
+                accept_last = (
+                    float(getattr(st, "accept_len_last", 0.0)) if st is not None else 0.0
+                )
+                q_max = (
+                    getattr(st, "q_max_mean_last", None) if st is not None else None
+                )
+                q_max = (
+                    float(q_max)
+                    if q_max is not None and math.isfinite(float(q_max))
+                    else None
+                )
+
+                promote_now = bool(
+                    accept_ema >= promote_accept_ema_ge
+                    or accept_last >= promote_accept_last_ge
+                    or (q_max is not None and q_max >= promote_qmax_ge)
+                )
+                demote_now = bool(
+                    accept_ema <= demote_accept_ema_le
+                    or accept_last <= demote_accept_last_le
+                    or (q_max is not None and q_max <= demote_qmax_le)
+                )
+
+                promote_streak = int(
+                    getattr(st, "failfast_promote_streak", 0) if st is not None else 0
+                )
+                demote_streak = int(
+                    getattr(st, "failfast_demote_streak", 0) if st is not None else 0
+                )
+
+                if promote_now and not demote_now:
+                    promote_streak += 1
+                    demote_streak = 0
+                elif demote_now:
+                    demote_streak += 1
+                    promote_streak = 0
+                else:
+                    promote_streak = 0
+                    demote_streak = 0
+
+                desired_width = int(current_width)
+                if demote_streak >= 2 and desired_width > base_width:
+                    desired_width = max(base_width, desired_width - step_size)
+                    demote_streak = 0
+                elif promote_streak >= 1 and desired_width < requested_block_size:
+                    desired_width = min(requested_block_size, desired_width + step_size)
+                    promote_streak = 0
+
+                if st is not None:
+                    st.failfast_width_last = int(desired_width)
+                    st.failfast_promote_streak = int(promote_streak)
+                    st.failfast_demote_streak = int(demote_streak)
+
+            desired_widths.append(int(desired_width))
+
+        min_hist_ready = max(1, math.ceil(float(batch_pass_ratio) * float(len(desired_widths))))
+        if hist_ready < min_hist_ready or not desired_widths:
+            warmup_width = int(base_width)
+            debug = {
+                "hist_ready_ratio": float(hist_ready) / float(len(desired_widths))
+                if desired_widths
+                else 0.0,
+                "history_support_ratio": 0.0,
+                "history_accept_ema_mean": (
+                    float(accept_ema_sum) / float(accept_ema_denom)
+                    if accept_ema_denom > 0
+                    else float("nan")
+                ),
+                "history_base_width": float(base_width),
+                "history_warmup": 1.0,
+            }
+            if (
+                warmup_width < requested_block_size
+                and self.tp_rank == 0
+                and self._failfast_log_ct < 20
+            ):
+                self._failfast_log_ct += 1
+                logger.info(
+                    "DFLASH FailFast warmup physical width: requested_block_size=%s -> physical_block_size=%s "
+                    "(hist_ready=%s/%s, min_history_verify_ct=%s, accept_ema_mean=%.2f)",
+                    requested_block_size,
+                    warmup_width,
+                    hist_ready,
+                    len(desired_widths),
+                    min_history_verify_ct,
+                    float(debug["history_accept_ema_mean"]),
+                )
+            return warmup_width, debug
+
+        active_block_size = int(requested_block_size)
+        selected_ratio = 1.0
+        for width in candidates:
+            support_ratio = float(
+                sum(1 for cap in desired_widths if int(cap) >= int(width))
+            ) / float(len(desired_widths))
+            if support_ratio + 1e-6 >= batch_pass_ratio:
+                active_block_size = int(width)
+                selected_ratio = support_ratio
+                continue
+            break
+
+        debug = {
+            "hist_ready_ratio": float(hist_ready) / float(len(desired_widths)),
+            "history_support_ratio": float(selected_ratio),
+            "history_accept_ema_mean": (
+                float(accept_ema_sum) / float(accept_ema_denom)
+                if accept_ema_denom > 0
+                else float("nan")
+            ),
+            "history_base_width": float(base_width),
+        }
+
+        if (
+            active_block_size != requested_block_size
+            and self.tp_rank == 0
+            and self._failfast_log_ct < 20
+        ):
+            self._failfast_log_ct += 1
+            if active_block_size > base_width:
+                logger.info(
+                    "DFLASH FailFast promoted physical draft width from history: base_width=%s -> physical_block_size=%s "
+                    "(requested_block_size=%s, batch_pass_ratio=%.2f, hist_ready_ratio=%.2f, support_ratio=%.2f, accept_ema_mean=%.2f)",
+                    base_width,
+                    active_block_size,
+                    requested_block_size,
+                    batch_pass_ratio,
+                    float(debug["hist_ready_ratio"]),
+                    float(debug["history_support_ratio"]),
+                    float(debug["history_accept_ema_mean"]),
+                )
+            else:
+                logger.info(
+                    "DFLASH FailFast reduced physical draft width from history: requested_block_size=%s -> physical_block_size=%s "
+                    "(batch_pass_ratio=%.2f, hist_ready_ratio=%.2f, support_ratio=%.2f, accept_ema_mean=%.2f)",
+                    requested_block_size,
+                    active_block_size,
+                    batch_pass_ratio,
+                    float(debug["hist_ready_ratio"]),
+                    float(debug["history_support_ratio"]),
+                    float(debug["history_accept_ema_mean"]),
+                )
+
+        return active_block_size, debug
 
     def _init_fused_kv_helper(self) -> None:
         """Initialize fused KV materialization helper (CUDA only)."""
@@ -632,6 +1007,13 @@ class DFlashWorker:
                 head_dim=first_attn.head_dim,
                 device=self.device,
             )
+            # Pre-grow RoPE cache once to avoid per-step Python overhead inside the fused helper.
+            try:
+                ensure_cache = getattr(rotary_emb, "_ensure_cos_sin_cache_length", None)
+                if callable(ensure_cache):
+                    ensure_cache(int(getattr(self.server_args, "context_length", 8192)) + 8)
+            except Exception:
+                pass
             if self.tp_rank == 0:
                 logger.info(
                     "DFLASH fused KV materialization enabled. "
@@ -842,6 +1224,14 @@ class DFlashWorker:
         if draft_prefix_lens.device != self.device:
             draft_prefix_lens = draft_prefix_lens.to(self.device, non_blocking=True)
         requested_block_size = int(self.block_size)
+        history_block_debug = None
+        if self._failfast_enabled and requested_block_size > 1:
+            requested_block_size, history_block_debug = (
+                self._resolve_failfast_history_physical_block_size(
+                    batch=batch,
+                    requested_block_size=requested_block_size,
+                )
+            )
         allocator = self.draft_model_runner.token_to_kv_pool_allocator
         active_block_size = requested_block_size
         block_ids = None
@@ -898,7 +1288,7 @@ class DFlashWorker:
 
             needed_tokens = bs * active_block_size
             evict_from_tree_cache(getattr(batch, "tree_cache", None), needed_tokens)
-            if self.page_size == 1:
+            if self.draft_page_size == 1:
                 # Allocate per iteration to avoid scheduler leak detection
                 block_cache_loc = allocator.alloc(needed_tokens)
                 should_free_block_cache_loc = block_cache_loc is not None
@@ -948,6 +1338,25 @@ class DFlashWorker:
         if block_ids is None or positions is None or positions_2d is None or input_embeds is None:
             raise RuntimeError("DFLASH internal error: draft block state was not initialized.")
 
+        # If we couldn't allocate a draft block at any width, do NOT crash the server.
+        # Fall back to target-only decode for this batch and try drafting again later.
+        if block_cache_loc is None:
+            if self.tp_rank == 0:
+                logger.warning(
+                    "DFLASH draft KV alloc failed for requested_block_size=%s (batch=%s). "
+                    "Falling back to target-only decode for this step.",
+                    requested_block_size,
+                    bs,
+                )
+            draft_input.linear_mode = "target_only"
+            draft_input._active_physical_block_size = 1
+            draft_input._active_draft_token_num = 1
+            draft_input._active_step_count = 0
+            batch.forward_mode = ForwardMode.DECODE
+            batch.spec_info = draft_input
+            batch.return_hidden_states = False
+            return
+
         draft_selected_probs = None
         draft_proposal_indices = None
         draft_proposal_probs = None
@@ -961,7 +1370,7 @@ class DFlashWorker:
                     f"for requested_block_size={requested_block_size}, batch={bs}."
                 )
             try:
-                if self.page_size == 1 and not self.use_compact_draft_cache:
+                if self.draft_page_size == 1 and not self.use_compact_draft_cache:
                     draft_req_to_token = self.draft_model_runner.req_to_token_pool.req_to_token
                     row_ids = batch.req_pool_indices.to(torch.int64).unsqueeze(1).expand(
                         -1, active_block_size
@@ -1012,7 +1421,7 @@ class DFlashWorker:
                 elif should_free_block_cache_loc:
                     # Clean up req->token pointers to avoid dangling references
                     try:
-                        if self.page_size == 1 and not self.use_compact_draft_cache:
+                        if self.draft_page_size == 1 and not self.use_compact_draft_cache:
                             draft_req_to_token = self.draft_model_runner.req_to_token_pool.req_to_token
                             row_ids = batch.req_pool_indices.to(torch.int64).unsqueeze(1).expand(
                                 -1, active_block_size
@@ -1049,6 +1458,16 @@ class DFlashWorker:
         if linear_mode == "draft=sampled,target=sampled" and active_block_size > 1:
             sampling_info = batch.sampling_info
             assert sampling_info is not None
+            # Avoid synchronizing on device tensors for these checks; SamplingBatchInfo already
+            # computed them from the request sampling params.
+            need_top_p_sampling = bool(getattr(sampling_info, "need_top_p_sampling", True))
+            need_top_k_sampling = bool(getattr(sampling_info, "need_top_k_sampling", True))
+            need_min_p_sampling = bool(getattr(sampling_info, "need_min_p_sampling", True))
+            # Proposal support width must be bounded for sampled->sampled verification.
+            try:
+                proposal_width_hint = max(int(r.sampling_params.top_k) for r in batch.reqs)
+            except Exception:
+                proposal_width_hint = int(getattr(self.server_args, "top_k", 1) or 1)
             row_count = bs * (active_block_size - 1)
             temperatures = torch.repeat_interleave(sampling_info.temperatures, active_block_size - 1, dim=0)
             top_ps = torch.repeat_interleave(sampling_info.top_ps, active_block_size - 1, dim=0)
@@ -1066,6 +1485,10 @@ class DFlashWorker:
                 min_ps=min_ps[:row_count],
                 positions=positions_2d[:, 1:].reshape(-1),
                 sampling_seed=sampling_seed[:row_count] if sampling_seed is not None else None,
+                need_top_p_sampling=need_top_p_sampling,
+                need_top_k_sampling=need_top_k_sampling,
+                need_min_p_sampling=need_min_p_sampling,
+                proposal_width_hint=proposal_width_hint,
                 return_proposal_support=True,
             )
             draft_next = sampled_result.token_ids.view(bs, active_block_size - 1)
@@ -1110,6 +1533,18 @@ class DFlashWorker:
                 draft_confidence=draft_confidence,
                 draft_entropy=draft_entropy,
             )
+        # If the logical verify width collapses to 1, it's effectively target-only; skip TARGET_VERIFY.
+        if logical_block_size <= 1:
+            draft_input.linear_mode = "target_only"
+            draft_input._active_physical_block_size = 1
+            draft_input._active_draft_token_num = 1
+            draft_input._active_step_count = 0
+            draft_input._draft_conf_debug = draft_conf_debug
+            draft_input._history_block_debug = history_block_debug
+            batch.forward_mode = ForwardMode.DECODE
+            batch.spec_info = draft_input
+            batch.return_hidden_states = False
+            return
         verify_positions_2d = positions_2d[:, :logical_block_size]
         verify_positions = verify_positions_2d.reshape(-1)
         verify_draft_tokens = draft_tokens[:, :logical_block_size]
@@ -1149,6 +1584,7 @@ class DFlashWorker:
         draft_input._active_draft_token_num = int(logical_block_size)
         draft_input._active_step_count = int(max(0, logical_block_size - 1))
         draft_input._draft_conf_debug = draft_conf_debug
+        draft_input._history_block_debug = history_block_debug
         if self.tp_rank == 0 and requested_block_size != active_block_size and active_block_size > 1:
             logger.warning(
                 "DFLASH reduced physical draft width for this batch: requested_block_size=%s -> active_block_size=%s (batch=%s).",
@@ -1329,6 +1765,10 @@ class DFlashWorker:
         min_ps: torch.Tensor,
         positions: torch.Tensor,
         sampling_seed: Optional[torch.Tensor],
+        need_top_p_sampling: bool,
+        need_top_k_sampling: bool,
+        need_min_p_sampling: bool,
+        proposal_width_hint: Optional[int] = None,
         chunk_size: int = 128,
         return_proposal_support: bool = False,
     ) -> DFlashDraftSamplingResult:
@@ -1373,12 +1813,16 @@ class DFlashWorker:
         out_selected_probs = None
         out_proposal_indices = None
         out_proposal_probs = None
-        need_min_p_sampling = torch.any(min_ps > 0).item()
-        simple_sampling_case = not (torch.any(top_ps != 1.0).item() or torch.any(top_ks != 1).item() or need_min_p_sampling)
+        # IMPORTANT: avoid implicit GPU->CPU syncs from `.item()` in the hot path.
+        # The caller (SamplingBatchInfo / reqs) can provide the correct booleans.
+        simple_sampling_case = not (bool(need_top_p_sampling) or bool(need_top_k_sampling) or bool(need_min_p_sampling))
         if return_proposal_support and simple_sampling_case:
             raise RuntimeError("DFLASH sampled draft requires bounded top-k/top-p/min-p support when return_proposal_support=True.")
         if return_proposal_support:
-            proposal_width = int(top_ks.to(torch.int64).max().item())
+            proposal_width = int(proposal_width_hint or 0)
+            if proposal_width <= 0:
+                # Fall back to a conservative width without synchronizing on device tensors.
+                proposal_width = 1
             proposal_width = max(1, min(proposal_width, valid_weight.shape[0]))
             out_selected_probs = torch.empty((num_tokens,), dtype=torch.float32, device=hidden_states.device)
             out_proposal_indices = torch.empty((num_tokens, proposal_width), dtype=torch.long, device=hidden_states.device)
@@ -1419,7 +1863,7 @@ class DFlashWorker:
                         sampled_local = multinomial_with_seed(torch.log(probs.to(torch.float64)), sampling_seed_chunk, positions_chunk).view(-1)
                 else:
                     probs_sort, probs_idx = build_dflash_filtered_sampling_distribution_from_probs(
-                        probs, top_ks_chunk, top_ps_chunk, min_ps_chunk, need_min_p_sampling
+                        probs, top_ks_chunk, top_ps_chunk, min_ps_chunk, bool(need_min_p_sampling)
                     )
                     sampled_local, _ = sample_dflash_filtered_distribution(
                         probs_sort=probs_sort,
@@ -1479,39 +1923,58 @@ class DFlashWorker:
             draft_prefix_lens.to(torch.int64) + ctx_lens.to(torch.int64)
         ).to(torch.int32)
 
-        # Gather cache locations and positions
+        # Gather cache locations and positions for the committed target tokens we need to append.
+        # IMPORTANT: when the draft worker does NOT share the target token allocator, we must
+        # allocate *new* draft slots and update the draft req_to_token mapping accordingly.
         if bs == 1:
-            max_ctx = total_ctx
-            r = self._block_pos_offsets[:max_ctx] if max_ctx <= self.block_size else torch.arange(max_ctx, device=device, dtype=torch.int64)
-            pos2d = ctx_start[:, None] + r[None, :]
-            cache2d = target_req_to_token[req_pool_indices[:, None], pos2d]
-            ctx_cache_loc = cache2d.reshape(-1).to(torch.int64)
-            ctx_positions = pos2d.reshape(-1)
+            max_ctx = int(total_ctx)
         else:
-            max_ctx = int(ctx_lens.max().item())
-            if max_ctx <= 0:
-                raise RuntimeError(f"DFLASH invalid max_ctx={max_ctx} for KV append.")
-            r = self._block_pos_offsets[:max_ctx] if max_ctx <= self.block_size else torch.arange(max_ctx, device=device, dtype=torch.int64)
-            r = r[None, :]
-            pos2d = ctx_start[:, None] + r
-            mask = r < ctx_lens[:, None]
-            ctx_cache_loc = self._gather_req_to_token_masked(
-                req_to_token=target_req_to_token,
-                req_pool_indices=req_pool_indices,
-                pos2d=pos2d,
-                mask=mask,
-                context="DFLASH target hidden KV append",
-            )
-            ctx_positions = pos2d[mask]
+            # Avoid `.item()` host sync in the decode hot path: during verify-append we expect
+            # ctx_lens <= block_size and total_ctx <= bs * block_size.
+            if total_ctx <= bs * int(self.block_size):
+                max_ctx = min(int(self.block_size), int(total_ctx))
+            else:
+                # Prefill / large append: allow a single small D2H for correctness.
+                max_ctx = int(ctx_lens.detach().to(device="cpu", dtype=torch.int32).max().item())
+        if max_ctx <= 0:
+            raise RuntimeError(f"DFLASH invalid max_ctx={max_ctx} for KV append.")
+        r = (
+            self._block_pos_offsets[:max_ctx]
+            if max_ctx <= self.block_size
+            else torch.arange(max_ctx, device=device, dtype=torch.int64)
+        )
+        r = r[None, :]
+        pos2d = ctx_start[:, None] + r
+        mask = r < ctx_lens[:, None]
+        ctx_positions = pos2d[mask]
+
+        ctx_cache_loc = self._gather_req_to_token_masked(
+            req_to_token=target_req_to_token,
+            req_pool_indices=req_pool_indices,
+            pos2d=pos2d,
+            mask=mask,
+            context="DFLASH target hidden KV append",
+        )
 
         with torch.inference_mode():
             ctx_hidden = self.draft_model.project_target_hidden(draft_input.target_hidden)
             if ctx_hidden.shape[0] != ctx_cache_loc.numel():
                 raise RuntimeError(f"ctx_hidden/cache_loc mismatch: {ctx_hidden.shape[0]} vs {ctx_cache_loc.numel()}.")
 
+            max_position_hint = None
+            try:
+                max_position_hint = int(batch.seq_lens_cpu[:bs].max().item()) + int(self.block_size)
+            except Exception:
+                max_position_hint = None
+
             if self._use_fused_kv_materialize and self._fused_kv_helper is not None:
                 try:
-                    self._append_target_hidden_fused(ctx_hidden, ctx_positions, ctx_cache_loc)
+                    self._append_target_hidden_fused(
+                        ctx_hidden,
+                        ctx_positions,
+                        ctx_cache_loc,
+                        max_position_hint=max_position_hint,
+                    )
                 except Exception as e:
                     logger.warning("Fused KV append failed, falling back to sequential: %s", e)
                     self._use_fused_kv_materialize = False
@@ -1528,6 +1991,7 @@ class DFlashWorker:
                 req_pool_indices=req_pool_indices,
                 start=suffix_start,
                 lengths=new_draft_seq_lens,
+                max_len_hint=int(self.draft_window_size) if self.draft_window_size is not None else None,
             )
             assign_req_to_token_pool_func(
                 batch.req_pool_indices,
@@ -1565,6 +2029,8 @@ class DFlashWorker:
         ctx_hidden: torch.Tensor,
         ctx_positions: torch.Tensor,
         ctx_cache_loc: torch.Tensor,
+        *,
+        max_position_hint: Optional[int] = None,
     ) -> None:
         token_to_kv_pool = self.draft_model_runner.token_to_kv_pool
         layers = self.draft_model.layers
@@ -1573,7 +2039,12 @@ class DFlashWorker:
             attn = layers[layer_idx].self_attn.attn
             token_to_kv_pool.set_kv_buffer(attn, ctx_cache_loc, cache_k, cache_v, attn.k_scale, attn.v_scale)
 
-        self._fused_kv_helper.materialize(ctx_hidden, ctx_positions, _write_layer_kv)
+        self._fused_kv_helper.materialize(
+            ctx_hidden,
+            ctx_positions,
+            _write_layer_kv,
+            max_position_hint=None if max_position_hint is None else int(max_position_hint),
+        )
 
     def _project_verified_hidden_selected(
         self,
@@ -1595,13 +2066,22 @@ class DFlashWorker:
         cache_plan,
         commit_lens: torch.Tensor,
     ) -> bool:
+        max_position_hint = None
+        try:
+            bs = int(commit_lens.shape[0])
+            max_position_hint = int(batch.seq_lens_cpu[:bs].max().item()) + int(self.block_size)
+        except Exception:
+            max_position_hint = None
         return apply_dflash_shared_pool_verify_append(
             draft_input=draft_input,
             verify_positions=verify_positions,
             hidden_states=hidden_states,
             cache_plan=cache_plan,
             commit_lens=commit_lens,
-            write_selected_hidden=self._project_and_write_verified_hidden_selected_to_draft_kv,
+            write_selected_hidden=lambda **kwargs: self._project_and_write_verified_hidden_selected_to_draft_kv(
+                **kwargs,
+                max_position_hint=max_position_hint,
+            ),
         )
 
     def _project_and_write_verified_hidden_selected_to_draft_kv(
@@ -1611,6 +2091,7 @@ class DFlashWorker:
         accepted_indices: torch.Tensor,
         ctx_positions: torch.Tensor,
         ctx_cache_loc: torch.Tensor,
+        max_position_hint: Optional[int] = None,
     ) -> None:
         with torch.inference_mode():
             ctx_hidden = self._project_verified_hidden_selected(
@@ -1621,7 +2102,12 @@ class DFlashWorker:
                 raise RuntimeError(f"Selected hidden/cache_loc mismatch: {ctx_hidden.shape[0]} vs {ctx_cache_loc.numel()}.")
             if self._use_fused_kv_materialize and self._fused_kv_helper is not None:
                 try:
-                    self._append_verified_hidden_selected_fused(ctx_hidden, ctx_positions, ctx_cache_loc)
+                    self._append_verified_hidden_selected_fused(
+                        ctx_hidden,
+                        ctx_positions,
+                        ctx_cache_loc,
+                        max_position_hint=max_position_hint,
+                    )
                     return
                 except Exception as e:
                     logger.warning("Fused selected verify append failed, falling back: %s", e)
@@ -1634,6 +2120,8 @@ class DFlashWorker:
         ctx_hidden: torch.Tensor,
         ctx_positions: torch.Tensor,
         ctx_cache_loc: torch.Tensor,
+        *,
+        max_position_hint: Optional[int] = None,
     ) -> None:
         token_to_kv_pool = self.draft_model_runner.token_to_kv_pool
         layers = self.draft_model.layers
@@ -1642,7 +2130,12 @@ class DFlashWorker:
             attn = layers[layer_idx].self_attn.attn
             token_to_kv_pool.set_kv_buffer(attn, ctx_cache_loc, cache_k, cache_v, attn.k_scale, attn.v_scale)
 
-        self._fused_kv_helper.materialize(ctx_hidden, ctx_positions, _write_layer_kv)
+        self._fused_kv_helper.materialize(
+            ctx_hidden,
+            ctx_positions,
+            _write_layer_kv,
+            max_position_hint=None if max_position_hint is None else int(max_position_hint),
+        )
 
     # ------------------------------------------------------------------
     #  Batch forward (prefill + decode/verify)
@@ -1722,7 +2215,8 @@ class DFlashWorker:
         torch_profile_verify_this_step = (
             self.tp_rank == 0
             and _should_torch_profile_verify_step(
-                _env_enabled("SGLANG_DFLASH_TORCH_PROFILER_VERIFY"),
+                _env_enabled("SGLANG_DFLASH_TORCH_PROFILER_VERIFY")
+                or _env_enabled("SGLANG_DFLASH_PROFILE_VERIFY_DETAILS"),
                 self._profile_step,
             )
         )
@@ -1737,6 +2231,30 @@ class DFlashWorker:
         t0 = time.perf_counter() if profile_this_step else 0.0
         self._prepare_for_speculative_decoding(batch, draft_input)
         t_prepare = time.perf_counter() if profile_this_step else 0.0
+
+        # Draft OOM / FailFast collapse can force this step back onto target-only decode.
+        if not batch.forward_mode.is_target_verify():
+            model_worker_batch = batch.get_model_worker_batch()
+            model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
+            model_worker_batch.capture_layer_ids = self.capture_layer_ids
+            batch_result = self.target_worker.forward_batch_generation(model_worker_batch, **kwargs)
+            logits_output, next_token_ids = batch_result.logits_output, batch_result.next_token_ids
+            if logits_output.hidden_states is not None:
+                bs = int(next_token_ids.shape[0])
+                draft_input.verified_id = next_token_ids.to(torch.int64)
+                draft_input.target_hidden = logits_output.hidden_states
+                draft_input.ctx_lens = torch.ones(
+                    (bs,), device=next_token_ids.device, dtype=torch.int32
+                )
+                # Avoid holding onto hidden-state tensors in the returned logits_output.
+                logits_output.hidden_states = None
+            batch.spec_info = draft_input
+            return GenerationBatchResult(
+                logits_output=logits_output,
+                next_token_ids=next_token_ids,
+                num_accepted_tokens=0,
+                can_run_cuda_graph=batch_result.can_run_cuda_graph,
+            )
 
         model_worker_batch = batch.get_model_worker_batch()
         assert model_worker_batch.forward_mode.is_target_verify()
@@ -1795,12 +2313,9 @@ class DFlashWorker:
                 target_model_runner, "piecewise_cuda_graph_runner", None
             )
             target_model_runner.graph_runner = None
-            # Prefer piecewise graphs for reduced-width verify when available.
-            # Only force eager verify if no piecewise runner exists.
-            if (
-                hasattr(target_model_runner, "piecewise_cuda_graph_runner")
-                and not piecewise_runner_available
-            ):
+            # Reduced-width verify does not match the captured TARGET_VERIFY graph shapes.
+            # Force eager verify by disabling both the main and piecewise CUDA-graph runners.
+            if hasattr(target_model_runner, "piecewise_cuda_graph_runner"):
                 target_model_runner.piecewise_cuda_graph_runner = None
 
         t1 = time.perf_counter() if profile_this_step else 0.0
@@ -2006,15 +2521,18 @@ class DFlashWorker:
                 raise RuntimeError(f"{context} req_to_token table empty but mask non-empty.")
             return torch.empty((0,), dtype=torch.int64, device=self.device)
         valid_mask = (~mask) | ((pos2d >= 0) & (pos2d < int(table_width)))
-        if not bool(torch.all(valid_mask).item()):
-            bad_positions = pos2d[mask & ~valid_mask]
-            bad_min = int(bad_positions.min().item()) if bad_positions.numel() > 0 else 0
-            bad_max = int(bad_positions.max().item()) if bad_positions.numel() > 0 else 0
-            raise RuntimeError(
-                f"{context} req_to_token position out of bounds: "
-                f"table_width={int(table_width)} bad_count={int(bad_positions.numel())} "
-                f"min={bad_min} max={bad_max}"
-            )
+        # This bounds check forces a device->host sync if evaluated on CUDA. Keep it behind a
+        # debug env so production decode doesn't pay for it.
+        if _env_enabled("SGLANG_DFLASH_STRICT_BOUNDS_CHECK"):
+            if not bool(torch.all(valid_mask).item()):
+                bad_positions = pos2d[mask & ~valid_mask]
+                bad_min = int(bad_positions.min().item()) if bad_positions.numel() > 0 else 0
+                bad_max = int(bad_positions.max().item()) if bad_positions.numel() > 0 else 0
+                raise RuntimeError(
+                    f"{context} req_to_token position out of bounds: "
+                    f"table_width={int(table_width)} bad_count={int(bad_positions.numel())} "
+                    f"min={bad_min} max={bad_max}"
+                )
         safe_pos2d = pos2d.masked_fill(~mask, 0)
         return req_to_token[req_pool_indices[:, None], safe_pos2d][mask].to(torch.int64)
 
@@ -2025,11 +2543,16 @@ class DFlashWorker:
         req_pool_indices: torch.Tensor,
         start: Optional[torch.Tensor],
         lengths: torch.Tensor,
+        max_len_hint: Optional[int] = None,
     ) -> torch.Tensor:
         lengths = lengths.to(torch.int64)
         if lengths.numel() == 0:
             return torch.empty((0,), dtype=torch.int64, device=self.device)
-        max_len = int(lengths.max().item())
+        # Avoid a device->host sync for `lengths.max().item()` in the decode hot path.
+        if max_len_hint is not None:
+            max_len = int(max_len_hint)
+        else:
+            max_len = int(lengths.max().item())
         if max_len <= 0:
             return torch.empty((0,), dtype=torch.int64, device=self.device)
         req_pool_indices = req_pool_indices.to(torch.int64)
@@ -2053,12 +2576,14 @@ class DFlashWorker:
             seq_lens.to(device=self.device, dtype=torch.int32),
             max=self.draft_window_size,
         )
-        if self.page_size <= 1:
+        if self.draft_page_size <= 1:
             return visible_lens
         seq_lens_i64 = seq_lens.to(torch.int64)
         visible_lens_i64 = visible_lens.to(torch.int64)
         visible_start = seq_lens_i64 - visible_lens_i64
-        aligned_start = visible_start - torch.remainder(visible_start, self.page_size)
+        aligned_start = visible_start - torch.remainder(
+            visible_start, int(self.draft_page_size)
+        )
         return (seq_lens_i64 - aligned_start).to(torch.int32)
 
     def _update_target_mamba_state_after_verify(
