@@ -448,6 +448,21 @@ class DFlashWorker:
                 self._mask_token,
                 self._mask_token_id,
             )
+            try:
+                logger.info(
+                    "DFLASH lane resolved: target_kv_dtype=%s draft_kv_dtype=%s page_size=%s draft_page_size=%s "
+                    "cuda_graph_mode=%s piecewise_max_tokens=%s max_running_requests=%s cuda_graph_bs=%s",
+                    getattr(server_args, "kv_cache_dtype", None),
+                    getattr(server_args, "speculative_draft_kv_cache_dtype", None),
+                    int(getattr(server_args, "page_size", 1) or 1),
+                    int(getattr(server_args, "speculative_draft_page_size", None) or 1),
+                    getattr(server_args, "cuda_graph_mode", None),
+                    getattr(server_args, "piecewise_cuda_graph_max_tokens", None),
+                    getattr(server_args, "max_running_requests", None),
+                    getattr(server_args, "cuda_graph_bs", None),
+                )
+            except Exception as e:
+                logger.info("DFLASH lane logging failed: %s", e)
 
         # Buffers for draft generation
         self._block_pos_offsets = torch.arange(
