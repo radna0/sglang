@@ -551,6 +551,7 @@ class FlashAttentionBackend(AttentionBackend):
             and str(self.kv_cache_dtype_str).startswith("fp8_")
         )
         self._logged_dflash_draft_fp8_keep_q_once = False
+        self._logged_fp8_keep_q_bf16_ignored_once = False
 
     def _should_keep_dflash_draft_q_bf16(self) -> bool:
         if not self._dflash_draft_fp8_keep_q_bf16:
@@ -580,17 +581,40 @@ class FlashAttentionBackend(AttentionBackend):
     ]:
         q_descale, k_descale, v_descale = None, None, None
 
+        kv_cache_dtype_str = str(self.kv_cache_dtype_str or "").strip().lower()
+        if not kv_cache_dtype_str.startswith("fp8_"):
+            return q, q_rope, k_rope, q_descale, k_descale, v_descale
+
         if self.kv_cache_dtype_str == "auto" or layer.head_dim > 256:
             return q, q_rope, k_rope, q_descale, k_descale, v_descale
         if self.fa_impl_ver == 4 and not fa4_hopper_stable_enabled():
             return q, q_rope, k_rope, q_descale, k_descale, v_descale
 
-        k_scale = getattr(layer, "k_scale_vec", None)
-        v_scale = getattr(layer, "v_scale_vec", None)
+        k_scale_vec = getattr(layer, "k_scale_vec", None)
+        v_scale_vec = getattr(layer, "v_scale_vec", None)
+        k_scale_is_one = False
+        v_scale_is_one = False
+
+        k_scale = k_scale_vec
+        v_scale = v_scale_vec
         if k_scale is None:
             k_scale = getattr(layer, "k_scale", None)
+            k_scale_float = getattr(layer, "k_scale_float", None)
+            if (
+                k_scale is not None
+                and isinstance(k_scale_float, (int, float))
+                and float(k_scale_float) == 1.0
+            ):
+                k_scale_is_one = True
         if v_scale is None:
             v_scale = getattr(layer, "v_scale", None)
+            v_scale_float = getattr(layer, "v_scale_float", None)
+            if (
+                v_scale is not None
+                and isinstance(v_scale_float, (int, float))
+                and float(v_scale_float) == 1.0
+            ):
+                v_scale_is_one = True
 
         if k_scale is not None:
             descale_shape = (batch_size, layer.tp_k_head_num)
@@ -599,22 +623,38 @@ class FlashAttentionBackend(AttentionBackend):
                 v_descale = v_scale.expand(descale_shape)
 
         if self._should_keep_dflash_draft_q_bf16():
-            if not self._logged_dflash_draft_fp8_keep_q_once:
-                logger.info(
-                    "FlashAttentionBackend: keeping DFLASH draft Q in bf16 while storing KV in %s.",
-                    str(self.kv_cache_dtype),
-                )
-                self._logged_dflash_draft_fp8_keep_q_once = True
-            return q, q_rope, k_rope, q_descale, k_descale, v_descale
-
-        keep_q_bf16 = (os.environ.get("SGLANG_FP8_KEEP_Q_BF16") or "").strip().lower() in (
+            if self.fa_impl_ver == 3:
+                if not self._logged_fp8_keep_q_bf16_ignored_once:
+                    logger.warning(
+                        "FlashAttentionBackend: ignoring SGLANG_DFLASH_DRAFT_FP8_KEEP_Q_BF16 for FA3 "
+                        "because FA3 requires query/key dtypes to match when KV cache is FP8."
+                    )
+                    self._logged_fp8_keep_q_bf16_ignored_once = True
+            else:
+                # Non-FA3 backends may support keeping Q in bf16.
+                if not self._logged_dflash_draft_fp8_keep_q_once:
+                    logger.info(
+                        "FlashAttentionBackend: keeping DFLASH draft Q in bf16 while storing KV in %s.",
+                        str(self.kv_cache_dtype),
+                    )
+                    self._logged_dflash_draft_fp8_keep_q_once = True
+                return q, q_rope, k_rope, q_descale, k_descale, v_descale
+        env_keep_q_bf16 = (os.environ.get("SGLANG_FP8_KEEP_Q_BF16") or "").strip().lower() in (
             "1",
             "true",
             "yes",
             "on",
         )
-        if keep_q_bf16:
-            return q, q_rope, k_rope, q_descale, k_descale, v_descale
+        if env_keep_q_bf16:
+            if self.fa_impl_ver == 3:
+                if not self._logged_fp8_keep_q_bf16_ignored_once:
+                    logger.warning(
+                        "FlashAttentionBackend: ignoring SGLANG_FP8_KEEP_Q_BF16 for FA3 "
+                        "because FA3 requires query/key dtypes to match when KV cache is FP8."
+                    )
+                    self._logged_fp8_keep_q_bf16_ignored_once = True
+            else:
+                return q, q_rope, k_rope, q_descale, k_descale, v_descale
 
         if k_scale is None:
             q = q.to(self.kv_cache_dtype)
@@ -690,12 +730,16 @@ class FlashAttentionBackend(AttentionBackend):
         else:
             descale_shape = (batch_size, layer.tp_k_head_num)
             q_descale = k_scale.expand(descale_shape)
-            q = (q / k_scale).to(self.kv_cache_dtype)
-            q_rope = (
-                (q_rope / k_scale).to(self.kv_cache_dtype)
-                if q_rope is not None
-                else None
-            )
+            if k_scale_is_one:
+                q = q.to(self.kv_cache_dtype)
+                q_rope = q_rope.to(self.kv_cache_dtype) if q_rope is not None else None
+            else:
+                q = (q / k_scale).to(self.kv_cache_dtype)
+                q_rope = (
+                    (q_rope / k_scale).to(self.kv_cache_dtype)
+                    if q_rope is not None
+                    else None
+                )
 
         if k_rope is not None:
             if (
@@ -704,9 +748,15 @@ class FlashAttentionBackend(AttentionBackend):
                 and k_rope.ndim == 3
                 and k_scale.numel() == k_rope.shape[1]
             ):
-                k_rope = (k_rope / k_scale.view(1, -1, 1)).to(self.kv_cache_dtype)
+                if k_scale_is_one:
+                    k_rope = k_rope.to(self.kv_cache_dtype)
+                else:
+                    k_rope = (k_rope / k_scale.view(1, -1, 1)).to(self.kv_cache_dtype)
             else:
-                k_rope = (k_rope / k_scale).to(self.kv_cache_dtype)
+                if k_scale_is_one:
+                    k_rope = k_rope.to(self.kv_cache_dtype)
+                else:
+                    k_rope = (k_rope / k_scale).to(self.kv_cache_dtype)
 
         return q, q_rope, k_rope, q_descale, k_descale, v_descale
 
@@ -1374,12 +1424,26 @@ class FlashAttentionBackend(AttentionBackend):
                     else forward_batch.encoder_out_cache_loc
                 )
                 if not self.use_mla:
-                    k_scale = getattr(layer, 'k_scale_vec', None)
-                    v_scale = getattr(layer, 'v_scale_vec', None)
+                    k_scale = getattr(layer, "k_scale_vec", None)
+                    v_scale = getattr(layer, "v_scale_vec", None)
+
                     if k_scale is None:
-                        k_scale = layer.k_scale
+                        k_scale_float = getattr(layer, "k_scale_float", None)
+                        if isinstance(k_scale_float, (int, float)) and float(k_scale_float) == 1.0:
+                            k_scale = None
+                        elif isinstance(k_scale_float, (int, float)):
+                            k_scale = float(k_scale_float)
+                        else:
+                            k_scale = getattr(layer, "k_scale", None)
+
                     if v_scale is None:
-                        v_scale = layer.v_scale
+                        v_scale_float = getattr(layer, "v_scale_float", None)
+                        if isinstance(v_scale_float, (int, float)) and float(v_scale_float) == 1.0:
+                            v_scale = None
+                        elif isinstance(v_scale_float, (int, float)):
+                            v_scale = float(v_scale_float)
+                        else:
+                            v_scale = getattr(layer, "v_scale", None)
                     forward_batch.token_to_kv_pool.set_kv_buffer(
                         layer, cache_loc, k, v, k_scale, v_scale
                     )

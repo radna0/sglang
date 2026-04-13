@@ -958,6 +958,10 @@ class MHATokenToKVPool(KVCache):
         v_scale: Optional[float] = None,
         layer_id_override: Optional[int] = None,
     ):
+        if k_scale is not None and isinstance(k_scale, (int, float)) and float(k_scale) == 1.0:
+            k_scale = None
+        if v_scale is not None and isinstance(v_scale, (int, float)) and float(v_scale) == 1.0:
+            v_scale = None
         if layer_id_override is not None:
             layer_id = layer_id_override
         else:
