@@ -78,6 +78,32 @@ _is_npu = is_npu()
 _is_cpu = is_cpu()
 _cpu_has_amx_support = cpu_has_amx_support()
 _is_hip = is_hip()
+_fused_fp8_set_kv_buffer = None
+_fused_fp8_set_kv_buffer_failed = False
+
+
+def _scale_is_scalar_like(scale: Optional[Union[float, torch.Tensor]]) -> bool:
+    if scale is None:
+        return True
+    if isinstance(scale, (int, float)):
+        return True
+    return isinstance(scale, torch.Tensor) and scale.numel() == 1
+
+
+def _get_fused_fp8_set_kv_buffer():
+    global _fused_fp8_set_kv_buffer, _fused_fp8_set_kv_buffer_failed
+    if _fused_fp8_set_kv_buffer_failed:
+        return None
+    if _fused_fp8_set_kv_buffer is None:
+        try:
+            from sglang.srt.layers.attention.triton_ops.trtllm_fp8_kv_kernel import (
+                fused_fp8_set_kv_buffer,
+            )
+        except Exception:
+            _fused_fp8_set_kv_buffer_failed = True
+            return None
+        _fused_fp8_set_kv_buffer = fused_fp8_set_kv_buffer
+    return _fused_fp8_set_kv_buffer
 
 
 def get_tensor_size_bytes(t: Union[torch.Tensor, List[torch.Tensor]]):
@@ -966,6 +992,35 @@ class MHATokenToKVPool(KVCache):
             layer_id = layer_id_override
         else:
             layer_id = layer.layer_id
+        if (
+            _is_cuda
+            and self.dtype in (torch.float8_e5m2, torch.float8_e4m3fn)
+            and self.same_kv_dim
+            and cache_k.dtype != self.dtype
+            and cache_v.dtype != self.dtype
+            and _scale_is_scalar_like(k_scale)
+            and _scale_is_scalar_like(v_scale)
+        ):
+            fused_fp8_writer = _get_fused_fp8_set_kv_buffer()
+            if fused_fp8_writer is not None:
+                try:
+                    fused_fp8_writer(
+                        k=cache_k,
+                        v=cache_v,
+                        k_cache=self._get_key_buffer(layer_id),
+                        v_cache=self._get_value_buffer(layer_id),
+                        cache_loc=loc,
+                        k_scale=k_scale,
+                        v_scale=v_scale,
+                        page_size=self.page_size,
+                    )
+                    return
+                except Exception:
+                    global _fused_fp8_set_kv_buffer_failed
+                    _fused_fp8_set_kv_buffer_failed = True
+                    logger.exception(
+                        "Fused FP8 KV write failed; falling back to generic set_kv_buffer path."
+                    )
         if cache_k.dtype != self.dtype:
             if k_scale is not None:
                 cache_k.div_(k_scale)

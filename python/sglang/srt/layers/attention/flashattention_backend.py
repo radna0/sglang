@@ -21,6 +21,26 @@ from sglang.srt.utils import get_compiler_backend
 
 logger = logging.getLogger(__name__)
 
+def _cast_fp8_buffered(
+    cache: dict[str, torch.Tensor],
+    name: str,
+    tensor: Optional[torch.Tensor],
+    fp8_dtype: torch.dtype,
+) -> Optional[torch.Tensor]:
+    if tensor is None:
+        return None
+    buffer = cache.get(name)
+    if (
+        buffer is None
+        or buffer.shape != tensor.shape
+        or buffer.device != tensor.device
+        or buffer.dtype != fp8_dtype
+    ):
+        buffer = torch.empty_like(tensor, dtype=fp8_dtype)
+        cache[name] = buffer
+    buffer.copy_(tensor)
+    return buffer
+
 
 def _fa3_flag(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
@@ -508,6 +528,7 @@ class FlashAttentionBackend(AttentionBackend):
             model_runner.server_args.speculative_num_draft_tokens
         )
         self.speculative_step_id = speculative_step_id
+        self._fp8_cast_buffers: dict[str, torch.Tensor] = {}
 
         self.fa_impl_ver = fa_impl_ver
 
@@ -606,6 +627,7 @@ class FlashAttentionBackend(AttentionBackend):
                 and float(k_scale_float) == 1.0
             ):
                 k_scale_is_one = True
+                k_scale = None
         if v_scale is None:
             v_scale = getattr(layer, "v_scale", None)
             v_scale_float = getattr(layer, "v_scale_float", None)
@@ -615,6 +637,7 @@ class FlashAttentionBackend(AttentionBackend):
                 and float(v_scale_float) == 1.0
             ):
                 v_scale_is_one = True
+                v_scale = None
 
         if k_scale is not None:
             descale_shape = (batch_size, layer.tp_k_head_num)
@@ -657,9 +680,13 @@ class FlashAttentionBackend(AttentionBackend):
                 return q, q_rope, k_rope, q_descale, k_descale, v_descale
 
         if k_scale is None:
-            q = q.to(self.kv_cache_dtype)
-            q_rope = q_rope.to(self.kv_cache_dtype) if q_rope is not None else None
-            k_rope = k_rope.to(self.kv_cache_dtype) if k_rope is not None else None
+            q = _cast_fp8_buffered(self._fp8_cast_buffers, "q", q, self.kv_cache_dtype)
+            q_rope = _cast_fp8_buffered(
+                self._fp8_cast_buffers, "q_rope", q_rope, self.kv_cache_dtype
+            )
+            k_rope = _cast_fp8_buffered(
+                self._fp8_cast_buffers, "k_rope", k_rope, self.kv_cache_dtype
+            )
             return q, q_rope, k_rope, q_descale, k_descale, v_descale
 
         dynamic_q_scale = (os.environ.get("SGLANG_FP8_DYNAMIC_Q_SCALE") or "").strip().lower() in (
@@ -731,8 +758,12 @@ class FlashAttentionBackend(AttentionBackend):
             descale_shape = (batch_size, layer.tp_k_head_num)
             q_descale = k_scale.expand(descale_shape)
             if k_scale_is_one:
-                q = q.to(self.kv_cache_dtype)
-                q_rope = q_rope.to(self.kv_cache_dtype) if q_rope is not None else None
+                q = _cast_fp8_buffered(
+                    self._fp8_cast_buffers, "q", q, self.kv_cache_dtype
+                )
+                q_rope = _cast_fp8_buffered(
+                    self._fp8_cast_buffers, "q_rope", q_rope, self.kv_cache_dtype
+                )
             else:
                 q = (q / k_scale).to(self.kv_cache_dtype)
                 q_rope = (
@@ -749,12 +780,16 @@ class FlashAttentionBackend(AttentionBackend):
                 and k_scale.numel() == k_rope.shape[1]
             ):
                 if k_scale_is_one:
-                    k_rope = k_rope.to(self.kv_cache_dtype)
+                    k_rope = _cast_fp8_buffered(
+                        self._fp8_cast_buffers, "k_rope", k_rope, self.kv_cache_dtype
+                    )
                 else:
                     k_rope = (k_rope / k_scale.view(1, -1, 1)).to(self.kv_cache_dtype)
             else:
                 if k_scale_is_one:
-                    k_rope = k_rope.to(self.kv_cache_dtype)
+                    k_rope = _cast_fp8_buffered(
+                        self._fp8_cast_buffers, "k_rope", k_rope, self.kv_cache_dtype
+                    )
                 else:
                     k_rope = (k_rope / k_scale).to(self.kv_cache_dtype)
 
