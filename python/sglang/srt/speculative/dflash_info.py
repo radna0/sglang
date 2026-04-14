@@ -21,7 +21,9 @@ from sglang.srt.speculative.dflash_utils import (
     apply_dflash_target_only_cache_plan,
     apply_dflash_target_only_mapping_updates,
     apply_dflash_target_only_req_kv_accounting,
+    apply_dflash_target_only_plain_device_defaults,
     build_dflash_target_only_cache_plan,
+    can_dflash_target_only_use_plain_device_defaults,
     compute_dflash_accept_len_and_bonus,
     compute_dflash_sampling_accept_len_and_bonus,
     commit_dflash_target_only_batch,
@@ -38,6 +40,7 @@ import logging
 
 logger = logging.getLogger(__name__)
 _DFLASH_GREEDY_VERIFY_DEBUG_CT: int = 0
+_DFLASH_GREEDY_VERIFY_LONGCTX_DEBUG_CT: int = 0
 _DFLASH_VERIFY_PROFILE_CT: int = 0
 
 
@@ -576,14 +579,41 @@ class DFlashVerifyInput(SpecInput):
                 target_predict=target_predict,
             )
             global _DFLASH_GREEDY_VERIFY_DEBUG_CT
-            if (
+            global _DFLASH_GREEDY_VERIFY_LONGCTX_DEBUG_CT
+            greedy_verify_debug_enabled = (
                 (os.environ.get("SGLANG_DFLASH_DEBUG_GREEDY_VERIFY") or "")
                 .strip()
                 .lower()
                 not in ("", "0", "false", "off", "no")
-                and _DFLASH_GREEDY_VERIFY_DEBUG_CT < 10
-            ):
-                _DFLASH_GREEDY_VERIFY_DEBUG_CT += 1
+            ) or (
+                (os.environ.get("SGLANG_DFLASH_PROFILE_VERIFY_DETAILS") or "")
+                .strip()
+                .lower()
+                not in ("", "0", "false", "off", "no")
+            )
+            first_pos_dbg = None
+            longctx_debug = False
+            should_log_greedy_debug = False
+            if greedy_verify_debug_enabled:
+                try:
+                    first_pos_dbg = int(
+                        self.positions.view(bs, self.draft_token_num)[0, 0]
+                        .detach()
+                        .to("cpu")
+                        .item()
+                    )
+                    longctx_debug = bool(first_pos_dbg >= 512)
+                except Exception:
+                    first_pos_dbg = None
+                    longctx_debug = False
+                if longctx_debug:
+                    if _DFLASH_GREEDY_VERIFY_LONGCTX_DEBUG_CT < 10:
+                        _DFLASH_GREEDY_VERIFY_LONGCTX_DEBUG_CT += 1
+                        should_log_greedy_debug = True
+                elif _DFLASH_GREEDY_VERIFY_DEBUG_CT < 10:
+                    _DFLASH_GREEDY_VERIFY_DEBUG_CT += 1
+                    should_log_greedy_debug = True
+            if should_log_greedy_debug:
                 with torch.no_grad():
                     try:
                         step_count = int(max(0, self.draft_token_num - 1))
@@ -595,24 +625,40 @@ class DFlashVerifyInput(SpecInput):
                         else:
                             first_match_frac = 0.0
                         accept_mean = float(accept_len.to(torch.float32).mean().item())
+                        commit_lens_dbg = (
+                            accept_len.to(device=device, dtype=torch.int32).clamp(
+                                min=0, max=int(self.draft_token_num - 1)
+                            )
+                            + 1
+                        )
                         # Log a tiny sample for quick diagnosis (token ids only).
                         samp_n = min(2, bs)
-                        cand0 = candidates[:samp_n, : min(4, self.draft_token_num)].detach().to("cpu").tolist()
-                        pred0 = target_predict[:samp_n, : min(4, self.draft_token_num)].detach().to("cpu").tolist()
+                        trace_width = min(6, self.draft_token_num)
+                        cand0 = (
+                            candidates[:samp_n, :trace_width].detach().to("cpu").tolist()
+                        )
+                        pred0 = (
+                            target_predict[:samp_n, :trace_width].detach().to("cpu").tolist()
+                        )
+                        commit0 = (
+                            commit_lens_dbg[:samp_n].detach().to("cpu").tolist()
+                        )
                         alt0 = getattr(self, "_debug_alt_next0", None)
                         if isinstance(alt0, torch.Tensor):
                             alt0 = alt0[:samp_n].detach().to("cpu").tolist()
                         logger.info(
                             "DFLASH greedy-verify debug: bs=%d block=%d first_match_frac=%.3f accept_mean=%.3f "
-                            "cand[:%d,:4]=%s target_pred[:%d,:4]=%s alt_next0=%s",
+                            "pos0=%s cand[:%d,:6]=%s target_pred[:%d,:6]=%s commit_lens=%s alt_next0=%s",
                             int(bs),
                             int(self.draft_token_num),
                             float(first_match_frac),
                             float(accept_mean),
+                            "?" if first_pos_dbg is None else int(first_pos_dbg),
                             int(samp_n),
                             cand0,
                             int(samp_n),
                             pred0,
+                            commit0,
                             alt0,
                         )
                     except Exception as e:
@@ -637,6 +683,10 @@ class DFlashVerifyInput(SpecInput):
             and commit_source_tokens.is_cuda
             and int(commit_source_tokens.numel())
             <= _get_dflash_target_only_small_cpu_pack_max()
+        )
+        can_use_plain_device_defaults = can_dflash_target_only_use_plain_device_defaults(
+            reqs=batch.reqs,
+            max_commit_len=int(self.draft_token_num),
         )
         packed_token_count = 0
         if use_dense_cpu_commit:
@@ -701,50 +751,70 @@ class DFlashVerifyInput(SpecInput):
             # full stream sync point in the profiler hot path.
             copy_done = _get_dflash_cpu_copy_event(batch, device=device)
             copy_done.record(copy_stream)
-            copy_done.synchronize()
-            if os.getenv("SGLANG_DFLASH_PROFILE"):
-                dt_sync = (time.perf_counter() - t_sync_0) * 1000
-                logger.info(f"[DFLASH_PROF] verify_synchronize: {dt_sync:.3f}ms")
-            if profile_details:
-                verify_profile_ms["verify_sync"] = (time.perf_counter() - t_sync_0) * 1000.0
+            if can_use_plain_device_defaults:
+                if profile_details:
+                    verify_profile_ms["verify_sync"] = 0.0
+                    verify_profile_ms["commit_batch"] = 0.0
+                    verify_profile_ms["commit_lists"] = 0.0
 
-            t_commit_0 = time.perf_counter()
-            commit_results = commit_dflash_target_only_batch(
-                reqs=batch.reqs,
-                proposed_dense_cpu=proposed_dense_cpu,
-                commit_lens_cpu=commit_lens_cpu_t,
-                empty_error_prefix="DFLASH verify",
-            )
-            if os.getenv("SGLANG_DFLASH_PROFILE"):
-                dt_commit = (time.perf_counter() - t_commit_0) * 1000
-                logger.info(f"[DFLASH_PROF] commit_dflash_batch: {dt_commit:.3f}ms")
-            if profile_details:
-                verify_profile_ms["commit_batch"] = (
-                    time.perf_counter() - t_commit_0
-                ) * 1000.0
+                t_sub = time.perf_counter() if profile_details else 0.0
+                commit_metadata = materialize_dflash_target_only_commit_metadata(
+                    commit_results=[],
+                    device=device,
+                    default_commit_lens=default_commit_lens,
+                    default_new_verified_id=default_new_verified_id,
+                )
+                if profile_details:
+                    verify_profile_ms["materialize_metadata"] = (
+                        time.perf_counter() - t_sub
+                    ) * 1000.0
+                commit_lens_cpu = None
+                packed_token_count = int(default_commit_lens.to(torch.int64).sum().item())
+            else:
+                copy_done.synchronize()
+                if os.getenv("SGLANG_DFLASH_PROFILE"):
+                    dt_sync = (time.perf_counter() - t_sync_0) * 1000
+                    logger.info(f"[DFLASH_PROF] verify_synchronize: {dt_sync:.3f}ms")
+                if profile_details:
+                    verify_profile_ms["verify_sync"] = (time.perf_counter() - t_sync_0) * 1000.0
 
-            t_sub = time.perf_counter() if profile_details else 0.0
-            accept_length_per_req_cpu = [
-                int(result.accepted_draft_tokens) for result in commit_results
-            ]
-            commit_lens_cpu = [int(result.commit_len) for result in commit_results]
-            packed_token_count = int(sum(commit_lens_cpu))
-            if profile_details:
-                verify_profile_ms["commit_lists"] = (
-                    time.perf_counter() - t_sub
-                ) * 1000.0
+                t_commit_0 = time.perf_counter()
+                commit_results = commit_dflash_target_only_batch(
+                    reqs=batch.reqs,
+                    proposed_dense_cpu=proposed_dense_cpu,
+                    commit_lens_cpu=commit_lens_cpu_t,
+                    empty_error_prefix="DFLASH verify",
+                )
+                if os.getenv("SGLANG_DFLASH_PROFILE"):
+                    dt_commit = (time.perf_counter() - t_commit_0) * 1000
+                    logger.info(f"[DFLASH_PROF] commit_dflash_batch: {dt_commit:.3f}ms")
+                if profile_details:
+                    verify_profile_ms["commit_batch"] = (
+                        time.perf_counter() - t_commit_0
+                    ) * 1000.0
 
-            t_sub = time.perf_counter() if profile_details else 0.0
-            commit_metadata = materialize_dflash_target_only_commit_metadata(
-                commit_results=commit_results,
-                device=device,
-                default_commit_lens=default_commit_lens,
-                default_new_verified_id=default_new_verified_id,
-            )
-            if profile_details:
-                verify_profile_ms["materialize_metadata"] = (
-                    time.perf_counter() - t_sub
-                ) * 1000.0
+                t_sub = time.perf_counter() if profile_details else 0.0
+                accept_length_per_req_cpu = [
+                    int(result.accepted_draft_tokens) for result in commit_results
+                ]
+                commit_lens_cpu = [int(result.commit_len) for result in commit_results]
+                packed_token_count = int(sum(commit_lens_cpu))
+                if profile_details:
+                    verify_profile_ms["commit_lists"] = (
+                        time.perf_counter() - t_sub
+                    ) * 1000.0
+
+                t_sub = time.perf_counter() if profile_details else 0.0
+                commit_metadata = materialize_dflash_target_only_commit_metadata(
+                    commit_results=commit_results,
+                    device=device,
+                    default_commit_lens=default_commit_lens,
+                    default_new_verified_id=default_new_verified_id,
+                )
+                if profile_details:
+                    verify_profile_ms["materialize_metadata"] = (
+                        time.perf_counter() - t_sub
+                    ) * 1000.0
         else:
             t_sub = time.perf_counter() if profile_details else 0.0
             packed_commits = pack_dflash_target_only_commits(
@@ -798,54 +868,78 @@ class DFlashVerifyInput(SpecInput):
                     )
             if profile_details:
                 verify_profile_ms["stage_copy"] = (time.perf_counter() - t_sub) * 1000.0
-            if packed_commits.proposed_flat.is_cuda:
-                t_sync_0 = time.perf_counter()
-                copy_done = _get_dflash_cpu_copy_event(batch, device=device)
-                copy_done.record(copy_stream)
-                copy_done.synchronize()
-                if os.getenv("SGLANG_DFLASH_PROFILE"):
-                    dt_sync = (time.perf_counter() - t_sync_0) * 1000
-                    logger.info(f"[DFLASH_PROF] verify_synchronize: {dt_sync:.3f}ms")
+            need_copy_wait = bool(packed_commits.proposed_flat.is_cuda)
+            if can_use_plain_device_defaults:
                 if profile_details:
-                    verify_profile_ms["verify_sync"] = (time.perf_counter() - t_sync_0) * 1000.0
-            elif profile_details:
-                verify_profile_ms["verify_sync"] = 0.0
+                    verify_profile_ms["verify_sync"] = 0.0
+                    verify_profile_ms["commit_batch"] = 0.0
+                    verify_profile_ms["commit_lists"] = 0.0
 
-            t_commit_0 = time.perf_counter()
-            commit_results = commit_dflash_target_only_batch(
-                reqs=batch.reqs,
-                proposed_flat_cpu=proposed_flat_cpu,
-                commit_lens_cpu=commit_lens_cpu_t,
-                empty_error_prefix="DFLASH verify",
-            )
-            if os.getenv("SGLANG_DFLASH_PROFILE"):
-                dt_commit = (time.perf_counter() - t_commit_0) * 1000
-                logger.info(f"[DFLASH_PROF] commit_dflash_batch: {dt_commit:.3f}ms")
-            if profile_details:
-                verify_profile_ms["commit_batch"] = (time.perf_counter() - t_commit_0) * 1000.0
+                t_sub = time.perf_counter() if profile_details else 0.0
+                commit_metadata = materialize_dflash_target_only_commit_metadata(
+                    commit_results=[],
+                    device=device,
+                    default_commit_lens=packed_commits.commit_lens,
+                    default_new_verified_id=packed_commits.default_new_verified_id,
+                )
+                if profile_details:
+                    verify_profile_ms["materialize_metadata"] = (
+                        time.perf_counter() - t_sub
+                    ) * 1000.0
+                commit_lens_cpu = None
+                packed_token_count = int(packed_commits.proposed_flat.numel())
+            else:
+                if need_copy_wait:
+                    t_sync_0 = time.perf_counter()
+                    copy_done = _get_dflash_cpu_copy_event(batch, device=device)
+                    copy_done.record(copy_stream)
+                    copy_done.synchronize()
+                    if os.getenv("SGLANG_DFLASH_PROFILE"):
+                        dt_sync = (time.perf_counter() - t_sync_0) * 1000
+                        logger.info(f"[DFLASH_PROF] verify_synchronize: {dt_sync:.3f}ms")
+                    if profile_details:
+                        verify_profile_ms["verify_sync"] = (time.perf_counter() - t_sync_0) * 1000.0
+                elif profile_details:
+                    verify_profile_ms["verify_sync"] = 0.0
 
-            t_sub = time.perf_counter() if profile_details else 0.0
-            accept_length_per_req_cpu = [
-                int(result.accepted_draft_tokens) for result in commit_results
-            ]
-            commit_lens_cpu = [int(result.commit_len) for result in commit_results]
-            packed_token_count = int(packed_commits.proposed_flat.numel())
-            if profile_details:
-                verify_profile_ms["commit_lists"] = (time.perf_counter() - t_sub) * 1000.0
+                t_commit_0 = time.perf_counter()
+                commit_results = commit_dflash_target_only_batch(
+                    reqs=batch.reqs,
+                    proposed_flat_cpu=proposed_flat_cpu,
+                    commit_lens_cpu=commit_lens_cpu_t,
+                    empty_error_prefix="DFLASH verify",
+                )
+                if os.getenv("SGLANG_DFLASH_PROFILE"):
+                    dt_commit = (time.perf_counter() - t_commit_0) * 1000
+                    logger.info(f"[DFLASH_PROF] commit_dflash_batch: {dt_commit:.3f}ms")
+                if profile_details:
+                    verify_profile_ms["commit_batch"] = (time.perf_counter() - t_commit_0) * 1000.0
 
-            t_sub = time.perf_counter() if profile_details else 0.0
-            commit_metadata = materialize_dflash_target_only_commit_metadata(
-                commit_results=commit_results,
-                device=device,
-                default_commit_lens=packed_commits.commit_lens,
-                default_new_verified_id=packed_commits.default_new_verified_id,
-            )
-            if profile_details:
-                verify_profile_ms["materialize_metadata"] = (
-                    time.perf_counter() - t_sub
-                ) * 1000.0
+                t_sub = time.perf_counter() if profile_details else 0.0
+                accept_length_per_req_cpu = [
+                    int(result.accepted_draft_tokens) for result in commit_results
+                ]
+                commit_lens_cpu = [int(result.commit_len) for result in commit_results]
+                packed_token_count = int(packed_commits.proposed_flat.numel())
+                if profile_details:
+                    verify_profile_ms["commit_lists"] = (time.perf_counter() - t_sub) * 1000.0
+
+                t_sub = time.perf_counter() if profile_details else 0.0
+                commit_metadata = materialize_dflash_target_only_commit_metadata(
+                    commit_results=commit_results,
+                    device=device,
+                    default_commit_lens=packed_commits.commit_lens,
+                    default_new_verified_id=packed_commits.default_new_verified_id,
+                )
+                if profile_details:
+                    verify_profile_ms["materialize_metadata"] = (
+                        time.perf_counter() - t_sub
+                    ) * 1000.0
         commit_lens = commit_metadata.commit_lens
         new_verified_id = commit_metadata.new_verified_id
+        mapping_commit_lens_cpu_tensor = (
+            None if can_use_plain_device_defaults else commit_lens_cpu_t
+        )
 
         t_sub = time.perf_counter() if profile_details else 0.0
         cache_plan = build_dflash_target_only_cache_plan(
@@ -871,7 +965,9 @@ class DFlashVerifyInput(SpecInput):
         t_sub = time.perf_counter() if profile_details else 0.0
         apply_dflash_target_only_req_kv_accounting(
             reqs=batch.reqs,
-            commit_lens_cpu=commit_lens_cpu,
+            commit_lens_cpu=(
+                commit_lens_cpu if commit_lens_cpu is not None else []
+            ),
         )
         if profile_details:
             verify_profile_ms["req_kv_accounting"] = (time.perf_counter() - t_sub) * 1000.0
@@ -881,7 +977,7 @@ class DFlashVerifyInput(SpecInput):
             batch=batch,
             commit_lens=commit_lens,
             commit_lens_cpu=commit_lens_cpu,
-            commit_lens_cpu_tensor=commit_lens_cpu_t,
+            commit_lens_cpu_tensor=mapping_commit_lens_cpu_tensor,
             cache_plan=cache_plan,
             draft_token_num=int(self.draft_token_num),
         )
@@ -899,6 +995,51 @@ class DFlashVerifyInput(SpecInput):
             hidden_states=hidden,
             accepted_indices=cache_plan.accepted_indices,
         )
+        if can_use_plain_device_defaults:
+            t_sync_0 = time.perf_counter()
+            if use_dense_cpu_commit or packed_commits.proposed_flat.is_cuda:
+                copy_done = _get_dflash_cpu_copy_event(batch, device=device)
+                if not use_dense_cpu_commit:
+                    copy_done.record(copy_stream)
+                copy_done.synchronize()
+            if os.getenv("SGLANG_DFLASH_PROFILE"):
+                dt_sync = (time.perf_counter() - t_sync_0) * 1000
+                logger.info(f"[DFLASH_PROF] verify_synchronize: {dt_sync:.3f}ms")
+            if profile_details:
+                verify_profile_ms["verify_sync"] = verify_profile_ms.get(
+                    "verify_sync", 0.0
+                ) + (time.perf_counter() - t_sync_0) * 1000.0
+
+            t_commit_0 = time.perf_counter()
+            if use_dense_cpu_commit:
+                accept_length_per_req_cpu, commit_lens_cpu = (
+                    apply_dflash_target_only_plain_device_defaults(
+                        reqs=batch.reqs,
+                        proposed_dense_cpu=proposed_dense_cpu,
+                        commit_lens_cpu=commit_lens_cpu_t,
+                    )
+                )
+            else:
+                accept_length_per_req_cpu, commit_lens_cpu = (
+                    apply_dflash_target_only_plain_device_defaults(
+                        reqs=batch.reqs,
+                        proposed_flat_cpu=proposed_flat_cpu,
+                        commit_lens_cpu=commit_lens_cpu_t,
+                    )
+                )
+            apply_dflash_target_only_req_kv_accounting(
+                reqs=batch.reqs,
+                commit_lens_cpu=commit_lens_cpu,
+            )
+            batch.seq_lens_cpu.add_(commit_lens_cpu_t.to(dtype=batch.seq_lens_cpu.dtype))
+            batch.seq_lens_sum += int(commit_lens_cpu_t.sum().item())
+            if os.getenv("SGLANG_DFLASH_PROFILE"):
+                dt_commit = (time.perf_counter() - t_commit_0) * 1000
+                logger.info(f"[DFLASH_PROF] commit_dflash_batch: {dt_commit:.3f}ms")
+            if profile_details:
+                verify_profile_ms["commit_batch"] = verify_profile_ms.get(
+                    "commit_batch", 0.0
+                ) + (time.perf_counter() - t_commit_0) * 1000.0
         if profile_details:
             verify_profile_ms["gather_hidden"] = (time.perf_counter() - t_sub) * 1000.0
             verify_profile_ms["verify_total"] = sum(verify_profile_ms.values())
@@ -931,6 +1072,7 @@ class DFlashVerifyInput(SpecInput):
                 float(verify_profile_ms.get("gather_hidden", 0.0)),
                 float(verify_profile_ms.get("verify_total", 0.0)),
             )
+        setattr(batch, "_dflash_verify_profile_ms", dict(verify_profile_ms))
 
         return (
             new_verified_id,

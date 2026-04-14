@@ -903,6 +903,94 @@ def _build_dflash_fast_finish_policy(req: Any) -> _DFlashFastFinishPolicy | None
     return policy
 
 
+def can_dflash_target_only_use_plain_device_defaults(
+    *,
+    reqs: List[Any],
+    max_commit_len: int,
+) -> bool:
+    """Return True when target-only verify can trust device-side commit defaults.
+
+    This is the strict common-case fast path:
+    - no grammar / stop strings / stop regex
+    - ignore_eos=True and no explicit stop-token ids
+    - request is not already finished / pending finish
+    - max_new_tokens budget is large enough that no verify-step truncation can happen
+
+    Under this contract, CPU-side request mutation cannot change commit lengths or the
+    new verified token, so the runtime can immediately continue with the device-side
+    cache/mapping path while CPU token-list updates happen later.
+    """
+    max_commit_len = int(max_commit_len)
+    if max_commit_len <= 0:
+        return True
+
+    for req in reqs:
+        if getattr(req, "to_finish", None) is not None:
+            return False
+        if req.finished():
+            return False
+
+        sp = req.sampling_params
+        if req.grammar is not None:
+            return False
+        if sp.stop_strs or sp.stop_regex_strs:
+            return False
+        if not bool(getattr(sp, "ignore_eos", False)):
+            return False
+        if getattr(sp, "stop_token_ids", None):
+            return False
+
+        remaining = int(sp.max_new_tokens) - len(req.output_ids)
+        if remaining < max_commit_len:
+            return False
+
+    return True
+
+
+def apply_dflash_target_only_plain_device_defaults(
+    *,
+    reqs: List[Any],
+    commit_lens_cpu: torch.Tensor,
+    proposed_flat_cpu: torch.Tensor | None = None,
+    proposed_dense_cpu: torch.Tensor | None = None,
+) -> tuple[list[int], list[int]]:
+    """Apply the strict plain target-only commit path without per-request result objects."""
+    if (proposed_flat_cpu is None) == (proposed_dense_cpu is None):
+        raise ValueError(
+            "apply_dflash_target_only_plain_device_defaults expects exactly one of "
+            "proposed_flat_cpu or proposed_dense_cpu."
+        )
+    if commit_lens_cpu.device.type != "cpu":
+        raise ValueError(
+            "apply_dflash_target_only_plain_device_defaults expects commit_lens_cpu on CPU, "
+            f"got device={commit_lens_cpu.device}."
+        )
+
+    accept_length_per_req_cpu: list[int] = [0] * len(reqs)
+    commit_lens_list: list[int] = [0] * len(reqs)
+    flat_offset = 0
+
+    for i, req in enumerate(reqs):
+        width = int(commit_lens_cpu[i].item())
+        commit_lens_list[i] = width
+        if width > 0:
+            if proposed_dense_cpu is not None:
+                req.output_ids.extend(proposed_dense_cpu[i, :width].tolist())
+            else:
+                assert proposed_flat_cpu is not None
+                req.output_ids.extend(proposed_flat_cpu[flat_offset : flat_offset + width].tolist())
+                flat_offset += width
+
+        accepted_draft_tokens = max(0, width - 1)
+        accept_length_per_req_cpu[i] = accepted_draft_tokens
+        req.spec_verify_ct += 1
+        req.spec_accepted_tokens += accepted_draft_tokens
+        if hasattr(req, "update_spec_acceptance_histogram"):
+            req.update_spec_acceptance_histogram(accepted_draft_tokens)
+
+    return accept_length_per_req_cpu, commit_lens_list
+
+
 def commit_dflash_proposed_tokens_to_req(
     *,
     req: Any,
@@ -1267,11 +1355,19 @@ def materialize_dflash_target_only_commit_metadata(
                 "Both default_commit_lens and default_new_verified_id must be provided together."
             )
 
-        if len(commit_results) != int(default_commit_lens.shape[0]) or len(
+        if len(commit_results) not in (0, int(default_commit_lens.shape[0])) or len(
             commit_results
-        ) != int(default_new_verified_id.shape[0]):
+        ) not in (0, int(default_new_verified_id.shape[0])):
             raise ValueError(
                 "Target-only commit defaults must match the number of commit results."
+            )
+
+        if len(commit_results) == 0:
+            return DFlashTargetOnlyCommitMetadata(
+                commit_lens=default_commit_lens.to(device=device, dtype=torch.int32),
+                new_verified_id=default_new_verified_id.to(
+                    device=device, dtype=torch.int64
+                ),
             )
 
         override_idx = [
@@ -1917,7 +2013,7 @@ def apply_dflash_commit_mapping_updates(
     *,
     batch: Any,
     commit_lens: torch.Tensor,
-    commit_lens_cpu: List[int],
+    commit_lens_cpu: List[int] | None,
     commit_lens_cpu_tensor: torch.Tensor | None = None,
     clear_start: torch.Tensor | None = None,
     clear_end: torch.Tensor | None = None,
@@ -1932,13 +2028,18 @@ def apply_dflash_commit_mapping_updates(
         bs <= 16 and int(batch.out_cache_loc.numel()) <= 512
     )
     if use_direct_packed_write:
+        max_len_hint = (
+            max((int(x) for x in commit_lens_cpu), default=0)
+            if commit_lens_cpu is not None
+            else int(commit_lens.max().item())
+        )
         _assign_dflash_req_to_token_packed_direct(
             req_pool_indices=batch.req_pool_indices,
             req_to_token=batch.req_to_token_pool.req_to_token,
             start_offset=batch.seq_lens,
             lengths=commit_lens.to(batch.seq_lens.dtype),
             out_cache_loc=batch.out_cache_loc,
-            max_len_hint=max((int(x) for x in commit_lens_cpu), default=0),
+            max_len_hint=max_len_hint,
         )
     else:
         assign_req_to_token_pool_func(
@@ -1961,23 +2062,27 @@ def apply_dflash_commit_mapping_updates(
         )
         clear_lengths = clear_end - clear_start
         if use_direct_packed_write:
-            _assign_dflash_req_to_token_packed_direct(
-                req_pool_indices=batch.req_pool_indices,
-                req_to_token=batch.req_to_token_pool.req_to_token,
-                start_offset=clear_start,
-                lengths=clear_lengths,
-                out_cache_loc=pad_locs,
-                max_len_hint=(
-                    max(
+            clear_max_len_hint = None
+            if draft_token_num is not None:
+                if commit_lens_cpu is not None:
+                    clear_max_len_hint = max(
                         (
                             max(0, int(draft_token_num) - int(commit_len))
                             for commit_len in commit_lens_cpu
                         ),
                         default=0,
                     )
-                    if draft_token_num is not None
-                    else None
-                ),
+                else:
+                    clear_max_len_hint = max(
+                        0, int(draft_token_num) - int(commit_lens.max().item())
+                    )
+            _assign_dflash_req_to_token_packed_direct(
+                req_pool_indices=batch.req_pool_indices,
+                req_to_token=batch.req_to_token_pool.req_to_token,
+                start_offset=clear_start,
+                lengths=clear_lengths,
+                out_cache_loc=pad_locs,
+                max_len_hint=clear_max_len_hint,
             )
         else:
             assign_req_to_token_pool_func(
@@ -2006,7 +2111,7 @@ def apply_dflash_target_only_mapping_updates(
     *,
     batch: Any,
     commit_lens: torch.Tensor,
-    commit_lens_cpu: List[int],
+    commit_lens_cpu: List[int] | None,
     commit_lens_cpu_tensor: torch.Tensor | None = None,
     cache_plan: DFlashTargetOnlyCachePlan,
     draft_token_num: int | None = None,
@@ -2652,7 +2757,7 @@ def pack_dflash_target_only_commits(
     try:
         cpu_pack_max = max(
             0,
-            int(
+        int(
                 (
                     os.environ.get("SGLANG_DFLASH_TARGET_ONLY_SMALL_CPU_PACK_MAX")
                     or "0"

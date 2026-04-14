@@ -30,16 +30,20 @@ def _cast_fp8_buffered(
     if tensor is None:
         return None
     buffer = cache.get(name)
+    needed = int(tensor.numel())
     if (
         buffer is None
-        or buffer.shape != tensor.shape
+        or buffer.numel() < needed
         or buffer.device != tensor.device
         or buffer.dtype != fp8_dtype
     ):
-        buffer = torch.empty_like(tensor, dtype=fp8_dtype)
+        # Reuse a capacity-sized flat storage so variable token counts do not
+        # force a fresh FP8 cast buffer allocation on every decode step.
+        buffer = torch.empty((needed,), device=tensor.device, dtype=fp8_dtype)
         cache[name] = buffer
-    buffer.copy_(tensor)
-    return buffer
+    view = buffer[:needed].view(tensor.shape)
+    view.copy_(tensor)
+    return view
 
 
 def _fa3_flag(name: str) -> bool:

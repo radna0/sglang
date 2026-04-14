@@ -1077,6 +1077,16 @@ class LogitsProcessor(nn.Module):
             )
         )
 
+        fast_top1_ids = self._get_dflash_target_verify_top1_only_fast(
+            hidden_states=hidden_states,
+            local_hidden_states=local_hidden_states,
+            lm_head=lm_head,
+            logits_metadata=logits_metadata,
+            dflash_raw_rows=dflash_raw_rows,
+        )
+        if fast_top1_ids is not None:
+            return fast_top1_ids
+
         logits = self._compute_lm_head(hidden_states, lm_head, embedding_bias)
         if dflash_raw_rows is not None and logits.shape[0] != dflash_raw_rows:
             logits = logits[:dflash_raw_rows]
@@ -1094,6 +1104,124 @@ class LogitsProcessor(nn.Module):
             logits, local_hidden_states, logits_metadata
         )
         return torch.argmax(logits[:, : self.vocab_size], dim=-1).to(torch.int64)
+
+    def _get_dflash_target_verify_top1_only_fast(
+        self,
+        *,
+        hidden_states: torch.Tensor,
+        local_hidden_states: torch.Tensor,
+        lm_head: VocabParallelEmbedding,
+        logits_metadata: LogitsMetadata,
+        dflash_raw_rows: Optional[int],
+        vocab_chunk_size: int = 32768,
+    ) -> Optional[torch.Tensor]:
+        enable_fast_top1 = (
+            os.environ.get("SGLANG_DFLASH_ENABLE_FAST_TOP1_ONLY") or ""
+        ).strip().lower()
+        disable_fast_top1 = (
+            os.environ.get("SGLANG_DFLASH_DISABLE_FAST_TOP1_ONLY") or ""
+        ).strip().lower()
+        if disable_fast_top1 not in ("", "0", "false", "off", "no"):
+            return None
+        server_args = get_global_server_args()
+        served_model_name = str(getattr(server_args, "served_model_name", "") or "")
+        model_path = str(getattr(server_args, "model_path", "") or "")
+        # GPT-OSS DFLASH A/B validation showed this shortcut can materially reduce
+        # acceptance and break Harmony formatting. Keep it opt-in there until the
+        # fast path is proven numerically equivalent to the full LM-head path.
+        if (
+            enable_fast_top1 in ("", "0", "false", "off", "no")
+            and (
+                "gpt-oss" in served_model_name.lower()
+                or "gpt-oss" in model_path.lower()
+            )
+        ):
+            _fa4_trace_logits(
+                "[FA4Logits] DFLASH fast top1-only verify disabled for GPT-OSS served_model_name=%s model_path=%s",
+                served_model_name,
+                model_path,
+            )
+            return None
+        if self.do_tensor_parallel_all_gather:
+            return None
+        if self.use_fp32_lm_head:
+            return None
+        if self.logit_scale is not None and float(self.logit_scale) <= 0:
+            return None
+        if hasattr(lm_head, "set_lora") and hasattr(lm_head, "apply_lora"):
+            return None
+        if not hasattr(lm_head, "weight") or not hasattr(lm_head, "shard_indices"):
+            return None
+        if use_intel_amx_backend(lm_head):
+            return None
+        if get_global_server_args().rl_on_policy_target is not None:
+            return None
+
+        shard = lm_head.shard_indices
+        weight = lm_head.weight
+        weight_dtype = weight.dtype
+        num_rows = hidden_states.shape[0]
+        if dflash_raw_rows is not None:
+            num_rows = int(dflash_raw_rows)
+            hidden_states = hidden_states[:num_rows]
+
+        if num_rows == 0:
+            return torch.empty((0,), dtype=torch.int64, device=hidden_states.device)
+
+        hidden_states = (
+            hidden_states
+            if hidden_states.dtype == weight_dtype
+            else hidden_states.to(weight_dtype)
+        )
+        best_vals = torch.full(
+            (num_rows,),
+            torch.finfo(weight_dtype).min,
+            dtype=weight_dtype,
+            device=hidden_states.device,
+        )
+        best_ids = torch.zeros(
+            (num_rows,), dtype=torch.int64, device=hidden_states.device
+        )
+
+        def _update_best(weight_start: int, weight_end: int, token_offset: int) -> None:
+            nonlocal best_vals, best_ids
+            for chunk_start in range(weight_start, weight_end, vocab_chunk_size):
+                chunk_end = min(weight_end, chunk_start + vocab_chunk_size)
+                logits_chunk = torch.matmul(
+                    hidden_states, weight[chunk_start:chunk_end].T
+                )
+                chunk_vals, chunk_arg = torch.max(logits_chunk, dim=-1)
+                chunk_ids = chunk_arg.to(torch.int64) + int(token_offset) + int(
+                    chunk_start - weight_start
+                )
+                use_chunk = chunk_vals > best_vals
+                best_vals = torch.where(use_chunk, chunk_vals, best_vals)
+                best_ids = torch.where(use_chunk, chunk_ids, best_ids)
+
+        num_org = int(shard.num_org_elements)
+        num_org_padded = int(shard.num_org_elements_padded)
+        num_added = int(shard.num_added_elements)
+        org_vocab_start = int(shard.org_vocab_start_index)
+        added_vocab_start = int(shard.added_vocab_start_index)
+
+        if num_org > 0:
+            _update_best(0, num_org, org_vocab_start)
+        if num_added > 0:
+            _update_best(
+                num_org_padded,
+                num_org_padded + num_added,
+                added_vocab_start,
+            )
+
+        if self.do_tensor_parallel_all_gather_dp_attn:
+            local_ids = torch.empty(
+                (local_hidden_states.shape[0],),
+                device=best_ids.device,
+                dtype=best_ids.dtype,
+            )
+            dp_scatter(local_ids, best_ids, logits_metadata)
+            best_ids = local_ids
+        return best_ids
 
     def _compute_lm_head(
         self,

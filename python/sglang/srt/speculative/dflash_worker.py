@@ -13,6 +13,7 @@ import torch
 from torch.profiler import ProfilerActivity, profile as torch_profile
 
 from sglang.srt.distributed import get_tp_group
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import (
     _sanitize_sampling_probs_for_multinomial_,
     multinomial_with_seed,
@@ -284,6 +285,24 @@ class DFlashWorker:
         )
         self.use_compact_draft_cache = self.draft_window_size is not None
         self.device = target_worker.device
+        full_draft_context_hint = int(
+            getattr(server_args, "context_length", None)
+            or getattr(target_worker.model_runner.model_config, "context_len", 0)
+            or 0
+        )
+        draft_prefill_hint = max(
+            int(getattr(server_args, "chunked_prefill_size", 0) or 0),
+            int(getattr(server_args, "max_prefill_tokens", 0) or 0),
+        )
+        auto_draft_window_size: Optional[int] = None
+        if self.draft_window_size is None and full_draft_context_hint > 0:
+            capped_draft_context_hint = full_draft_context_hint
+            if draft_prefill_hint > 0:
+                capped_draft_context_hint = min(
+                    capped_draft_context_hint, int(draft_prefill_hint)
+                )
+            if 0 < capped_draft_context_hint < full_draft_context_hint:
+                auto_draft_window_size = int(capped_draft_context_hint)
 
         # ---------- Target layer capture mapping ----------
         # ModelRunner already resolves the authoritative DFLASH capture contract from the
@@ -385,6 +404,23 @@ class DFlashWorker:
                     "target_kv_dtype=%s draft_kv_dtype=%s. Draft KV will allocate independently.",
                     target_kv_dtype,
                     draft_kv_dtype,
+                )
+
+        if (
+            not should_share_token_allocator
+            and self.draft_window_size is None
+            and auto_draft_window_size is not None
+        ):
+            self.draft_window_size = int(auto_draft_window_size)
+            self.use_compact_draft_cache = True
+            shared_req_to_token_pool = None
+            if self.tp_rank == 0:
+                logger.info(
+                    "DFLASH auto-enabled compact draft cache for non-shared draft KV: "
+                    "draft_window_size=%s (context_length=%s, prefill_hint=%s).",
+                    int(self.draft_window_size),
+                    int(full_draft_context_hint),
+                    int(draft_prefill_hint),
                 )
 
         self._draft_shares_token_allocator = bool(should_share_token_allocator)
@@ -2129,7 +2165,38 @@ class DFlashWorker:
         if draft_input.target_hidden is None:
             raise RuntimeError("DFLASH draft state missing target_hidden.")
         if draft_input.ctx_lens.numel() != bs or draft_input.draft_seq_lens.numel() != bs:
-            raise RuntimeError("DFLASH ctx_lens/draft_seq_lens length mismatch.")
+            if self.tp_rank == 0:
+                logger.warning(
+                    "DFLASH draft state shape mismatch before append; realigning instead of failing: "
+                    "bs=%s ctx_lens=%s draft_seq_lens=%s target_hidden_rows=%s",
+                    bs,
+                    int(draft_input.ctx_lens.numel()),
+                    int(draft_input.draft_seq_lens.numel()),
+                    0
+                    if draft_input.target_hidden is None
+                    else int(draft_input.target_hidden.shape[0]),
+                )
+            target_hidden = draft_input.target_hidden
+            if target_hidden is not None and int(target_hidden.shape[0]) == bs:
+                ctx_lens = torch.ones((bs,), device=device, dtype=torch.int32)
+            elif int(draft_input.ctx_lens.numel()) >= bs:
+                ctx_lens = draft_input.ctx_lens[:bs].to(
+                    device=device, dtype=torch.int32, non_blocking=True
+                )
+                expected_total_ctx = int(ctx_lens.to(torch.int64).sum().item())
+                if target_hidden is None or int(target_hidden.shape[0]) != expected_total_ctx:
+                    ctx_lens = torch.zeros((bs,), device=device, dtype=torch.int32)
+                    target_hidden = (
+                        target_hidden[:0] if target_hidden is not None else target_hidden
+                    )
+            else:
+                ctx_lens = torch.zeros((bs,), device=device, dtype=torch.int32)
+                target_hidden = target_hidden[:0] if target_hidden is not None else target_hidden
+            draft_input.ctx_lens = ctx_lens
+            draft_input.draft_seq_lens = batch.seq_lens[:bs].to(
+                device=device, dtype=torch.int32
+            )
+            draft_input.target_hidden = target_hidden
 
         total_ctx = draft_input.target_hidden.shape[0]
         if total_ctx <= 0:
@@ -2332,14 +2399,11 @@ class DFlashWorker:
                     )
 
         if self.use_compact_draft_cache:
-            if not share_pools:
-                raise RuntimeError(
-                    "DFLASH compact draft cache requires shared pools on this branch."
-                )
             new_draft_seq_lens = self._compute_compact_draft_seq_lens(seq_lens_after)
             suffix_start = seq_lens_after.to(torch.int64) - new_draft_seq_lens.to(torch.int64)
+            compact_req_to_token = target_req_to_token if share_req_to_token else draft_req_to_token
             suffix_cache_loc = self._gather_req_to_token_segments(
-                req_to_token=target_req_to_token,
+                req_to_token=compact_req_to_token,
                 req_pool_indices=req_pool_indices,
                 start=suffix_start,
                 lengths=new_draft_seq_lens,
@@ -2358,6 +2422,58 @@ class DFlashWorker:
             draft_input.draft_seq_lens = seq_lens_after.to(torch.int32)
         draft_input.ctx_lens = torch.zeros_like(ctx_lens)
         draft_input.target_hidden = draft_input.target_hidden[:0]
+
+    def _update_draft_state_after_target_only_decode(
+        self,
+        *,
+        batch: ScheduleBatch,
+        draft_input: DFlashDraftInput,
+        logits_output: LogitsProcessorOutput,
+        next_token_ids: torch.Tensor,
+    ) -> None:
+        """Normalize draft-side state after a target-only decode fallback."""
+        if logits_output.hidden_states is None:
+            return
+
+        bs = int(next_token_ids.shape[0])
+        device = next_token_ids.device
+        draft_input.verified_id = next_token_ids.to(torch.int64)
+        draft_input.target_hidden = logits_output.hidden_states
+        draft_input.ctx_lens = torch.ones((bs,), device=device, dtype=torch.int32)
+        draft_input.draft_seq_lens = batch.seq_lens[:bs].to(
+            device=device, dtype=torch.int32
+        )
+        draft_input.linear_mode = "target_only"
+        draft_input._active_physical_block_size = 1
+        draft_input._active_draft_token_num = 1
+        draft_input._active_step_count = 0
+        logits_output.hidden_states = None
+
+    def _materialize_target_verify_token_ids(
+        self,
+        *,
+        logits_output: LogitsProcessorOutput,
+        batch_result,
+    ) -> torch.Tensor:
+        """Detach tiny target-verify token ids from graph-owned replay buffers.
+
+        TARGET_VERIFY only needs bs * block token ids here, so making an owned
+        contiguous copy is cheap and prevents later verify/commit work from
+        touching a replay buffer that may be reused by the next graph launch.
+        """
+        target_next_token_ids = getattr(
+            logits_output, "_dflash_target_top1_ids", batch_result.next_token_ids
+        )
+        if target_next_token_ids is None:
+            return None
+        if not isinstance(target_next_token_ids, torch.Tensor):
+            raise RuntimeError(
+                "DFLASH target verify expected tensor next_token_ids or None, got "
+                f"{type(target_next_token_ids)!r}."
+            )
+        if target_next_token_ids.device.type != "cuda":
+            return target_next_token_ids.to(dtype=torch.int64).contiguous()
+        return target_next_token_ids.to(dtype=torch.int64).clone(memory_format=torch.contiguous_format)
 
     def _append_target_hidden_sequential(
         self,
@@ -2712,22 +2828,12 @@ class DFlashWorker:
             model_worker_batch.capture_layer_ids = self.capture_layer_ids
             batch_result = self.target_worker.forward_batch_generation(model_worker_batch, **kwargs)
             logits_output, next_token_ids = batch_result.logits_output, batch_result.next_token_ids
-            if logits_output.hidden_states is not None:
-                bs = int(next_token_ids.shape[0])
-                draft_input.verified_id = next_token_ids.to(torch.int64)
-                draft_input.target_hidden = logits_output.hidden_states
-                draft_input.ctx_lens = torch.ones(
-                    (bs,), device=next_token_ids.device, dtype=torch.int32
-                )
-                # Target-only fallback can happen after request compaction, OOM-driven
-                # width shrink, or scheduler churn. Keep the draft-visible prefix lengths
-                # aligned with the *current* running batch so the next append step sees
-                # consistent [bs]-shaped ctx/draft_seq tensors.
-                draft_input.draft_seq_lens = batch.seq_lens[:bs].to(
-                    device=next_token_ids.device, dtype=torch.int32
-                )
-                # Avoid holding onto hidden-state tensors in the returned logits_output.
-                logits_output.hidden_states = None
+            self._update_draft_state_after_target_only_decode(
+                batch=batch,
+                draft_input=draft_input,
+                logits_output=logits_output,
+                next_token_ids=next_token_ids,
+            )
             batch.spec_info = draft_input
             return GenerationBatchResult(
                 logits_output=logits_output,
@@ -2770,14 +2876,12 @@ class DFlashWorker:
                 batch_result.logits_output,
                 batch_result.next_token_ids,
             )
-            if logits_output.hidden_states is not None:
-                bs = int(next_token_ids.shape[0])
-                draft_input.verified_id = next_token_ids.to(torch.int64)
-                draft_input.target_hidden = logits_output.hidden_states
-                draft_input.ctx_lens = torch.ones(
-                    (bs,), device=next_token_ids.device, dtype=torch.int32
-                )
-                logits_output.hidden_states = None
+            self._update_draft_state_after_target_only_decode(
+                batch=batch,
+                draft_input=draft_input,
+                logits_output=logits_output,
+                next_token_ids=next_token_ids,
+            )
             batch.spec_info = draft_input
             return GenerationBatchResult(
                 logits_output=logits_output,
@@ -2812,14 +2916,12 @@ class DFlashWorker:
                 batch_result.logits_output,
                 batch_result.next_token_ids,
             )
-            if logits_output.hidden_states is not None:
-                bs = int(next_token_ids.shape[0])
-                draft_input.verified_id = next_token_ids.to(torch.int64)
-                draft_input.target_hidden = logits_output.hidden_states
-                draft_input.ctx_lens = torch.ones(
-                    (bs,), device=next_token_ids.device, dtype=torch.int32
-                )
-                logits_output.hidden_states = None
+            self._update_draft_state_after_target_only_decode(
+                batch=batch,
+                draft_input=draft_input,
+                logits_output=logits_output,
+                next_token_ids=next_token_ids,
+            )
             batch.spec_info = draft_input
             return GenerationBatchResult(
                 logits_output=logits_output,
@@ -2840,6 +2942,36 @@ class DFlashWorker:
             self.target_worker.model_runner.attn_backend, "update_mamba_state_after_mtp_verify"
         )
         seq_lens_pre_verify = batch.seq_lens.clone() if need_mamba_verify_commit else None
+        trace_verify_details = (
+            (os.environ.get("SGLANG_DFLASH_PROFILE_VERIFY_DETAILS") or "")
+            .strip()
+            .lower()
+            not in ("", "0", "false", "off", "no")
+        )
+        trace_verify_details_this_step = False
+        draft_seq_lens_before_verify = None
+        verified_id_before_verify = None
+        trace_max_prefix_before_verify = None
+        if trace_verify_details and self.tp_rank == 0:
+            draft_seq_lens_before_verify = draft_input.draft_seq_lens.detach().clone()
+            verified_id_before_verify = draft_input.verified_id.detach().clone()
+            try:
+                trace_max_prefix_before_verify = int(
+                    draft_seq_lens_before_verify.max().detach().to("cpu").item()
+                )
+            except Exception:
+                trace_max_prefix_before_verify = None
+            if int(self._profile_step) <= 4:
+                trace_verify_details_this_step = True
+            else:
+                longctx_trace_ct = int(getattr(self, "_longctx_verify_trace_ct", 0))
+                if (
+                    trace_max_prefix_before_verify is not None
+                    and trace_max_prefix_before_verify >= 512
+                    and longctx_trace_ct < 6
+                ):
+                    setattr(self, "_longctx_verify_trace_ct", longctx_trace_ct + 1)
+                    trace_verify_details_this_step = True
 
         if cuda_event_profile_this_step:
             cuda_stream = torch.cuda.current_stream(device=batch.device)
@@ -2931,8 +3063,9 @@ class DFlashWorker:
             verify_profile = cProfile.Profile()
             verify_profile.enable()
             try:
-                target_next_token_ids = getattr(
-                    logits_output, "_dflash_target_top1_ids", batch_result.next_token_ids
+                target_next_token_ids = self._materialize_target_verify_token_ids(
+                    logits_output=logits_output,
+                    batch_result=batch_result,
                 )
                 new_verified_id, commit_lens, cache_plan, next_target_hidden, accept_length_per_req_cpu = (
                     verify_input.verify(
@@ -2949,8 +3082,9 @@ class DFlashWorker:
                     prefix="[DFLASH_CPROFILE_VERIFY]",
                 )
         else:
-            target_next_token_ids = getattr(
-                logits_output, "_dflash_target_top1_ids", batch_result.next_token_ids
+            target_next_token_ids = self._materialize_target_verify_token_ids(
+                logits_output=logits_output,
+                batch_result=batch_result,
             )
             new_verified_id, commit_lens, cache_plan, next_target_hidden, accept_length_per_req_cpu = (
                 verify_input.verify(
@@ -2989,6 +3123,55 @@ class DFlashWorker:
             draft_input.ctx_lens = commit_lens
             self._append_target_hidden_to_draft_kv(batch, draft_input)
         t_append = time.perf_counter() if profile_this_step else 0.0
+        if trace_verify_details_this_step and self.tp_rank == 0:
+            try:
+                bs_trace = int(batch.batch_size())
+                trace_rows = min(2, bs_trace)
+                trace_width = min(6, int(verify_input.draft_token_num))
+                draft_tokens_trace = (
+                    verify_input.draft_token.view(bs_trace, int(verify_input.draft_token_num))[
+                        :trace_rows, :trace_width
+                    ]
+                    .detach()
+                    .to("cpu")
+                    .tolist()
+                )
+                verify_positions_trace = (
+                    verify_input.positions.view(bs_trace, int(verify_input.draft_token_num))[
+                        :trace_rows, :trace_width
+                    ]
+                    .detach()
+                    .to("cpu")
+                    .tolist()
+                )
+                logger.info(
+                    "DFLASH verify trace: step=%s bs=%s mode=%s max_prefix=%s drafted=%s positions=%s "
+                    "verified_before=%s commit_lens=%s new_verified=%s draft_seq_before=%s draft_seq_after=%s append_path=%s",
+                    int(self._profile_step),
+                    bs_trace,
+                    str(getattr(draft_input, "linear_mode", "")),
+                    "?" if trace_max_prefix_before_verify is None else int(trace_max_prefix_before_verify),
+                    draft_tokens_trace,
+                    verify_positions_trace,
+                    None
+                    if verified_id_before_verify is None
+                    else verified_id_before_verify[:trace_rows]
+                    .detach()
+                    .to("cpu")
+                    .tolist(),
+                    commit_lens[:trace_rows].detach().to("cpu").tolist(),
+                    new_verified_id[:trace_rows].detach().to("cpu").tolist(),
+                    None
+                    if draft_seq_lens_before_verify is None
+                    else draft_seq_lens_before_verify[:trace_rows]
+                    .detach()
+                    .to("cpu")
+                    .tolist(),
+                    draft_input.draft_seq_lens[:trace_rows].detach().to("cpu").tolist(),
+                    "direct" if appended_from_verify else "staged",
+                )
+            except Exception as e:
+                logger.warning("DFLASH verify trace logging failed: %s", e)
         if cuda_event_profile_this_step and step_cuda_end is not None:
             step_cuda_end.record(torch.cuda.current_stream(device=batch.device))
 
@@ -3025,6 +3208,22 @@ class DFlashWorker:
         if profile_this_step and self.tp_rank == 0:
             verify_cuda_ms = None
             step_cuda_ms = None
+            verify_profile_ms = getattr(batch, "_dflash_verify_profile_ms", None)
+            verify_core_ms = None
+            verify_sync_ms = None
+            verify_commit_ms = None
+            verify_mapping_ms = None
+            if isinstance(verify_profile_ms, dict):
+                try:
+                    verify_core_ms = float(verify_profile_ms.get("verify_total", 0.0))
+                    verify_sync_ms = float(verify_profile_ms.get("verify_sync", 0.0))
+                    verify_commit_ms = float(verify_profile_ms.get("commit_batch", 0.0))
+                    verify_mapping_ms = float(verify_profile_ms.get("mapping_updates", 0.0))
+                except Exception:
+                    verify_core_ms = None
+                    verify_sync_ms = None
+                    verify_commit_ms = None
+                    verify_mapping_ms = None
             if (
                 cuda_event_profile_this_step
                 and verify_cuda_start is not None
@@ -3038,7 +3237,7 @@ class DFlashWorker:
             bs = batch.batch_size()
             logger.info(
                 "[DFLASH profile] bs=%d mode=%s can_run_cuda_graph=%s "
-                "prepare_ms=%.2f (append_ms=%.2f draft_ms=%.2f) target_verify_ms=%.2f verify_cpu_ms=%.2f verify_wall_ms=%.2f append_ms=%.2f total_ms=%.2f "
+                "prepare_ms=%.2f (append_ms=%.2f draft_ms=%.2f) target_verify_ms=%.2f verify_cpu_ms=%.2f verify_wall_ms=%.2f verify_core_ms=%s verify_sync_ms=%s verify_commit_ms=%s verify_mapping_ms=%s append_ms=%.2f total_ms=%.2f "
                 "verify_cuda_ms=%s step_cuda_ms=%s "
                 "accept_sum=%d accept_mean=%.2f",
                 bs,
@@ -3050,6 +3249,10 @@ class DFlashWorker:
                 (t_target - t1) * 1000.0,
                 (t_verify - t2) * 1000.0,
                 (t_verify - t2) * 1000.0,
+                f"{verify_core_ms:.2f}" if verify_core_ms is not None else "n/a",
+                f"{verify_sync_ms:.2f}" if verify_sync_ms is not None else "n/a",
+                f"{verify_commit_ms:.2f}" if verify_commit_ms is not None else "n/a",
+                f"{verify_mapping_ms:.2f}" if verify_mapping_ms is not None else "n/a",
                 (t_append - t_verify) * 1000.0,
                 (t_append - t0) * 1000.0,
                 f"{verify_cuda_ms:.2f}" if verify_cuda_ms is not None else "n/a",

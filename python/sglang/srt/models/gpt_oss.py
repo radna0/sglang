@@ -853,7 +853,11 @@ class GptOssModel(nn.Module):
                     if residual is None:
                         dst.copy_(hidden_states)
                     else:
-                        torch.add(hidden_states, residual, out=dst)
+                        # Torch compile rejects non-contiguous `out=` on this strided
+                        # aux-capture slice. Copy+add keeps the capture contract but
+                        # avoids the graph-break in piecewise warmup.
+                        dst.copy_(hidden_states)
+                        dst.add_(residual)
                 layer = self.layers[i]
                 hidden_states, residual = layer(
                     positions, hidden_states, forward_batch, residual
