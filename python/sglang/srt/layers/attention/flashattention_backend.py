@@ -529,6 +529,7 @@ class FlashAttentionBackend(AttentionBackend):
         )
         self.speculative_step_id = speculative_step_id
         self._fp8_cast_buffers: dict[str, torch.Tensor] = {}
+        self._logged_fp8_qkv_path_once = False
 
         self.fa_impl_ver = fa_impl_ver
 
@@ -678,6 +679,24 @@ class FlashAttentionBackend(AttentionBackend):
                     self._logged_fp8_keep_q_bf16_ignored_once = True
             else:
                 return q, q_rope, k_rope, q_descale, k_descale, v_descale
+
+        trace_fp8_qkv = _fa3_flag("SGLANG_FA3_TRACE_FP8_QKV_BRANCH")
+        if trace_fp8_qkv and not self._logged_fp8_qkv_path_once:
+            logger.warning(
+                "FlashAttentionBackend FP8 QKV path: layer=%s kv_dtype=%s k_scale_type=%s v_scale_type=%s "
+                "k_scale_float=%s v_scale_float=%s k_scale_is_one=%s v_scale_is_one=%s dynamic_q_scale=%s",
+                getattr(layer, "layer_id", None),
+                str(self.kv_cache_dtype),
+                None if k_scale is None else type(k_scale).__name__,
+                None if v_scale is None else type(v_scale).__name__,
+                getattr(layer, "k_scale_float", None),
+                getattr(layer, "v_scale_float", None),
+                k_scale_is_one,
+                v_scale_is_one,
+                (os.environ.get("SGLANG_FP8_DYNAMIC_Q_SCALE") or "").strip().lower()
+                in ("1", "true", "yes", "on"),
+            )
+            self._logged_fp8_qkv_path_once = True
 
         if k_scale is None:
             q = _cast_fp8_buffered(self._fp8_cast_buffers, "q", q, self.kv_cache_dtype)

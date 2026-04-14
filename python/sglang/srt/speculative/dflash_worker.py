@@ -73,6 +73,12 @@ def _parse_env_float(name: str, default: float) -> float:
         return float(default)
 
 
+def _align_up(value: int, alignment: int) -> int:
+    value = int(value)
+    alignment = max(1, int(alignment))
+    return ((value + alignment - 1) // alignment) * alignment
+
+
 def _should_cprofile_verify_step(enabled: bool, step_index: int) -> bool:
     if not enabled:
         return False
@@ -335,12 +341,60 @@ class DFlashWorker:
             draft_server_args.kv_cache_dtype = (
                 draft_server_args.speculative_draft_kv_cache_dtype
             )
+        if draft_server_args.speculative_draft_page_size is not None:
+            draft_server_args.page_size = draft_server_args.speculative_draft_page_size
+
+        # Pool sharing requires allocator semantics (including page_size) to match. When the user
+        # requests a different draft page_size (common in production: target paged-KV but draft non-paged),
+        # we must disable allocator + req_to_token sharing and allocate draft KV slots independently.
+        target_page_size = int(getattr(server_args, "page_size", 1) or 1)
+        target_kv_dtype = str(getattr(server_args, "kv_cache_dtype", "") or "").strip().lower()
+        draft_kv_dtype = str(getattr(draft_server_args, "kv_cache_dtype", "") or "").strip().lower()
+        requested_draft_page_size = int(
+            getattr(draft_server_args, "page_size", target_page_size) or target_page_size
+        )
+        target_allocator_is_hybrid = bool(
+            hasattr(target_token_to_kv_pool_allocator, "swa_available_size")
+            and hasattr(target_token_to_kv_pool_allocator, "full_available_size")
+        )
+        if should_share_token_allocator and target_allocator_is_hybrid:
+            should_share_token_allocator = False
+            shared_req_to_token_pool = None
+            if self.tp_rank == 0:
+                logger.warning(
+                    "DFLASH disabling pool sharing because target allocator is hybrid SWA/full: "
+                    "allocator=%s. Draft KV will allocate independently.",
+                    type(target_token_to_kv_pool_allocator).__name__,
+                )
+        if should_share_token_allocator and requested_draft_page_size != target_page_size:
+            should_share_token_allocator = False
+            shared_req_to_token_pool = None
+            if self.tp_rank == 0:
+                logger.warning(
+                    "DFLASH disabling pool sharing due to draft_page_size mismatch: "
+                    "target_page_size=%s draft_page_size=%s. Draft KV will allocate independently.",
+                    int(target_page_size),
+                    int(requested_draft_page_size),
+                )
+        if should_share_token_allocator and draft_kv_dtype != target_kv_dtype:
+            should_share_token_allocator = False
+            shared_req_to_token_pool = None
+            if self.tp_rank == 0:
+                logger.warning(
+                    "DFLASH disabling pool sharing due to KV dtype mismatch: "
+                    "target_kv_dtype=%s draft_kv_dtype=%s. Draft KV will allocate independently.",
+                    target_kv_dtype,
+                    draft_kv_dtype,
+                )
+
+        self._draft_shares_token_allocator = bool(should_share_token_allocator)
+
         if draft_server_args.speculative_draft_mem_fraction_static is not None:
             # When sharing the target token allocator, draft KV indices are drawn from the
             # target allocator's slot space. Ensure the draft KV pool is at least as large
             # as the target pool so those indices remain in-bounds.
             if (
-                bool(getattr(self, "_draft_shares_token_allocator", True))
+                should_share_token_allocator
                 and float(draft_server_args.speculative_draft_mem_fraction_static)
                 < float(server_args.mem_fraction_static)
             ):
@@ -356,35 +410,82 @@ class DFlashWorker:
             draft_server_args.mem_fraction_static = (
                 draft_server_args.speculative_draft_mem_fraction_static
             )
-        if draft_server_args.speculative_draft_page_size is not None:
-            draft_server_args.page_size = draft_server_args.speculative_draft_page_size
-
-        # Pool sharing requires allocator semantics (including page_size) to match. When the user
-        # requests a different draft page_size (common in production: target paged-KV but draft non-paged),
-        # we must disable allocator + req_to_token sharing and allocate draft KV slots independently.
-        target_page_size = int(getattr(server_args, "page_size", 1) or 1)
-        requested_draft_page_size = int(
-            getattr(draft_server_args, "page_size", target_page_size) or target_page_size
-        )
-        if should_share_token_allocator and requested_draft_page_size != target_page_size:
-            should_share_token_allocator = False
-            self._draft_shares_token_allocator = False
-            shared_req_to_token_pool = None
-            if self.tp_rank == 0:
-                logger.warning(
-                    "DFLASH disabling pool sharing due to draft_page_size mismatch: "
-                    "target_page_size=%s draft_page_size=%s. Draft KV will allocate independently.",
-                    int(target_page_size),
-                    int(requested_draft_page_size),
-                )
-        else:
-            self._draft_shares_token_allocator = bool(should_share_token_allocator)
 
         if should_share_token_allocator:
             draft_server_args.page_size = target_page_size
             self.draft_page_size = target_page_size
         else:
             self.draft_page_size = requested_draft_page_size
+            draft_block_size_hint = int(
+                getattr(server_args, "speculative_dflash_block_size", None)
+                or getattr(server_args, "speculative_num_draft_tokens", None)
+                or 16
+            )
+            draft_max_num_reqs = int(
+                getattr(server_args, "max_running_requests", None)
+                or getattr(server_args, "max_num_reqs", None)
+                or 1
+            )
+            draft_prefill_hint = max(
+                int(getattr(server_args, "chunked_prefill_size", 0) or 0),
+                int(getattr(server_args, "max_prefill_tokens", 0) or 0),
+            )
+            draft_context_len_hint = int(
+                getattr(server_args, "context_length", None)
+                or getattr(target_worker.model_runner.model_config, "context_len", 0)
+                or 0
+            )
+            if draft_prefill_hint > 0:
+                draft_context_len_hint = min(draft_context_len_hint, draft_prefill_hint)
+            if self.draft_window_size is not None:
+                draft_context_len_hint = min(
+                    draft_context_len_hint,
+                    int(self.draft_window_size) + draft_block_size_hint + 8,
+                )
+            draft_extra_tokens = max(
+                32,
+                int(getattr(server_args, "num_reserved_decode_tokens", 0) or 0),
+                draft_block_size_hint * 4,
+            )
+            draft_required_tokens = _align_up(
+                draft_max_num_reqs * (draft_context_len_hint + draft_extra_tokens),
+                self.draft_page_size,
+            )
+            inherited_draft_cache_size = int(
+                getattr(draft_server_args, "draft_runner_cache_size", 0) or 0
+            )
+            if inherited_draft_cache_size > 0:
+                draft_required_tokens = min(
+                    int(inherited_draft_cache_size), int(draft_required_tokens)
+                )
+            draft_required_tokens = max(
+                int(self.draft_page_size),
+                int(draft_required_tokens),
+            )
+            draft_server_args.draft_runner_cache_size = int(draft_required_tokens)
+            draft_server_args.max_num_reqs = int(draft_max_num_reqs)
+            existing_max_total_tokens = getattr(draft_server_args, "max_total_tokens", None)
+            if existing_max_total_tokens is None:
+                draft_server_args.max_total_tokens = int(draft_required_tokens)
+            else:
+                draft_server_args.max_total_tokens = min(
+                    int(existing_max_total_tokens), int(draft_required_tokens)
+                )
+            if self.tp_rank == 0:
+                logger.info(
+                    "DFLASH non-shared draft cache cap: draft_runner_cache_size=%s "
+                    "(max_num_reqs=%s, context_hint=%s, extra_tokens=%s, inherited_target_cache=%s, "
+                    "draft_page_size=%s, target_page_size=%s, target_kv_dtype=%s, draft_kv_dtype=%s)",
+                    int(draft_server_args.draft_runner_cache_size),
+                    int(draft_server_args.max_num_reqs),
+                    int(draft_context_len_hint),
+                    int(draft_extra_tokens),
+                    int(inherited_draft_cache_size),
+                    int(self.draft_page_size),
+                    int(target_page_size),
+                    target_kv_dtype,
+                    draft_kv_dtype,
+                )
 
         if self.tp_rank == 0:
             try:
@@ -2490,7 +2591,34 @@ class DFlashWorker:
         # ---------- PREFILL / EXTEND ----------
         if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
             model_worker_batch = batch.get_model_worker_batch()
-            # Capture hidden states at the specified layers for prefill
+            if (
+                model_worker_batch.extend_seq_lens is None
+                or model_worker_batch.extend_prefix_lens is None
+            ):
+                raise RuntimeError(
+                    "DFLASH expected extend_seq_lens/extend_prefix_lens in extend mode."
+                )
+
+            prefill_device = self.model_runner.device
+
+            def _to_int32_device_tensor(x, device=prefill_device):
+                if isinstance(x, torch.Tensor):
+                    x = x.to(device, non_blocking=True)
+                    return x if x.dtype == torch.int32 else x.to(torch.int32)
+                return torch.tensor(x, dtype=torch.int32, device=device)
+
+            prefill_ctx_lens = _to_int32_device_tensor(model_worker_batch.extend_seq_lens)
+            prefill_draft_seq_lens = (
+                torch.zeros_like(prefill_ctx_lens)
+                if self.use_compact_draft_cache
+                else _to_int32_device_tensor(model_worker_batch.extend_prefix_lens)
+            )
+
+            # Capture hidden states at the specified layers for prefill.
+            # Important: snapshot extend/prefix lengths *before* target forward.
+            # Some backends mutate forward-batch tensors in-place during prefill /
+            # mixed-batch processing, and DFLASH must keep the original per-request
+            # append lengths aligned with the returned aux hidden rows.
             model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
             model_worker_batch.capture_layer_ids = self.capture_layer_ids
 
@@ -2499,25 +2627,33 @@ class DFlashWorker:
             if logits_output.hidden_states is None:
                 raise RuntimeError("DFLASH requires target aux hidden capture for prefill.")
 
-            if model_worker_batch.extend_seq_lens is None or model_worker_batch.extend_prefix_lens is None:
-                raise RuntimeError("DFLASH expected extend_seq_lens/extend_prefix_lens in extend mode.")
+            hidden_rows = int(logits_output.hidden_states.shape[0])
+            expected_ctx = int(prefill_ctx_lens.to(torch.int64).sum().item())
+            if hidden_rows != expected_ctx:
+                alt_ctx_lens = (
+                    batch.seq_lens[: int(prefill_ctx_lens.shape[0])]
+                    .to(device=next_token_ids.device, dtype=torch.int32)
+                    - prefill_draft_seq_lens.to(device=next_token_ids.device, dtype=torch.int32)
+                )
+                alt_expected_ctx = int(alt_ctx_lens.to(torch.int64).sum().item())
+                if alt_expected_ctx == hidden_rows:
+                    prefill_ctx_lens = alt_ctx_lens
+                else:
+                    raise RuntimeError(
+                        "DFLASH prefill hidden/context mismatch: "
+                        f"hidden_rows={hidden_rows} "
+                        f"extend_ctx_total={expected_ctx} "
+                        f"alt_ctx_total={alt_expected_ctx} "
+                        f"ctx_lens={prefill_ctx_lens.detach().to(device='cpu', dtype=torch.int32).tolist()} "
+                        f"draft_seq_lens={prefill_draft_seq_lens.detach().to(device='cpu', dtype=torch.int32).tolist()}"
+                    )
 
-            device = next_token_ids.device
-            def _to_int32_device_tensor(x, device=device):
-                if isinstance(x, torch.Tensor):
-                    x = x.to(device, non_blocking=True)
-                    return x if x.dtype == torch.int32 else x.to(torch.int32)
-                return torch.tensor(x, dtype=torch.int32, device=device)
-
-            extend_seq_lens = _to_int32_device_tensor(model_worker_batch.extend_seq_lens)
             draft_input = DFlashDraftInput(
                 verified_id=next_token_ids.to(torch.int64),
                 target_hidden=logits_output.hidden_states,
-                ctx_lens=extend_seq_lens,
-                draft_seq_lens=(
-                    torch.zeros_like(extend_seq_lens)
-                    if self.use_compact_draft_cache
-                    else _to_int32_device_tensor(model_worker_batch.extend_prefix_lens)
+                ctx_lens=prefill_ctx_lens.to(device=next_token_ids.device, dtype=torch.int32),
+                draft_seq_lens=prefill_draft_seq_lens.to(
+                    device=next_token_ids.device, dtype=torch.int32
                 ),
             )
             self._append_target_hidden_to_draft_kv(batch, draft_input)
@@ -2582,6 +2718,13 @@ class DFlashWorker:
                 draft_input.target_hidden = logits_output.hidden_states
                 draft_input.ctx_lens = torch.ones(
                     (bs,), device=next_token_ids.device, dtype=torch.int32
+                )
+                # Target-only fallback can happen after request compaction, OOM-driven
+                # width shrink, or scheduler churn. Keep the draft-visible prefix lengths
+                # aligned with the *current* running batch so the next append step sees
+                # consistent [bs]-shaped ctx/draft_seq tensors.
+                draft_input.draft_seq_lens = batch.seq_lens[:bs].to(
+                    device=next_token_ids.device, dtype=torch.int32
                 )
                 # Avoid holding onto hidden-state tensors in the returned logits_output.
                 logits_output.hidden_states = None

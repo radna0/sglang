@@ -434,6 +434,13 @@ class CudaGraphRunner:
                 else CaptureHiddenMode.NULL
             ),
         )
+        # Graph families are mode-specific. In particular, DFLASH target workers capture
+        # TARGET_VERIFY graphs, while fallback target-only decode steps still arrive here
+        # with ForwardMode.DECODE. Replaying a TARGET_VERIFY graph on a DECODE batch
+        # corrupts the expected token count (bs * draft_width vs bs) and crashes in
+        # input-buffer population. Only allow replay when the requested forward mode
+        # exactly matches the graph family's capture mode.
+        forward_mode_matches = forward_batch.forward_mode == self.capture_forward_mode
         capture_hidden_mode_matches = (
             requested_capture_hidden_mode == CaptureHiddenMode.NULL
             or requested_capture_hidden_mode == self.capture_hidden_mode
@@ -455,6 +462,7 @@ class CudaGraphRunner:
             is_bs_supported
             and is_encoder_lens_supported
             and is_tbo_supported
+            and forward_mode_matches
             and capture_hidden_mode_matches
             and is_ngram_supported
         )

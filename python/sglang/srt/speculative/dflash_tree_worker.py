@@ -2052,6 +2052,28 @@ class DFlashTreeWorker:
             model_worker_batch = self._coerce_model_worker_batch(
                 batch, overlap_v2=overlap_v2
             )
+            if (
+                model_worker_batch.extend_seq_lens is None
+                or model_worker_batch.extend_prefix_lens is None
+            ):
+                raise RuntimeError(
+                    "DFLASH_TREE expected extend_seq_lens / extend_prefix_lens to be populated in extend mode, but got None."
+                )
+
+            prefill_device = self.model_runner.device
+
+            def _to_int32_device_tensor(x, *, device=prefill_device):
+                if isinstance(x, torch.Tensor):
+                    if x.device != device:
+                        x = x.to(device, non_blocking=True)
+                    return x if x.dtype == torch.int32 else x.to(torch.int32)
+                return torch.tensor(x, dtype=torch.int32, device=device)
+
+            prefill_ctx_lens = _to_int32_device_tensor(model_worker_batch.extend_seq_lens)
+            prefill_draft_seq_lens = _to_int32_device_tensor(
+                model_worker_batch.extend_prefix_lens
+            )
+
             model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
 
             batch_result = self.target_worker.forward_batch_generation(
@@ -2066,29 +2088,33 @@ class DFlashTreeWorker:
                     "DFLASH_TREE requires target aux hidden capture for prefill, but got None."
                 )
 
-            if (
-                model_worker_batch.extend_seq_lens is None
-                or model_worker_batch.extend_prefix_lens is None
-            ):
-                raise RuntimeError(
-                    "DFLASH_TREE expected extend_seq_lens / extend_prefix_lens to be populated in extend mode, but got None."
+            hidden_rows = int(logits_output.hidden_states.shape[0])
+            expected_ctx = int(prefill_ctx_lens.to(torch.int64).sum().item())
+            if hidden_rows != expected_ctx:
+                alt_ctx_lens = (
+                    batch.seq_lens[: int(prefill_ctx_lens.shape[0])]
+                    .to(device=next_token_ids.device, dtype=torch.int32)
+                    - prefill_draft_seq_lens.to(device=next_token_ids.device, dtype=torch.int32)
                 )
-
-            device = next_token_ids.device
-
-            def _to_int32_device_tensor(x, *, device=device):
-                if isinstance(x, torch.Tensor):
-                    if x.device != device:
-                        x = x.to(device, non_blocking=True)
-                    return x if x.dtype == torch.int32 else x.to(torch.int32)
-                return torch.tensor(x, dtype=torch.int32, device=device)
+                alt_expected_ctx = int(alt_ctx_lens.to(torch.int64).sum().item())
+                if alt_expected_ctx == hidden_rows:
+                    prefill_ctx_lens = alt_ctx_lens
+                else:
+                    raise RuntimeError(
+                        "DFLASH_TREE prefill hidden/context mismatch: "
+                        f"hidden_rows={hidden_rows} "
+                        f"extend_ctx_total={expected_ctx} "
+                        f"alt_ctx_total={alt_expected_ctx} "
+                        f"ctx_lens={prefill_ctx_lens.detach().to(device='cpu', dtype=torch.int32).tolist()} "
+                        f"draft_seq_lens={prefill_draft_seq_lens.detach().to(device='cpu', dtype=torch.int32).tolist()}"
+                    )
 
             draft_input = DFlashDraftInput(
                 verified_id=next_token_ids.to(torch.int64),
                 target_hidden=logits_output.hidden_states,
-                ctx_lens=_to_int32_device_tensor(model_worker_batch.extend_seq_lens),
-                draft_seq_lens=_to_int32_device_tensor(
-                    model_worker_batch.extend_prefix_lens
+                ctx_lens=prefill_ctx_lens.to(device=next_token_ids.device, dtype=torch.int32),
+                draft_seq_lens=prefill_draft_seq_lens.to(
+                    device=next_token_ids.device, dtype=torch.int32
                 ),
             )
             self._append_target_hidden_to_draft_kv(batch, draft_input)

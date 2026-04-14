@@ -822,16 +822,38 @@ class GptOssModel(nn.Module):
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
 
-        aux_hidden_states = []
+        capture_layer_ids = self.layers_to_capture
+        capture_layer_map = (
+            {int(layer_id): idx for idx, layer_id in enumerate(capture_layer_ids)}
+            if capture_layer_ids
+            else None
+        )
+        aux_hidden_states = None
+        aux_hidden_stride = int(hidden_states.shape[-1]) if capture_layer_map else 0
         for i in range(self.start_layer, self.end_layer):
             with get_global_expert_distribution_recorder().with_current_layer(i):
-                if i in self.layers_to_capture:
+                capture_slot = None if capture_layer_map is None else capture_layer_map.get(int(i))
+                if capture_slot is not None:
                     # DFLASH/EAGLE aux capture happens *before* executing layer i.
                     # For i==0 on the first PP rank, residual is None (we are at embeddings),
                     # so interpret "hidden + residual" as just hidden.
-                    aux_hidden_states.append(
-                        hidden_states if residual is None else (hidden_states + residual)
-                    )
+                    if aux_hidden_states is None:
+                        aux_hidden_states = hidden_states.new_empty(
+                            (
+                                hidden_states.shape[0],
+                                aux_hidden_stride * len(capture_layer_ids),
+                            )
+                        )
+                    dst = aux_hidden_states[
+                        :,
+                        capture_slot
+                        * aux_hidden_stride : (capture_slot + 1)
+                        * aux_hidden_stride,
+                    ]
+                    if residual is None:
+                        dst.copy_(hidden_states)
+                    else:
+                        torch.add(hidden_states, residual, out=dst)
                 layer = self.layers[i]
                 hidden_states, residual = layer(
                     positions, hidden_states, forward_batch, residual
@@ -878,7 +900,7 @@ class GptOssModel(nn.Module):
                 else:
                     torch.cuda.synchronize(hidden_states.device)
                     logger.info("[FA3ModelTail] sync_after_norm_ok")
-        if len(aux_hidden_states) == 0:
+        if aux_hidden_states is None:
             return hidden_states
 
         return hidden_states, aux_hidden_states
