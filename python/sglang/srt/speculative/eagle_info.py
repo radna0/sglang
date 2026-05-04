@@ -66,6 +66,10 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
     capture_hidden_mode: CaptureHiddenMode
     seq_lens_sum: int
     seq_lens_cpu: torch.Tensor
+    sampling_temperatures: torch.Tensor | None = None
+    sampling_top_ps: torch.Tensor | None = None
+    sampling_top_ks: torch.Tensor | None = None
+    sampling_min_ps: torch.Tensor | None = None
     grammar: BaseGrammarObject = None
 
     # Shape info for padding
@@ -254,6 +258,10 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         bs = self.retrive_index.shape[0]
         candidates = self.draft_token.reshape(bs, self.draft_token_num)
         sampling_info = batch.sampling_info
+        sampling_temperatures = self.sampling_temperatures
+        sampling_top_ps = self.sampling_top_ps
+        sampling_top_ks = self.sampling_top_ks
+        sampling_min_ps = self.sampling_min_ps
 
         predict_shape = list(logits_output.next_token_logits.shape)[:-1]
         predict_shape[-1] += 1
@@ -267,6 +275,22 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             sampling_info = copy.deepcopy(sampling_info)
             # NOTE: retrive_index are the indices of the requests that are kept.
             sampling_info.filter_batch(self.retrive_index.tolist(), self.retrive_index)
+            if sampling_temperatures is not None:
+                sampling_temperatures = sampling_temperatures.index_select(
+                    0, self.retrive_index.to(device=sampling_temperatures.device)
+                )
+            if sampling_top_ps is not None:
+                sampling_top_ps = sampling_top_ps.index_select(
+                    0, self.retrive_index.to(device=sampling_top_ps.device)
+                )
+            if sampling_top_ks is not None:
+                sampling_top_ks = sampling_top_ks.index_select(
+                    0, self.retrive_index.to(device=sampling_top_ks.device)
+                )
+            if sampling_min_ps is not None:
+                sampling_min_ps = sampling_min_ps.index_select(
+                    0, self.retrive_index.to(device=sampling_min_ps.device)
+                )
 
         # Apply the custom logit processors if registered in the sampling info.
         if sampling_info.has_custom_logit_processor:
@@ -324,8 +348,17 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
 
         else:
             # apply temperature and get target probs
+            if sampling_temperatures is None:
+                sampling_temperatures = sampling_info.temperatures
+            if sampling_top_ps is None:
+                sampling_top_ps = sampling_info.top_ps
+            if sampling_top_ks is None:
+                sampling_top_ks = sampling_info.top_ks
+            if sampling_min_ps is None:
+                sampling_min_ps = sampling_info.min_ps
+
             expanded_temperature = torch.repeat_interleave(
-                sampling_info.temperatures, self.draft_token_num, dim=0
+                sampling_temperatures, self.draft_token_num, dim=0
             )  # (bs * draft_token_num, 1)
 
             target_probs = F.softmax(
@@ -333,16 +366,12 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             )  # (bs * draft_token_num, vocab_size)
             target_probs = top_k_renorm_prob(
                 target_probs,
-                torch.repeat_interleave(
-                    sampling_info.top_ks, self.draft_token_num, dim=0
-                ),
+                torch.repeat_interleave(sampling_top_ks, self.draft_token_num, dim=0),
             )  # (bs * draft_token_num, vocab_size)
-            if not torch.all(sampling_info.top_ps == 1.0):
+            if not torch.all(sampling_top_ps == 1.0):
                 target_probs = top_p_renorm_prob(
                     target_probs,
-                    torch.repeat_interleave(
-                        sampling_info.top_ps, self.draft_token_num, dim=0
-                    ),
+                    torch.repeat_interleave(sampling_top_ps, self.draft_token_num, dim=0),
                 )
             target_probs = target_probs.reshape(bs, self.draft_token_num, -1)
 

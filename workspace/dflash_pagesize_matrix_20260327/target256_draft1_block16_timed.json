@@ -1,0 +1,52 @@
+{
+  "regime": {
+    "model_path": "/workspace/offload_root/gpt-oss-120b",
+    "draft_model_path": "/root/epoch_65_step_23760",
+    "reference_csv": "/root/reference.csv",
+    "question_ids": [
+      "92ba6a",
+      "9c1c5f",
+      "a295e9"
+    ],
+    "context_length": 8192,
+    "decode_len": 2048,
+    "concurrency": 8,
+    "num_prompts": 8,
+    "page_size": 256,
+    "kv_cache_dtype": "fp8_e4m3",
+    "draft_kv_cache_dtype": "bfloat16",
+    "draft_page_size": 1,
+    "attention_backend": "fa3",
+    "moe_runner_backend": "triton_kernel",
+    "draft_attention_backend": "fa3",
+    "speculative_moe_runner_backend": "triton_kernel",
+    "speculative_dflash_block_size": 16,
+    "cuda_graph": true,
+    "cuda_graph_max_bs": 8,
+    "max_running_requests": 8,
+    "piecewise_cuda_graph_max_tokens": 8192
+  },
+  "baseline": {
+    "completed": 8,
+    "wall_s": 25.74305,
+    "req_s": 0.311,
+    "wall_tok_s": 636.444,
+    "accept_length": 1.0,
+    "step_time_p20_s": 0.006838,
+    "output_tok_s_p20": 146.246,
+    "avg_output_tokens": 2048.0
+  },
+  "dflash": {
+    "completed": 8,
+    "wall_s": 22.782394,
+    "req_s": 0.351,
+    "wall_tok_s": 719.152,
+    "accept_length": 3.077,
+    "step_time_p20_s": 0.01944,
+    "output_tok_s_p20": 158.264,
+    "avg_output_tokens": 2048.0
+  },
+  "speedup_req_s": 1.1286,
+  "speedup_wall_tok_s": 1.13,
+  "speedup_output_tok_s_p20": 1.0822
+}

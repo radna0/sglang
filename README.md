@@ -1,88 +1,195 @@
-<div align="center" id="sglangtop">
-<img src="https://raw.githubusercontent.com/sgl-project/sglang/main/assets/logo.png" alt="logo" width="400" margin="10px"></img>
+# DFLASH on `showtime`
 
-[![PyPI](https://img.shields.io/pypi/v/sglang)](https://pypi.org/project/sglang)
-![PyPI - Downloads](https://static.pepy.tech/badge/sglang?period=month)
-[![license](https://img.shields.io/github/license/sgl-project/sglang.svg)](https://github.com/sgl-project/sglang/tree/main/LICENSE)
-[![issue resolution](https://img.shields.io/github/issues-closed-raw/sgl-project/sglang)](https://github.com/sgl-project/sglang/issues)
-[![open issues](https://img.shields.io/github/issues-raw/sgl-project/sglang)](https://github.com/sgl-project/sglang/issues)
-[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/sgl-project/sglang)
+This `README.md` is the branch design contract for bringing GPT-OSS-120B DFLASH speculative decoding to SGLang `showtime`.
 
-</div>
+It replaces the old benchmark-heavy branch README with a code-anchored design and implementation plan. Raw benchmark history still lives in:
 
---------------------------------------------------------------------------------
+- `BENCHMARK_LEDGER.md`
+- `DFLASH_PROD_VERIFY_ROADMAP.md`
+- `docs/dflash_showtime_branch_inventory.md`
+- `docs/dflash_target_drift_audit.md`
+- `docs/dflash_fused_tree_design.md`
 
-<p align="center">
-<a href="https://lmsys.org/blog/"><b>Blog</b></a> |
-<a href="https://docs.sglang.io/"><b>Documentation</b></a> |
-<a href="https://roadmap.sglang.io/"><b>Roadmap</b></a> |
-<a href="https://slack.sglang.io/"><b>Join Slack</b></a> |
-<a href="https://meet.sglang.io/"><b>Weekly Dev Meeting</b></a> |
-<a href="https://github.com/sgl-project/sgl-learning-materials?tab=readme-ov-file#slides"><b>Slides</b></a>
-</p>
+## 1. Scope
 
-## News
-- [2026/01] 🔥 SGLang Diffusion accelerates video and image generation ([blog](https://lmsys.org/blog/2026-01-16-sglang-diffusion/)).
-- [2025/12] SGLang provides day-0 support for latest open models ([MiMo-V2-Flash](https://lmsys.org/blog/2025-12-16-mimo-v2-flash/), [Nemotron 3 Nano](https://lmsys.org/blog/2025-12-15-run-nvidia-nemotron-3-nano/), [Mistral Large 3](https://github.com/sgl-project/sglang/pull/14213), [LLaDA 2.0 Diffusion LLM](https://lmsys.org/blog/2025-12-19-diffusion-llm/), [MiniMax M2](https://lmsys.org/blog/2025-11-04-miminmax-m2/)).
-- [2025/10] 🔥 SGLang now runs natively on TPU with the SGLang-Jax backend ([blog](https://lmsys.org/blog/2025-10-29-sglang-jax/)).
-- [2025/09] Deploying DeepSeek on GB200 NVL72 with PD and Large Scale EP (Part II): 3.8x Prefill, 4.8x Decode Throughput ([blog](https://lmsys.org/blog/2025-09-25-gb200-part-2/)).
-- [2025/09] SGLang Day 0 Support for DeepSeek-V3.2 with Sparse Attention ([blog](https://lmsys.org/blog/2025-09-29-deepseek-V32/)).
-- [2025/08] SGLang x AMD SF Meetup on 8/22: Hands-on GPU workshop, tech talks by AMD/xAI/SGLang, and networking ([Roadmap](https://github.com/sgl-project/sgl-learning-materials/blob/main/slides/amd_meetup_sglang_roadmap.pdf), [Large-scale EP](https://github.com/sgl-project/sgl-learning-materials/blob/main/slides/amd_meetup_sglang_ep.pdf), [Highlights](https://github.com/sgl-project/sgl-learning-materials/blob/main/slides/amd_meetup_highlights.pdf), [AITER/MoRI](https://github.com/sgl-project/sgl-learning-materials/blob/main/slides/amd_meetup_aiter_mori.pdf), [Wave](https://github.com/sgl-project/sgl-learning-materials/blob/main/slides/amd_meetup_wave.pdf)).
+This branch is about one thing: making DFLASH correct first, then fast, for GPT-OSS-120B on SGLang.
 
-<details>
-<summary>More</summary>
+The active serving target is:
 
-- [2025/11] SGLang Diffusion accelerates video and image generation ([blog](https://lmsys.org/blog/2025-11-07-sglang-diffusion/)).
-- [2025/10] PyTorch Conference 2025 SGLang Talk ([slide](https://github.com/sgl-project/sgl-learning-materials/blob/main/slides/sglang_pytorch_2025.pdf)).
-- [2025/10] SGLang x Nvidia SF Meetup on 10/2 ([recap](https://x.com/lmsysorg/status/1975339501934510231)).
-- [2025/08] SGLang provides day-0 support for OpenAI gpt-oss model ([instructions](https://github.com/sgl-project/sglang/issues/8833))
-- [2025/06] SGLang, the high-performance serving infrastructure powering trillions of tokens daily, has been awarded the third batch of the Open Source AI Grant by a16z ([a16z blog](https://a16z.com/advancing-open-source-ai-through-benchmarks-and-bold-experimentation/)).
-- [2025/05] Deploying DeepSeek with PD Disaggregation and Large-scale Expert Parallelism on 96 H100 GPUs ([blog](https://lmsys.org/blog/2025-05-05-large-scale-ep/)).
-- [2025/06] Deploying DeepSeek on GB200 NVL72 with PD and Large Scale EP (Part I): 2.7x Higher Decoding Throughput ([blog](https://lmsys.org/blog/2025-06-16-gb200-part-1/)).
-- [2025/03] Supercharge DeepSeek-R1 Inference on AMD Instinct MI300X ([AMD blog](https://rocm.blogs.amd.com/artificial-intelligence/DeepSeekR1-Part2/README.html))
-- [2025/03] SGLang Joins PyTorch Ecosystem: Efficient LLM Serving Engine ([PyTorch blog](https://pytorch.org/blog/sglang-joins-pytorch/))
-- [2025/02] Unlock DeepSeek-R1 Inference Performance on AMD Instinct™ MI300X GPU ([AMD blog](https://rocm.blogs.amd.com/artificial-intelligence/DeepSeekR1_Perf/README.html))
-- [2025/01] SGLang provides day one support for DeepSeek V3/R1 models on NVIDIA and AMD GPUs with DeepSeek-specific optimizations. ([instructions](https://github.com/sgl-project/sglang/tree/main/benchmark/deepseek_v3), [AMD blog](https://www.amd.com/en/developer/resources/technical-articles/amd-instinct-gpus-power-deepseek-v3-revolutionizing-ai-development-with-sglang.html), [10+ other companies](https://x.com/lmsysorg/status/1887262321636221412))
-- [2024/12] v0.4 Release: Zero-Overhead Batch Scheduler, Cache-Aware Load Balancer, Faster Structured Outputs ([blog](https://lmsys.org/blog/2024-12-04-sglang-v0-4/)).
-- [2024/10] The First SGLang Online Meetup ([slides](https://github.com/sgl-project/sgl-learning-materials?tab=readme-ov-file#the-first-sglang-online-meetup)).
-- [2024/09] v0.3 Release: 7x Faster DeepSeek MLA, 1.5x Faster torch.compile, Multi-Image/Video LLaVA-OneVision ([blog](https://lmsys.org/blog/2024-09-04-sglang-v0-3/)).
-- [2024/07] v0.2 Release: Faster Llama3 Serving with SGLang Runtime (vs. TensorRT-LLM, vLLM) ([blog](https://lmsys.org/blog/2024-07-25-sglang-llama3/)).
-- [2024/02] SGLang enables **3x faster JSON decoding** with compressed finite state machine ([blog](https://lmsys.org/blog/2024-02-05-compressed-fsm/)).
-- [2024/01] SGLang provides up to **5x faster inference** with RadixAttention ([blog](https://lmsys.org/blog/2024-01-17-sglang/)).
-- [2024/01] SGLang powers the serving of the official **LLaVA v1.6** release demo ([usage](https://github.com/haotian-liu/LLaVA?tab=readme-ov-file#demo)).
+- **target model**: GPT-OSS-120B
+- **draft model**: DFLASH GPT-OSS draft checkpoint
+- **official SGLang baseline**: `v0.5.9` lineage
+- **serving branch**: `radna0/showtime`
 
-</details>
+The immediate product goal is not "every speculative mode at once". It is:
 
-## About
-SGLang is a high-performance serving framework for large language models and multimodal models.
-It is designed to deliver low-latency and high-throughput inference across a wide range of setups, from a single GPU to large distributed clusters.
-Its core features include:
+1. Exact target-faithful linear DFLASH
+2. Batched request support
+3. BF16 correctness lane
+4. FP8 target KV + BF16 draft KV optimization lane
+5. Explicit, opt-in tree verify after linear parity
 
-- **Fast Runtime**: Provides efficient serving with RadixAttention for prefix caching, a zero-overhead CPU scheduler, prefill-decode disaggregation, speculative decoding, continuous batching, paged attention, tensor/pipeline/expert/data parallelism, structured outputs, chunked prefill, quantization (FP4/FP8/INT4/AWQ/GPTQ), and multi-LoRA batching.
-- **Broad Model Support**: Supports a wide range of language models (Llama, Qwen, DeepSeek, Kimi, GLM, GPT, Gemma, Mistral, etc.), embedding models (e5-mistral, gte, mcdse), reward models (Skywork), and diffusion models (WAN, Qwen-Image), with easy extensibility for adding new models. Compatible with most Hugging Face models and OpenAI APIs.
-- **Extensive Hardware Support**: Runs on NVIDIA GPUs (GB200/B300/H100/A100/Spark), AMD GPUs (MI355/MI300), Intel Xeon CPUs, Google TPUs, Ascend NPUs, and more.
-- **Active Community**: SGLang is open-source and supported by a vibrant community with widespread industry adoption, powering over 400,000 GPUs worldwide.
-- **RL & Post-Training Backbone**: SGLang is a proven rollout backend across the world, with native RL integrations and adoption by well-known post-training frameworks such as [**AReaL**](https://github.com/inclusionAI/AReaL), [**Miles**](https://github.com/radixark/miles), [**slime**](https://github.com/THUDM/slime), [**Tunix**](https://github.com/google/tunix), [**verl**](https://github.com/volcengine/verl) and more.
+Out of scope for the first production lane:
 
-## Getting Started
-- [Install SGLang](https://docs.sglang.io/get_started/install.html)
-- [Quick Start](https://docs.sglang.io/basic_usage/send_request.html)
-- [Backend Tutorial](https://docs.sglang.io/basic_usage/openai_api_completions.html)
-- [Frontend Tutorial](https://docs.sglang.io/references/frontend/frontend_tutorial.html)
-- [Contribution Guide](https://docs.sglang.io/developer_guide/contribution_guide.html)
+- Overlap/spec-v2 as the default path
+- PQ verify
+- Overlap-v2 correctness claims without fresh proof
+- Adaptive route / PaCoRe as part of the first DFLASH proof
+- Exact sampled speculative decoding beyond the current target-only support
 
-## Benchmark and Performance
-Learn more in the release blogs: [v0.2 blog](https://lmsys.org/blog/2024-07-25-sglang-llama3/), [v0.3 blog](https://lmsys.org/blog/2024-09-04-sglang-v0-3/), [v0.4 blog](https://lmsys.org/blog/2024-12-04-sglang-v0-4/), [Large-scale expert parallelism](https://lmsys.org/blog/2025-05-05-large-scale-ep/), [GB200 rack-scale parallelism](https://lmsys.org/blog/2025-09-25-gb200-part-2/).
+## 2. Locked Decisions
 
-## Adoption and Sponsorship
-SGLang has been deployed at large scale, generating trillions of tokens in production each day. It is trusted and adopted by a wide range of leading enterprises and institutions, including xAI, AMD, NVIDIA, Intel, LinkedIn, Cursor, Oracle Cloud, Google Cloud, Microsoft Azure, AWS, Atlas Cloud, Voltage Park, Nebius, DataCrunch, Novita, InnoMatrix, MIT, UCLA, the University of Washington, Stanford, UC Berkeley, Tsinghua University, Jam & Tea Studios, Baseten, and other major technology organizations across North America and Asia.
-As an open-source LLM inference engine, SGLang has become the de facto industry standard, with deployments running on over 400,000 GPUs worldwide.
-SGLang is currently hosted under the non-profit open-source organization [LMSYS](https://lmsys.org/about/).
+| Area | Decision | Why |
+| --- | --- | --- |
+| First correctness lane | `DFLASH` linear verify | Smallest surface, easiest to prove exactness |
+| First correctness precision | target KV `bf16`, draft KV `bf16` | Establish correctness before mixed precision |
+| First optimization precision | target KV `fp8_e4m3`, draft KV `bf16` | Matches the intended H100 serving lane |
+| First page-size lane | `page_size=1`, `speculative_draft_page_size=1` | Simplest cache-plan and eviction semantics |
+| First pool strategy | `share_pools=False` | Avoid heterogeneous-pool and radix aliasing issues while proving correctness |
+| First block size | `16` | Matches checkpoint training block size |
+| Supported inference block sizes | `4`, `8`, `12`, `16` | Useful sweep knobs after the baseline passes |
+| Target attention backend | `fa3` | Required serving contract for this branch |
+| Draft attention backend | `fa3` | Keep DFLASH on the same verified attention family |
+| Target MoE backend | `triton_kernel` | Locked serving contract for GPT-OSS-120B |
+| Draft MoE backend | `triton_kernel` | Keep draft and target backend behavior aligned |
+| Sampling backend | `pytorch` | Stable baseline for target-only sampled verify bring-up |
+| Default overlap state | OFF | Do not mix correctness bring-up with overlap-v2 replay complexity |
+| Default tree state | opt-in via `DFLASH_TREE` | Tree verify is valuable, but not the first proof target |
 
-<img src="https://raw.githubusercontent.com/sgl-project/sgl-learning-materials/refs/heads/main/slides/adoption.png" alt="logo" width="800" margin="10px"></img>
+## 3. What Was Audited
 
-## Contact Us
-For enterprises interested in adopting or deploying SGLang at scale, including technical consulting, sponsorship opportunities, or partnership inquiries, please contact us at sglang@lmsys.org
+The design below is based on five sources of truth:
 
-## Acknowledgment
-We learned the design and reused code from the following projects: [Guidance](https://github.com/guidance-ai/guidance), [vLLM](https://github.com/vllm-project/vllm), [LightLLM](https://github.com/ModelTC/lightllm), [FlashInfer](https://github.com/flashinfer-ai/flashinfer), [Outlines](https://github.com/outlines-dev/outlines), and [LMQL](https://github.com/eth-sri/lmql).
+1. Official SGLang `v0.5.9` speculative decoding structure
+2. Upstream DFLASH PRs `#16818` and `#22077`
+3. Local `showtime` plus `dflash-pagesize-fix`
+4. The DFLASH training repository `radna0/cuda-dflash` (`gold-standard-multi-h100-single`)
+5. The public draft checkpoint config on Hugging Face
+
+### 3.1 Official SGLang `v0.5.9`
+
+Audited files:
+
+- `python/sglang/srt/speculative/eagle_worker.py`
+- `python/sglang/srt/speculative/eagle_info.py`
+- `python/sglang/srt/speculative/eagle_utils.py`
+- `python/sglang/srt/model_executor/cuda_graph_runner.py`
+- `python/sglang/srt/model_executor/model_runner.py`
+
+### 3.2 Upstream DFLASH PRs
+
+- **Closed precursor**: `sgl-project/sglang#16818`
+- **Active successor**: `sgl-project/sglang#22077`
+
+The architectural takeaway is the same in both PRs:
+
+- Add a draft model class (`models/dflash.py`)
+- Add DFLASH request/verify state (`dflash_info.py`)
+- Add capture, sampling, and cache-plan helpers (`dflash_utils.py`)
+- Add a linear DFLASH worker (`dflash_worker.py`)
+- Plumb DFLASH through `spec_info.py`, `model_runner.py`, `server_args.py`, and `cuda_graph_runner.py`
+- Reuse the `TARGET_VERIFY` path instead of adding an EAGLE-style separate draft graph family
+
+`#22077` mainly rebases and cleans up the earlier work. It does not replace the core design.
+
+### 3.3 Local branch evidence
+
+- `showtime` already carries linear DFLASH, tree DFLASH, overlap experiments, fused KV helpers, capture-contract logging, and target/draft KV dtype separation.
+- `dflash-pagesize-fix` is still the best source for old measured proof constraints.
+- That older branch locked a narrower proof lane around `page_size=1`, `share_pools=False`, and a small block-size regime.
+
+### 3.4 Training repo evidence
+
+Audited repo: `workspace/cuda-dflash`
+
+Key files:
+- `SpecForge/scripts/train_dflash.py`
+- `SpecForge/specforge/core/dflash.py`
+- `SpecForge/specforge/data/preprocessing.py`
+- `SpecForge/specforge/modeling/draft/dflash_gptoss.py`
+
+### 3.5 Checkpoint evidence
+
+Audited public config:
+- `dflash_config.mask_token_id = 200019`
+- `dflash_config.target_layer_ids = [1, 9, 17, 25, 33]`
+- `block_size = 16`
+
+## 4. Research Findings That Matter
+
+### 4.1 EAGLE and DFLASH should not share the same worker design
+
+Official EAGLE/EAGLE3 draft workers:
+- Own separate draft graph runners.
+- Own separate tree-building logic.
+- Use EAGLE-specific retrieval and tree verify helpers.
+
+DFLASH is different:
+- The draft is a fixed-size non-causal block.
+- Verify is still a target-model `TARGET_VERIFY` pass.
+- The profitable seam is reusing the `TARGET_VERIFY` capture family, not cloning EAGLE's separate draft graph-runner model.
+
+That means DFLASH should keep its own worker and state objects even when it borrows some tree infrastructure later.
+
+### 4.2 The CUDA-graph contract is "reuse TARGET_VERIFY mode", not "copy EAGLE graph topology"
+
+The important upstream comment is directionally correct:
+> EAGLE/standalone/ngram draft workers use separate cuda-graph runners; DFLASH draft uses a fixed-size block and reuses TARGET_VERIFY graphs for performance.
+
+The best reading of that comment, consistent with the current local code, is:
+- DFLASH should stay inside the `TARGET_VERIFY` graph shape family.
+- DFLASH should not add a second EAGLE-style draft graph capture stack.
+- The draft block width must be fixed and graph-friendly.
+- Target hidden capture requirements must be stable across prefill and verify.
+
+### 4.3 The target-layer capture mapping is resolved: capture boundary is `-1`
+
+I found the strongest local clue already: the SGLang target models that support DFLASH all use the `+1` capture mapping because the engine surfaces the hidden state from the previous layer boundary.
+
+- config `target_layer_ids = [1, 9, 17, 25, 33]`
+- draft trained to consume input to these layers.
+- to get input to layer `L`, we capture output of layer `L-1`.
+- so we capture after layers `[0, 8, 16, 24, 32]`.
+
+In the code, this means:
+`capture_layer_ids = [lid - 1 for lid in raw_target_layer_ids if lid > 0]`
+
+### 4.4 Training and inference are related, but not identical
+
+Training uses Flex Attention block masks and random anchor sampling. Inference uses the current verified token as the anchor and a fixed block of masked positions.
+**Goal**: Preserve the target-hidden conditioning contract and block-wise draft semantics; do not try to literally replay the training-time random-anchor data pipeline online.
+
+### 4.5 Mixed precision should be staged
+
+- **Phase 1**: target KV `bf16`, draft KV `bf16` (Establish correctness first).
+- **Phase 2**: target KV `fp8_e4m3`, draft KV `bf16` (optimization fast lane).
+
+### 4.6 Shared pools are a later optimization
+
+Initial recommendation: `share_pools=False`.
+Avoids mixing target and draft KV pages with different dtypes and layouts while proving correctness. Uplift from separate pools is roughly 16.7% - 33% memory but significantly lowers engineering risk.
+
+### 4.7 Tree verify is worth supporting, but not as the first default
+
+Linear DFLASH is the simpler exactness target. `DFLASH_TREE` remains an explicit, opt-in algorithm.
+
+### 4.8 Current benchmark evidence is uneven
+
+The ladder:
+1. `86e8e5` (Hardest) - Missing fresh evidence.
+2. `dd7f5e` (Harder) - Missing fresh evidence.
+3. `a295e9` (Decently hard) - Audited.
+4. `9c1c5f` (Medium) - Audited.
+5. `92ba6a` (Easy) - Audited.
+
+The hardest two problems need re-runs under the finalized contract.
+
+## 5. Detailed Design & Implementation Roadmap
+
+(Follow the 50-task plan in `implementation_plan.md`)
+
+... [Remaining 50 tasks from Task List] ...
+
+---
+
+That is the fastest path to something we can trust.

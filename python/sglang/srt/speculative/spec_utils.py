@@ -127,6 +127,60 @@ def assign_req_to_token_pool_func(
     out_cache_loc: torch.Tensor,
     batch_size: int,
 ):
+    use_direct_write = (
+        os.environ.get("SGLANG_USE_DIRECT_REQ_TO_TOKEN_WRITE")
+        or os.environ.get("SGLANG_DFLASH_USE_DIRECT_REQ_TO_TOKEN_WRITE")
+        or ""
+    ).strip().lower() not in ("", "0", "false", "off", "no")
+
+    if use_direct_write:
+        lengths = (
+            end_offset.to(device=req_pool_indices.device, dtype=torch.int64)
+            - start_offset.to(device=req_pool_indices.device, dtype=torch.int64)
+        ).clamp_min(0)
+        total = int(lengths.sum().item())
+        if total <= 0:
+            return
+        if int(out_cache_loc.numel()) != total:
+            raise RuntimeError(
+                "Packed req_to_token write size mismatch: "
+                f"expected {total} values, got {int(out_cache_loc.numel())}."
+            )
+
+        max_len = int(lengths.max().item())
+        offs = torch.arange(
+            max_len, device=req_pool_indices.device, dtype=torch.int64
+        )
+        mask = offs.unsqueeze(0) < lengths.unsqueeze(1)
+        row_ids = req_pool_indices.to(torch.int64).unsqueeze(1).expand(-1, max_len)[
+            mask
+        ]
+        col_ids = (
+            start_offset.to(device=req_pool_indices.device, dtype=torch.int64)
+            .unsqueeze(1)
+            .add(offs.unsqueeze(0))
+        )[mask]
+        if int(row_ids.numel()) != total or int(col_ids.numel()) != total:
+            raise RuntimeError(
+                "Packed req_to_token indexing produced the wrong number of elements: "
+                f"rows={int(row_ids.numel())} cols={int(col_ids.numel())} expected={total}."
+            )
+        if total > 0:
+            max_row = int(row_ids.max().item())
+            max_col = int(col_ids.max().item())
+            if max_row >= int(req_to_token.shape[0]) or max_col >= int(
+                req_to_token.shape[1]
+            ):
+                raise RuntimeError(
+                    "Packed req_to_token write produced out-of-range indices: "
+                    f"max_row={max_row} max_col={max_col} "
+                    f"req_to_token_shape={tuple(req_to_token.shape)}"
+                )
+        req_to_token[row_ids, col_ids] = out_cache_loc.to(
+            device=req_to_token.device, dtype=req_to_token.dtype
+        )
+        return
+
     assign_req_to_token_pool[(batch_size,)](
         req_pool_indices,
         req_to_token,

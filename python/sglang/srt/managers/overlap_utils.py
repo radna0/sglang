@@ -11,6 +11,7 @@ from sglang.srt.utils import get_compiler_backend, is_npu
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ModelWorkerBatch
     from sglang.srt.managers.scheduler import GenerationBatchResult
+    from sglang.srt.speculative.dflash_info import DFlashDraftInput
     from sglang.srt.speculative.eagle_info import EagleDraftInput
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
@@ -70,7 +71,39 @@ class FutureMap:
             # This is to make the shape derivation easier.
             self.buf_initialized = False
 
+    def _lazy_init_dflash_buf(self, draft_input: DFlashDraftInput):
+        self.buf_initialized = True
+
+        verified_id0 = draft_input.verified_id[0]
+        draft_seq_lens0 = draft_input.draft_seq_lens[0]
+        new_seq_lens0 = (
+            draft_input.new_seq_lens[0]
+            if draft_input.new_seq_lens is not None
+            else draft_input.draft_seq_lens[0]
+        )
+
+        self.dflash_verified_id_buf = torch.empty(
+            (self.future_buffer_len, *verified_id0.shape),
+            dtype=verified_id0.dtype,
+            device=self.device,
+        )
+        self.dflash_draft_seq_lens_buf = torch.empty(
+            (self.future_buffer_len, *draft_seq_lens0.shape),
+            dtype=draft_seq_lens0.dtype,
+            device=self.device,
+        )
+        self.dflash_new_seq_lens_buf = torch.empty(
+            (self.future_buffer_len, *new_seq_lens0.shape),
+            dtype=new_seq_lens0.dtype,
+            device=self.device,
+        )
+        self.dflash_verify_done_buf = [None] * self.future_buffer_len
+
     def _lazy_init_buf(self, draft_input: EagleDraftInput):
+        if self.spec_algo.is_dflash_family():
+            self._lazy_init_dflash_buf(draft_input)
+            return
+
         self.buf_initialized = True
 
         # Get a reference for each tensor
@@ -122,18 +155,35 @@ class FutureMap:
             _resolve_future_token_ids(model_worker_batch.input_ids, self.token_ids_buf)
         else:
             # TODO(lsyin): write future indices into spec_info.future_indices
-            draft_input: EagleDraftInput = model_worker_batch.spec_info
+            draft_input = model_worker_batch.spec_info
             if draft_input is None:
                 # FIXME(lsyin): No future exists, only for prefill batch, not compatible with mixed mode
                 return
             indices = draft_input.future_indices.indices
-            # The indices tensor was allocated on the default stream but is
-            # used here on the forward stream. Meanwhile, the old spec_info
-            # holding this tensor will lose all Python references (replaced at
-            # model_worker_batch.spec_info and batch.spec_info), so the
-            # caching allocator (torch GC) could reclaim the memory before
-            # the GPU finishes reading it.
-            indices.record_stream(torch.get_device_module(self.device).current_stream())
+            if torch.device(self.device).type != "cpu":
+                # The indices tensor was allocated on the default stream but is
+                # used here on the forward stream. Meanwhile, the old spec_info
+                # holding this tensor will lose all Python references (replaced at
+                # model_worker_batch.spec_info and batch.spec_info), so the
+                # caching allocator (torch GC) could reclaim the memory before
+                # the GPU finishes reading it.
+                indices.record_stream(
+                    torch.get_device_module(self.device).current_stream()
+                )
+            if self.spec_algo.is_dflash_family():
+                draft_input.verified_id = self.dflash_verified_id_buf[indices]
+                draft_input.draft_seq_lens = self.dflash_draft_seq_lens_buf[indices]
+                draft_input.new_seq_lens = self.dflash_new_seq_lens_buf[indices]
+                draft_input.ctx_lens = torch.zeros_like(draft_input.draft_seq_lens)
+                draft_input.target_hidden = torch.empty(
+                    (0,), dtype=torch.float32, device=self.device
+                )
+                if getattr(self, "dflash_verify_done_buf", None) is not None:
+                    draft_input.verify_done = self.dflash_verify_done_buf[
+                        int(indices[0].item())
+                    ]
+                return
+
             draft_input.topk_p = self.topk_p_buf[indices]
             draft_input.topk_index = self.topk_index_buf[indices]
             draft_input.verified_id = self.verified_id_buf[indices]
@@ -161,6 +211,10 @@ class FutureMap:
     def store_to_map_for_new_batch(
         self, future_indices: FutureIndices, draft_input: EagleDraftInput
     ):
+        if self.spec_algo.is_dflash_family():
+            self.store_to_map_for_new_dflash_batch(future_indices, draft_input)
+            return
+
         intv = future_indices.interval
         if self.is_empty_slice(intv):
             # idle indices in dp attention do not need store info
@@ -175,3 +229,35 @@ class FutureMap:
         self.new_seq_lens_buf[intv] = draft_input.new_seq_lens
         if spec_need_hidden_states():
             self.hidden_states_buf[intv] = draft_input.hidden_states
+
+    def store_to_map_for_new_dflash_batch(
+        self, future_indices: FutureIndices, draft_input: DFlashDraftInput
+    ):
+        intv = future_indices.interval
+        if self.is_empty_slice(intv):
+            return
+
+        if not self.buf_initialized:
+            self._lazy_init_dflash_buf(draft_input)
+
+        if draft_input.new_seq_lens is None:
+            raise ValueError(
+                "DFLASH overlap payload requires explicit new_seq_lens."
+            )
+        if draft_input.target_hidden is not None and draft_input.target_hidden.numel() > 0:
+            raise ValueError(
+                "DFLASH overlap payload must store post-append draft state with empty target_hidden."
+            )
+        if draft_input.ctx_lens is not None and draft_input.ctx_lens.numel() > 0:
+            if int(draft_input.ctx_lens.sum().item()) != 0:
+                raise ValueError(
+                    "DFLASH overlap payload must store post-append draft state with zero ctx_lens."
+                )
+
+        self.dflash_verified_id_buf[intv] = draft_input.verified_id
+        self.dflash_draft_seq_lens_buf[intv] = draft_input.draft_seq_lens
+        self.dflash_new_seq_lens_buf[intv] = draft_input.new_seq_lens
+        if getattr(self, "dflash_verify_done_buf", None) is not None:
+            verify_done = getattr(draft_input, "verify_done", None)
+            for idx in range(int(intv.start), int(intv.stop)):
+                self.dflash_verify_done_buf[idx] = verify_done

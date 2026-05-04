@@ -513,6 +513,9 @@ class OpenAIServingResponses(OpenAIServingChat):
         )
 
         if request.store:
+            if self.use_harmony:
+                assert isinstance(context, HarmonyContext)
+                self.msg_store[response.id] = copy.copy(context.messages)
             async with self.response_store_lock:
                 stored_response = self.response_store.get(response.id)
                 # If the response is already cancelled, don't update it
@@ -692,7 +695,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             messages.append(get_user_message(request.input))
         else:
             if prev_response is not None:
-                prev_outputs = copy(prev_response.output)
+                prev_outputs = copy.copy(prev_response.output)
             else:
                 prev_outputs = []
             for response_msg in request.input:

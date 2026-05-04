@@ -34,82 +34,115 @@ else:
     from transformers import AutoConfig, GenerationConfig
 
 from transformers import (
-    AutoProcessor,
     AutoTokenizer,
     PretrainedConfig,
     PreTrainedTokenizer,
     PreTrainedTokenizerBase,
     PreTrainedTokenizerFast,
 )
+try:
+    from transformers import AutoProcessor
+except Exception as exc:  # pragma: no cover - environment-specific optional dep failure
+    AutoProcessor = None  # type: ignore[assignment]
+    logging.getLogger(__name__).warning(
+        "AutoProcessor import failed; continuing without multimodal processor support. error=%r",
+        exc,
+    )
 from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
 
-from sglang.srt.configs import (
-    AfmoeConfig,
-    BailingHybridConfig,
-    ChatGLMConfig,
-    DbrxConfig,
-    DeepseekVL2Config,
-    DotsOCRConfig,
-    DotsVLMConfig,
-    ExaoneConfig,
-    FalconH1Config,
-    GraniteMoeHybridConfig,
-    JetNemotronConfig,
-    JetVLMConfig,
-    KimiK25Config,
-    KimiLinearConfig,
-    KimiVLConfig,
-    LongcatFlashConfig,
-    MultiModalityConfig,
-    NemotronH_Nano_VL_V2_Config,
-    NemotronHConfig,
-    Olmo3Config,
-    Qwen3_5Config,
-    Qwen3_5MoeConfig,
-    Qwen3NextConfig,
-    Step3p5Config,
-    Step3VLConfig,
-)
-from sglang.srt.configs.deepseek_ocr import DeepseekVLV2Config
-from sglang.srt.configs.internvl import InternVLChatConfig
+# Optional config classes (may be unavailable when multimodal deps are missing).
+DeepseekVLV2Config = None  # type: ignore
+InternVLChatConfig = None  # type: ignore
+
+_DISABLE_MM_CONFIGS = get_bool_env_var("SGLANG_DISABLE_MM_CONFIGS")
+
+_CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {}
+if not _DISABLE_MM_CONFIGS:
+    try:
+        from sglang.srt.configs import (
+            AfmoeConfig,
+            BailingHybridConfig,
+            ChatGLMConfig,
+            DbrxConfig,
+            DeepseekVL2Config,
+            DotsOCRConfig,
+            DotsVLMConfig,
+            ExaoneConfig,
+            FalconH1Config,
+            GraniteMoeHybridConfig,
+            JetNemotronConfig,
+            JetVLMConfig,
+            KimiK25Config,
+            KimiLinearConfig,
+            KimiVLConfig,
+            LongcatFlashConfig,
+            MultiModalityConfig,
+            NemotronH_Nano_VL_V2_Config,
+            NemotronHConfig,
+            Olmo3Config,
+            Qwen3_5Config,
+            Qwen3_5MoeConfig,
+            Qwen3NextConfig,
+            Step3p5Config,
+            Step3VLConfig,
+        )
+
+        try:
+            from sglang.srt.configs.deepseek_ocr import DeepseekVLV2Config
+        except ModuleNotFoundError:
+            DeepseekVLV2Config = None
+
+        try:
+            from sglang.srt.configs.internvl import InternVLChatConfig
+        except ModuleNotFoundError:
+            InternVLChatConfig = None
+
+        _config_classes: List[Type[PretrainedConfig]] = [
+            AfmoeConfig,
+            BailingHybridConfig,
+            ChatGLMConfig,
+            DbrxConfig,
+            ExaoneConfig,
+            DeepseekVL2Config,
+            MultiModalityConfig,
+            KimiVLConfig,
+            InternVLChatConfig,
+            Step3VLConfig,
+            LongcatFlashConfig,
+            Olmo3Config,
+            KimiLinearConfig,
+            Qwen3NextConfig,
+            FalconH1Config,
+            GraniteMoeHybridConfig,
+            DotsVLMConfig,
+            DotsOCRConfig,
+            NemotronH_Nano_VL_V2_Config,
+            NemotronHConfig,
+            DeepseekVLV2Config,
+            Qwen3_5Config,
+            Qwen3_5MoeConfig,
+            JetNemotronConfig,
+            JetVLMConfig,
+            KimiK25Config,
+            Step3p5Config,
+        ]
+        _CONFIG_REGISTRY = {
+            config_cls.model_type: config_cls
+            for config_cls in _config_classes
+            if config_cls is not None
+        }
+    except Exception as exc:
+        logging.getLogger(__name__).warning(
+            "Optional sglang.srt.configs import failed; continuing without extra configs. error=%r",
+            exc,
+        )
 from sglang.srt.connector import create_remote_connector
-from sglang.srt.multimodal.customized_mm_processor_utils import _CUSTOMIZED_MM_PROCESSOR
+try:
+    from sglang.srt.multimodal.customized_mm_processor_utils import _CUSTOMIZED_MM_PROCESSOR
+except Exception:
+    _CUSTOMIZED_MM_PROCESSOR = {}
 from sglang.srt.utils import is_remote_url, logger, lru_cache_frozenset, mistral_utils
 from sglang.srt.utils.patch_tokenizer import patch_tokenizer
-
-_CONFIG_REGISTRY: List[Type[PretrainedConfig]] = [
-    AfmoeConfig,
-    BailingHybridConfig,
-    ChatGLMConfig,
-    DbrxConfig,
-    ExaoneConfig,
-    DeepseekVL2Config,
-    MultiModalityConfig,
-    KimiVLConfig,
-    InternVLChatConfig,
-    Step3VLConfig,
-    LongcatFlashConfig,
-    Olmo3Config,
-    KimiLinearConfig,
-    Qwen3NextConfig,
-    FalconH1Config,
-    GraniteMoeHybridConfig,
-    DotsVLMConfig,
-    DotsOCRConfig,
-    NemotronH_Nano_VL_V2_Config,
-    NemotronHConfig,
-    DeepseekVLV2Config,
-    Qwen3_5Config,
-    Qwen3_5MoeConfig,
-    JetNemotronConfig,
-    JetVLMConfig,
-    KimiK25Config,
-    Step3p5Config,
-]
-
-_CONFIG_REGISTRY = {
-    config_cls.model_type: config_cls for config_cls in _CONFIG_REGISTRY
-}
 
 for name, cls in _CONFIG_REGISTRY.items():
     with contextlib.suppress(ValueError):
@@ -119,6 +152,7 @@ for name, cls in _CONFIG_REGISTRY.items():
 def download_from_hf(
     model_path: str,
     allow_patterns: Optional[Union[str, list]] = None,
+    revision: Optional[str] = None,
 ):
     if os.path.exists(model_path):
         return model_path
@@ -126,7 +160,9 @@ def download_from_hf(
     if not allow_patterns:
         allow_patterns = ["*.json", "*.bin", "*.model"]
 
-    return snapshot_download(model_path, allow_patterns=allow_patterns)
+    return snapshot_download(
+        model_path, allow_patterns=allow_patterns, revision=revision
+    )
 
 
 def get_hf_text_config(config: PretrainedConfig):
@@ -342,6 +378,14 @@ def get_config(
             "patch_size": 14,
         }
         config.vision_config = SiglipVisionConfig(**vision_config)
+
+    if config.architectures in [
+        ["LongcatCausalLM"],
+        ["LongcatFlashForCausalLM"],
+        ["LongcatFlashNgramForCausalLM"],
+    ]:
+        config.model_type = "longcat_flash"
+
     text_config = get_hf_text_config(config=config)
 
     if isinstance(model, str) and text_config is not None:
@@ -388,6 +432,9 @@ def get_config(
 
     if config.model_type == "multi_modality":
         config.update({"architectures": ["MultiModalityCausalLM"]})
+
+    if config.model_type == "longcat_flash":
+        config.update({"architectures": ["LongcatFlashForCausalLM"]})
 
     if model_override_args:
         config.update(model_override_args)
@@ -634,6 +681,11 @@ def get_processor(
                     **kwargs,
                 )
             else:
+                if AutoProcessor is None:
+                    raise RuntimeError(
+                        "AutoProcessor is unavailable in this environment. "
+                        "Multimodal processor loading requires fixing the Transformers/torchvision stack."
+                    )
                 processor = AutoProcessor.from_pretrained(
                     tokenizer_name,
                     *args,
@@ -649,6 +701,11 @@ def get_processor(
                 f"Processor {tokenizer_name} does not have a slow version. Automatically use fast version"
             )
             kwargs["use_fast"] = True
+            if AutoProcessor is None:
+                raise RuntimeError(
+                    "AutoProcessor is unavailable in this environment. "
+                    "Multimodal processor loading requires fixing the Transformers/torchvision stack."
+                )
             processor = AutoProcessor.from_pretrained(
                 tokenizer_name,
                 *args,

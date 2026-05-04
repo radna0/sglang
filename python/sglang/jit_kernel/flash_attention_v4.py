@@ -15,8 +15,37 @@ else:
     _flash_attn_import_error = None
 
 
+def fa4_hopper_stable_enabled() -> bool:
+    return False
+
+
+def fa4_hopper_scheduler_metadata_enabled() -> bool:
+    return False
+
+
+def hopper_get_scheduler_metadata(*args, **kwargs):
+    raise NotImplementedError(
+        "FA4 Hopper scheduler metadata is not available in this build."
+    )
+
+
 def _maybe_contiguous(x: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
+
+
+def fa4_hopper_stable_enabled() -> bool:
+    # The vendored CuTe FA4 path on this branch does not expose the newer
+    # Hopper-stable feature gate. Treat it as unavailable unless a future port
+    # brings in the full implementation.
+    return False
+
+
+def fa4_hopper_scheduler_metadata_enabled() -> bool:
+    return False
+
+
+def hopper_get_scheduler_metadata(*_args, **_kwargs):
+    return None
 
 
 def flash_attn_varlen_func(

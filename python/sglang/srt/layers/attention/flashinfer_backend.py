@@ -421,6 +421,31 @@ class FlashInferAttnBackend(AttentionBackend):
             ),
         )
 
+    @torch.inference_mode()
+    def append_kv(self, pool, ctx_lens, hidden_states):
+        """Append projected hidden states to the KV pool for conditioning."""
+        if hidden_states is None or hidden_states.numel() == 0:
+            return
+
+        # Obtain layer projections from the draft model.
+        model = self._model_runner.model
+        layers = model.layers
+
+        # Extract cache locations from the req_to_token_pool.
+        req_to_token = self._model_runner.req_to_token_pool.req_to_token
+        req_indices = self._model_runner.req_pool_indices
+        num_ctx = hidden_states.shape[0] // req_indices.shape[0]
+
+        # Extract the cache locations from the pool.
+        # We assume ctx tokens are at [req_idx, 0:num_ctx]
+        locs = req_to_token[req_indices, :num_ctx].reshape(-1).to(torch.int32)
+
+        # Project and write to KV pool.
+        for layer in layers:
+            if hasattr(layer.self_attn, "kv_proj_only"):
+                k, v = layer.self_attn.kv_proj_only(hidden_states)
+                pool.set_kv_buffer(layer.self_attn, locs, k, v)
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         if forward_batch.forward_mode.is_decode_or_idle():
             self.indices_updater_decode.update(
@@ -588,8 +613,24 @@ class FlashInferAttnBackend(AttentionBackend):
                     fast_decode_plan, decode_wrappers[i]
                 )
         elif forward_mode.is_target_verify():
+            # FlashInfer's prefill wrapper decides mask mode based on whether
+            # `custom_mask_buf` is initialized (not whether a custom mask is provided).
+            # For cases like DFLASH draft (ENCODER_ONLY / non-causal) we do NOT use a
+            # custom mask, so we must avoid initializing `custom_mask_buf`, otherwise
+            # FlashInfer will treat the (zero) buffer as a real mask and block attention.
+            use_custom_mask = (
+                spec_info is not None
+                and getattr(spec_info, "custom_mask", None) is not None
+            )
             prefill_wrappers = []
             for i in range(self.num_wrappers):
+                wrapper_kwargs = {}
+                if use_custom_mask:
+                    wrapper_kwargs = {
+                        "custom_mask_buf": self.cuda_graph_custom_mask,
+                        "mask_indptr_buf": self.cuda_graph_qk_indptr[i][: bs + 1],
+                    }
+
                 prefill_wrappers.append(
                     BatchPrefillWithPagedKVCacheWrapper(
                         self.workspace_buffer,
@@ -600,8 +641,7 @@ class FlashInferAttnBackend(AttentionBackend):
                         paged_kv_indptr_buf=self.kv_indptr[i][: bs + 1],
                         paged_kv_indices_buf=self.cuda_graph_kv_indices[i],
                         paged_kv_last_page_len_buf=self.kv_last_page_len[:bs],
-                        custom_mask_buf=self.cuda_graph_custom_mask,
-                        mask_indptr_buf=self.cuda_graph_qk_indptr[i][: bs + 1],
+                        **wrapper_kwargs,
                     )
                 )
             seq_lens_sum = seq_lens.sum().item()
@@ -774,10 +814,14 @@ class FlashInferAttnBackend(AttentionBackend):
                         layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                     )
 
+            causal = (
+                not layer.is_cross_attention
+                and layer.attn_type != AttentionType.ENCODER_ONLY
+            )
             o = prefill_wrapper_paged.forward(
                 q.view(-1, layer.tp_q_head_num, layer.head_dim),
                 forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id),
-                causal=not layer.is_cross_attention,
+                causal=causal,
                 sm_scale=layer.scaling,
                 # Disable sliding window attention for multi-item scoring:
                 # - Sliding window could cut across item boundaries, breaking semantic coherence
@@ -806,13 +850,11 @@ class FlashInferAttnBackend(AttentionBackend):
             if k is None and v is None:
                 k = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)[0]
                 v = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)[1]
-            causal = True
-            if (
-                layer.is_cross_attention
-                or layer.attn_type == AttentionType.ENCODER_ONLY
-            ):
-                causal = False
-            if not self.is_dllm_model and layer.attn_type == AttentionType.ENCODER_ONLY:
+            causal = (
+                not layer.is_cross_attention
+                and layer.attn_type != AttentionType.ENCODER_ONLY
+            )
+            if save_kv_cache and layer.attn_type == AttentionType.ENCODER_ONLY:
                 save_kv_cache = False
 
             if self.forward_metadata.extend_no_prefix:
@@ -829,11 +871,6 @@ class FlashInferAttnBackend(AttentionBackend):
                 )
 
             else:
-                if not self.is_dllm_model:
-                    # TODO: design a better interface
-                    # For other models, use causal attention for the ragged part as previously
-                    causal = True
-
                 o1, s1 = self.prefill_wrapper_ragged.forward_return_lse(
                     q.view(-1, layer.tp_q_head_num, layer.head_dim),
                     k.view(-1, layer.tp_k_head_num, layer.head_dim),

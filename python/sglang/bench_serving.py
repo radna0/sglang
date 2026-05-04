@@ -12,6 +12,7 @@ python3 -m sglang.bench_serving --backend sglang --dataset-name random --num-pro
 
 import argparse
 import asyncio
+import contextlib
 import copy
 import importlib.util
 import io
@@ -105,6 +106,7 @@ class RequestFuncOutput:
     error: str = ""
     output_len: int = 0
     start_time: float = 0.0
+    meta_info: Dict[str, Any] = field(default_factory=dict)
 
     @staticmethod
     def init_new(request_func_input: RequestFuncInput):
@@ -115,6 +117,21 @@ class RequestFuncOutput:
 
 def remove_prefix(text: str, prefix: str) -> str:
     return text[len(prefix) :] if text.startswith(prefix) else text
+
+
+def _merge_request_extra_body(
+    extra_request_body: Dict[str, Any], per_request_extra_body: Dict[str, Any]
+) -> Dict[str, Any]:
+    merged_extra_body = {**extra_request_body, **per_request_extra_body}
+    if (
+        "sampling_params" in extra_request_body
+        or "sampling_params" in per_request_extra_body
+    ):
+        merged_extra_body["sampling_params"] = {
+            **extra_request_body.get("sampling_params", {}),
+            **per_request_extra_body.get("sampling_params", {}),
+        }
+    return merged_extra_body
 
 
 def remove_suffix(text: str, suffix: str) -> str:
@@ -593,21 +610,27 @@ async def async_request_sglang_generate(
 ) -> RequestFuncOutput:
     api_url = request_func_input.api_url
     prompt = request_func_input.prompt
+    extra_request_body = dict(request_func_input.extra_request_body or {})
+    extra_sampling_params = extra_request_body.pop("sampling_params", None)
+    if not isinstance(extra_sampling_params, dict):
+        extra_sampling_params = {}
+    sampling_params = {
+        "temperature": 0.0,
+        "max_new_tokens": request_func_input.output_len,
+        "ignore_eos": not args.disable_ignore_eos,
+    }
+    sampling_params.update(extra_sampling_params)
 
     async with _create_bench_client_session() as session:
         payload = {
             ("text" if isinstance(prompt, str) else "input_ids"): prompt,
-            "sampling_params": {
-                "temperature": 0.0,
-                "max_new_tokens": request_func_input.output_len,
-                "ignore_eos": not args.disable_ignore_eos,
-            },
+            "sampling_params": sampling_params,
             "stream": not args.disable_stream,
             "lora_path": request_func_input.lora_name,
             "return_logprob": args.return_logprob,
             "return_routed_experts": args.return_routed_experts,
             "logprob_start_len": -1,
-            **request_func_input.extra_request_body,
+            **extra_request_body,
         }
 
         # Add image data if available (list of image urls/base64)
@@ -632,42 +655,57 @@ async def async_request_sglang_generate(
                 url=api_url, json=payload, headers=headers
             ) as response:
                 if response.status == 200:
-                    async for chunk_bytes in response.content:
-                        chunk_bytes = chunk_bytes.strip()
-                        if not chunk_bytes:
-                            continue
-
-                        chunk = remove_prefix(chunk_bytes.decode("utf-8"), "data: ")
+                    if args.disable_stream:
+                        data = await response.json()
                         latency = time.perf_counter() - st
-                        if chunk == "[DONE]":
-                            pass
-                        else:
-                            data = json.loads(chunk)
+                        generated_text = data.get("text") or ""
+                        output.meta_info = data.get("meta_info") or {}
+                        output_len = int(
+                            output.meta_info.get(
+                                "completion_tokens", request_func_input.output_len
+                            )
+                        )
+                        output.ttft = latency
+                    else:
+                        async for chunk_bytes in response.content:
+                            chunk_bytes = chunk_bytes.strip()
+                            if not chunk_bytes:
+                                continue
 
-                            # NOTE: Some completion API might have a last
-                            # usage summary response without a token so we
-                            # want to check a token was generated
-                            if "text" in data and data["text"]:
-                                timestamp = time.perf_counter()
-                                generated_text = data["text"]
-                                output_len = data["meta_info"]["completion_tokens"]
+                            chunk = remove_prefix(chunk_bytes.decode("utf-8"), "data: ")
+                            latency = time.perf_counter() - st
+                            if chunk == "[DONE]":
+                                pass
+                            else:
+                                data = json.loads(chunk)
 
-                                # First token
-                                if ttft == 0.0:
-                                    ttft = time.perf_counter() - st
-                                    output.ttft = ttft
+                                # NOTE: Some completion API might have a last
+                                # usage summary response without a token so we
+                                # want to check a token was generated
+                                if "text" in data and data["text"]:
+                                    timestamp = time.perf_counter()
+                                    generated_text = data["text"]
+                                    output.meta_info = data.get("meta_info") or {}
+                                    output_len = output.meta_info["completion_tokens"]
 
-                                # Decoding phase
-                                else:
-                                    num_new_tokens = output_len - last_output_len
-                                    if num_new_tokens == 0:
-                                        continue
-                                    chunk_gap = timestamp - most_recent_timestamp
-                                    adjust_itl = chunk_gap / num_new_tokens
-                                    output.itl.extend([adjust_itl] * num_new_tokens)
+                                    # First token
+                                    if ttft == 0.0:
+                                        ttft = time.perf_counter() - st
+                                        output.ttft = ttft
 
-                                most_recent_timestamp = timestamp
-                                last_output_len = output_len
+                                    # Decoding phase
+                                    else:
+                                        num_new_tokens = output_len - last_output_len
+                                        if num_new_tokens == 0:
+                                            continue
+                                        chunk_gap = timestamp - most_recent_timestamp
+                                        adjust_itl = chunk_gap / num_new_tokens
+                                        output.itl.extend(
+                                            [adjust_itl] * num_new_tokens
+                                        )
+
+                                    most_recent_timestamp = timestamp
+                                    last_output_len = output_len
 
                     output.generated_text = generated_text
                     output.success = True
@@ -2216,6 +2254,10 @@ def calculate_metrics(
                 print("tip: install termplotlib and gnuplot to plot the metrics")
 
     itls = retokenized_itls if use_retokenized_itl else itls
+    # Some benchmark modes intentionally continue collecting outputs even when every
+    # request failed. Keep metric aggregation total-order and JSON-emittable in that
+    # case instead of raising on empty latency arrays.
+    e2e_latencies_or_zero = e2e_latencies if e2e_latencies else [0.0]
     metrics = BenchmarkMetrics(
         completed=completed,
         total_input=total_input,
@@ -2245,12 +2287,12 @@ def calculate_metrics(
         p95_itl_ms=np.percentile(itls or 0, 95) * 1000,
         p99_itl_ms=np.percentile(itls or 0, 99) * 1000,
         max_itl_ms=np.max(itls or 0) * 1000,
-        mean_e2e_latency_ms=np.mean(e2e_latencies) * 1000,
-        median_e2e_latency_ms=np.median(e2e_latencies) * 1000,
-        std_e2e_latency_ms=np.std(e2e_latencies) * 1000,
-        p90_e2e_latency_ms=np.percentile(e2e_latencies, 90) * 1000,
-        p99_e2e_latency_ms=np.percentile(e2e_latencies, 99) * 1000,
-        concurrency=np.sum(e2e_latencies) / dur_s,
+        mean_e2e_latency_ms=np.mean(e2e_latencies_or_zero) * 1000,
+        median_e2e_latency_ms=np.median(e2e_latencies_or_zero) * 1000,
+        std_e2e_latency_ms=np.std(e2e_latencies_or_zero) * 1000,
+        p90_e2e_latency_ms=np.percentile(e2e_latencies_or_zero, 90) * 1000,
+        p99_e2e_latency_ms=np.percentile(e2e_latencies_or_zero, 99) * 1000,
+        concurrency=(np.sum(e2e_latencies) / dur_s) if e2e_latencies else 0.0,
         max_output_tokens_per_s=max_output_tokens_per_s,
         max_concurrent_requests=max_concurrent_requests,
     )
@@ -2488,9 +2530,9 @@ async def benchmark(
         else:
             lora_name = None
 
-        # Merge global extra_request_body with per-request extras
-        # Per-request parameters take precedence over global ones
-        merged_extra_body = {**extra_request_body, **request.extra_request_body}
+        merged_extra_body = _merge_request_extra_body(
+            extra_request_body, request.extra_request_body
+        )
 
         request_func_input = RequestFuncInput(
             model=model_id,
@@ -2532,24 +2574,22 @@ async def benchmark(
         pbar.close()
 
     if "sglang" in backend:
-        server_info = requests.get(
-            base_url + "/get_server_info", headers=get_auth_headers()
-        )
-        if server_info.status_code == 200:
-            server_info_json = server_info.json()
-            if "decode" in server_info_json:
-                server_info_json = server_info_json["decode"][0]
-            if (
-                "internal_states" in server_info_json
-                and server_info_json["internal_states"]
-            ):
-                accept_length = server_info_json["internal_states"][0].get(
-                    "avg_spec_accept_length", None
-                )
-            else:
-                accept_length = None
-        else:
-            accept_length = None
+        accept_length = None
+        with contextlib.suppress(Exception):
+            server_info = requests.get(
+                base_url + "/get_server_info", headers=get_auth_headers()
+            )
+            if server_info.status_code == 200:
+                server_info_json = server_info.json()
+                if "decode" in server_info_json:
+                    server_info_json = server_info_json["decode"][0]
+                if (
+                    "internal_states" in server_info_json
+                    and server_info_json["internal_states"]
+                ):
+                    accept_length = server_info_json["internal_states"][0].get(
+                        "avg_spec_accept_length", None
+                    )
     else:
         accept_length = None
 
@@ -2660,8 +2700,10 @@ async def benchmark(
     print("{:<40} {:<10.2f}".format("Max ITL (ms):", metrics.max_itl_ms))
     print("=" * 50)
 
-    resp = requests.get(base_url + "/get_server_info", headers=get_auth_headers())
-    server_info = resp.json() if resp.status_code == 200 else None
+    server_info = None
+    with contextlib.suppress(Exception):
+        resp = requests.get(base_url + "/get_server_info", headers=get_auth_headers())
+        server_info = resp.json() if resp.status_code == 200 else None
 
     if (
         metrics.median_ttft_ms is not None
@@ -2744,6 +2786,7 @@ async def benchmark(
         "ttfts": [output.ttft for output in outputs],
         "itls": [output.itl for output in outputs],
         "generated_texts": [output.generated_text for output in outputs],
+        "meta_infos": [output.meta_info for output in outputs],
         "errors": [output.error for output in outputs],
     }
 

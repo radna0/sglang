@@ -15,6 +15,7 @@
 
 import dataclasses
 import logging
+import os
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -60,6 +61,25 @@ from sglang.srt.utils.common import is_npu, use_intel_amx_backend
 logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
+_fa4_logits_trace_count = 0
+
+
+def _fa4_trace_logits(msg: str, *args) -> None:
+    global _fa4_logits_trace_count
+    enabled = (
+        os.environ.get("SGLANG_FA4_TRACE_LOGITS", "").strip().lower()
+        in ("1", "true", "yes", "on")
+    )
+    if not enabled:
+        return
+    try:
+        limit = int(os.environ.get("SGLANG_FA4_TRACE_LOGITS_LIMIT", "256") or "256")
+    except Exception:
+        limit = 256
+    if limit >= 0 and _fa4_logits_trace_count >= limit:
+        return
+    logger.info(msg, *args)
+    _fa4_logits_trace_count += 1
 
 
 @dataclasses.dataclass
@@ -112,6 +132,9 @@ class LogitsMetadata:
     forward_mode: ForwardMode
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.NULL
     next_token_logits_buffer: Optional[torch.Tensor] = None
+    dflash_draft_token_num: int = 0
+    dflash_default_draft_token_num: int = 0
+    dflash_greedy_top1_only: bool = False
 
     extend_return_logprob: bool = False
     extend_return_top_logprob: bool = False
@@ -152,6 +175,26 @@ class LogitsMetadata:
 
     @classmethod
     def from_forward_batch(cls, forward_batch: ForwardBatch):
+        dflash_draft_token_num = 0
+        dflash_default_draft_token_num = 0
+        dflash_greedy_top1_only = False
+        if (
+            forward_batch.forward_mode.is_target_verify()
+            and forward_batch.spec_algorithm is not None
+            and forward_batch.spec_algorithm.is_dflash_family()
+            and forward_batch.spec_info is not None
+        ):
+            dflash_draft_token_num = int(
+                getattr(forward_batch.spec_info, "draft_token_num", 0) or 0
+            )
+            dflash_default_draft_token_num = int(
+                getattr(get_global_server_args(), "speculative_num_draft_tokens", 0)
+                or 0
+            )
+            dflash_greedy_top1_only = bool(
+                getattr(forward_batch.spec_info, "dflash_greedy_top1_only", False)
+            )
+
         if (
             forward_batch.forward_mode.is_extend()
             and forward_batch.return_logprob
@@ -181,6 +224,9 @@ class LogitsMetadata:
             forward_mode=forward_batch.forward_mode,
             capture_hidden_mode=forward_batch.capture_hidden_mode,
             next_token_logits_buffer=forward_batch.next_token_logits_buffer,
+            dflash_draft_token_num=dflash_draft_token_num,
+            dflash_default_draft_token_num=dflash_default_draft_token_num,
+            dflash_greedy_top1_only=dflash_greedy_top1_only,
             extend_return_logprob=extend_return_logprob,
             extend_return_top_logprob=extend_return_top_logprob,
             extend_token_ids_logprob=extend_token_ids_logprob,
@@ -282,6 +328,36 @@ class LogitsProcessor(nn.Module):
         self.enable_logprobs_chunk = envs.SGLANG_ENABLE_LOGITS_PROCESSER_CHUNK.get()
         # chunk size for logprobs processing
         self.logprobs_chunk_size = envs.SGLANG_LOGITS_PROCESSER_CHUNK_SIZE.get()
+        self._dflash_verify_lm_head_pad_buffers: dict[tuple, torch.Tensor] = {}
+
+    def reserve_dflash_target_verify_lm_head_pad_buffers(
+        self,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+        hidden_size: int,
+        actual_width: int,
+        default_width: int,
+        batch_sizes: List[int],
+    ) -> None:
+        actual_width = int(actual_width)
+        default_width = int(default_width)
+        if actual_width <= 0 or default_width <= 0 or actual_width >= default_width:
+            return
+
+        for bs in batch_sizes:
+            bs = int(bs)
+            if bs <= 0:
+                continue
+            padded_rows = bs * default_width
+            key = (str(device), dtype, int(hidden_size), int(padded_rows))
+            if key in self._dflash_verify_lm_head_pad_buffers:
+                continue
+            self._dflash_verify_lm_head_pad_buffers[key] = torch.empty(
+                (padded_rows, hidden_size),
+                dtype=dtype,
+                device=device,
+            )
 
     def forward(
         self,
@@ -323,6 +399,16 @@ class LogitsProcessor(nn.Module):
             aux_hidden_states,
             logits_metadata,
         )
+        _fa4_trace_logits(
+            "[FA4Logits] pruned_states shape=%s dtype=%s sample_indices=%s input_logprob_indices=%s forward_mode=%s",
+            tuple(pruned_states.shape),
+            pruned_states.dtype,
+            None if sample_indices is None else tuple(sample_indices.shape),
+            None
+            if input_logprob_indices is None
+            else tuple(input_logprob_indices.shape),
+            logits_metadata.forward_mode,
+        )
 
         hidden_states_to_store = self._get_hidden_states_to_store(
             hidden_states,
@@ -338,7 +424,33 @@ class LogitsProcessor(nn.Module):
 
         if not logits_metadata.extend_return_logprob:
             # Compute logits for both input and sampled tokens.
+            if (
+                logits_metadata.forward_mode.is_target_verify()
+                and logits_metadata.dflash_greedy_top1_only
+            ):
+                target_top1_ids = self._get_dflash_target_verify_top1_only(
+                    pruned_states,
+                    lm_head,
+                    logits_metadata,
+                )
+                output = LogitsProcessorOutput(
+                    next_token_logits=None,
+                    hidden_states=hidden_states_to_store,
+                    mm_input_embeds=logits_metadata.mm_input_embeds,
+                )
+                output._dflash_target_top1_ids = target_top1_ids
+                return output
+            _fa4_trace_logits(
+                "[FA4Logits] before_get_logits hidden=%s dtype=%s",
+                tuple(pruned_states.shape),
+                pruned_states.dtype,
+            )
             logits = self._get_logits(pruned_states, lm_head, logits_metadata)
+            _fa4_trace_logits(
+                "[FA4Logits] after_get_logits logits=%s dtype=%s",
+                tuple(logits.shape),
+                logits.dtype,
+            )
             sampled_logits = (
                 logits[sample_indices] if sample_indices is not None else logits
             )
@@ -400,7 +512,7 @@ class LogitsProcessor(nn.Module):
         self,
         hidden_states: torch.Tensor,
         hidden_states_before_norm: Optional[torch.Tensor],
-        aux_hidden_states: Optional[torch.Tensor],
+        aux_hidden_states: Optional[Union[torch.Tensor, List[torch.Tensor]]],
         logits_metadata: LogitsMetadata,
     ):
         pruned_states_before_norm: Optional[torch.Tensor] = None
@@ -415,7 +527,10 @@ class LogitsProcessor(nn.Module):
             pruned_states = hidden_states
             pruned_states_before_norm = hidden_states_before_norm
             if aux_hidden_states is not None:
-                aux_pruned_states = [hidden for hidden in aux_hidden_states]
+                if isinstance(aux_hidden_states, (list, tuple)):
+                    aux_pruned_states = [hidden for hidden in aux_hidden_states]
+                else:
+                    aux_pruned_states = aux_hidden_states
             sample_indices = None
             input_logprob_indices = None
 
@@ -443,7 +558,10 @@ class LogitsProcessor(nn.Module):
             if hidden_states_before_norm is not None:
                 pruned_states_before_norm = hidden_states_before_norm[last_index]
             if aux_hidden_states is not None:
-                aux_pruned_states = [hidden[last_index] for hidden in aux_hidden_states]
+                if isinstance(aux_hidden_states, (list, tuple)):
+                    aux_pruned_states = [hidden[last_index] for hidden in aux_hidden_states]
+                else:
+                    aux_pruned_states = aux_hidden_states[last_index]
             sample_indices = None
             input_logprob_indices = None
         else:
@@ -538,10 +656,10 @@ class LogitsProcessor(nn.Module):
         self,
         hidden_states: torch.Tensor,
         hidden_states_before_norm: Optional[torch.Tensor],
-        aux_hidden_states: Optional[List[torch.Tensor]],
+        aux_hidden_states: Optional[Union[torch.Tensor, List[torch.Tensor]]],
         pruned_states: torch.Tensor,
         pruned_states_before_norm: Optional[torch.Tensor],
-        aux_pruned_states: Optional[List[torch.Tensor]],
+        aux_pruned_states: Optional[Union[torch.Tensor, List[torch.Tensor]]],
         sample_indices: Optional[torch.Tensor],
         logits_metadata: LogitsMetadata,
     ) -> Optional[torch.Tensor]:
@@ -550,8 +668,11 @@ class LogitsProcessor(nn.Module):
         if logits_metadata.capture_hidden_mode.need_capture():
             if logits_metadata.capture_hidden_mode.is_full():
                 if aux_hidden_states is not None:
-                    aux_hidden_states = torch.cat(aux_hidden_states, dim=-1)
-                    hidden_states_to_store = aux_hidden_states
+                    hidden_states_to_store = (
+                        torch.cat(aux_hidden_states, dim=-1)
+                        if isinstance(aux_hidden_states, (list, tuple))
+                        else aux_hidden_states
+                    )
                 else:
                     hidden_states_to_store = hidden_states
                 hidden_states_to_store_before_norm = hidden_states_before_norm
@@ -559,7 +680,11 @@ class LogitsProcessor(nn.Module):
                 # Get the last token hidden states. If sample_indices is None,
                 # pruned states only contain the last tokens already.
                 if aux_hidden_states is not None:
-                    aux_pruned_states = torch.cat(aux_pruned_states, dim=-1)
+                    aux_pruned_states = (
+                        torch.cat(aux_pruned_states, dim=-1)
+                        if isinstance(aux_pruned_states, (list, tuple))
+                        else aux_pruned_states
+                    )
                     hidden_states_to_store = (
                         aux_pruned_states[sample_indices]
                         if sample_indices is not None
@@ -819,11 +944,34 @@ class LogitsProcessor(nn.Module):
         last position (e.g., extend without input logprobs). The caller should
         guarantee the given hidden_states follow this constraint.
         """
+        _fa4_trace_logits(
+            "[FA4Logits] enter_get_logits hidden=%s dtype=%s",
+            tuple(hidden_states.shape),
+            hidden_states.dtype,
+        )
         hidden_states, local_hidden_states = self._gather_dp_attn_hidden_states(
             hidden_states, logits_metadata
         )
+        _fa4_trace_logits(
+            "[FA4Logits] after_dp_gather hidden=%s dtype=%s local_hidden=%s",
+            tuple(hidden_states.shape),
+            hidden_states.dtype,
+            None if local_hidden_states is None else tuple(local_hidden_states.shape),
+        )
+        hidden_states, dflash_raw_rows = (
+            self._maybe_pad_dflash_target_verify_hidden_states(
+                hidden_states, logits_metadata
+            )
+        )
 
         logits = self._compute_lm_head(hidden_states, lm_head, embedding_bias)
+        if dflash_raw_rows is not None and logits.shape[0] != dflash_raw_rows:
+            logits = logits[:dflash_raw_rows]
+        _fa4_trace_logits(
+            "[FA4Logits] after_lm_head logits=%s dtype=%s",
+            tuple(logits.shape),
+            logits.dtype,
+        )
 
         if self.logit_scale is not None:
             logits.mul_(self.logit_scale)
@@ -837,8 +985,18 @@ class LogitsProcessor(nn.Module):
         logits = self._scatter_dp_attn_logits(
             logits, local_hidden_states, logits_metadata
         )
+        _fa4_trace_logits(
+            "[FA4Logits] after_dp_scatter logits=%s dtype=%s",
+            tuple(logits.shape),
+            logits.dtype,
+        )
 
         logits = self._copy_logits_to_buffer(logits, logits_metadata)
+        _fa4_trace_logits(
+            "[FA4Logits] after_copy_buffer logits=%s dtype=%s",
+            tuple(logits.shape),
+            logits.dtype,
+        )
 
         if self.final_logit_softcapping:
             if not _is_npu:
@@ -847,8 +1005,223 @@ class LogitsProcessor(nn.Module):
                 logits = self.final_logit_softcapping * torch.tanh(
                     logits / self.final_logit_softcapping
                 )
+            _fa4_trace_logits(
+                "[FA4Logits] after_softcap logits=%s dtype=%s",
+                tuple(logits.shape),
+                logits.dtype,
+            )
 
         return logits
+
+    def _maybe_pad_dflash_target_verify_hidden_states(
+        self,
+        hidden_states: torch.Tensor,
+        logits_metadata: LogitsMetadata,
+    ) -> Tuple[torch.Tensor, Optional[int]]:
+        if not logits_metadata.forward_mode.is_target_verify():
+            return hidden_states, None
+
+        actual_width = int(logits_metadata.dflash_draft_token_num or 0)
+        default_width = int(logits_metadata.dflash_default_draft_token_num or 0)
+        if actual_width <= 0 or default_width <= 0 or actual_width >= default_width:
+            return hidden_states, None
+
+        raw_rows = int(hidden_states.shape[0])
+        if raw_rows <= 0 or raw_rows % actual_width != 0:
+            return hidden_states, None
+
+        batch_size = raw_rows // actual_width
+        padded_rows = batch_size * default_width
+        if padded_rows <= raw_rows:
+            return hidden_states, None
+
+        key = (
+            str(hidden_states.device),
+            hidden_states.dtype,
+            int(hidden_states.shape[1]),
+            padded_rows,
+        )
+        padded = self._dflash_verify_lm_head_pad_buffers.get(key)
+        if padded is None or padded.device != hidden_states.device:
+            padded = torch.empty(
+                (padded_rows, hidden_states.shape[1]),
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
+            self._dflash_verify_lm_head_pad_buffers[key] = padded
+
+        padded.zero_()
+        padded[:raw_rows].copy_(hidden_states)
+        _fa4_trace_logits(
+            "[FA4Logits] dflash_verify_lm_head_pad raw_rows=%s padded_rows=%s actual_width=%s default_width=%s",
+            raw_rows,
+            padded_rows,
+            actual_width,
+            default_width,
+        )
+        return padded, raw_rows
+
+    def _get_dflash_target_verify_top1_only(
+        self,
+        hidden_states: torch.Tensor,
+        lm_head: VocabParallelEmbedding,
+        logits_metadata: LogitsMetadata,
+        embedding_bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        hidden_states, local_hidden_states = self._gather_dp_attn_hidden_states(
+            hidden_states, logits_metadata
+        )
+        hidden_states, dflash_raw_rows = (
+            self._maybe_pad_dflash_target_verify_hidden_states(
+                hidden_states, logits_metadata
+            )
+        )
+
+        fast_top1_ids = self._get_dflash_target_verify_top1_only_fast(
+            hidden_states=hidden_states,
+            local_hidden_states=local_hidden_states,
+            lm_head=lm_head,
+            logits_metadata=logits_metadata,
+            dflash_raw_rows=dflash_raw_rows,
+        )
+        if fast_top1_ids is not None:
+            return fast_top1_ids
+
+        logits = self._compute_lm_head(hidden_states, lm_head, embedding_bias)
+        if dflash_raw_rows is not None and logits.shape[0] != dflash_raw_rows:
+            logits = logits[:dflash_raw_rows]
+
+        if self.logit_scale is not None:
+            logits.mul_(self.logit_scale)
+
+        if self.do_tensor_parallel_all_gather:
+            if self.use_attn_tp_group:
+                logits = self._gather_attn_tp_logits(logits)
+            else:
+                logits = tensor_model_parallel_all_gather(logits)
+
+        logits = self._scatter_dp_attn_logits(
+            logits, local_hidden_states, logits_metadata
+        )
+        return torch.argmax(logits[:, : self.vocab_size], dim=-1).to(torch.int64)
+
+    def _get_dflash_target_verify_top1_only_fast(
+        self,
+        *,
+        hidden_states: torch.Tensor,
+        local_hidden_states: torch.Tensor,
+        lm_head: VocabParallelEmbedding,
+        logits_metadata: LogitsMetadata,
+        dflash_raw_rows: Optional[int],
+        vocab_chunk_size: int = 32768,
+    ) -> Optional[torch.Tensor]:
+        enable_fast_top1 = (
+            os.environ.get("SGLANG_DFLASH_ENABLE_FAST_TOP1_ONLY") or ""
+        ).strip().lower()
+        disable_fast_top1 = (
+            os.environ.get("SGLANG_DFLASH_DISABLE_FAST_TOP1_ONLY") or ""
+        ).strip().lower()
+        if disable_fast_top1 not in ("", "0", "false", "off", "no"):
+            return None
+        server_args = get_global_server_args()
+        served_model_name = str(getattr(server_args, "served_model_name", "") or "")
+        model_path = str(getattr(server_args, "model_path", "") or "")
+        # GPT-OSS DFLASH A/B validation showed this shortcut can materially reduce
+        # acceptance and break Harmony formatting. Keep it opt-in there until the
+        # fast path is proven numerically equivalent to the full LM-head path.
+        if (
+            enable_fast_top1 in ("", "0", "false", "off", "no")
+            and (
+                "gpt-oss" in served_model_name.lower()
+                or "gpt-oss" in model_path.lower()
+            )
+        ):
+            _fa4_trace_logits(
+                "[FA4Logits] DFLASH fast top1-only verify disabled for GPT-OSS served_model_name=%s model_path=%s",
+                served_model_name,
+                model_path,
+            )
+            return None
+        if self.do_tensor_parallel_all_gather:
+            return None
+        if self.use_fp32_lm_head:
+            return None
+        if self.logit_scale is not None and float(self.logit_scale) <= 0:
+            return None
+        if hasattr(lm_head, "set_lora") and hasattr(lm_head, "apply_lora"):
+            return None
+        if not hasattr(lm_head, "weight") or not hasattr(lm_head, "shard_indices"):
+            return None
+        if use_intel_amx_backend(lm_head):
+            return None
+        if get_global_server_args().rl_on_policy_target is not None:
+            return None
+
+        shard = lm_head.shard_indices
+        weight = lm_head.weight
+        weight_dtype = weight.dtype
+        num_rows = hidden_states.shape[0]
+        if dflash_raw_rows is not None:
+            num_rows = int(dflash_raw_rows)
+            hidden_states = hidden_states[:num_rows]
+
+        if num_rows == 0:
+            return torch.empty((0,), dtype=torch.int64, device=hidden_states.device)
+
+        hidden_states = (
+            hidden_states
+            if hidden_states.dtype == weight_dtype
+            else hidden_states.to(weight_dtype)
+        )
+        best_vals = torch.full(
+            (num_rows,),
+            torch.finfo(weight_dtype).min,
+            dtype=weight_dtype,
+            device=hidden_states.device,
+        )
+        best_ids = torch.zeros(
+            (num_rows,), dtype=torch.int64, device=hidden_states.device
+        )
+
+        def _update_best(weight_start: int, weight_end: int, token_offset: int) -> None:
+            nonlocal best_vals, best_ids
+            for chunk_start in range(weight_start, weight_end, vocab_chunk_size):
+                chunk_end = min(weight_end, chunk_start + vocab_chunk_size)
+                logits_chunk = torch.matmul(
+                    hidden_states, weight[chunk_start:chunk_end].T
+                )
+                chunk_vals, chunk_arg = torch.max(logits_chunk, dim=-1)
+                chunk_ids = chunk_arg.to(torch.int64) + int(token_offset) + int(
+                    chunk_start - weight_start
+                )
+                use_chunk = chunk_vals > best_vals
+                best_vals = torch.where(use_chunk, chunk_vals, best_vals)
+                best_ids = torch.where(use_chunk, chunk_ids, best_ids)
+
+        num_org = int(shard.num_org_elements)
+        num_org_padded = int(shard.num_org_elements_padded)
+        num_added = int(shard.num_added_elements)
+        org_vocab_start = int(shard.org_vocab_start_index)
+        added_vocab_start = int(shard.added_vocab_start_index)
+
+        if num_org > 0:
+            _update_best(0, num_org, org_vocab_start)
+        if num_added > 0:
+            _update_best(
+                num_org_padded,
+                num_org_padded + num_added,
+                added_vocab_start,
+            )
+
+        if self.do_tensor_parallel_all_gather_dp_attn:
+            local_ids = torch.empty(
+                (local_hidden_states.shape[0],),
+                device=best_ids.device,
+                dtype=best_ids.dtype,
+            )
+            dp_scatter(local_ids, best_ids, logits_metadata)
+            best_ids = local_ids
+        return best_ids
 
     def _compute_lm_head(
         self,
@@ -858,14 +1231,22 @@ class LogitsProcessor(nn.Module):
     ) -> torch.Tensor:
         if hasattr(lm_head, "set_lora") and hasattr(lm_head, "apply_lora"):
             # This is a LoRA-wrapped module, use its forward method
+            _fa4_trace_logits(
+                "[FA4Logits] lm_head_branch=lora hidden=%s hidden_dtype=%s",
+                tuple(hidden_states.shape),
+                hidden_states.dtype,
+            )
             logits = lm_head(hidden_states)
         elif hasattr(lm_head, "weight"):
             # Normal linear layer
+            branch = "matmul"
             if self.use_fp32_lm_head:
+                branch = "fp32_matmul"
                 logits = torch.matmul(
                     hidden_states.to(torch.float32), lm_head.weight.to(torch.float32).T
                 )
             elif use_intel_amx_backend(lm_head):
+                branch = "intel_amx"
                 logits = torch.ops.sgl_kernel.weight_packed_linear(
                     hidden_states.to(lm_head.weight.dtype),
                     lm_head.weight,
@@ -874,22 +1255,51 @@ class LogitsProcessor(nn.Module):
                 )
             elif get_global_server_args().rl_on_policy_target is not None:
                 # Due to tie-weight, we may not be able to change lm_head's weight dtype
+                branch = "rl_bf16_tied"
                 logits = torch.matmul(
                     hidden_states.bfloat16(), lm_head.weight.T.bfloat16()
                 )
             else:
+                branch = "weight_dtype_matmul"
+                _fa4_trace_logits(
+                    "[FA4Logits] lm_head_branch=%s hidden=%s hidden_dtype=%s weight=%s weight_dtype=%s",
+                    branch,
+                    tuple(hidden_states.shape),
+                    hidden_states.dtype,
+                    tuple(lm_head.weight.shape),
+                    lm_head.weight.dtype,
+                )
                 logits = torch.matmul(
                     hidden_states.to(lm_head.weight.dtype), lm_head.weight.T
+                )
+            if branch != "weight_dtype_matmul":
+                _fa4_trace_logits(
+                    "[FA4Logits] lm_head_branch=%s hidden=%s hidden_dtype=%s weight=%s weight_dtype=%s",
+                    branch,
+                    tuple(hidden_states.shape),
+                    hidden_states.dtype,
+                    tuple(lm_head.weight.shape),
+                    lm_head.weight.dtype,
                 )
         else:
             # GGUF models
             # TODO: use weight_packed_linear for GGUF models
             if self.use_fp32_lm_head:
+                _fa4_trace_logits(
+                    "[FA4Logits] lm_head_branch=gguf_fp32 hidden=%s hidden_dtype=%s",
+                    tuple(hidden_states.shape),
+                    hidden_states.dtype,
+                )
                 with torch.cuda.amp.autocast(enabled=False):
                     logits = lm_head.quant_method.apply(
                         lm_head, hidden_states.to(torch.float32), embedding_bias
                     )
             else:
+                _fa4_trace_logits(
+                    "[FA4Logits] lm_head_branch=gguf_quant hidden=%s hidden_dtype=%s",
+                    tuple(hidden_states.shape),
+                    hidden_states.dtype,
+                )
                 logits = lm_head.quant_method.apply(
                     lm_head, hidden_states, embedding_bias
                 )
@@ -955,8 +1365,9 @@ class LogitsProcessor(nn.Module):
     ) -> torch.Tensor:
         if logits_metadata.next_token_logits_buffer is not None:
             logits_buffer = logits_metadata.next_token_logits_buffer
-            assert logits_buffer.dtype == torch.float
-            logits_buffer.copy_(logits[:, : self.vocab_size])
+            # Default buffer dtype is fp32, but CUDA-graph preallocation can be configured
+            # to fp16/bf16 to avoid OOMs for very large capture ladders.
+            logits_buffer.copy_(logits[:, : self.vocab_size].to(logits_buffer.dtype))
             logits = logits_buffer
         else:
             logits = logits[:, : self.vocab_size].float()
@@ -1055,7 +1466,7 @@ class LogitsProcessor(nn.Module):
                 input_token_ids_logprobs_val,
                 input_token_ids_logprobs_idx,
             ) = get_token_ids_logprobs_prefill(
-                sliced_logprobs, logits_metadata, delay_cpu_copy=True
+                sliced_logprobs, logits_metadata, no_copy_to_cpu=True
             )
 
         # Get the logprob of top-k tokens
